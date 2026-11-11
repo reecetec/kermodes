@@ -77,15 +77,29 @@ impl Key {
     }
 }
 
-/// An engine running inside this Python process.
+/// An engine running inside this Python process, with the tables of a store directory if it
+/// opened one.
 #[pyclass(module = "kermodes", name = "Session", frozen)]
-pub struct Session(kermodes_core::Session);
+pub struct Session {
+    engine: kermodes_core::Session,
+    store: Option<Arc<kermodes_weir::Store>>,
+}
 
 #[pymethods]
 impl Session {
+    /// An engine in this process; with `path`, also the store in that directory (created if
+    /// needed): its tables, their rows, and their writers' progress survive the process.
     #[new]
-    fn new() -> Self {
-        Self(kermodes_core::Session::new())
+    #[pyo3(signature = (path=None))]
+    fn new(py: Python<'_>, path: Option<PathBuf>) -> PyResult<Self> {
+        let store = path
+            .map(|path| py.detach(|| kermodes_weir::Store::open(&path)))
+            .transpose()
+            .map_err(store_error)?;
+        Ok(Self {
+            engine: kermodes_core::Session::new(),
+            store: store.map(Arc::new),
+        })
     }
 
     /// A refreshing table with the given column names and types. Without `key`, rows arrive
@@ -98,20 +112,13 @@ impl Session {
         columns: &Bound<'_, PyDict>,
         key: Option<Key>,
     ) -> PyResult<Table> {
-        let mut fields = Vec::with_capacity(columns.len());
-        for (name, type_name) in columns.iter() {
-            let name: String = name.extract()?;
-            let type_name: String = type_name.extract()?;
-            let data_type = kermodes_core::parse_type(&type_name).map_err(engine_error)?;
-            fields.push(Field::new(name, data_type, true));
-        }
-        let schema = Schema::new(fields);
+        let schema = schema_from(columns)?;
         let names = key.map(Key::names);
         let table = py.detach(|| match &names {
-            None => self.0.input_table(&schema),
+            None => self.engine.input_table(&schema),
             Some(names) => {
                 let names: Vec<&str> = names.iter().map(String::as_str).collect();
-                self.0.keyed_input_table(&schema, &names)
+                self.engine.keyed_input_table(&schema, &names)
             }
         });
         Ok(Table(table.map_err(engine_error)?))
@@ -121,14 +128,14 @@ impl Session {
     fn static_table(&self, py: Python<'_>, data: AnyRecordBatch) -> PyResult<Table> {
         let (schema, batches) = read_batches(data)?;
         let table = py
-            .detach(|| self.0.static_table(schema, batches))
+            .detach(|| self.engine.static_table(schema, batches))
             .map_err(engine_error)?;
         Ok(Table(table))
     }
 
     /// Runs one cycle and returns its number.
     fn step(&self, py: Python<'_>) -> u64 {
-        py.detach(|| self.0.step())
+        py.detach(|| self.engine.step())
     }
 
     /// Runs cycles in the background: one as soon as writes arrive, folding writes that arrive
@@ -137,24 +144,25 @@ impl Session {
     #[pyo3(signature = (min_period=None))]
     fn start(&self, py: Python<'_>, min_period: Option<&str>) -> PyResult<()> {
         let min_period = min_period.map(parse_period).transpose()?;
-        py.detach(|| self.0.start(min_period)).map_err(engine_error)
+        py.detach(|| self.engine.start(min_period))
+            .map_err(engine_error)
     }
 
     /// Stops the background cycles, after any cycle in progress.
     fn stop(&self, py: Python<'_>) {
-        py.detach(|| self.0.stop());
+        py.detach(|| self.engine.stop());
     }
 
     #[getter]
     fn is_running(&self, py: Python<'_>) -> bool {
-        py.detach(|| self.0.is_running())
+        py.detach(|| self.engine.is_running())
     }
 
     /// How many tables the session holds: those Python refers to, and those they are computed
     /// from. A table goes as soon as neither is true.
     #[getter]
     fn table_count(&self, py: Python<'_>) -> usize {
-        py.detach(|| self.0.table_count())
+        py.detach(|| self.engine.table_count())
     }
 
     /// Serves this session's published tables to the web UI on `host:port` (port 0 picks a
@@ -168,12 +176,121 @@ impl Session {
         // The web app ships in the package (`bun run build` in web/ writes it there).
         let package: PathBuf = py.import("kermodes")?.getattr("__file__")?.extract()?;
         let app = package.parent().map(|dir| dir.join("static").join("app"));
-        let session = self.0.clone();
+        let session = self.engine.clone();
         let server = py
             .detach(|| kermodes_gateway::serve(session, addr, app))
             .map_err(|e| PyValueError::new_err(format!("cannot listen on {addr}: {e}")))?;
         Ok(Server(Mutex::new(server)))
     }
+
+    /// Creates the stored table `name` ("namespace.table") with these column names and types,
+    /// or does nothing if it exists with the same columns.
+    fn create_table(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        columns: &Bound<'_, PyDict>,
+    ) -> PyResult<()> {
+        let store = self.store()?;
+        let name = kermodes_weir::TableName::parse(name).map_err(store_error)?;
+        let schema = schema_from(columns)?;
+        py.detach(|| store.create_table(&name, &schema))
+            .map_err(store_error)?;
+        Ok(())
+    }
+
+    /// The stored tables' names.
+    #[getter]
+    fn tables(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        let store = self.store()?;
+        let tables = py.detach(|| store.tables()).map_err(store_error)?;
+        Ok(tables.iter().map(|t| t.name.to_string()).collect())
+    }
+
+    /// Writes rows of `name` for one source (one writer per source at a time).
+    #[pyo3(signature = (name, source="default"))]
+    fn writer(&self, py: Python<'_>, name: &str, source: &str) -> PyResult<Writer> {
+        let store = self.store()?;
+        let name = kermodes_weir::TableName::parse(name).map_err(store_error)?;
+        let source = kermodes_weir::SourceId::parse(source).map_err(store_error)?;
+        let writer = py
+            .detach(|| store.writer(&name, &source))
+            .map_err(store_error)?;
+        Ok(Writer(writer))
+    }
+
+    /// The stored table `name`, ticking: every row written so far, then each batch as it is
+    /// written. Its rows come only from its writers.
+    fn live_table(&self, py: Python<'_>, name: &str) -> PyResult<Table> {
+        let store = self.store()?;
+        let name = kermodes_weir::TableName::parse(name).map_err(store_error)?;
+        let table = py.detach(|| {
+            let entry = store.table(&name).map_err(store_error)?;
+            let (table, feed) = self
+                .engine
+                .fed_table(&entry.schema, &format!("live {name}"))
+                .map_err(engine_error)?;
+            store
+                .subscribe(
+                    &name,
+                    Box::new(move |batch| {
+                        matches!(feed.append(std::slice::from_ref(batch)), Ok(true))
+                    }),
+                )
+                .map_err(store_error)?;
+            Ok::<_, PyErr>(table)
+        })?;
+        Ok(Table(table))
+    }
+}
+
+impl Session {
+    fn store(&self) -> PyResult<Arc<kermodes_weir::Store>> {
+        self.store.clone().ok_or_else(|| {
+            KermodesError::new_err("this session keeps no tables: open a store with km.local(path)")
+        })
+    }
+}
+
+/// Writes one source's rows of a stored table (`Session.writer`).
+#[pyclass(module = "kermodes", name = "Writer", frozen)]
+pub struct Writer(kermodes_weir::Writer);
+
+#[pymethods]
+impl Writer {
+    /// Writes `data` (any Arrow table or batch; columns matched by name) as one batch with
+    /// sequence number `seq`, or the next after `last_seq`. Returns once it is durable; `False`
+    /// when `seq` was already written, which writes nothing (a resend after a restart).
+    #[pyo3(signature = (data, seq=None))]
+    fn write(&self, py: Python<'_>, data: AnyRecordBatch, seq: Option<u64>) -> PyResult<bool> {
+        let (schema, batches) = read_batches(data)?;
+        py.detach(|| {
+            let batch = arrow::compute::concat_batches(&schema, &batches).map_err(arrow_error)?;
+            self.0.write(&batch, seq).map_err(store_error)
+        })
+    }
+
+    /// The last sequence number this source wrote (in its newest partition), or `None`.
+    #[getter]
+    fn last_seq(&self, py: Python<'_>) -> Option<u64> {
+        py.detach(|| self.0.last_seq())
+    }
+}
+
+fn store_error(error: kermodes_weir::Error) -> PyErr {
+    KermodesError::new_err(error.to_string())
+}
+
+/// A schema from column names and type names (`km.int64()` and so on), every column nullable.
+fn schema_from(columns: &Bound<'_, PyDict>) -> PyResult<Schema> {
+    let mut fields = Vec::with_capacity(columns.len());
+    for (name, type_name) in columns.iter() {
+        let name: String = name.extract()?;
+        let type_name: String = type_name.extract()?;
+        let data_type = kermodes_core::parse_type(&type_name).map_err(engine_error)?;
+        fields.push(Field::new(name, data_type, true));
+    }
+    Ok(Schema::new(fields))
 }
 
 /// The web UI's server for a session (`Session.serve`). Published tables are held until
@@ -705,7 +822,7 @@ impl Viewer {
 #[pymodule]
 mod _native {
     #[pymodule_export]
-    use super::{Server, Session, Table, Viewer, merge};
+    use super::{Server, Session, Table, Viewer, Writer, merge};
 
     use pyo3::prelude::*;
 

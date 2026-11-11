@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 publish = false
 
 [workspace.dependencies]
@@ -16,6 +16,7 @@ pyo3-arrow = "0.21"
 sqlparser = { version = "0.64", default-features = false, features = ["std"] }
 kermodes-core = { path = "crates/kermodes-core" }
 kermodes-gateway = { path = "crates/kermodes-gateway" }
+kermodes-weir = { path = "crates/kermodes-weir" }
 
 # Editable Python builds (uv sync): optimised enough to use the engine, fast to rebuild.
 [profile.dev-py]

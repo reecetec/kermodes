@@ -197,6 +197,8 @@ struct TableState {
 
 enum Source {
     Append,
+    /// Append-only rows that only a `Feed` delivers: a table a store such as weir keeps.
+    Fed,
     Keyed(Box<Keyed>),
     Static,
     Derived {
@@ -228,7 +230,7 @@ impl Source {
             }
             Source::Join { left, right, .. } => (Some(*left), Some(*right), &[]),
             Source::Merge { inputs } => (None, None, inputs),
-            Source::Append | Source::Keyed(_) | Source::Static => (None, None, &[]),
+            Source::Append | Source::Fed | Source::Keyed(_) | Source::Static => (None, None, &[]),
         };
         first.into_iter().chain(second).chain(rest.iter().copied())
     }
@@ -621,6 +623,25 @@ impl WeakTable {
     }
 }
 
+/// Delivers rows to a fed table (`Session::fed_table`). It holds the table weakly: once nothing
+/// else does, `append` reports the table gone and the store can stop feeding it.
+pub struct Feed {
+    table: WeakTable,
+}
+
+impl Feed {
+    /// Queues rows for the table's next cycle, as `Table::append` does; `false` once the table is
+    /// gone.
+    pub fn append(&self, batches: &[RecordBatch]) -> Result<bool, Error> {
+        let Some(table) = self.table.upgrade() else {
+            return Ok(false);
+        };
+        let batches = conform_all(&table.schema, batches)?;
+        table.queue(batches.into_iter().map(Write::Append));
+        Ok(true)
+    }
+}
+
 /// A table in a session. Cheap to clone; clones refer to the same table. The table lives while
 /// any clone does, or while a live table is computed from it.
 #[derive(Clone)]
@@ -646,6 +667,24 @@ impl Session {
             Growth::AppendOnly,
             Source::Append,
         )))
+    }
+
+    /// An append-only refreshing table whose rows arrive only through the returned `Feed`, for
+    /// tables a store keeps (weir's live tables): their writers go through the store, and
+    /// `Table::append` refuses them. Every column is nullable.
+    pub fn fed_table(&self, schema: &Schema, description: &str) -> Result<(Table, Feed), Error> {
+        let schema = nullable(schema)?;
+        let table = self.add(TableState::new(
+            description.to_owned(),
+            schema,
+            true,
+            Growth::AppendOnly,
+            Source::Fed,
+        ));
+        let feed = Feed {
+            table: table.downgrade(),
+        };
+        Ok((table, feed))
     }
 
     /// A refreshing table with one row per value of `key`; rows arrive through `Table::upsert`
@@ -731,7 +770,9 @@ impl Session {
             let delta_of = |id: usize| before[id].delta.as_ref().unwrap_or(&unchanged);
             let result = match &mut table.source {
                 Source::Static => continue,
-                Source::Append => Ok(appended(table.storage.as_ref().expect(STORED), writes)),
+                Source::Append | Source::Fed => {
+                    Ok(appended(table.storage.as_ref().expect(STORED), writes))
+                }
                 Source::Keyed(keyed) => {
                     keyed.resolve(table.storage.as_ref().expect(STORED), writes)
                 }

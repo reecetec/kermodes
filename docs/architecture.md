@@ -128,7 +128,7 @@ Core data path: the arrow-rs family only — `arrow` (array, compute kernels, IP
 workspace.
 
 Infrastructure crates are allowed where writing our own would add risk without value: `tokio`,
-`tonic` (via arrow-flight), `sqlx` (Postgres, SQLite), `kube`, `ort` (ONNX Runtime), `pyo3` +
+`tonic` (via arrow-flight), `sqlx` (Postgres), `kube`, `ort` (ONNX Runtime), `pyo3` +
 `pyo3-arrow`, `openidconnect`, `jsonwebtoken`, `clap`, `serde`, `tracing`/OpenTelemetry.
 
 `sqlparser` is the one parsing dependency: it turns SQL text into an AST and does nothing else (its
@@ -137,6 +137,11 @@ than it saves.
 
 `ahash` (already compiled in through arrow-array) hashes group keys; using it directly adds no
 crate to the build.
+
+`rusqlite` (with SQLite bundled) holds the local catalog: a synchronous, in-process database is
+what an embedded store (`km.local(path)`) and `kermodes dev` need, with no runtime to start; the
+cluster's catalog is Postgres through `sqlx`, behind the same storage interface. `crc32fast`
+checks weir's index records, so recovery can tell a committed record from one a crash cut short.
 
 `mimalloc` is the Python extension's global allocator. The system allocators keep freed memory
 resident (macOS keeps large freed blocks cached; glibc keeps freed memory in its heaps), so a
@@ -317,22 +322,27 @@ def parse_odds(msgs: km.Batch) -> km.Batch: ...
 ### 7.1 Storage
 
 ```
-/data/weir/{location}/{date}/{source_id}/     location = {branch}/{namespace}/{table}.{id} (§5.1)
-  seg-000042.arrow      sealed: Arrow IPC file (footer present), immutable
-  seg-000042.idx        batch offsets, seq range, ingest-time range, row range, epoch
-  seg-000043.arrows     open: Arrow IPC stream, append + fsync
-  state.json            last_seq, epoch, schema_version, sealed flag for the day
+{store}/weir/{location}/{date}/{source_id}/     location = {branch}/{namespace}/{table}.{id} (§5.1)
+  seg-000042.arrows     Arrow IPC stream: the segment's batches, appended and fsynced
+  seg-000042.idx        format header, then per batch: seq, rows, ingest time, end offset,
+                        epoch, change kind, CRC
 ```
 
-- Open segments are Arrow IPC streams. Appends are fsynced before ack.
-- A segment seals after N rows or N seconds: the file is rewritten/finalized with its footer and
-  index so it can be memory-mapped.
-- Crash recovery: read the open stream to the last complete batch, truncate the rest, restore
-  `last_seq`.
+- A batch is committed when its index record is: the batch is appended and fsynced to the
+  stream, then its record is appended and fsynced, then the writer is acknowledged and
+  subscribers get the batch. The index is the commit record; there is no separate state file.
+- Crash recovery reads each index up to the first record that fails its CRC (or does not follow
+  the one before) and reads its stream only that far. `last_seq` is the last good record's.
+  Writing after a restart starts a new segment, so what a crash left beyond the last commit is
+  never read; a segment with no committed batch is deleted.
+- A segment takes batches until its stream reaches 64 MiB. Later: sealing rewrites a full
+  segment as an Arrow IPC file with its footer, so it can be memory-mapped and copied to S3.
 - Row positions within an internal partition are stable (append-only), which maps onto add-only
   tables in the engine.
 - Per-batch metadata (`seq`, ingest time) lives in the index, not in user columns. An
   `IngestTime` column can be materialized per table if requested.
+- The epoch and change-kind fields are written from the start (0, and "rows"), so fencing (§17)
+  and keyed tables' upserts and deletes need no format change.
 
 ### 7.2 Serving
 
@@ -1168,7 +1178,7 @@ failure; `plan` warns when a non-replayable source has no replicated ack.
 | Historical files | `parquet` |
 | Object storage | `object_store` (S3 / rustfs, local filesystem) |
 | Query frontends | Python table API and SQL (`sqlparser` for parsing), both compiled to the Kermodes plan (§9.3, §9.8) |
-| Catalog and control-plane DB | Postgres (cluster) / SQLite (local) via `sqlx` |
+| Catalog and control-plane DB | Postgres via `sqlx` (cluster); SQLite via `rusqlite` (local) |
 | Inference | ONNX Runtime via `ort`; Python sidecar for other flavors |
 | Kubernetes | `kube` |
 | Python bindings | PyO3 (abi3), `pyo3-arrow` (Arrow PyCapsule interface), maturin, uv |

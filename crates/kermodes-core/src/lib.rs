@@ -21,5 +21,5 @@ pub mod viewer;
 pub use error::Error;
 pub use expr::Expression;
 pub use rolling::Window;
-pub use session::{RowsAt, Session, Table, WeakTable, set_idle_hook};
+pub use session::{Feed, RowsAt, Session, Table, WeakTable, set_idle_hook};
 pub use types::{parse_type, type_name};
