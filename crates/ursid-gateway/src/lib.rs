@@ -1,0 +1,465 @@
+//! The gateway (architecture.md §4, §15.2): the web UI's server. This first slice serves one
+//! local session: the built web app, and on `/ws` a WebSocket over which the app lists the
+//! session's published tables and opens them in the table viewer (§15.3). Authentication,
+//! routing to worker pods, and Flight come with the cluster gateway (M4).
+//!
+//! Messages from the app are JSON text: `{"type": "tables"}`, `{"type": "open", "view": id,
+//! "table": name}`, `{"type": "close", "view": id}`, and the viewer's own messages (`viewport`,
+//! `sort`, `filter`, `fetch`, as in `ursid_core::viewer`) with a `"view"` field. The server
+//! answers with JSON text (`tables`, `state` for a view before each of its windows, `error`)
+//! and binary frames: a little-endian u32 header length, the header (JSON: `view`, `type`
+//! "rows" or "fetched", `id` for fetches, `start`, `total`, `cycle`), a u32 rows length, the
+//! rows (Arrow IPC stream), then the rows' keys (little-endian u64 each). After every engine
+//! cycle, each open view whose table changed gets its window again.
+
+use std::collections::{BTreeMap, HashMap};
+use std::io;
+use std::net::{SocketAddr, TcpListener};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use axum::Router;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path as UrlPath, State};
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use serde_json::{Value, json};
+use tokio::sync::{oneshot, watch};
+use ursid_core::viewer::{Frame, Request, SortKey, Viewer};
+use ursid_core::{Session, Table, type_name};
+
+/// How long the cycle watcher waits before checking whether the server is stopping.
+const CYCLE_WAIT: Duration = Duration::from_millis(500);
+
+/// A running server; stops when dropped.
+pub struct Server {
+    addr: SocketAddr,
+    shared: Arc<Shared>,
+    shutdown: Option<oneshot::Sender<()>>,
+    runtime: Option<JoinHandle<()>>,
+    watcher: Option<JoinHandle<()>>,
+    stopping: Arc<AtomicBool>,
+}
+
+struct Shared {
+    /// Published tables by name, held until unpublished or the server stops.
+    tables: Mutex<BTreeMap<String, Table>>,
+    /// Bumped when the published set changes, so connections resend the list.
+    catalog: watch::Sender<u64>,
+    /// The last finished engine cycle.
+    cycles: watch::Sender<u64>,
+    /// The built web app (`index.html` and its assets), if any.
+    app: Option<PathBuf>,
+}
+
+impl Shared {
+    fn tables(&self) -> MutexGuard<'_, BTreeMap<String, Table>> {
+        self.tables
+            .lock()
+            .expect("ursid gateway tables poisoned by an earlier panic")
+    }
+}
+
+/// Serves `session` on `addr` (port 0 picks a free one), with the web app in `app`.
+pub fn serve(session: Session, addr: SocketAddr, app: Option<PathBuf>) -> io::Result<Server> {
+    let listener = TcpListener::bind(addr)?;
+    listener.set_nonblocking(true)?;
+    let addr = listener.local_addr()?;
+    let shared = Arc::new(Shared {
+        tables: Mutex::new(BTreeMap::new()),
+        catalog: watch::Sender::new(0),
+        cycles: watch::Sender::new(0),
+        app,
+    });
+    let stopping = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let (shared, stopping) = (shared.clone(), stopping.clone());
+        thread::Builder::new()
+            .name("ursid-gateway-cycles".into())
+            .spawn(move || {
+                let mut last = 0;
+                while !stopping.load(Ordering::Acquire) {
+                    let cycle = session.wait_cycle(last, CYCLE_WAIT);
+                    if cycle > last {
+                        last = cycle;
+                        shared.cycles.send_replace(cycle);
+                    }
+                }
+            })?
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("ursid-gateway")
+        .enable_all()
+        .build()?;
+    let (shutdown, stopped) = oneshot::channel::<()>();
+    let router = Router::new()
+        .route("/ws", get(upgrade))
+        .route("/", get(index))
+        .route("/{*path}", get(asset))
+        .with_state(shared.clone());
+    let runtime = thread::Builder::new()
+        .name("ursid-gateway".into())
+        .spawn(move || {
+            runtime.block_on(async move {
+                let listener =
+                    tokio::net::TcpListener::from_std(listener).expect("a bound listener converts");
+                let _ = axum::serve(listener, router)
+                    .with_graceful_shutdown(async {
+                        let _ = stopped.await;
+                    })
+                    .await;
+            });
+        })?;
+    Ok(Server {
+        addr,
+        shared,
+        shutdown: Some(shutdown),
+        runtime: Some(runtime),
+        watcher: Some(watcher),
+        stopping,
+    })
+}
+
+impl Server {
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Makes `table` visible to the web app as `name`, replacing any table of that name. The
+    /// server holds it until it is unpublished or the server stops.
+    pub fn publish(&self, name: &str, table: &Table) {
+        self.shared.tables().insert(name.to_owned(), table.clone());
+        self.shared.catalog.send_modify(|v| *v += 1);
+    }
+
+    /// Whether a table of that name was published.
+    pub fn unpublish(&self, name: &str) -> bool {
+        let removed = self.shared.tables().remove(name).is_some();
+        self.shared.catalog.send_modify(|v| *v += 1);
+        removed
+    }
+
+    pub fn published(&self) -> Vec<String> {
+        self.shared.tables().keys().cloned().collect()
+    }
+
+    /// Stops serving: open connections close, and published tables are let go.
+    pub fn stop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        self.stopping.store(true, Ordering::Release);
+        for handle in [self.runtime.take(), self.watcher.take()]
+            .into_iter()
+            .flatten()
+        {
+            let _ = handle.join();
+        }
+        self.shared.tables().clear();
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+async fn index(State(shared): State<Arc<Shared>>) -> Response {
+    file(&shared, Path::new("index.html")).await
+}
+
+async fn asset(State(shared): State<Arc<Shared>>, UrlPath(path): UrlPath<String>) -> Response {
+    let path = Path::new(&path);
+    // Only plain relative paths inside the app directory.
+    if !path.components().all(|c| matches!(c, Component::Normal(_))) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    file(&shared, path).await
+}
+
+async fn file(shared: &Shared, path: &Path) -> Response {
+    const NOT_BUILT: &str = "the web app is not built: run `bun run build` in web/";
+    let Some(app) = &shared.app else {
+        return (StatusCode::NOT_FOUND, NOT_BUILT).into_response();
+    };
+    // Read on every request, so a build after the server started is served at once.
+    match tokio::fs::read(app.join(path)).await {
+        Ok(bytes) => ([(header::CONTENT_TYPE, content_type(path))], bytes).into_response(),
+        Err(_) if path == Path::new("index.html") => {
+            (StatusCode::NOT_FOUND, NOT_BUILT).into_response()
+        }
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+fn content_type(path: &Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js" | "mjs") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json") => "application/json",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("woff2") => "font/woff2",
+        _ => "application/octet-stream",
+    }
+}
+
+async fn upgrade(ws: WebSocketUpgrade, State(shared): State<Arc<Shared>>) -> Response {
+    ws.on_upgrade(move |socket| connection(socket, shared))
+}
+
+/// An open view: its viewer and the cycle of the window last sent.
+struct Open {
+    viewer: Arc<Mutex<Viewer>>,
+    sent: Option<u64>,
+}
+
+async fn connection(mut socket: WebSocket, shared: Arc<Shared>) {
+    let mut views: HashMap<u64, Open> = HashMap::new();
+    let mut cycles = shared.cycles.subscribe();
+    let mut catalog = shared.catalog.subscribe();
+    let mut outgoing = vec![tables(&shared)];
+    loop {
+        for message in outgoing.drain(..) {
+            if socket.send(message).await.is_err() {
+                return;
+            }
+        }
+        tokio::select! {
+            received = socket.recv() => match received {
+                Some(Ok(Message::Text(text))) => {
+                    outgoing = handle(&shared, &mut views, &text).await;
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+                Some(Ok(_)) => {}
+            },
+            Ok(()) = cycles.changed() => {
+                cycles.borrow_and_update();
+                for (id, open) in &mut views {
+                    let viewer = open.viewer.clone();
+                    let changed = blocking(move || lock(&viewer).changed()).await;
+                    if changed.is_some() && changed != open.sent {
+                        open.sent = changed;
+                        let viewer = open.viewer.clone();
+                        let reply = blocking(move || lock(&viewer).rows()).await;
+                        outgoing.extend(answer(*id, &open.viewer, reply));
+                    }
+                }
+            },
+            Ok(()) = catalog.changed() => {
+                catalog.borrow_and_update();
+                outgoing.push(tables(&shared));
+            },
+        }
+    }
+}
+
+/// The replies to one message from the app.
+async fn handle(shared: &Shared, views: &mut HashMap<u64, Open>, text: &str) -> Vec<Message> {
+    let message: Value = match serde_json::from_str(text) {
+        Ok(message) => message,
+        Err(e) => return vec![error(None, &format!("not JSON: {e}"))],
+    };
+    let kind = message["type"].as_str().unwrap_or_default();
+    let view = message["view"].as_u64();
+    match (kind, view) {
+        ("tables", _) => vec![tables(shared)],
+        ("open", Some(id)) => {
+            let name = message["table"].as_str().unwrap_or_default();
+            let Some(table) = shared.tables().get(name).cloned() else {
+                return vec![error(Some(id), &format!("no published table `{name}`"))];
+            };
+            let viewer = Arc::new(Mutex::new(blocking(move || Viewer::new(&table)).await));
+            let rows = {
+                let viewer = viewer.clone();
+                blocking(move || lock(&viewer).rows()).await
+            };
+            let sent = rows.as_ref().ok().and_then(|f| f.as_ref()).map(|f| f.cycle);
+            let replies = answer(id, &viewer, rows);
+            views.insert(id, Open { viewer, sent });
+            replies
+        }
+        ("close", Some(id)) => {
+            views.remove(&id);
+            Vec::new()
+        }
+        (_, Some(id)) => {
+            let Some(open) = views.get_mut(&id) else {
+                return vec![error(Some(id), "no such view")];
+            };
+            let request = match request(kind, &message) {
+                Ok(Some(request)) => request,
+                Ok(None) => return vec![error(Some(id), &format!("unknown message `{kind}`"))],
+                Err(e) => return vec![error(Some(id), &e)],
+            };
+            let viewer = open.viewer.clone();
+            let reply = blocking(move || lock(&viewer).receive(request)).await;
+            if let Ok(Some(frame)) = &reply
+                && frame.fetched.is_none()
+            {
+                open.sent = Some(frame.cycle);
+            }
+            answer(id, &open.viewer, reply)
+        }
+        _ => vec![error(None, &format!("unknown message `{kind}`"))],
+    }
+}
+
+/// A viewer message, as `ursid_core::viewer::Request`; `None` for other types.
+fn request(kind: &str, message: &Value) -> Result<Option<Request>, String> {
+    let number = |name: &str| {
+        message[name]
+            .as_u64()
+            .map(|n| n as usize)
+            .ok_or_else(|| format!("`{kind}` needs a number `{name}`"))
+    };
+    Ok(Some(match kind {
+        "viewport" => Request::Viewport {
+            top: number("top")?,
+            bottom: number("bottom")?,
+        },
+        "sort" => Request::Sort(
+            message["by"]
+                .as_array()
+                .ok_or("`sort` needs a list `by`")?
+                .iter()
+                .map(|key| {
+                    Ok(SortKey {
+                        column: key["column"]
+                            .as_str()
+                            .ok_or("a sort key needs a `column`")?
+                            .to_owned(),
+                        descending: key["descending"].as_bool().unwrap_or(false),
+                    })
+                })
+                .collect::<Result<_, &str>>()?,
+        ),
+        "filter" => Request::Filter(
+            message["filters"]
+                .as_object()
+                .ok_or("`filter` needs an object `filters`")?
+                .iter()
+                .map(|(column, text)| {
+                    (column.clone(), text.as_str().unwrap_or_default().to_owned())
+                })
+                .collect(),
+        ),
+        "fetch" => Request::Fetch {
+            id: number("id")? as u64,
+            start: number("start")?,
+            count: number("count")?,
+        },
+        _ => return Ok(None),
+    }))
+}
+
+/// A view's frame as messages: its state (for windows), then the binary frame; or the error.
+fn answer(
+    id: u64,
+    viewer: &Mutex<Viewer>,
+    reply: Result<Option<Frame>, ursid_core::Error>,
+) -> Vec<Message> {
+    match reply {
+        Ok(Some(frame)) => {
+            let mut messages = Vec::with_capacity(2);
+            if frame.fetched.is_none() {
+                messages.push(state(id, &lock(viewer), &frame));
+            }
+            messages.push(binary(id, frame));
+            messages
+        }
+        Ok(None) => vec![error(Some(id), "the table is gone")],
+        Err(e) => vec![error(Some(id), &e.to_string())],
+    }
+}
+
+fn state(id: u64, viewer: &Viewer, frame: &Frame) -> Message {
+    let sort: Vec<Value> = viewer
+        .sort()
+        .iter()
+        .map(|k| json!({"column": k.column, "descending": k.descending}))
+        .collect();
+    Message::Text(
+        json!({
+            "type": "state",
+            "view": id,
+            "row_count": frame.total,
+            "status": viewer.status(frame.cycle),
+            "sort": sort,
+            "filters": viewer.filters(),
+            "filter_errors": viewer.filter_errors(),
+        })
+        .to_string()
+        .into(),
+    )
+}
+
+fn binary(id: u64, frame: Frame) -> Message {
+    let mut head = json!({
+        "view": id,
+        "type": if frame.fetched.is_some() { "fetched" } else { "rows" },
+        "start": frame.start,
+        "total": frame.total,
+        "cycle": frame.cycle,
+    });
+    if let Some(fetch) = frame.fetched {
+        head["id"] = fetch.into();
+    }
+    let head = head.to_string();
+    let mut bytes = Vec::with_capacity(8 + head.len() + frame.rows.len() + frame.keys.len());
+    bytes.extend_from_slice(&(head.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(head.as_bytes());
+    bytes.extend_from_slice(&(frame.rows.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&frame.rows);
+    bytes.extend_from_slice(&frame.keys);
+    Message::Binary(bytes.into())
+}
+
+fn tables(shared: &Shared) -> Message {
+    let tables: Vec<Value> = shared
+        .tables()
+        .iter()
+        .map(|(name, table)| {
+            let columns: Vec<Value> = table
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| json!({"name": f.name(), "type": type_name(f.data_type())}))
+                .collect();
+            json!({"name": name, "columns": columns, "refreshing": table.is_refreshing()})
+        })
+        .collect();
+    Message::Text(
+        json!({"type": "tables", "tables": tables})
+            .to_string()
+            .into(),
+    )
+}
+
+fn error(view: Option<u64>, message: &str) -> Message {
+    Message::Text(
+        json!({"type": "error", "view": view, "message": message})
+            .to_string()
+            .into(),
+    )
+}
+
+fn lock(viewer: &Mutex<Viewer>) -> MutexGuard<'_, Viewer> {
+    viewer
+        .lock()
+        .expect("ursid viewer poisoned by an earlier panic")
+}
+
+/// Runs engine work (which takes the session's locks) off the async workers.
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    tokio::task::spawn_blocking(work)
+        .await
+        .expect("ursid gateway engine call panicked")
+}

@@ -19,3 +19,4 @@ libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 pyo3.workspace = true
 pyo3-arrow.workspace = true
 ursid-core.workspace = true
+ursid-gateway.workspace = true

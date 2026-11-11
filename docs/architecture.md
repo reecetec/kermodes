@@ -145,6 +145,11 @@ OOM-killed in containers. mimalloc reuses freed memory while work runs, and the 
 return what is free whenever it goes idle (`engine.md` §4), at no measured cost to cycle times.
 Polars ships a tuned jemalloc for the same reason.
 
+`axum` (hyper, with tokio-tungstenite for WebSocket) serves HTTP and WebSocket for the gateway:
+today the local server behind `Session.serve`, later the cluster gateway. HTTP and WebSocket
+protocol handling written ourselves would be risk without value. `serde_json` reads and writes
+the web app's JSON messages.
+
 No embedded query engines (DataFusion, DuckDB, Polars). A new data-path dependency needs a written
 reason in this section.
 
@@ -912,6 +917,10 @@ namespaces).
 - Auth: OIDC authorization code + PKCE (`oidc-client-ts`). Local mode skips login.
 - The production build ships inside the `ursid` wheel and is served by the gateway, so local mode
   and the cluster serve the same UI with no separate web server.
+- First slice, before the cluster gateway: `server = session.serve()` serves the app for one
+  local session, and `server.publish(name, table)` lists a table there (held until unpublished
+  or the server stops). It listens on 127.0.0.1 and has no authentication; the WebSocket
+  protocol is in `ursid-gateway`'s module doc. `ursid dev` will start the same server.
 - v1 surfaces: catalog (schemas, versions, lineage), live and historical table viewer, console
   (SQL and table-API editor on CodeMirror 6, `EXPLAIN` view), pipelines (commit → deploy per
   target), job runs and logs (live from `sys.*`), models and aliases, agent chat backed by ranger.

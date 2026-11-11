@@ -1,5 +1,7 @@
 //! `ursid._native`: the engine exposed to Python. Engine work runs with the interpreter released.
 
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -153,6 +155,72 @@ impl Session {
     #[getter]
     fn table_count(&self, py: Python<'_>) -> usize {
         py.detach(|| self.0.table_count())
+    }
+
+    /// Serves this session's published tables to the web UI on `host:port` (port 0 picks a
+    /// free one): the app at `server.url`, tables published with `server.publish(name, table)`.
+    /// Local use: there is no authentication, so it listens on 127.0.0.1 unless told otherwise.
+    #[pyo3(signature = (port=0, host="127.0.0.1"))]
+    fn serve(&self, py: Python<'_>, port: u16, host: &str) -> PyResult<Server> {
+        let addr: SocketAddr = format!("{host}:{port}")
+            .parse()
+            .map_err(|e| PyValueError::new_err(format!("cannot listen on {host}:{port}: {e}")))?;
+        // The web app ships in the package (`bun run build` in web/ writes it there).
+        let package: PathBuf = py.import("ursid")?.getattr("__file__")?.extract()?;
+        let app = package.parent().map(|dir| dir.join("static").join("app"));
+        let session = self.0.clone();
+        let server = py
+            .detach(|| ursid_gateway::serve(session, addr, app))
+            .map_err(|e| PyValueError::new_err(format!("cannot listen on {addr}: {e}")))?;
+        Ok(Server(Mutex::new(server)))
+    }
+}
+
+/// The web UI's server for a session (`Session.serve`). Published tables are held until
+/// unpublished or the server stops; it stops when this object goes, or with `stop()`.
+#[pyclass(module = "ursid", name = "Server", frozen)]
+pub struct Server(Mutex<ursid_gateway::Server>);
+
+impl Server {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ursid_gateway::Server> {
+        self.0
+            .lock()
+            .expect("ursid server poisoned by an earlier panic")
+    }
+}
+
+#[pymethods]
+impl Server {
+    /// The web UI's address.
+    #[getter]
+    fn url(&self) -> String {
+        format!("http://{}/", self.lock().addr())
+    }
+
+    /// Shows `table` in the web UI as `name`, replacing any table of that name.
+    fn publish(&self, py: Python<'_>, name: &str, table: PyRef<'_, Table>) {
+        let table = &table.0;
+        py.detach(|| self.lock().publish(name, table));
+    }
+
+    /// Removes `name` from the web UI; whether it was published.
+    fn unpublish(&self, py: Python<'_>, name: &str) -> bool {
+        py.detach(|| self.lock().unpublish(name))
+    }
+
+    /// Published names, in order.
+    #[getter]
+    fn published(&self) -> Vec<String> {
+        self.lock().published()
+    }
+
+    /// Stops serving: connections close and published tables are let go.
+    fn stop(&self, py: Python<'_>) {
+        py.detach(|| self.lock().stop());
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<ursid.Server {}>", self.url())
     }
 }
 
@@ -637,7 +705,7 @@ impl Viewer {
 #[pymodule]
 mod _native {
     #[pymodule_export]
-    use super::{Session, Table, Viewer, merge};
+    use super::{Server, Session, Table, Viewer, merge};
 
     use pyo3::prelude::*;
 
