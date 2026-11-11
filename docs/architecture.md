@@ -1078,13 +1078,20 @@ host it: Kubernetes (§16.1–16.5) and local (§16.6).
 
 ### 16.1 Packaging
 
-- Helm chart `kermodes` in this repo (`deploy/helm/kermodes`), published to the Gitea OCI registry,
-  plus one image, `kermodes:<version>` (Python slim + the `kermodes` wheel), which runs every role and is
-  the base for environment images.
-- The Argo CD repo consumes it like other upstream charts (values in
-  `components/kermodes/helm/values.yaml`); Kargo promotes chart versions.
-- The chart installs: CRDs, `kermodes-control`, `kermodes-gateway`, weir, ServiceAccounts and RBAC,
-  config. It does not contain workers, ingesters, or jobs; the controller creates those at runtime.
+- Helm chart `kermodes` in this repo (`deploy/helm/kermodes`), published to the Gitea OCI registry
+  (`oci://git.rcolclough.com/rcolclough/charts`), plus one image, `kermodes:<version>` (Python
+  slim + the `kermodes` wheel, web app included; the root `Dockerfile`), which runs every role and
+  is the base for environment images.
+- A release is a tag `v<version>` on a commit whose `pyproject.toml`, `Cargo.toml`, and
+  `Chart.yaml` all say `<version>`. CI checks that, then builds the image and the chart once and
+  pushes both. The chart's image tag defaults to its `appVersion`, so a chart version runs the
+  image released with it.
+- The Argo CD repo pins a chart version in an umbrella chart (`components/kermodes/helm/`, values in
+  its `values.yaml`); Kargo promotes a release by updating that pin.
+- The chart installs weir (a StatefulSet on a PVC, reachable only from its namespace until Flight
+  has authentication) and `kermodes ui` (a Deployment, with an optional Gateway API route). It
+  grows to CRDs, `kermodes-control`, `kermodes-gateway`, ServiceAccounts and RBAC, and config. It
+  does not contain workers, ingesters, or jobs; the controller creates those at runtime.
 - External dependencies are values: Postgres (existing CNPG cluster or connection secret; the
   chart can optionally render a CNPG `Cluster`), S3 endpoint and bucket (rustfs), OCI registry for
   environment images, git hosts, OIDC issuer.

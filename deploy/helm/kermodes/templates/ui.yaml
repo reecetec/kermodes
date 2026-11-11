@@ -1,0 +1,84 @@
+{{- $name := printf "%s-ui" (include "kermodes.fullname" .) -}}
+{{- $selector := dict "root" . "component" "ui" -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "kermodes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ui
+spec:
+  selector:
+    {{- include "kermodes.selectorLabels" $selector | nindent 4 }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+# The engine: follows every table in weir and serves the web UI. It exits when it loses weir, and
+# restarts and rebuilds its tables from weir.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "kermodes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ui
+spec:
+  replicas: {{ .Values.ui.replicas }}
+  selector:
+    matchLabels:
+      {{- include "kermodes.selectorLabels" $selector | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kermodes.labels" . | nindent 8 }}
+        app.kubernetes.io/component: ui
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "kermodes.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: ui
+          image: {{ include "kermodes.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [ui, --server, {{ include "kermodes.weirUrl" . | quote }}, --host, 0.0.0.0, --port, "8730"]
+          ports:
+            - name: http
+              containerPort: 8730
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.ui.resources | nindent 12 }}
+          securityContext:
+            {{- include "kermodes.containerSecurityContext" . | nindent 12 }}
+{{- if .Values.ui.httpRoute.enabled }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "kermodes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ui
+spec:
+  parentRefs:
+    {{- toYaml .Values.ui.httpRoute.parentRefs | nindent 4 }}
+  hostnames:
+    {{- toYaml .Values.ui.httpRoute.hostnames | nindent 4 }}
+  rules:
+    - backendRefs:
+        - name: {{ $name }}
+          port: 80
+{{- end }}

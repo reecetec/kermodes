@@ -1,0 +1,37 @@
+image:
+  repository: git.rcolclough.com/rcolclough/kermodes
+  # Defaults to the chart's appVersion: a chart release runs the image released with it.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+weir:
+  storage:
+    size: 20Gi
+    # Empty: the cluster's default StorageClass.
+    storageClassName: ""
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 2Gi
+  # weir's Flight endpoint has no authentication yet: only pods in the release's namespace may
+  # reach it.
+  networkPolicy:
+    enabled: true
+
+ui:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 2Gi
+  # A Gateway API route to the web UI.
+  httpRoute:
+    enabled: false
+    parentRefs: []
+    hostnames: []

@@ -6,9 +6,13 @@ on:
   push:
     branches:
       - master
+    # A release: v<version>, where every version in the repository says <version>.
+    tags:
+      - "v*"
 
 permissions:
   contents: read
+  packages: write
 
 jobs:
   check:
@@ -79,3 +83,66 @@ jobs:
 
       - name: Run Python tests
         run: uv run --no-sync pytest
+
+  # Builds the release's one image and its chart, once; Kargo promotes them from the registry.
+  release:
+    needs: check
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: arc
+    container:
+      image: git.rcolclough.com/rcolclough/buildah-ci:stable-node20
+    env:
+      REGISTRY: git.rcolclough.com
+      REGISTRY_USER: reecec
+      IMAGE: git.rcolclough.com/rcolclough/kermodes
+      CHARTS: oci://git.rcolclough.com/rcolclough/charts
+      HELM_VERSION: v4.3.0
+      BUILDAH_ISOLATION: chroot
+      STORAGE_DRIVER: vfs
+      XDG_RUNTIME_DIR: /tmp/containers-run
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          set-safe-directory: true
+
+      - name: Check the tag matches every version
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          grep -qx "version = \"$VERSION\"" pyproject.toml
+          grep -qx "version = \"$VERSION\"" Cargo.toml
+          grep -qx "version: $VERSION" deploy/helm/kermodes/Chart.yaml
+          grep -qx "appVersion: \"$VERSION\"" deploy/helm/kermodes/Chart.yaml
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to the registry
+        run: |
+          mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+          echo "${{ secrets.REGISTRY_TOKEN }}" | buildah login "$REGISTRY" --username "$REGISTRY_USER" --password-stdin
+
+      - name: Build and push the image
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          buildah build \
+            --arch amd64 \
+            --build-arg IMAGE_CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --build-arg IMAGE_REVISION="$GITHUB_SHA" \
+            --build-arg IMAGE_SOURCE="https://git.rcolclough.com/${GITHUB_REPOSITORY}" \
+            --build-arg IMAGE_VERSION="$VERSION" \
+            --target runtime \
+            --tag "$IMAGE:$VERSION" \
+            .
+          buildah push "$IMAGE:$VERSION"
+
+      - name: Push the chart
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" | tar -xz -C /tmp
+          HELM=/tmp/linux-amd64/helm
+          echo "${{ secrets.REGISTRY_TOKEN }}" | $HELM registry login "$REGISTRY" --username "$REGISTRY_USER" --password-stdin
+          $HELM package deploy/helm/kermodes --destination /tmp/chart
+          $HELM push "/tmp/chart/kermodes-$VERSION.tgz" "$CHARTS"

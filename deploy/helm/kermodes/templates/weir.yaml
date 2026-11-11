@@ -1,0 +1,101 @@
+{{- $name := printf "%s-weir" (include "kermodes.fullname" .) -}}
+{{- $selector := dict "root" . "component" "weir" -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "kermodes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: weir
+spec:
+  selector:
+    {{- include "kermodes.selectorLabels" $selector | nindent 4 }}
+  ports:
+    - name: flight
+      port: 8731
+      targetPort: flight
+      appProtocol: kubernetes.io/h2c
+---
+# One replica: a store has one writer (it holds the store's lock), and its PVC is ReadWriteOnce.
+# A restart recovers to the last committed index record; writers resume from their last_seq.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "kermodes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: weir
+spec:
+  serviceName: {{ $name }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "kermodes.selectorLabels" $selector | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kermodes.labels" . | nindent 8 }}
+        app.kubernetes.io/component: weir
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "kermodes.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: weir
+          image: {{ include "kermodes.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [weir, --data-dir, /var/lib/kermodes, --host, 0.0.0.0, --port, "8731"]
+          ports:
+            - name: flight
+              containerPort: 8731
+          readinessProbe:
+            tcpSocket:
+              port: flight
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: flight
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.weir.resources | nindent 12 }}
+          securityContext:
+            {{- include "kermodes.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kermodes
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with .Values.weir.storage.storageClassName }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.weir.storage.size }}
+{{- if .Values.weir.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "kermodes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: weir
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "kermodes.selectorLabels" $selector | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8731
+{{- end }}

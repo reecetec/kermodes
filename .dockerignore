@@ -1,0 +1,12 @@
+.git/
+target/
+.venv/
+.kermodes/
+**/node_modules/
+**/__pycache__/
+**/.pytest_cache/
+**/.ruff_cache/
+web/**/dist/
+python/kermodes/static/
+python/kermodes/*.so
+examples/
