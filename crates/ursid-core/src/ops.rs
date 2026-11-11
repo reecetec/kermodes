@@ -147,6 +147,9 @@ pub(crate) struct Assignment {
 
 pub(crate) struct Update {
     pub assignments: Vec<Assignment>,
+    /// The columns output, in order, from the input's columns plus the assignments' (all of
+    /// them for `update`; those listed for `select`).
+    pub columns: Vec<usize>,
     pub output: SchemaRef,
 }
 
@@ -192,6 +195,7 @@ impl Update {
                 columns[assignment.position] = value;
             }
         }
+        let columns = self.columns.iter().map(|c| columns[*c].clone()).collect();
         RecordBatch::try_new_with_options(self.output.clone(), columns, &rows)
     }
 }

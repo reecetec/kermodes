@@ -46,6 +46,7 @@ OPERATIONS = [
     "tail",
     "sort",
     "rolling",
+    "select",
 ]
 # Each result's row count plus a checksum: the sum (or non-null count) of one column.
 CHECKS = {
@@ -59,6 +60,7 @@ CHECKS = {
     "tail": ("price", "sum"),
     "sort": ("price", "sum"),
     "rolling": ("avg", "sum"),
+    "select": ("notional", "sum"),
 }
 MB = 1 << 20
 
@@ -86,6 +88,7 @@ def operations(engine: str, ticks, quotes, refs):
             ),
             "tail": lambda: t.tail(1000),
             "sort": lambda: t.sort("sym", "ts desc"),
+            "select": lambda: t.select("sym", "notional = price * size"),
             "rolling": lambda: t.rolling(
                 "sym", rows=100, avg="mean(price)", vol="std(price)"
             ),
@@ -115,6 +118,7 @@ def operations(engine: str, ticks, quotes, refs):
             "(select * from ticks union all select * from ticks) group by sym",
             "tail": "select * from ticks where rowid >= (select max(rowid) - 999 from ticks)",
             "sort": "select * from ticks order by sym, ts desc",
+            "select": "select sym, price * size as notional from ticks",
             "rolling": "select *, avg(price) over w as avg, stddev_samp(price) over w as vol "
             "from ticks window w as (partition by sym order by rowid "
             "rows between 99 preceding and current row)",
@@ -152,6 +156,7 @@ def operations(engine: str, ticks, quotes, refs):
         ),
         "tail": lambda: t.tail(1000),
         "sort": lambda: t.sort(["sym", "ts"], descending=[False, True]),
+        "select": lambda: t.select("sym", notional=pl.col("price") * pl.col("size")),
         "rolling": lambda: t.with_columns(
             avg=pl.col("price").rolling_mean(100, min_samples=1).over("sym"),
             vol=pl.col("price").rolling_std(100, min_samples=1).over("sym"),

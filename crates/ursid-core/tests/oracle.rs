@@ -100,6 +100,21 @@ const PIPELINES: &[(&str, Pipeline)] = &[
         Table::merge(&[&latest, &inner]).unwrap()
     }),
     ("head", |t| t.head(5).unwrap()),
+    ("select", |t| {
+        t.select(&[
+            "flag",
+            "notional = price * size",
+            "sym",
+            "price = notional + 1",
+        ])
+        .unwrap()
+    }),
+    ("select then last_by", |t| {
+        t.select(&["sym", "size"])
+            .unwrap()
+            .last_by(&["sym"])
+            .unwrap()
+    }),
     ("tail", |t| t.tail(5).unwrap()),
     ("head of none", |t| t.head(0).unwrap()),
     ("where then tail", |t| {

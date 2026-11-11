@@ -46,6 +46,17 @@ def test_static_tables_compute_without_cycles():
     assert pa.table(doubled)["size"].to_pylist() == [2, 4]
 
 
+def test_select_keeps_and_computes_columns_in_order():
+    s = us.local(manual=True)
+    src = s.input_table(COLUMNS)
+    picked = src.select("size", "notional = price * size", "sym")
+    src.append(ticks(["a"], [2.0], [3]))
+    s.step()
+    assert pa.table(picked).to_pylist() == [{"size": 3, "notional": 6.0, "sym": "a"}]
+    with pytest.raises(us.UrsidError, match="twice"):
+        src.select("sym", "sym")
+
+
 def test_expression_errors_point_at_the_problem():
     src = us.local(manual=True).input_table(COLUMNS)
     with pytest.raises(us.UrsidError, match="did you mean `price`"):

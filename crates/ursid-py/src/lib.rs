@@ -233,6 +233,17 @@ impl Table {
         Ok(Table(table))
     }
 
+    /// Only the listed columns, in that order: each an existing column's name or
+    /// `name = expression`, as in `update`.
+    #[pyo3(signature = (*columns))]
+    fn select(&self, py: Python<'_>, columns: Vec<String>) -> PyResult<Table> {
+        let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
+        let table = py
+            .detach(|| self.0.select(&columns))
+            .map_err(engine_error)?;
+        Ok(Table(table))
+    }
+
     /// Adds or replaces columns, each given as `name = expression`.
     #[pyo3(signature = (*assignments))]
     fn update(&self, py: Python<'_>, assignments: Vec<String>) -> PyResult<Table> {

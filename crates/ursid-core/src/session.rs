@@ -1090,28 +1090,13 @@ impl Table {
         let mut schema = self.schema.clone();
         let mut bound = Vec::with_capacity(assignments.len());
         for text in assignments {
-            let (name, expression) = Expression::assignment(text, &schema)?;
-            let field: FieldRef = Arc::new(Field::new(&name, expression.data_type().clone(), true));
-            let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
-            let position = match schema.index_of(&name) {
-                Ok(index) => {
-                    fields[index] = field;
-                    index
-                }
-                Err(_) => {
-                    fields.push(field);
-                    fields.len() - 1
-                }
-            };
-            bound.push(Assignment {
-                input: schema.clone(),
-                expression,
-                position,
-            });
-            schema = Arc::new(Schema::new(fields));
+            let (assignment, next) = assign(&schema, text)?;
+            bound.push(assignment);
+            schema = next;
         }
         let update = Update {
             assignments: bound,
+            columns: (0..schema.fields().len()).collect(),
             output: schema.clone(),
         };
         self.derive(
@@ -1119,6 +1104,49 @@ impl Table {
             schema,
             self.growth(),
             Operator::Update(update),
+        )
+    }
+
+    /// Only the listed columns, in that order: each an existing column's name or
+    /// `name = expression` (as in `update`; later entries see earlier ones).
+    pub fn select(&self, columns: &[&str]) -> Result<Table, Error> {
+        if columns.is_empty() {
+            return Err(Error::Unsupported(
+                "select needs at least one column".into(),
+            ));
+        }
+        let mut schema = self.schema.clone();
+        let (mut bound, mut keep) = (Vec::new(), Vec::with_capacity(columns.len()));
+        for text in columns {
+            let index = match schema.index_of(text.trim()) {
+                Ok(index) => index,
+                Err(_) => {
+                    let (assignment, next) = assign(&schema, text)?;
+                    let index = assignment.position;
+                    bound.push(assignment);
+                    schema = next;
+                    index
+                }
+            };
+            if keep.contains(&index) {
+                return Err(Error::Schema(format!(
+                    "select lists column `{}` twice",
+                    schema.field(index).name()
+                )));
+            }
+            keep.push(index);
+        }
+        let output = Arc::new(schema.project(&keep).map_err(schema_error)?);
+        let select = Update {
+            assignments: bound,
+            columns: keep,
+            output: output.clone(),
+        };
+        self.derive(
+            format!("select({})", columns.join(", ")),
+            output,
+            self.growth(),
+            Operator::Update(select),
         )
     }
 
@@ -1858,6 +1886,30 @@ fn nullable(schema: &Schema) -> Result<SchemaRef, Error> {
 
 fn schema_error(error: ArrowError) -> Error {
     Error::Schema(error.to_string())
+}
+
+/// Binds `text`, `name = expression`, against `schema`: the assignment, and the schema after it
+/// (the column replaced, or appended if new).
+fn assign(schema: &SchemaRef, text: &str) -> Result<(Assignment, SchemaRef), Error> {
+    let (name, expression) = Expression::assignment(text, schema)?;
+    let field: FieldRef = Arc::new(Field::new(&name, expression.data_type().clone(), true));
+    let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
+    let position = match schema.index_of(&name) {
+        Ok(index) => {
+            fields[index] = field;
+            index
+        }
+        Err(_) => {
+            fields.push(field);
+            fields.len() - 1
+        }
+    };
+    let assignment = Assignment {
+        input: schema.clone(),
+        expression,
+        position,
+    };
+    Ok((assignment, Arc::new(Schema::new(fields))))
 }
 
 /// Matches each batch's columns to `schema` by name and type; empty batches are dropped.
