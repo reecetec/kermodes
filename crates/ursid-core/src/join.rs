@@ -19,6 +19,7 @@ use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
 use crate::groups::{KeyKind, Membership};
 use crate::ops::push_removed;
+use crate::parallel::{PIECE_ROWS, row_pieces, run, threads_for};
 use crate::storage::{Delta, Modified, RowKey, Rows, Storage};
 
 /// What a join reads and writes.
@@ -70,6 +71,20 @@ fn group_ids(
         .collect())
 }
 
+/// The existing group of each row of `batch`, if any. Creates nothing, so pieces can look up in
+/// parallel.
+fn find_ids(
+    kind: &KeyKind,
+    groups: &Membership,
+    batch: &RecordBatch,
+) -> Result<Vec<Option<u32>>, ArrowError> {
+    let encoded = kind.encode(batch)?;
+    let keys = kind.keys(batch, encoded.as_ref());
+    Ok((0..batch.num_rows())
+        .map(|row| groups.find(keys.hash(row), |k| keys.matches(row, k)))
+        .collect())
+}
+
 /// Each row's value in an integer, date, or timestamp column read through `kind`.
 fn times(kind: &KeyKind, batch: &RecordBatch) -> Vec<Option<i64>> {
     let keys = kind.keys(batch, None);
@@ -85,16 +100,29 @@ fn sync<T: Default>(len: usize, created: &[u32], state: &mut Vec<T>) {
     }
 }
 
-/// Rows per piece when a join works through a large batch: per-row scratch (group ids, times,
-/// matches, gather indices) stays bounded instead of growing with the batch.
-const PIECE_ROWS: usize = 1 << 16;
+/// The latest of a group's `rows` (sorted by time) not after `time`. `cursor` holds the group's
+/// previous lookup in this cycle: when times move forward, the search gallops on from it, so
+/// time-ordered rows cost a short scan rather than a binary search over the group.
+fn match_from(
+    rows: &[(i64, RowKey)],
+    time: i64,
+    cursor: &mut Option<(i64, usize)>,
+) -> Option<RowKey> {
+    let after = match *cursor {
+        Some((last, from)) if last <= time => from + gallop(&rows[from..], time),
+        _ => rows.partition_point(|row| row.0 <= time),
+    };
+    *cursor = Some((time, after));
+    after.checked_sub(1).map(|at| rows[at].1)
+}
 
-/// `rows` in pieces of at most `PIECE_ROWS`: each piece's keys and rows.
-fn pieces(rows: &Rows) -> impl Iterator<Item = (&[RowKey], RecordBatch)> {
-    (0..rows.keys.len()).step_by(PIECE_ROWS).map(move |start| {
-        let len = PIECE_ROWS.min(rows.keys.len() - start);
-        (&rows.keys[start..start + len], rows.batch.slice(start, len))
-    })
+/// The cursor for `group` in a cycle's per-group cursors, growing them as groups appear.
+fn cursor(cursors: &mut Vec<Option<(i64, usize)>>, group: u32) -> &mut Option<(i64, usize)> {
+    let at = group as usize;
+    if at >= cursors.len() {
+        cursors.resize(at + 1, None);
+    }
+    &mut cursors[at]
 }
 
 /// How many leading `rows` have a time not after `time`, by exponential then binary search:
@@ -246,7 +274,7 @@ impl NaturalJoin {
                 changed.extend([old, new]);
             }
         }
-        for (keys, batch) in right_delta.added.iter().flat_map(pieces) {
+        for (keys, batch) in row_pieces(&right_delta.added, PIECE_ROWS) {
             for (id, key) in self.ids(false, &batch)?.into_iter().zip(keys) {
                 self.right_rows[id as usize].insert(*key);
                 changed.push(id);
@@ -303,16 +331,35 @@ impl NaturalJoin {
                 keys: modified.keys.clone(),
             });
         }
-        for (keys, batch) in left_delta.added.iter().flat_map(pieces) {
-            let ids = self.ids(true, &batch)?;
-            for (id, key) in ids.iter().zip(keys) {
-                self.insert_left(*id, *key);
+        let added = row_pieces(&left_delta.added, PIECE_ROWS);
+        if self.tracking == Tracking::None {
+            // Nothing is recorded per group, so pieces look up in parallel and create no groups.
+            let threads = threads_for(added.iter().map(|(keys, _)| keys.len()).sum());
+            let (shape, groups, right_rows) = (&self.shape, &self.groups, &self.right_rows);
+            for rows in run(threads, added, |(), (keys, batch)| {
+                let matches: Vec<_> = find_ids(&shape.left_keys, groups, &batch)?
+                    .into_iter()
+                    .map(|id| id.and_then(|id| right_rows[id as usize].first().copied()))
+                    .collect();
+                Ok::<_, ArrowError>(Rows {
+                    keys: keys.to_vec(),
+                    batch: shape.rows(&batch, right, &matches)?,
+                })
+            }) {
+                out.added.push(rows?);
             }
-            let matches: Vec<_> = ids.iter().map(|id| self.matched(*id)).collect();
-            out.added.push(Rows {
-                keys: keys.to_vec(),
-                batch: self.shape.rows(&batch, right, &matches)?,
-            });
+        } else {
+            for (keys, batch) in added {
+                let ids = self.ids(true, &batch)?;
+                for (id, key) in ids.iter().zip(keys) {
+                    self.insert_left(*id, *key);
+                }
+                let matches: Vec<_> = ids.iter().map(|id| self.matched(*id)).collect();
+                out.added.push(Rows {
+                    keys: keys.to_vec(),
+                    batch: self.shape.rows(&batch, right, &matches)?,
+                });
+            }
         }
         push_rematched(&mut out, &self.shape, left, right, own, rematched)?;
 
@@ -392,27 +439,6 @@ impl AsOfJoin {
         after.checked_sub(1).map(|at| rows[at].1)
     }
 
-    /// `matched`, resuming from the group's previous lookup in `cursors` when times move
-    /// forward: rows usually arrive in time order, so a lookup is a short gallop rather than a
-    /// binary search over the group. Valid while the right rows do not change.
-    fn matched_from(
-        &self,
-        cursors: &mut Vec<Option<(i64, usize)>>,
-        group: u32,
-        time: Option<i64>,
-    ) -> Option<RowKey> {
-        let (rows, time, at) = (&self.right_rows[group as usize], time?, group as usize);
-        if at >= cursors.len() {
-            cursors.resize(at + 1, None);
-        }
-        let after = match cursors[at] {
-            Some((last, from)) if last <= time => from + gallop(&rows[from..], time),
-            _ => rows.partition_point(|row| row.0 <= time),
-        };
-        cursors[at] = Some((time, after));
-        after.checked_sub(1).map(|at| rows[at].1)
-    }
-
     fn process(
         &mut self,
         left: &Storage,
@@ -430,7 +456,7 @@ impl AsOfJoin {
             ));
         }
         let mut points = Vec::new();
-        for (keys, batch) in right_delta.added.iter().flat_map(pieces) {
+        for (keys, batch) in row_pieces(&right_delta.added, PIECE_ROWS) {
             for ((id, time), key) in self.locate(false, &batch)?.into_iter().zip(keys) {
                 if let Some(time) = time {
                     let rows = &mut self.right_rows[id as usize];
@@ -503,24 +529,53 @@ impl AsOfJoin {
                 keys: modified.keys.clone(),
             });
         }
-        let mut cursors = Vec::new();
-        for (keys, batch) in left_delta.added.iter().flat_map(pieces) {
-            let located = self.locate(true, &batch)?;
-            if self.tracking {
+        let added = row_pieces(&left_delta.added, PIECE_ROWS);
+        if !self.tracking {
+            // Nothing is recorded per group, so pieces look up in parallel and create no groups;
+            // each thread keeps its own cursors.
+            let threads = threads_for(added.iter().map(|(keys, _)| keys.len()).sum());
+            let (shape, left_at) = (&self.shape, &self.left_at);
+            let (groups, right_rows) = (&self.groups, &self.right_rows);
+            for rows in run(threads, added, |cursors: &mut Vec<_>, (keys, batch)| {
+                let ids = find_ids(&shape.left_keys, groups, &batch)?;
+                let matches: Vec<_> = ids
+                    .into_iter()
+                    .zip(times(left_at, &batch))
+                    .map(|located| match located {
+                        (Some(id), Some(time)) => {
+                            match_from(&right_rows[id as usize], time, cursor(cursors, id))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                Ok::<_, ArrowError>(Rows {
+                    keys: keys.to_vec(),
+                    batch: shape.rows(&batch, right, &matches)?,
+                })
+            }) {
+                out.added.push(rows?);
+            }
+        } else {
+            let mut cursors = Vec::new();
+            for (keys, batch) in added {
+                let located = self.locate(true, &batch)?;
                 for ((id, time), key) in located.iter().zip(keys) {
                     if let Some(time) = time {
                         self.left_rows[*id as usize].insert((*time, *key));
                     }
                 }
+                let matches: Vec<_> = located
+                    .iter()
+                    .map(|(id, time)| {
+                        let rows = &self.right_rows[*id as usize];
+                        time.and_then(|time| match_from(rows, time, cursor(&mut cursors, *id)))
+                    })
+                    .collect();
+                out.added.push(Rows {
+                    keys: keys.to_vec(),
+                    batch: self.shape.rows(&batch, right, &matches)?,
+                });
             }
-            let matches: Vec<_> = located
-                .iter()
-                .map(|(id, t)| self.matched_from(&mut cursors, *id, *t))
-                .collect();
-            out.added.push(Rows {
-                keys: keys.to_vec(),
-                batch: self.shape.rows(&batch, right, &matches)?,
-            });
         }
         push_rematched(&mut out, &self.shape, left, right, own, rematched)?;
 

@@ -526,6 +526,14 @@ impl Membership {
         result
     }
 
+    /// The id of the group whose key `matches`, if any. Creates and touches nothing, so many
+    /// threads may look up at once.
+    pub fn find(&self, hash: u64, matches: impl Fn(&OwnedKey) -> bool) -> Option<u32> {
+        self.table
+            .find(hash, |id| matches(&self.owned[*id as usize]))
+            .copied()
+    }
+
     /// The id of the group whose key `matches`, created with key `make()` if none does, marked
     /// touched. `hash` is the key's engine-wide hash.
     pub fn group(

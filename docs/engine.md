@@ -115,9 +115,11 @@ Delta { added: [(keys, rows)], removed: [(keys, last rows)], modified: [(keys, p
   - manual (`us.local(manual=True)`): `step()` runs one cycle (tests, replay).
 - Each table records the cycle that last changed its rows (or failed it); viewers poll that to
   re-render only what changed.
-- Cycles run tables one after another. `agg_by` spreads a large delta (64k+ rows) over every core
-  in two phases (§5), or over `URSID_THREADS` cores if that is set; other operators are
-  single-threaded until a profile shows the need.
+- Cycles run tables one after another. Within a table, a large delta (64k+ rows) spreads over every
+  core (or `URSID_THREADS`) in fixed pieces, so results never depend on the core count: `agg_by`
+  in two phases (§5); `where`, `update`, and joins against a static right side in 64k-row pieces
+  whose outputs keep piece order. A join whose right side ticks records left rows per key, which
+  stays on one thread, as do removes and modifies.
 - Failure: if an operator errors, its table and everything downstream of it enter a failed state
   holding the error; the rest of the graph keeps running. Snapshots of a failed table raise the
   error in Python.

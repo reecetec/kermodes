@@ -11,9 +11,7 @@
 //! recomputation can differ in the last bits; piece boundaries never depend on the number of
 //! cores, so results do not either.
 
-use std::num::NonZero;
 use std::sync::Arc;
-use std::thread;
 
 use arrow::array::{
     Array, ArrayRef, ArrowPrimitiveType, AsArray, Float64Array, Int64Array, PrimitiveArray,
@@ -28,11 +26,9 @@ use hashbrown::HashTable;
 
 use crate::groups::{KeyKind, LocalEntry, LocalGroups, Membership, shard_of, split};
 use crate::ops::{pick_column, push_removed};
+use crate::parallel::{PARALLEL_ROWS, offsets, run, threads};
 use crate::storage::{Delta, Modified, RowKey, Rows, Storage};
 use crate::{Error, type_name};
-
-/// Below this many rows in a cycle's delta, the phases run on the calling thread.
-const PARALLEL_ROWS: usize = 1 << 16;
 
 /// Rows per piece. Fixed, so results never depend on the number of cores.
 const PIECE_ROWS: usize = 1 << 18;
@@ -775,7 +771,7 @@ impl AggBy {
         let routed = view.routed();
         let mut pieces = Vec::new();
         for (segment, batch) in routed.iter().enumerate() {
-            for (offset, len) in pieces_of(batch.num_rows()) {
+            for (offset, len) in offsets(batch.num_rows(), PIECE_ROWS) {
                 pieces.push((segment, offset, len));
             }
         }
@@ -790,7 +786,7 @@ impl AggBy {
         // Added rows: aggregate each piece into partial states.
         let mut pieces = Vec::new();
         for (keys, batch) in &view.added {
-            for (offset, len) in pieces_of(batch.num_rows()) {
+            for (offset, len) in offsets(batch.num_rows(), PIECE_ROWS) {
                 pieces.push((&keys[offset..offset + len], batch.slice(offset, len)));
             }
         }
@@ -815,69 +811,6 @@ impl AggBy {
         }
         Ok(out)
     }
-}
-
-/// Cores to use: the `URSID_THREADS` environment variable if it holds a positive number (as
-/// DuckDB's `threads` setting or `POLARS_MAX_THREADS`), else every core.
-fn threads() -> usize {
-    std::env::var("URSID_THREADS")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|count| *count > 0)
-        .unwrap_or_else(|| thread::available_parallelism().map_or(1, NonZero::get))
-}
-
-/// Fixed pieces `(offset, len)` covering `rows` rows.
-fn pieces_of(rows: usize) -> impl Iterator<Item = (usize, usize)> {
-    (0..rows)
-        .step_by(PIECE_ROWS)
-        .map(move |offset| (offset, PIECE_ROWS.min(rows - offset)))
-}
-
-/// Runs `f` over `items`, spread across up to `threads` scoped threads, returning results in
-/// item order. Each thread passes `f` its own scratch state, reused across its items.
-fn run<I: Send, T: Send, S: Default>(
-    threads: usize,
-    items: Vec<I>,
-    f: impl Fn(&mut S, I) -> T + Sync,
-) -> Vec<T> {
-    if threads <= 1 || items.len() <= 1 {
-        let mut scratch = S::default();
-        return items
-            .into_iter()
-            .map(|item| f(&mut scratch, item))
-            .collect();
-    }
-    let count = items.len();
-    let mut queues: Vec<Vec<(usize, I)>> = (0..threads).map(|_| Vec::new()).collect();
-    for (index, item) in items.into_iter().enumerate() {
-        queues[index % threads].push((index, item));
-    }
-    let f = &f;
-    let mut results: Vec<Option<T>> = (0..count).map(|_| None).collect();
-    thread::scope(|scope| {
-        let workers: Vec<_> = queues
-            .into_iter()
-            .map(|queue| {
-                scope.spawn(move || {
-                    let mut scratch = S::default();
-                    queue
-                        .into_iter()
-                        .map(|(index, item)| (index, f(&mut scratch, item)))
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        for worker in workers {
-            for (index, result) in worker.join().expect("aggregation worker panicked") {
-                results[index] = Some(result);
-            }
-        }
-    });
-    results
-        .into_iter()
-        .map(|r| r.expect("every item ran"))
-        .collect()
 }
 
 /// One piece of added rows, aggregated on its own.

@@ -12,6 +12,7 @@ use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use crate::Expression;
 use crate::agg::AggBy;
 use crate::groups::Membership;
+use crate::parallel::{PIECE_ROWS, row_pieces, run, threads_for};
 use crate::storage::{Delta, Modified, RowKey, Rows, Storage};
 
 pub(crate) enum Operator {
@@ -54,16 +55,23 @@ impl Where {
 
     fn process(&self, delta: &Delta, own: &Storage) -> Result<Delta, ArrowError> {
         let mut out = Delta::default();
+        let added = row_pieces(&delta.added, PIECE_ROWS);
+        let threads = threads_for(added.iter().map(|(keys, _)| keys.len()).sum());
         if self.rekey {
+            let filtered = run(threads, added, |(), (_, batch)| {
+                filter_record_batch(&batch, &self.mask(&batch)?)
+            });
             let mut next = own.next_key();
-            for rows in &delta.added {
-                let batch = filter_record_batch(&rows.batch, &self.mask(&rows.batch)?)?;
+            for batch in filtered {
+                let batch = batch?;
                 let count = batch.num_rows() as RowKey;
-                out.added.push(Rows {
-                    keys: (next..next + count).collect(),
-                    batch,
-                });
-                next += count;
+                if count > 0 {
+                    out.added.push(Rows {
+                        keys: (next..next + count).collect(),
+                        batch,
+                    });
+                    next += count;
+                }
             }
             return Ok(out);
         }
@@ -76,10 +84,15 @@ impl Where {
                 .collect();
             push_removed(&mut out, own, keys)?;
         }
-        for rows in &delta.added {
-            let mask = self.mask(&rows.batch)?;
+        for rows in run(threads, added, |(), (keys, batch)| {
+            let mask = self.mask(&batch)?;
             let picked: Vec<usize> = (0..mask.len()).filter(|i| mask.value(*i)).collect();
-            push_added(&mut out, &rows.keys, &rows.batch, &picked)?;
+            Ok::<_, ArrowError>(Rows {
+                keys: pick_keys(keys, &picked),
+                batch: take_rows(&batch, &picked)?,
+            })
+        }) {
+            out.added.push(rows?);
         }
         for modified in &delta.modified {
             let mask = self.mask(&modified.current)?;
@@ -143,11 +156,15 @@ impl Update {
                 current: self.compute(&modified.current)?,
             });
         }
-        for rows in &delta.added {
-            out.added.push(Rows {
-                keys: rows.keys.clone(),
-                batch: self.compute(&rows.batch)?,
-            });
+        let added = row_pieces(&delta.added, PIECE_ROWS);
+        let threads = threads_for(added.iter().map(|(keys, _)| keys.len()).sum());
+        for rows in run(threads, added, |(), (keys, batch)| {
+            Ok::<_, ArrowError>(Rows {
+                keys: keys.to_vec(),
+                batch: self.compute(&batch)?,
+            })
+        }) {
+            out.added.push(rows?);
         }
         Ok(out)
     }

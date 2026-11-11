@@ -250,6 +250,64 @@ fn parallel_aggregation_matches_cycle_by_cycle_aggregation() {
     }
 }
 
+/// The same for row-at-a-time operators: a 300k-row static input runs `where`, `update`, and
+/// joins against a static right side in parallel pieces; 2k-row cycles run on one thread. An
+/// append-only `where` must also keep its input's row order.
+#[test]
+fn parallel_row_operators_match_cycle_by_cycle_results() {
+    let mut rng = Rng(11);
+    let session = Session::new();
+    let refs = {
+        let sym: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), Some("c"), None]));
+        let price: ArrayRef = Arc::new(Float64Array::from(vec![1.5, 2.5, 3.5]));
+        let batch = RecordBatch::try_from_iter([("sym", sym), ("price", price)]).unwrap();
+        session.static_table(batch.schema(), vec![batch]).unwrap()
+    };
+    let quotes = {
+        let batch = random_batch(&mut rng, 5_000);
+        session.static_table(batch.schema(), vec![batch]).unwrap()
+    };
+    let build = |table: &Table| {
+        [
+            table
+                .filter("size > 2")
+                .unwrap()
+                .update(&["x = price * 2"])
+                .unwrap(),
+            table
+                .natural_join(&refs, &["sym"], Some(&["ref_price=price"]))
+                .unwrap(),
+            table
+                .as_of_join(
+                    &quotes,
+                    &["sym"],
+                    "size",
+                    Some(&["q_price=price", "q_id=id"]),
+                )
+                .unwrap(),
+        ]
+    };
+    let input = session.input_table(&schema()).unwrap();
+    let ticking = build(&input);
+    for _ in 0..150 {
+        input.append(&[random_batch(&mut rng, 2_000)]).unwrap();
+        session.step();
+    }
+    let everything = session
+        .static_table(input.schema().clone(), input.snapshot().unwrap())
+        .unwrap();
+    let fixed = build(&everything);
+    for (ticking, fixed) in ticking.iter().zip(&fixed) {
+        assert_same(&contents(ticking), &contents(fixed), &fixed.description());
+    }
+    let in_order = |table: &Table| concat_batches(table.schema(), &table.snapshot().unwrap());
+    assert_eq!(
+        in_order(&ticking[0]).unwrap(),
+        in_order(&fixed[0]).unwrap(),
+        "where keeps row order"
+    );
+}
+
 #[test]
 fn ticking_tables_over_upserts_and_deletes_match_their_static_recomputation() {
     for seed in 1..=150 {
