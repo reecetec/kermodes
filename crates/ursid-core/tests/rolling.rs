@@ -282,8 +282,9 @@ fn rolling_std_stays_accurate_as_values_move_away() {
     }
 }
 
-/// A 300k-row batch rolls shard by shard on every core; 2k-row cycles roll on one thread. Each
-/// group sees its rows in the same order either way, so results match exactly.
+/// A 1.2M-row batch rolls in chunks (over a million rows each), shard by shard on every core;
+/// 2k-row cycles roll on one thread. Each group sees its rows in the same order either way, so
+/// results match exactly.
 #[test]
 fn parallel_rolling_matches_cycle_by_cycle_rolling() {
     let mut rng = Rng(11);
@@ -291,7 +292,7 @@ fn parallel_rolling_matches_cycle_by_cycle_rolling() {
     let ticking = session.input_table(&schema()).unwrap();
     let mut clock = 0;
     let mut batches = Vec::new();
-    for _ in 0..150 {
+    for _ in 0..600 {
         let (mut sym, mut ts, mut price, mut size) = (vec![], vec![], vec![], vec![]);
         for _ in 0..2_000 {
             clock += rng.below(3) as i64;

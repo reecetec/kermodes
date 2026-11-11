@@ -20,6 +20,10 @@ use crate::groups::{KeyKind, LocalGroups, Membership};
 use crate::parallel::{PIECE_ROWS, offsets, run, threads, threads_for};
 use crate::storage::{Delta, Rows};
 
+/// Rows rolled at a time: bounds the temporary memory of a large batch (16 pieces, so a chunk
+/// still rolls on every core).
+const CHUNK_ROWS: usize = 16 * PIECE_ROWS;
+
 /// Which of its group's rows a row's window holds: the row itself and rows before it in key
 /// order.
 #[derive(Clone, Copy, Debug)]
@@ -217,11 +221,16 @@ impl Rolling {
             ));
         }
         let mut out = Delta::default();
+        // A large batch rolls in chunks, each its own output chunk: temporary memory (group ids,
+        // shard partitions, per-row results) then stays bounded by the chunk, not the batch, and
+        // each chunk is still large enough to roll on every core.
         for rows in &delta.added {
-            out.added.push(Rows {
-                keys: rows.keys.clone(),
-                batch: self.add(&rows.batch)?,
-            });
+            for (offset, len) in offsets(rows.keys.len(), CHUNK_ROWS) {
+                out.added.push(Rows {
+                    keys: rows.keys[offset..offset + len].to_vec(),
+                    batch: self.add(&rows.batch.slice(offset, len))?,
+                });
+            }
         }
         Ok(out)
     }

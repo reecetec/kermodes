@@ -44,18 +44,32 @@ pub(crate) fn sorted(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let words = words(&fields);
     let mut order: Vec<u32> = (0..count).collect();
-    // Least significant word first: each pass is stable, so earlier words decide.
-    for word in words(&fields).iter().rev() {
+    let mut fields = Some(fields);
+    // Least significant word first: each pass is stable, so earlier words decide. Once the most
+    // significant word's pairs exist, the normalized columns are no longer needed: they go
+    // before that word's pairs are partitioned, and before the output is built.
+    for (index, word) in words.iter().enumerate().rev() {
+        let all = fields.as_ref().expect("fields live until the last word");
+        let word: Vec<&Field> = word.iter().map(|at| &all[*at]).collect();
         let width: u32 = word.iter().map(|f| f.width).sum();
         order = if width <= 64 {
-            sort_by(&order, width, |row| pack(word, row) as u64)
+            let pairs = keyed(&order, |row| pack(&word, row) as u64);
+            drop(word);
+            if index == 0 {
+                fields = None;
+            }
+            sort_pairs(&order, width, pairs)
         } else {
-            sort_by(&order, width, |row| pack(word, row))
+            let pairs = keyed(&order, |row| pack(&word, row));
+            drop(word);
+            if index == 0 {
+                fields = None;
+            }
+            sort_pairs(&order, width, pairs)
         };
     }
-    // The normalized columns are no longer needed: free them before the output is built.
-    drop(fields);
     gather(batches, &order)
 }
 
@@ -188,15 +202,16 @@ fn ranks(arrays: &[&ArrayRef]) -> Vec<u64> {
     row_ids.iter().map(|id| rank[*id as usize]).collect()
 }
 
-/// Consecutive fields packed into words of at most 128 bits; a field is at most 65 bits wide.
-fn words(fields: &[Field]) -> Vec<Vec<&Field>> {
-    let mut words: Vec<Vec<&Field>> = Vec::new();
+/// Consecutive fields, by index, packed into words of at most 128 bits; a field is at most 65
+/// bits wide.
+fn words(fields: &[Field]) -> Vec<Vec<usize>> {
+    let mut words: Vec<Vec<usize>> = Vec::new();
     let mut width = 0;
-    for field in fields {
+    for (at, field) in fields.iter().enumerate() {
         match words.last_mut() {
-            Some(word) if width + field.width <= 128 => word.push(field),
+            Some(word) if width + field.width <= 128 => word.push(at),
             _ => {
-                words.push(vec![field]);
+                words.push(vec![at]);
                 width = 0;
             }
         }
@@ -228,15 +243,18 @@ impl Key for u128 {
     }
 }
 
-/// `order` stably sorted by `key` (`width` bits wide) of each row.
-fn sort_by<K: Key>(order: &[u32], width: u32, key: impl Fn(u32) -> K) -> Vec<u32> {
-    // The pair's second half is the row's place in `order`: unique, so an unstable sort of
-    // the pairs is stable in effect.
-    let mut pairs: Vec<(K, u32)> = order
+/// Each of `order`'s rows keyed by `key`, paired with its place in `order`: unique, so an
+/// unstable sort of the pairs is stable in effect.
+fn keyed<K: Key>(order: &[u32], key: impl Fn(u32) -> K) -> Vec<(K, u32)> {
+    order
         .iter()
         .enumerate()
         .map(|(at, row)| (key(*row), at as u32))
-        .collect();
+        .collect()
+}
+
+/// `order` stably sorted by its rows' `pairs` (keys `width` bits wide).
+fn sort_pairs<K: Key>(order: &[u32], width: u32, mut pairs: Vec<(K, u32)>) -> Vec<u32> {
     let threads = threads_for(pairs.len());
     if threads <= 1 {
         pairs.sort_unstable();
