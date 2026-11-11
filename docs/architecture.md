@@ -32,6 +32,9 @@ Goals
 - Feature store with one definition for offline training and online serving.
 - Agent-first: every resource is a typed spec with validate → plan → apply.
 - Python SDK and Jupyter as the primary human surface.
+- Multi-user from the start: OIDC login, namespace RBAC, per-user isolated worker pods.
+- Schema changes as first-class, planned operations across live data, history, and dependents.
+- Kubernetes-native: Helm install; the controller runs every worker as its own pod.
 
 Non-goals (for now)
 
@@ -64,11 +67,12 @@ from file format.
 | Ingest server | weir | Rust | Accepts ingest protocol, writes Arrow IPC segments, serves snapshot + tail |
 | Engine | falls | Rust (library + server) | Incremental update graph, expressions, inference, Flight server |
 | Merge | — | Rust job | Daily intraday → sorted Parquet → DuckLake commit |
-| Control plane | — | Rust | Spec API, scheduler, deployment controller, registry, audit |
+| Control plane | — | Rust | Spec API, scheduler, Kubernetes controller, registry, audit |
 | Scheduler | run | Rust (in control plane) | Cron, DAGs, retries, leases |
 | Model registry | den | Rust (in control plane) | Model versions, aliases, signatures |
 | Feature store | forage | Rust + Python SDK | Feature views, point-in-time training sets, online state |
 | Agent surface | ranger | Rust | MCP server over the spec API and query surface |
+| Gateway | — | Rust | Single authenticated entry point; proxies Flight/WebSocket to worker pods |
 | SDK | `ursid` | Python (+ PyO3 engine wheel) | Client, local engine, notebook widgets |
 
 ```mermaid
@@ -83,13 +87,13 @@ flowchart LR
   S1 & S2 & S3 & S4 --> ING
   W -->|snapshot + tail| EW[Engine workers]
   EW -->|derived live tables| W
-  EW -->|viewports| C[Notebooks / agents / UI]
+  EW -->|viewports| GWY[Gateway\nauth + routing] -->|Flight / WebSocket| C[Notebooks / agents / UI]
   W -->|sealed day| M[Merge job]
   M -->|sorted Parquet + commit| LK[(DuckLake\nPostgres catalog + S3)]
   LK -->|pushed-down SQL| DDB[Embedded DuckDB]
   LK -->|Parquet + local cache| EW
   DDB --> EW & C
-  CP[Control plane\nspecs, scheduler, registry] -->|deploys| ING & EW & M
+  CP[Control plane\nspecs, scheduler, registry, controller] -->|worker pods, Jobs| ING & EW & M
   CP --> PG[(Postgres)]
   AG[Agents] -->|MCP| CP
 ```
@@ -99,8 +103,8 @@ flowchart LR
 ### 5.1 Tables and schemas
 
 - A table is identified by `namespace.table`.
-- Schemas are Arrow schemas, versioned in the catalog. Live and historical share the schema
-  history.
+- Schemas are Arrow schemas with stable column IDs, versioned in the catalog. Live and historical
+  share the schema history. Changes are planned operations (§5.4).
 - Column partition: `Date` (UTC, string `YYYY-MM-DD`), assigned from **ingest time**, not event
   time. This makes a day's partition closable at a fixed wall-clock moment. Late events land in the
   partition of the day they arrived.
@@ -135,6 +139,61 @@ full = db.table("sports", "odds")                         # historical ∪ live,
 lake come from history, the rest from weir. When a merge commits, the date moves from live to
 historical at a cycle boundary; the rows are identical, so downstream sees no change.
 
+### 5.4 Schema evolution
+
+Schema changes are ordinary resource changes: validate → plan → apply (§10.2), from the SDK, CLI,
+or an agent.
+
+```python
+plan = (us.schema.alter("sports.odds")
+          .add("venue", us.string(), default=None)
+          .rename("px", "price")
+          .widen("size", us.int64()))
+plan.show()     # change classes, affected dependents, rewrite cost
+plan.apply()
+```
+
+Column identity
+
+- Every column has a stable ID, carried as Arrow field metadata and Parquet `field_id`, and mapped
+  to DuckLake column IDs. Names are labels; data is matched by ID everywhere.
+- Renames are metadata-only. Old data never needs rewriting to change a name.
+
+Change classes, determined by `plan`
+
+| Change | Class | Effect |
+|---|---|---|
+| Add column (nullable or with default) | compatible | Applies mid-day. Older segments and files read as null/default. |
+| Widen type (int32→int64, float32→float64, new enum value) | compatible | Cast on read. |
+| Rename column | compatible | Metadata only. Dependents referencing the old name are rewritten in the same apply. |
+| Drop column | contract | Hidden from reads immediately; stored data kept until an explicit purge job. |
+| Incompatible type change, recomputed values | rewrite | Backfill DAG with one task per date: rewrite Parquet with a transform expression, commit each date atomically. Resumable. |
+| Sort keys / layout | rewrite (optional) | Applies to future merges; backfill optional. |
+
+Dependents
+
+- `plan` walks lineage and lists every affected ingester, deployment, feature view, and model
+  signature as unaffected, auto-migrated, or must-change.
+- Apply is atomic across the table and its dependent specs. A change that would break a feature
+  view or model signature is rejected unless the same plan updates it.
+
+Live data
+
+- A new schema version on a live table takes effect at a cycle boundary and opens new weir
+  segments.
+- weir accepts writes at any version compatible with the current one and projects them up by
+  column ID (defaults, casts, dropped columns discarded). Producers and tables upgrade
+  independently: expand → migrate producers → contract.
+- Initial implementation restarts dependent deployments, which rebuild state from weir and
+  history. Hot re-planning for compatible changes comes later.
+
+History
+
+- The schema change commits to DuckLake in the same transaction as the catalog version bump.
+  Existing Parquet files are not touched; reads map them by column ID.
+- Time travel to an older snapshot sees the older schema.
+- Merge projects every version present in a date onto the table's current version (§8.2).
+
 ## 6. Ingestion
 
 ### 6.1 Ingest protocol
@@ -149,7 +208,9 @@ Arrow Flight `DoPut`.
 - On (re)connect the writer calls `GetFlightInfo` / an action `last_seq` and resumes the source from
   there. For log-structured sources (NATS JetStream, Kafka) the source offset is the `seq`, so
   connectors keep no state of their own.
-- Batches must match the descriptor's schema version. A schema change opens a new segment.
+- The descriptor's `schema_version` may be any version compatible with the table's current one;
+  weir projects batches up by column ID (§5.4). Incompatible versions are rejected. A new version
+  opens a new segment.
 
 Fallback for lightweight producers: WebSocket (and HTTP POST) carrying Arrow IPC or JSON rows,
 coerced to the table schema by weir, same `seq` semantics.
@@ -237,7 +298,8 @@ Per-table layout config, applied by the merge writer:
 Daily, scheduled through the Ursid scheduler.
 
 1. Wait until all internal partitions for `D` are sealed.
-2. Read sealed segments, sort per layout config, write Parquet.
+2. Read sealed segments, project every schema version present in `D` onto the table's current
+   version by column ID (§5.4), sort per layout config, write Parquet.
 3. Commit to DuckLake in one transaction, **replacing** partition `D` (idempotent re-runs).
    Registering pre-written files uses DuckLake's add-data-files path; confirm semantics against the
    deployed DuckLake version.
@@ -260,8 +322,8 @@ Daily, scheduled through the Ursid scheduler.
 - Deephaven-style update graph. Execution proceeds in cycles; each cycle propagates deltas
   (added / removed / modified row sets, plus shifts) through operators in topological order.
 - Data is held as Arrow chunks. Append-only sources produce only `added` deltas.
-- One engine process per deployment. Sessions (notebook, agent) are separate processes with
-  quotas.
+- One worker pod per deployment, ingester, or session (§15.3). No worker process is shared
+  between users.
 - The engine is a library first (Rust crate, PyO3 wheel for `us.local()`) and a server second
   (same crate plus Flight).
 
@@ -396,10 +458,51 @@ MCP server over the control plane and query surface.
 - Resources: validate / plan / apply for every resource kind; job logs; retry; model comparison.
 - Sandboxes: agent sessions run in their own engine processes with memory, CPU, and time quotas;
   writes go to scratch namespaces unless the role allows otherwise.
+- Agents act with a delegated, optionally narrowed token from their user (§13); they never exceed
+  the user's grants.
 - Every agent action is recorded in `sys.audit`.
 - Errors are structured (code, location, fix hint) so agents can repair specs without guessing.
 
-## 13. Python SDK and notebooks
+## 13. Identity and access
+
+Multi-user within one organization first; separate tenants later.
+
+Identity
+
+- Any OIDC provider; Dex in the reference deployment.
+- Browser and hosted notebooks: authorization code + PKCE. CLI and SDK: device authorization flow
+  (`us.login()`), token cached in the OS keychain.
+- The control plane exchanges the OIDC ID token for a short-lived Ursid access token (JWT,
+  refreshable) carrying subject, groups, and scopes. weir, the gateway, and workers verify it
+  against the control plane's JWKS; nothing calls the OIDC provider on the request path.
+
+Workload identity
+
+- Every worker and job pod runs under its own Kubernetes ServiceAccount. The pod's projected
+  ServiceAccount token (audience `ursid`) is exchanged at the control plane for an Ursid token
+  scoped to the resource's owner and grants. No long-lived credentials in pods.
+
+Authorization
+
+- RBAC per namespace. Roles: `viewer` (read tables), `writer` (ingest, publish derived tables),
+  `editor` (create and modify resources), `admin` (schema changes, grants, purges).
+- Bindings map users or OIDC groups to roles.
+- Resources have owners and run with the owner's grants, re-checked at every (re)start.
+- `sys.*` rows are filtered to namespaces the caller can view.
+
+Enforcement points: control plane (spec operations), gateway (which workers a caller may reach),
+weir (per-table writes; reads by workers only), workers (table opens checked against the worker's
+token).
+
+Isolation and quotas
+
+- Each session is its own pod; per-user quotas on memory, CPU, concurrent sessions, and idle time.
+- `sys.audit` records subject and actor separately (user vs agent acting for the user).
+
+Later: row filters, column masking, multiple tenants (tenant-scoped namespaces and Kubernetes
+namespaces).
+
+## 14. Python SDK and notebooks
 
 - `us.connect()` — remote cluster; `us.local()` — in-process engine from the same Rust crate.
 - Tables convert to pyarrow, pandas, and polars without copying where possible.
@@ -407,24 +510,78 @@ MCP server over the control plane and query surface.
 - Decorators: `@us.job`, `@us.feature_view`; registry: `us.models.register(...)`; ingest:
   `us.ingest.writer(...)`.
 
-## 14. Deployment
+## 15. Kubernetes runtime and deployment
 
-Target: the existing Talos cluster managed from the Argo CD repo (`components/ursid`, promoted by
-Kargo).
+### 15.1 Packaging
+
+- Helm chart `ursid` in this repo (`deploy/helm/ursid`), published to the Gitea OCI registry,
+  one image per component.
+- The Argo CD repo consumes it like other upstream charts (values in
+  `components/ursid/helm/values.yaml`); Kargo promotes chart versions.
+- The chart installs: CRDs, `ursid-control`, `ursid-gateway`, weir, ServiceAccounts and RBAC,
+  config. It does not contain workers, ingesters, or jobs; the controller creates those at runtime.
+- External dependencies are values: Postgres (existing CNPG cluster or connection secret; the
+  chart can optionally render a CNPG `Cluster`), S3 endpoint and bucket (rustfs), DuckLake catalog,
+  OIDC issuer.
+
+### 15.2 Controller
+
+- `ursid-control` is one binary: API, scheduler, reconciler, ranger. It runs with several
+  replicas; scheduler and reconciler loops use leader election via a Kubernetes `Lease`, and every
+  replica serves the API.
+- Two layers of state:
+  - **Intent** in Postgres: specs, versions, owners, run history, audit. Written by
+    validate → plan → apply.
+  - **Runtime** in Kubernetes: custom resources the controller writes from intent and reconciles
+    into native objects. `kubectl get ursidworkers` shows what is running.
+- Status flows back: the controller watches Pods and Jobs and writes status to the custom
+  resource and to `sys.deployments` / `sys.task_runs`.
+- Owner references garbage-collect everything a worker created.
+
+| Runtime object | Created for | Reconciled into |
+|---|---|---|
+| `UrsidWorker` (CRD) | deployment, ingester, session | StatefulSet (1 replica) or Pod, Service, ServiceAccount |
+| `batch/v1` Job | scheduled task attempt | created directly by the scheduler; history in Postgres |
+
+### 15.3 Worker pods
+
+- One worker = one pod. Containers: `engine` (Rust, Flight server) and an optional `python`
+  sidecar (Python model flavors, UDFs, user code), connected by a Unix socket on a shared
+  `emptyDir`.
+- Deployments and ingesters: StatefulSet with one replica. This guarantees at most one pod per
+  identity (no rollout overlap double-publishing derived tables), stable DNS, and a PVC for the
+  segment/Parquet cache. Restarts rebuild state from weir and history.
+- Sessions: bare Pod, `restartPolicy: Never`, reaped after the idle timeout; resources from the
+  session request within the user's quota.
+- Jobs: one `batch/v1` Job per task attempt with `backoffLimit: 0`; the Ursid scheduler owns
+  retries so every attempt is a row in `sys.task_runs`.
+- User Python: the `ursid-python` base image plus per-resource requirements installed with uv into a
+  cached volume at start, or a user image built `FROM` the base.
+- Scheduling: requests/limits from the spec; node selectors and tolerations pass through. Priority
+  classes: deployments > ingesters > jobs > sessions.
+
+### 15.4 Gateway
+
+- Clients never address worker pods directly. `ursid-gateway` terminates TLS, verifies tokens,
+  checks the caller may reach the target worker, and proxies Flight (gRPC) and WebSocket to it,
+  routed by `x-ursid-worker` metadata or URL path.
+- One Gateway API `HTTPRoute` exposes the whole platform.
+
+### 15.5 Reference deployment
 
 | Workload | Kind | Storage / dependency |
 |---|---|---|
-| weir | StatefulSet | Longhorn PVC |
-| Engine deployments | Deployment per Ursid deployment, created by control plane | local cache volume |
-| Engine sessions | Pod per session, created on demand | ephemeral |
-| Control plane + ranger | Deployment | Postgres (CNPG) |
-| Merge, jobs | Kubernetes Jobs created by the scheduler | rustfs, DuckLake catalog |
+| weir | StatefulSet (chart) | Longhorn PVC |
+| ursid-control | Deployment, 2+ replicas (chart) | Postgres (CNPG) |
+| ursid-gateway | Deployment (chart) | — |
+| Workers | `UrsidWorker` → StatefulSet / Pod (controller) | PVC cache for deployments |
+| Merge, jobs | `batch/v1` Job (scheduler) | rustfs, DuckLake catalog |
 | Lake | existing DuckLake component | CNPG catalog + rustfs |
 
-Auth: OIDC via Dex. Telemetry: OpenTelemetry traces to Tempo, logs to Loki, metrics to Prometheus;
-platform state stays in `sys.*` tables.
+Telemetry: OpenTelemetry traces to Tempo, logs to Loki, metrics to Prometheus; platform state stays
+in `sys.*` tables.
 
-## 15. Technology choices
+## 16. Technology choices
 
 | Concern | Choice |
 |---|---|
@@ -439,8 +596,10 @@ platform state stays in `sys.*` tables.
 | Control-plane DB | Postgres via sqlx |
 | Python bindings | PyO3 + maturin |
 | Notebook widget | anywidget |
+| Auth | OIDC (`openidconnect`), JWT (`jsonwebtoken`) |
+| Packaging | Helm chart, OCI registry on Gitea |
 
-## 16. Planned repository layout
+## 17. Planned repository layout
 
 ```
 crates/
@@ -451,34 +610,34 @@ crates/
   ursid-weir      ingest server and segment store
   ursid-lake      DuckLake catalog, Parquet writer, merge
   ursid-control   spec API, scheduler, registry, MCP
+  ursid-gateway   authenticated Flight/WebSocket proxy
   ursid-py        PyO3 bindings
 python/ursid      SDK, widgets, decorators
-deploy/           kustomize bases consumed by the Argo CD repo
+deploy/helm/ursid Helm chart: CRDs, control plane, gateway, weir
 docs/
 ```
 
-## 17. Roadmap
+## 18. Roadmap
 
 | Milestone | Deliverable | Toy example |
 |---|---|---|
 | M0 | Engine crate: chunks, update graph, initial operators, expressions; PyO3 wheel; notebook widget | Random-walk ticker → rolling mean/vol, live in Jupyter |
-| M1 | weir (DoPut, segments, seq dedup, snapshot + tail); `db.live_table`; WebSocket connector | Synthetic ticker over WebSocket → weir → engine |
-| M2 | Merge job, DuckLake commit, `db.historical_table`, `db.table`, DuckDB pushdown, replay clock | Ticker merged nightly, replayed as a backtest |
-| M3 | Control plane: specs, validate/plan/apply, scheduler, `sys.*` tables, ranger MCP | Agent creates a DAG; retries visible live |
+| M1 | weir (DoPut, segments, seq dedup, snapshot + tail); `db.live_table`; WebSocket connector; Helm chart (weir + engine) | Synthetic ticker over WebSocket → weir → engine |
+| M2 | Merge job, DuckLake commit, `db.historical_table`, `db.table`, DuckDB pushdown, replay clock; column IDs and compatible schema changes | Ticker merged nightly, replayed as a backtest; add a column mid-day |
+| M3 | Control plane: specs, validate/plan/apply, scheduler, `sys.*` tables, ranger MCP; OIDC, RBAC, `UrsidWorker` controller, gateway; schema plans with dependents and rewrites | Two users, each with their own sessions; agent creates a DAG; retries visible live |
 | M4 | den: register sklearn LinearRegression → ONNX → `predict`; torch MLP; aliases, shadow mode | Live prediction; swap champion without restart |
 | M5 | forage: feature views, training sets, online `last_by`, served-feature logging | Toy sportsbook: simulated games + odds → form features → live win probability vs implied odds |
 | M6 | Port juicebear sportsflow features and models | Real data |
 
-## 18. Open questions
+## 19. Open questions
 
 1. Latency target per event (assumed 100 ms–1 s cycles).
 2. Peak rows/sec and live state size for juicebear — validates single-process deployments.
-3. Tenancy: single-tenant homelab vs multi-tenant product (auth, isolation, quotas).
-4. Derived-state checkpointing: replay from start of day vs periodic engine snapshots.
-5. Schema evolution rules mid-day (additive only?) and how merge reconciles multiple schema
-   versions within a date.
+3. Derived-state checkpointing: replay from start of day vs periodic engine snapshots.
+4. User Python packaging: uv install at start vs built images as the default.
+5. weir sharding: how tables are assigned to weir replicas once one StatefulSet is not enough.
 
-## 19. Risks
+## 20. Risks
 
 - **Engine scope.** A general Deephaven-class engine is years of work; hold the operator set fixed
   until M5.
@@ -488,3 +647,7 @@ docs/
 - **Two SQL dialects.** Mitigated by the expression language and conformance corpus (§9.3).
 - **Single weir writer.** Node loss stalls ingest for that partition until the PVC reattaches;
   acceptable initially, revisit with S3 segment replication.
+- **Rewrite cost.** Incompatible schema changes on long histories are expensive; `plan` must show
+  partitions and bytes to rewrite, and the backfill must be resumable per date.
+- **Two state layers.** Postgres intent and Kubernetes runtime objects can drift; the reconciler
+  treats Postgres as truth and recreates or deletes runtime objects to match.
