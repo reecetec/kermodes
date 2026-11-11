@@ -14,8 +14,8 @@ use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use crate::agg::{Accumulator, AggBy, agg_schema};
 use crate::groups::{KeyKind, Membership, resolve};
 use crate::join::{AsOfJoin, Join, JoinShape, NaturalJoin, Tracking};
-use crate::ops::{Assignment, LastBy, Operator, Update, Where};
-use crate::storage::{Delta, Modified, RowKey, Rows, Storage};
+use crate::ops::{Assignment, Edge, LastBy, Operator, Update, Where};
+use crate::storage::{Delta, End, Modified, RowKey, Rows, Storage};
 use crate::types::check_types;
 use crate::{Error, Expression, type_name};
 
@@ -293,25 +293,53 @@ impl<'a> Reader<'a> {
     }
 
     /// The first `n` rows in key order.
-    pub fn head(self, n: usize) -> Result<RecordBatch, ArrowError> {
-        self.gather(&self.head_keys(n)?)
+    pub fn first_rows(self, n: usize) -> Result<RecordBatch, ArrowError> {
+        self.gather(&self.edge_keys(End::First, n, None)?)
     }
 
-    fn head_keys(self, n: usize) -> Result<Vec<RowKey>, ArrowError> {
+    /// As `Storage::edge_keys`.
+    pub fn edge_keys(
+        self,
+        end: End,
+        n: usize,
+        bound: Option<RowKey>,
+    ) -> Result<Vec<RowKey>, ArrowError> {
         match self.place() {
-            Place::Stored(storage) => Ok(storage.head_keys(n)),
-            Place::Joined { left, .. } => left.head_keys(n),
-            // Merged keys order by input first, so the first rows are the first inputs'.
+            Place::Stored(storage) => Ok(storage.edge_keys(end, n, bound)),
+            Place::Joined { left, .. } => left.edge_keys(end, n, bound),
+            // Merged keys order by input first: walk the inputs from `end`, starting at the
+            // bound's input, until `n` keys are found.
             Place::Merged { inputs, .. } => {
-                let mut keys = Vec::new();
-                for (index, id) in inputs.iter().enumerate() {
-                    if keys.len() == n {
+                let bound = bound.map(|b| {
+                    let index = (b >> MERGE_KEY_BITS) as usize;
+                    (index, b & ((1 << MERGE_KEY_BITS) - 1))
+                });
+                let (mut chunks, mut found) = (Vec::new(), 0);
+                for step in 0..inputs.len() {
+                    if found == n {
                         break;
                     }
-                    let first = self.input(*id).head_keys(n - keys.len())?;
-                    keys.extend(merged_keys(index, &first)?);
+                    let index = match end {
+                        End::First => step,
+                        End::Last => inputs.len() - 1 - step,
+                    };
+                    let within = match bound {
+                        None => None,
+                        Some((at, key)) if at == index => Some(key),
+                        // Inputs on the near side of the bound's input are skipped entirely.
+                        Some((at, _)) if (end == End::First) == (index < at) => continue,
+                        Some(_) => None,
+                    };
+                    let keys = self
+                        .input(inputs[index])
+                        .edge_keys(end, n - found, within)?;
+                    found += keys.len();
+                    chunks.push(merged_keys(index, &keys)?);
                 }
-                Ok(keys)
+                if end == End::Last {
+                    chunks.reverse();
+                }
+                Ok(chunks.concat())
             }
         }
     }
@@ -940,6 +968,32 @@ impl Table {
         )
     }
 
+    /// The first `n` rows in key order (arrival order for appended rows), kept current as rows
+    /// come and go.
+    pub fn head(&self, n: usize) -> Result<Table, Error> {
+        self.edge(End::First, n)
+    }
+
+    /// The last `n` rows in key order (the newest, for appended rows), kept current as rows come
+    /// and go.
+    pub fn tail(&self, n: usize) -> Result<Table, Error> {
+        self.edge(End::Last, n)
+    }
+
+    fn edge(&self, end: End, n: usize) -> Result<Table, Error> {
+        let name = match end {
+            End::First => "head",
+            End::Last => "tail",
+        };
+        // Rows leave as nearer ones arrive, so the output can lose rows whatever its input does.
+        self.derive(
+            format!("{name}({n})"),
+            self.schema.clone(),
+            false,
+            Operator::Edge(Edge::new(end, n)),
+        )
+    }
+
     /// The last row (in arrival order) for each value of `columns`.
     pub fn last_by(&self, columns: &[&str]) -> Result<Table, Error> {
         let groups = self.membership(columns)?;
@@ -1310,14 +1364,14 @@ impl Table {
     }
 
     /// The first `n` rows in key order, or the error that failed the table.
-    pub fn head(&self, n: usize) -> Result<RecordBatch, Error> {
+    pub fn first_rows(&self, n: usize) -> Result<RecordBatch, Error> {
         let graph = self.session.read();
         let table = &graph.tables[self.id];
         if let Some(error) = &table.failure {
             return Err(error.clone());
         }
         Reader::new(&graph.tables, self.id)
-            .head(n)
+            .first_rows(n)
             .map_err(|e| Error::Compute {
                 table: table.description.clone(),
                 message: e.to_string(),

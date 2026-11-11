@@ -151,7 +151,7 @@ keep no state) and an incremental path below. Static paths use the same kernels 
 | `as_of_join(right, on, at, joins)` | The same grouping table; per group, right rows as a vector sorted by `(time, row key)` (appended when they arrive in time order), and left rows by `(time, row key)` only if the right side ticks | A left row matches the right row with the greatest time not after its own, the latest arrival among equal times; NULL times never match. Lookups within a cycle resume from the group's previous one, galloping forward when times increase, so time-ordered rows cost a short scan rather than a binary search each. A right row added at time `t` re-matches exactly the left rows timed from `t` up to the group's next right time. Cycles order work as for `natural_join`; with a ticking right side, the output computes its rows on read (§2.4). | Right must only gain rows; `at` is an integer, date, or timestamp column. |
 | `rolling(by, window, aggs)` | Per group: a ring buffer (row windows) or deque (time windows) with running accumulators | Added rows in key order: push, evict out-of-window, emit the aggregate as columns on the added row. Earlier rows never change. | Input must be `append_only`; windows look backward only. |
 | `merge(tables)` | None; rows are read from the inputs (§2.4) | Re-key each input's delta with its input index; union. The batches are shared, not copied. A merge among the inputs contributes its own inputs, so merges never nest. | Same column names and types, in the same order; at most 256 inputs. |
-| `head(n)` / `tail(n)` | Output row set | Positions over the parent's row set; recompute the boundary on deltas. | — |
+| `head(n)` / `tail(n)` | The input's `n` keys nearest that end, as an ordered set; every other input key lies beyond the boundary (the kept key farthest from the end). The kept rows are stored. | Kept rows the input removes leave; the set then refills with the input's next keys beyond the boundary (arithmetic for append-only inputs, a linear selection over slot tables, input by input for merges). Additions nearer than the boundary displace the farthest kept key; only a cycle's `n` nearest additions are considered, so a large append costs one linear selection. Kept rows the input modifies are modified. | Order is key order: arrival order for appended rows. |
 | `sort(by)` | — | Static only in M0. | Ticking sort is M2 (SQL `ORDER BY`). |
 
 Grouping keys:
@@ -218,6 +218,7 @@ m = us.local(manual=True)  # only m.step() runs cycles; m.start() / m.stop()
 enriched = live.natural_join(refs, on="sym")  # `joins=` picks and renames right columns
 priced = ticks.as_of_join(quotes, on="sym", at="ts")
 both = us.merge(east, west)  # rows of every table, uncopied
+recent = ticks.tail(100)  # head(n) / tail(n), kept current
 
 # Still to come in M0:
 vol = ticks.rolling("sym", rows=100, std_price="std(price)")

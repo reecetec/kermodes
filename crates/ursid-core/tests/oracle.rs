@@ -99,6 +99,23 @@ const PIPELINES: &[(&str, Pipeline)] = &[
         let inner = Table::merge(&[t, &latest]).unwrap();
         Table::merge(&[&latest, &inner]).unwrap()
     }),
+    ("head", |t| t.head(5).unwrap()),
+    ("tail", |t| t.tail(5).unwrap()),
+    ("head of none", |t| t.head(0).unwrap()),
+    ("where then tail", |t| {
+        t.filter("flag").unwrap().tail(3).unwrap()
+    }),
+    ("tail then agg_by", |t| {
+        t.tail(7).unwrap().agg_by(&["sym"], AGGREGATIONS).unwrap()
+    }),
+    ("merge then tail", |t| {
+        let flagged = t.filter("flag").unwrap();
+        Table::merge(&[t, &flagged]).unwrap().tail(6).unwrap()
+    }),
+    ("merge then head", |t| {
+        let flagged = t.filter("flag").unwrap();
+        Table::merge(&[&flagged, t]).unwrap().head(6).unwrap()
+    }),
 ];
 
 /// xorshift64*: small, seedable, and enough to shake out ordering and chunking bugs.

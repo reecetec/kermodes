@@ -217,6 +217,18 @@ impl Table {
         Ok(Table(table))
     }
 
+    /// The first `n` rows in key order (arrival order for appended rows), kept current.
+    fn head(&self, py: Python<'_>, n: usize) -> PyResult<Table> {
+        let table = py.detach(|| self.0.head(n)).map_err(engine_error)?;
+        Ok(Table(table))
+    }
+
+    /// The last `n` rows in key order (the newest, for appended rows), kept current.
+    fn tail(&self, py: Python<'_>, n: usize) -> PyResult<Table> {
+        let table = py.detach(|| self.0.tail(n)).map_err(engine_error)?;
+        Ok(Table(table))
+    }
+
     /// Each row with columns from the `right` row whose `on` columns hold the same values, or
     /// NULLs; a key with more than one right row fails the table. `on` and `joins` entries are
     /// `"name"` or `"left=right"` (`"new=old"` for `joins`); `joins` defaults to every right
@@ -317,8 +329,8 @@ impl Table {
 
     /// The first `rows` rows as an HTML table, with the row count, or the table's error.
     fn _preview_html(&self, py: Python<'_>, rows: usize) -> PyResult<String> {
-        let preview =
-            py.detach(|| Ok::<_, ursid_core::Error>((self.0.head(rows)?, self.0.num_rows()?)));
+        let preview = py
+            .detach(|| Ok::<_, ursid_core::Error>((self.0.first_rows(rows)?, self.0.num_rows()?)));
         let status = if self.0.is_refreshing() {
             format!("ticking · updated in cycle {}", self.0.changed())
         } else {

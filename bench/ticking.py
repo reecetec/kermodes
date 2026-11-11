@@ -32,6 +32,7 @@ OPERATIONS = [
     "natural_join",
     "as_of_join",
     "merge + agg_by",
+    "tail",
 ]
 MB = 1 << 20
 
@@ -71,6 +72,7 @@ def worker(op: str, cycles: int, batch: int) -> dict:
         "merge + agg_by": lambda: us.merge(ticks, ticks.where("price > 100")).agg_by(
             "sym", n="count(*)", avg="mean(price)"
         ),
+        "tail": lambda: ticks.tail(1000),
     }[op]()
 
     def copy(table: pa.Table, start: int) -> pa.Table:

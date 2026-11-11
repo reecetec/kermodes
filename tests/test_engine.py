@@ -205,3 +205,15 @@ def test_merge_follows_its_tables_in_order_and_needs_matching_columns():
     other = s.input_table({"sym": us.string(), "price": us.float64()})
     with pytest.raises(us.UrsidError, match="same columns"):
         us.merge(east, other)
+
+
+def test_head_and_tail_follow_the_ends_of_a_ticking_table():
+    s = us.local(manual=True)
+    src = s.input_table(COLUMNS)
+    first, last = src.head(2), src.tail(2)
+    src.append(ticks(["a", "b", "c"], [1.0, 2.0, 3.0], [1, 2, 3]))
+    s.step()
+    src.append(ticks(["d"], [4.0], [4]))
+    s.step()
+    assert pa.table(first)["sym"].to_pylist() == ["a", "b"]
+    assert pa.table(last)["sym"].to_pylist() == ["c", "d"]

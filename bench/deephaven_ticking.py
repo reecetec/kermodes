@@ -31,6 +31,7 @@ OPERATIONS = [
     "natural_join",
     "as_of_join",
     "merge + agg_by",
+    "tail",
 ]
 WARM = 10
 MB = 1 << 20
@@ -81,6 +82,7 @@ def worker(op: str, cycles: int, batch: int) -> dict:
         "merge + agg_by": lambda: merge([ticks, ticks.where("price > 100")]).agg_by(
             [agg.count_("n"), agg.avg("avg=price")], by="sym"
         ),
+        "tail": lambda: ticks.tail(1000),
     }[op]()
 
     times = []

@@ -80,6 +80,7 @@ def main() -> None:
             ),
             ("n", "sum"),
         ),
+        "tail": (lambda: ticks.tail(1000), ("price", "sum")),
     }
 
     print(

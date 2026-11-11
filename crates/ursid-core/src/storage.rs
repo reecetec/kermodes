@@ -230,17 +230,36 @@ impl Storage {
         }
     }
 
-    /// The `n` smallest live keys, in order. A sparse table selects them in linear time rather
-    /// than sorting all of its keys.
-    pub fn head_keys(&self, n: usize) -> Vec<RowKey> {
+    /// The `n` keys nearest `end` among those beyond `bound` (greater than it for `End::First`,
+    /// less for `End::Last`; every key without one), in key order. A sparse table selects them
+    /// in linear time rather than sorting all of its keys.
+    pub fn edge_keys(&self, end: End, n: usize, bound: Option<RowKey>) -> Vec<RowKey> {
         match &self.index {
-            Index::Dense { len, .. } => (0..(n as RowKey).min(*len)).collect(),
+            Index::Dense { len, .. } => {
+                let (len, n) = (*len, n as RowKey);
+                let range = match end {
+                    End::First => {
+                        let start = bound.map_or(0, |b| b.saturating_add(1)).min(len);
+                        start..start.saturating_add(n).min(len)
+                    }
+                    End::Last => {
+                        let stop = bound.map_or(len, |b| b.min(len));
+                        stop.saturating_sub(n)..stop
+                    }
+                };
+                range.collect()
+            }
             Index::Sparse { slot_of, .. } => {
-                let mut keys: Vec<RowKey> = slot_of.keys().copied().collect();
-                if keys.len() > n {
-                    keys.select_nth_unstable(n);
-                    keys.truncate(n);
-                }
+                let mut keys: Vec<RowKey> = slot_of
+                    .keys()
+                    .copied()
+                    .filter(|key| match (end, bound) {
+                        (_, None) => true,
+                        (End::First, Some(bound)) => *key > bound,
+                        (End::Last, Some(bound)) => *key < bound,
+                    })
+                    .collect();
+                nearest(&mut keys, end, n);
                 keys.sort_unstable();
                 keys
             }
@@ -354,5 +373,31 @@ impl Storage {
             }
         }
         Ok(())
+    }
+}
+
+/// Either end of a table's key order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum End {
+    First,
+    Last,
+}
+
+/// Keeps only the `n` of `keys` nearest `end`, in no particular order, in linear time.
+pub(crate) fn nearest(keys: &mut Vec<RowKey>, end: End, n: usize) {
+    if n == 0 {
+        keys.clear();
+    } else if keys.len() > n {
+        match end {
+            End::First => {
+                keys.select_nth_unstable(n);
+                keys.truncate(n);
+            }
+            End::Last => {
+                let cut = keys.len() - n;
+                keys.select_nth_unstable(cut);
+                keys.drain(..cut);
+            }
+        }
     }
 }

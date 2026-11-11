@@ -1,7 +1,7 @@
 //! Derived-table operators. Each turns its input's delta for a cycle into its own delta. A
 //! static table is the same code fed every row as one addition.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, UInt32Array};
 use arrow::compute::{filter_record_batch, take_record_batch};
@@ -15,13 +15,14 @@ use crate::agg::AggBy;
 use crate::groups::{KeyKind, LocalGroups, Membership};
 use crate::parallel::{PIECE_ROWS, row_pieces, run, threads_for};
 use crate::session::Reader;
-use crate::storage::{Delta, Modified, RowKey, Rows, Storage};
+use crate::storage::{Delta, End, Modified, RowKey, Rows, Storage, nearest};
 
 pub(crate) enum Operator {
     Where(Where),
     Update(Update),
     LastBy(Box<LastBy>),
     AggBy(AggBy),
+    Edge(Edge),
 }
 
 impl Operator {
@@ -36,6 +37,7 @@ impl Operator {
             Operator::Update(op) => op.process(delta, own),
             Operator::LastBy(op) => op.process(input, delta, own),
             Operator::AggBy(op) => op.process(input, delta, own),
+            Operator::Edge(op) => op.process(input, delta, own),
         }
     }
 }
@@ -345,6 +347,113 @@ impl LastBy {
             keys: slots,
         });
         push_removed(&mut out, own, removed)?;
+        Ok(out)
+    }
+}
+
+/// The `n` rows nearest one end of the input's key order: `head` or `tail`.
+pub(crate) struct Edge {
+    end: End,
+    n: usize,
+    /// The output's keys: the input's `n` keys nearest `end`, or all of them if fewer. Every
+    /// other input key lies beyond the kept key farthest from `end`.
+    kept: BTreeSet<RowKey>,
+}
+
+impl Edge {
+    pub fn new(end: End, n: usize) -> Self {
+        Self {
+            end,
+            n,
+            kept: BTreeSet::new(),
+        }
+    }
+
+    /// The kept key farthest from `end`: the boundary.
+    fn boundary(&self) -> Option<RowKey> {
+        match self.end {
+            End::First => self.kept.last().copied(),
+            End::Last => self.kept.first().copied(),
+        }
+    }
+
+    fn process(
+        &mut self,
+        input: Reader<'_>,
+        delta: &Delta,
+        own: &Storage,
+    ) -> Result<Delta, ArrowError> {
+        let (mut leaving, mut entering, mut changed) = (Vec::new(), HashSet::new(), HashSet::new());
+        for key in delta.removed.iter().flat_map(|r| &r.keys) {
+            if self.kept.remove(key) {
+                leaving.push(*key);
+            }
+        }
+        for key in delta.modified.iter().flat_map(|m| &m.keys) {
+            if self.kept.contains(key) {
+                changed.insert(*key);
+            }
+        }
+        // Short of `n`: take the input's next keys beyond the boundary. The input already holds
+        // this cycle's additions, so from an empty set this is the answer.
+        let was_empty = self.kept.is_empty();
+        if self.kept.len() < self.n && input.len() > self.kept.len() {
+            let wanted = self.n - self.kept.len();
+            for key in input.edge_keys(self.end, wanted, self.boundary())? {
+                self.kept.insert(key);
+                entering.insert(key);
+            }
+        }
+        // Additions on the near side of the boundary displace kept keys; only the `n` nearest
+        // `end` can.
+        if !was_empty {
+            let mut added: Vec<RowKey> = delta
+                .added
+                .iter()
+                .flat_map(|r| r.keys.iter().copied())
+                .collect();
+            nearest(&mut added, self.end, self.n);
+            for key in added {
+                if self.kept.contains(&key) {
+                    continue;
+                }
+                if self.kept.len() < self.n {
+                    self.kept.insert(key);
+                    entering.insert(key);
+                    continue;
+                }
+                let worst = self.boundary().expect("n > 0 keys are kept");
+                let nearer = match self.end {
+                    End::First => key < worst,
+                    End::Last => key > worst,
+                };
+                if nearer {
+                    self.kept.remove(&worst);
+                    self.kept.insert(key);
+                    entering.insert(key);
+                    if !entering.remove(&worst) {
+                        changed.remove(&worst);
+                        leaving.push(worst);
+                    }
+                }
+            }
+        }
+
+        let mut out = Delta::default();
+        let mut entering: Vec<RowKey> = entering.into_iter().collect();
+        entering.sort_unstable();
+        out.added.push(Rows {
+            batch: input.gather(&entering)?,
+            keys: entering,
+        });
+        let mut changed: Vec<RowKey> = changed.into_iter().collect();
+        changed.sort_unstable();
+        out.modified.push(Modified {
+            previous: own.gather(&changed)?,
+            current: input.gather(&changed)?,
+            keys: changed,
+        });
+        push_removed(&mut out, own, leaving)?;
         Ok(out)
     }
 }
