@@ -418,6 +418,16 @@ impl TableState {
         }
     }
 
+    /// Finishes building a derived table: its first rows are applied, so their delta goes. A
+    /// table that never refreshes never runs its operator again, so the operator's state (join
+    /// indexes, aggregation shards, group tables) goes too, leaving only the rows.
+    fn settle(&mut self) {
+        self.delta = None;
+        if !self.refreshing {
+            self.source = Source::Static;
+        }
+    }
+
     fn fail(&mut self, error: Error) {
         self.failure = Some(error);
         self.delta = None;
@@ -906,7 +916,7 @@ impl Table {
         if let Some(error) = state.failure {
             return Err(error);
         }
-        state.delta = None;
+        state.settle();
         graph.tables.push(state);
         Ok(Table {
             session: self.session.clone(),
@@ -1014,7 +1024,7 @@ impl Table {
         if let Some(error) = state.failure {
             return Err(error);
         }
-        state.delta = None;
+        state.settle();
         graph.tables.push(state);
         Ok(Table {
             session: self.session.clone(),
