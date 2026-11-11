@@ -1194,7 +1194,7 @@ host it: Kubernetes (§16.1–16.5) and local (§16.6).
 
 | Kubernetes object | Created for | Notes |
 |---|---|---|
-| `apps/v1` Deployment | deployment, ingester | One replica, two for a hot standby. `RollingUpdate` (`maxSurge: 1`, `maxUnavailable: 0`) or `Recreate` (§11.4); the controller changes the template only to roll out an artifact. An init container fetches the commit's snapshot from the controller. A PodDisruptionBudget per resource, once the controller moves runs off cordoned nodes (§17.1): before that, one would block every drain. |
+| `apps/v1` Deployment | deployment, ingester | One replica, two for a hot standby. `RollingUpdate` (`maxSurge: 1`, `maxUnavailable: 0`) or `Recreate` (§11.4); the controller changes the template only to roll out an artifact. An init container fetches the commit's snapshot from the controller. A PodDisruptionBudget per resource; the controller moves runs off cordoned nodes (§17.1). |
 | Pod | session | `restartPolicy: Never`, reaped after the idle timeout |
 | `batch/v1` Job | scheduled task attempt, pipeline stage, discovery, environment build | Created by the scheduler or pipeline; history in Postgres |
 
@@ -1323,18 +1323,22 @@ Node drains (Talos or Kubernetes upgrades, `kubectl drain`) evict pods, and an e
 rollout: `maxSurge` applies only to template changes, so an evicted single-replica Deployment is
 down until its replacement has rebuilt. Kermodes moves runs before they are evicted:
 
-- Each deployment and ingester has a PodDisruptionBudget that blocks eviction of its only ready
-  run.
-- The controller watches for cordoned nodes and rolls the resources on them (§11.4): the new run is
-  scheduled elsewhere, catches up, and takes the source leases; the old run then stops, and the
-  drain proceeds.
+- Each deployment and ingester has a PodDisruptionBudget (`maxUnavailable: 0`) that blocks
+  eviction of its runs while they are ready; a run that is not ready can always be evicted, so a
+  broken run never holds a node.
+- The controller checks for cordoned nodes every 5 s and restarts the Deployment of each settled
+  resource running on one (§11.4): the new run is scheduled elsewhere, catches up, and takes the
+  source leases; the old run then stops through the rollout, and the drain proceeds. While the
+  controller is down, or no other node has room for the new run, the drain waits rather than
+  evicting a healthy run.
 - A hot standby (`replicas=2`) needs no move: eviction takes one run and the other takes the lease.
   It also covers unplanned node loss, at twice the resources all the time.
 
 | Component | Draining its node |
 |---|---|
 | Deployments, ingesters | No downtime |
-| Control plane, gateway, `kermodes ui` | No downtime: stateless, 2+ replicas and a PodDisruptionBudget |
+| Gateway, `kermodes ui` | No downtime: stateless, 2+ replicas and a PodDisruptionBudget |
+| Control plane | Until it elects a leader, one replica: syncs, rollouts, and moves pause while it reschedules; what runs keeps running |
 | Postgres (CNPG) | No downtime: CNPG switches the primary over before eviction |
 | weir | A brief outage until it is replicated: the pod reschedules and its volume reattaches. Writers buffer and resume from `last_seq`; readers restart and rebuild until subscriptions resume by row position (§7.2) |
 

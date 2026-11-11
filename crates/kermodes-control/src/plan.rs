@@ -5,13 +5,14 @@
 //! commit's code snapshot, which an init container fetches from the controller (pods never hold
 //! git credentials, §11.7). Its pod template names the commit, so only a new commit changes it,
 //! and Kubernetes rolls it as the resource asks: start the new run, wait until it is ready, stop
-//! the old (§11.4). PodDisruptionBudgets come with the drain-aware controller (§17.1): with one
-//! replica and nothing to move it, a budget would block every node drain.
+//! the old (§11.4). A PodDisruptionBudget keeps a drain from evicting a healthy run; the
+//! controller moves it instead, by the same rollout (§17.1).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::batch::v1::Job;
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use serde_json::{Value, json};
 
 use crate::manifest::{Resource, Rollout, Update};
@@ -88,12 +89,15 @@ pub fn object_names(
     Ok(names)
 }
 
+/// The labels that select a resource's pods; they never change, so neither does a Deployment's
+/// selector.
+fn selector(project: &str, resource: &str) -> Value {
+    json!({"kermodes.io/project": project, "kermodes.io/resource": resource})
+}
+
 /// The Deployment that runs `resource` at the target's commit.
 pub fn deployment(target: &Target, resource: &Resource, name: &str) -> Deployment {
-    let selector = json!({
-        "kermodes.io/project": target.project,
-        "kermodes.io/resource": resource.name,
-    });
+    let selector = selector(&target.project, &resource.name);
     let mut labels = selector.clone();
     labels["app.kubernetes.io/name"] = json!(name);
     labels["app.kubernetes.io/managed-by"] = json!("kermodes-control");
@@ -145,6 +149,53 @@ pub fn deployment(target: &Target, resource: &Resource, name: &str) -> Deploymen
         },
     });
     serde_json::from_value(object).expect("a Deployment built from known fields")
+}
+
+/// Stops a drain from evicting a resource's healthy run (§17.1). The drain waits while the
+/// controller sees the cordon and rolls the run onto another node, and the old pod then leaves
+/// through that rollout, which the budget does not block. A run that is not ready can always be
+/// evicted, so a broken run never holds a node.
+pub fn disruption_budget(project: &str, resource: &str, name: &str) -> PodDisruptionBudget {
+    let object = json!({
+        "apiVersion": "policy/v1",
+        "kind": "PodDisruptionBudget",
+        "metadata": {
+            "name": name,
+            "labels": {
+                "kermodes.io/project": project,
+                "kermodes.io/resource": resource,
+                "app.kubernetes.io/name": name,
+                "app.kubernetes.io/managed-by": "kermodes-control",
+            },
+        },
+        "spec": {
+            "maxUnavailable": 0,
+            "selector": {"matchLabels": selector(project, resource)},
+            "unhealthyPodEvictionPolicy": "AlwaysAllow",
+        },
+    });
+    serde_json::from_value(object).expect("a PodDisruptionBudget built from known fields")
+}
+
+/// Where a resource's Deployment runs.
+#[derive(Clone, Debug)]
+pub struct Placement {
+    pub name: String,
+    /// Its rollout is done: every run is at its template and ready.
+    pub settled: bool,
+    /// The nodes of its pods, leaving out pods already terminating.
+    pub nodes: Vec<String>,
+}
+
+/// The Deployments to roll onto other nodes because a run sits on a cordoned one. A rollout in
+/// progress already starts its new run elsewhere (the scheduler skips cordoned nodes), and one
+/// that failed would only fail again, so only settled Deployments move.
+pub fn to_move<'a>(placements: &'a [Placement], cordoned: &BTreeSet<String>) -> Vec<&'a str> {
+    placements
+        .iter()
+        .filter(|p| p.settled && p.nodes.iter().any(|node| cordoned.contains(node)))
+        .map(|p| p.name.as_str())
+        .collect()
 }
 
 /// The Job that discovers what the target's commit declares: `kermodes manifest` on its code,
@@ -346,5 +397,48 @@ mod tests {
         assert!(run.readiness_probe.is_some());
         let fetch = pod.init_containers.unwrap()[0].args.clone().unwrap();
         assert_eq!(fetch[1], "http://kermodes-control:8732/snapshots/ticker/a");
+    }
+
+    #[test]
+    fn a_budget_guards_exactly_its_resources_runs_and_never_a_broken_one() {
+        let ticks = resource("ticks", Update::Auto, Rollout::Rolling);
+        let d = deployment(&target("a"), &ticks, "ticker-ticks");
+        let budget = disruption_budget("ticker", "ticks", "ticker-ticks")
+            .spec
+            .unwrap();
+        assert_eq!(
+            Some(budget.selector.unwrap()),
+            Some(d.spec.unwrap().selector)
+        );
+        assert_eq!(
+            budget.max_unavailable,
+            Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(0))
+        );
+        assert_eq!(
+            budget.unhealthy_pod_eviction_policy.as_deref(),
+            Some("AlwaysAllow")
+        );
+    }
+
+    #[test]
+    fn only_settled_runs_on_cordoned_nodes_move() {
+        let placement = |name: &str, settled: bool, nodes: &[&str]| Placement {
+            name: name.into(),
+            settled,
+            nodes: nodes.iter().map(|n| n.to_string()).collect(),
+        };
+        let placements = [
+            placement("on-cordoned", true, &["n1"]),
+            placement("elsewhere", true, &["n2"]),
+            placement("already-rolling", false, &["n1", "n2"]),
+            placement("one-of-two-cordoned", true, &["n2", "n1"]),
+            placement("no-pods", true, &[]),
+        ];
+        let cordoned = BTreeSet::from(["n1".to_string()]);
+        assert_eq!(
+            to_move(&placements, &cordoned),
+            ["on-cordoned", "one-of-two-cordoned"]
+        );
+        assert!(to_move(&placements, &BTreeSet::new()).is_empty());
     }
 }

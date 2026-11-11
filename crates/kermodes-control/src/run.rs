@@ -100,6 +100,7 @@ pub async fn run(config: Config) -> Result<(), String> {
         .await
         .map_err(|e| format!("cannot listen on {}: {e}", controller.config.listen))?;
     let server = tokio::spawn(crate::http::serve(controller.clone(), listener));
+    let mover = tokio::spawn(move_off_cordoned(controller.clone()));
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| format!("cannot handle SIGTERM: {e}"))?;
     let poll = Duration::from_secs(controller.config.poll_seconds);
@@ -117,6 +118,35 @@ pub async fn run(config: Config) -> Result<(), String> {
         }
     }
     server.abort();
+    mover.abort();
+    Ok(())
+}
+
+/// How often runs on cordoned nodes are looked for: a drain waits this long at most before the
+/// controller starts moving them.
+const CORDON_CHECK: Duration = Duration::from_secs(5);
+
+/// Moves runs off cordoned nodes, so a drain never evicts a healthy run (§17.1): each run's
+/// disruption budget blocks the eviction, and its Deployment rolls onto another node instead.
+async fn move_off_cordoned(controller: Arc<Controller>) {
+    loop {
+        if let Err(e) = move_once(&controller.kube).await {
+            eprintln!("kermodes control: moving runs off cordoned nodes: {e}");
+        }
+        tokio::time::sleep(CORDON_CHECK).await;
+    }
+}
+
+async fn move_once(kube: &Kube) -> Result<(), String> {
+    let cordoned = kube.cordoned().await?;
+    if cordoned.is_empty() {
+        return Ok(());
+    }
+    let placements = kube.placements().await?;
+    for name in plan::to_move(&placements, &cordoned) {
+        kube.restart(name).await?;
+        eprintln!("kermodes control: {name}: moving off a cordoned node");
+    }
     Ok(())
 }
 
@@ -241,6 +271,14 @@ async fn reconcile(controller: &Controller, project: &ProjectConfig) -> Result<(
                 }
             }
         }
+        controller
+            .kube
+            .apply_budget(&plan::disruption_budget(
+                &project.name,
+                &resource.name,
+                name,
+            ))
+            .await?;
     }
     // Resources the commit no longer declares stop.
     let wanted: BTreeSet<&String> = names.values().collect();
