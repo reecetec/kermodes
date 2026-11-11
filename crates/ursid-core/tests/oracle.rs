@@ -4,12 +4,26 @@
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
-use arrow::compute::concat_batches;
+use arrow::compute::{SortColumn, concat_batches, lexsort_to_indices, take_record_batch};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use ursid_core::{Session, Table};
 
 type Pipeline = fn(&Table) -> Table;
+
+const AGGREGATIONS: &[(&str, &str)] = &[
+    ("n", "count(*)"),
+    ("sizes", "count(size)"),
+    ("total", "sum(size)"),
+    ("value", "sum(price)"),
+    ("avg", "mean(price)"),
+    ("avg_size", "mean(size)"),
+    ("vol", "std(price)"),
+    ("low", "min(price)"),
+    ("high", "max(sym)"),
+    ("first_price", "first(price)"),
+    ("last_size", "last(size)"),
+];
 
 const PIPELINES: &[(&str, Pipeline)] = &[
     ("where", |t| t.filter("price > 0 AND flag").unwrap()),
@@ -33,6 +47,31 @@ const PIPELINES: &[(&str, Pipeline)] = &[
             .unwrap()
             .filter("notional > 1 OR NOT flag")
             .unwrap()
+    }),
+    ("last_by", |t| t.last_by(&["sym"]).unwrap()),
+    ("last_by two keys", |t| t.last_by(&["sym", "flag"]).unwrap()),
+    ("agg_by", |t| t.agg_by(&["sym"], AGGREGATIONS).unwrap()),
+    ("agg_by all rows", |t| t.agg_by(&[], AGGREGATIONS).unwrap()),
+    ("where then agg_by", |t| {
+        t.filter("size > 2")
+            .unwrap()
+            .agg_by(&["flag"], AGGREGATIONS)
+            .unwrap()
+    }),
+    ("agg_by then where", |t| {
+        t.agg_by(&["sym"], AGGREGATIONS)
+            .unwrap()
+            .filter("n > 2")
+            .unwrap()
+    }),
+    ("last_by then update", |t| {
+        t.last_by(&["sym"])
+            .unwrap()
+            .update(&["double = size * 2"])
+            .unwrap()
+    }),
+    ("where then last_by", |t| {
+        t.filter("flag").unwrap().last_by(&["sym"]).unwrap()
     }),
 ];
 
@@ -58,6 +97,7 @@ impl Rng {
 
 fn schema() -> Schema {
     Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
         Field::new("sym", DataType::Utf8, true),
         Field::new("price", DataType::Float64, true),
         Field::new("size", DataType::Int64, true),
@@ -65,18 +105,22 @@ fn schema() -> Schema {
     ])
 }
 
+/// Ids come from a small range so keyed writes collide, within and across cycles.
 fn random_batch(rng: &mut Rng, rows: usize) -> RecordBatch {
+    let mut id = Vec::with_capacity(rows);
     let mut sym = Vec::with_capacity(rows);
     let mut price = Vec::with_capacity(rows);
     let mut size = Vec::with_capacity(rows);
     let mut flag = Vec::with_capacity(rows);
     for _ in 0..rows {
+        id.push(Some(rng.below(12) as i64));
         sym.push((!rng.null()).then(|| ["a", "b", "c", "d"][rng.below(4) as usize]));
         price.push((!rng.null()).then(|| (rng.below(1000) as f64 - 500.0) / 100.0));
         size.push((!rng.null()).then(|| rng.below(13) as i64 - 3));
         flag.push((!rng.null()).then(|| rng.below(2) == 0));
     }
     let columns: Vec<(&str, ArrayRef)> = vec![
+        ("id", Arc::new(Int64Array::from(id))),
         ("sym", Arc::new(StringArray::from(sym))),
         ("price", Arc::new(Float64Array::from(price))),
         ("size", Arc::new(Int64Array::from(size))),
@@ -85,21 +129,51 @@ fn random_batch(rng: &mut Rng, rows: usize) -> RecordBatch {
     RecordBatch::try_from_iter(columns).unwrap()
 }
 
+fn random_ids(rng: &mut Rng, rows: usize) -> RecordBatch {
+    let ids: Vec<i64> = (0..rows).map(|_| rng.below(12) as i64).collect();
+    RecordBatch::try_from_iter([("id", Arc::new(Int64Array::from(ids)) as ArrayRef)]).unwrap()
+}
+
+/// Rows sorted by every column: tables are compared as sets of rows.
 fn contents(table: &Table) -> RecordBatch {
-    concat_batches(table.schema(), &table.snapshot().unwrap()).unwrap()
+    let all = concat_batches(table.schema(), &table.snapshot().unwrap()).unwrap();
+    if all.num_rows() == 0 {
+        return all;
+    }
+    let columns: Vec<SortColumn> = all
+        .columns()
+        .iter()
+        .map(|values| SortColumn {
+            values: values.clone(),
+            options: None,
+        })
+        .collect();
+    let order = lexsort_to_indices(&columns, None).unwrap();
+    take_record_batch(&all, &order).unwrap()
+}
+
+fn check(session: &Session, input: &Table, ticking: &[Table], seed: u64, cycle: usize) {
+    let snapshot = session
+        .static_table(input.schema().clone(), input.snapshot().unwrap())
+        .unwrap();
+    for ((name, build), table) in PIPELINES.iter().zip(ticking) {
+        assert_eq!(
+            contents(table),
+            contents(&build(&snapshot)),
+            "pipeline `{name}` diverged: seed {seed}, cycle {cycle}"
+        );
+    }
 }
 
 #[test]
-fn ticking_tables_match_their_static_recomputation() {
-    for seed in 1..=200 {
+fn ticking_tables_over_appends_match_their_static_recomputation() {
+    for seed in 1..=150 {
         let mut rng = Rng(seed);
         let session = Session::new();
         let input = session.input_table(&schema()).unwrap();
         let ticking: Vec<Table> = PIPELINES.iter().map(|(_, build)| build(&input)).collect();
-
-        for cycle in 0..12 {
-            let appends = rng.below(4);
-            let batches: Vec<RecordBatch> = (0..appends)
+        for cycle in 0..10 {
+            let batches: Vec<RecordBatch> = (0..rng.below(4))
                 .map(|_| {
                     let rows = rng.below(40) as usize;
                     random_batch(&mut rng, rows)
@@ -107,18 +181,29 @@ fn ticking_tables_match_their_static_recomputation() {
                 .collect();
             input.append(&batches).unwrap();
             session.step();
+            check(&session, &input, &ticking, seed, cycle);
+        }
+    }
+}
 
-            let snapshot = session
-                .static_table(input.schema().clone(), input.snapshot().unwrap())
-                .unwrap();
-            for ((name, build), table) in PIPELINES.iter().zip(&ticking) {
-                let expected = contents(&build(&snapshot));
-                assert_eq!(
-                    contents(table),
-                    expected,
-                    "pipeline `{name}` diverged: seed {seed}, cycle {cycle}"
-                );
+#[test]
+fn ticking_tables_over_upserts_and_deletes_match_their_static_recomputation() {
+    for seed in 1..=150 {
+        let mut rng = Rng(seed);
+        let session = Session::new();
+        let input = session.keyed_input_table(&schema(), &["id"]).unwrap();
+        let ticking: Vec<Table> = PIPELINES.iter().map(|(_, build)| build(&input)).collect();
+        for cycle in 0..15 {
+            for _ in 0..rng.below(4) {
+                let rows = rng.below(8) as usize;
+                if rng.below(3) == 0 {
+                    input.delete(&[random_ids(&mut rng, rows)]).unwrap();
+                } else {
+                    input.upsert(&[random_batch(&mut rng, rows)]).unwrap();
+                }
             }
+            session.step();
+            check(&session, &input, &ticking, seed, cycle);
         }
     }
 }

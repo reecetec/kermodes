@@ -1,13 +1,16 @@
 //! A session owns one update graph: input tables, the tables derived from them, and cycles.
 
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use arrow::array::{ArrayRef, AsArray};
-use arrow::compute::filter_record_batch;
-use arrow::datatypes::{Field, FieldRef, Schema, SchemaRef};
+use arrow::compute::interleave_record_batch;
+use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
+use crate::groups::Grouper;
+use crate::ops::{AggBy, Aggregation, Assignment, LastBy, Operator, Update, Where, agg_schema};
+use crate::storage::{Delta, Modified, RowKey, Rows, Storage};
 use crate::{Error, Expression, type_name};
 
 /// An engine instance: one update graph and the tables in it. Clones share the graph.
@@ -19,8 +22,15 @@ pub struct Session {
 #[derive(Default)]
 struct Inner {
     graph: RwLock<Graph>,
-    /// Appends waiting for the next cycle, in arrival order.
-    pending: Mutex<Vec<(usize, RecordBatch)>>,
+    /// Writes waiting for the next cycle, in arrival order.
+    pending: Mutex<Vec<(usize, Write)>>,
+}
+
+enum Write {
+    Append(RecordBatch),
+    Upsert(RecordBatch),
+    /// Key columns only.
+    Delete(RecordBatch),
 }
 
 #[derive(Default)]
@@ -33,34 +43,32 @@ struct Graph {
 struct TableState {
     description: String,
     schema: SchemaRef,
-    batches: Vec<RecordBatch>,
+    storage: Storage,
     refreshing: bool,
+    /// Only ever gains rows; operators keep less state over such inputs.
+    add_only: bool,
     failure: Option<Error>,
-    operator: Operator,
+    /// This cycle's changes, read by the tables built from this one.
+    delta: Option<Delta>,
+    source: Source,
 }
 
-enum Operator {
-    Input,
+enum Source {
+    Append,
+    Keyed(Keyed),
     Static,
-    Derived {
-        parent: usize,
-        /// Parent batches already processed.
-        consumed: usize,
-        op: Derived,
-    },
+    Derived { parent: usize, operator: Operator },
 }
 
-enum Derived {
-    Where(Expression),
-    Update(Vec<Assignment>),
-}
-
-struct Assignment {
-    /// The schema the expression is bound to: the parent's plus earlier assignments.
-    input: SchemaRef,
-    expression: Expression,
-    /// The column it writes: an existing index to replace, or the next index to append.
-    position: usize,
+/// An input table with one row per key value: upserts replace, deletes remove.
+struct Keyed {
+    /// Key columns within full rows.
+    rows: Grouper,
+    /// Key columns within delete batches, which carry only the key.
+    deletes: Grouper,
+    key_schema: SchemaRef,
+    slots: HashMap<Vec<u8>, RowKey>,
+    next_slot: RowKey,
 }
 
 /// A table in a session. Cheap to clone; clones refer to the same table.
@@ -78,27 +86,44 @@ impl Session {
 
     /// A refreshing table that receives rows through `Table::append`. Every column is nullable.
     pub fn input_table(&self, schema: &Schema) -> Result<Table, Error> {
-        let fields: Vec<Field> = schema
-            .fields()
-            .iter()
-            .map(|f| f.as_ref().clone().with_nullable(true))
-            .collect();
-        for (i, field) in fields.iter().enumerate() {
-            if fields[..i].iter().any(|f| f.name() == field.name()) {
-                return Err(Error::Schema(format!(
-                    "duplicate column `{}`",
-                    field.name()
-                )));
-            }
+        let schema = nullable(schema)?;
+        Ok(self.add(TableState::new(
+            "input".into(),
+            schema,
+            true,
+            true,
+            Source::Append,
+        )))
+    }
+
+    /// A refreshing table with one row per value of `key`; rows arrive through `Table::upsert`
+    /// and leave through `Table::delete`. Every column is nullable.
+    pub fn keyed_input_table(&self, schema: &Schema, key: &[&str]) -> Result<Table, Error> {
+        if key.is_empty() {
+            return Err(Error::Schema(
+                "a keyed table needs at least one key column".into(),
+            ));
         }
-        Ok(self.add(TableState {
-            description: "input".into(),
-            schema: Arc::new(Schema::new(fields)),
-            batches: Vec::new(),
-            refreshing: true,
-            failure: None,
-            operator: Operator::Input,
-        }))
+        let schema = nullable(schema)?;
+        let rows = Grouper::new(&schema, key)?;
+        let key_schema = Arc::new(schema.project(rows.columns()).map_err(schema_error)?);
+        let deletes =
+            Grouper::by_position(&key_schema, (0..key.len()).collect()).map_err(schema_error)?;
+        let keyed = Keyed {
+            rows,
+            deletes,
+            key_schema,
+            slots: HashMap::new(),
+            next_slot: 0,
+        };
+        let description = format!("input keyed by {}", key.join(", "));
+        Ok(self.add(TableState::new(
+            description,
+            schema,
+            true,
+            false,
+            Source::Keyed(keyed),
+        )))
     }
 
     /// A table that never changes. Tables built from it are computed once, immediately.
@@ -108,33 +133,68 @@ impl Session {
         batches: Vec<RecordBatch>,
     ) -> Result<Table, Error> {
         let batches = conform_all(&schema, &batches)?;
-        Ok(self.add(TableState {
-            description: "static".into(),
-            schema,
-            batches,
-            refreshing: false,
-            failure: None,
-            operator: Operator::Static,
-        }))
+        let mut state = TableState::new("static".into(), schema, false, true, Source::Static);
+        let mut next = 0;
+        let added = batches
+            .into_iter()
+            .map(|batch| {
+                let count = batch.num_rows() as RowKey;
+                next += count;
+                Rows {
+                    keys: (next - count..next).collect(),
+                    batch,
+                }
+            })
+            .collect();
+        state
+            .storage
+            .apply(&Delta {
+                added,
+                ..Delta::default()
+            })
+            .map_err(schema_error)?;
+        Ok(self.add(state))
     }
 
-    /// Runs one cycle: applies pending appends, then updates every refreshing derived table in
-    /// creation order. Returns the cycle number.
+    /// Runs one cycle: applies pending writes to input tables, then updates every refreshing
+    /// derived table in creation order. Returns the cycle number.
     pub fn step(&self) -> u64 {
         let pending = std::mem::take(&mut *self.pending());
         let mut graph = self.write();
-        for (id, batch) in pending {
-            graph.tables[id].batches.push(batch);
+        let mut writes: Vec<Vec<Write>> = graph.tables.iter().map(|_| Vec::new()).collect();
+        for (id, write) in pending {
+            writes[id].push(write);
         }
-        for index in 0..graph.tables.len() {
-            let Operator::Derived { parent, .. } = graph.tables[index].operator else {
-                continue;
-            };
-            if !graph.tables[index].refreshing {
+        for (index, writes) in writes.into_iter().enumerate() {
+            let (before, rest) = graph.tables.split_at_mut(index);
+            let table = &mut rest[0];
+            table.delta = None;
+            if table.failure.is_some() {
                 continue;
             }
-            let (before, rest) = graph.tables.split_at_mut(index);
-            advance(&before[parent], &mut rest[0]);
+            let result = match &mut table.source {
+                Source::Static => continue,
+                Source::Append => Ok(appended(&table.storage, writes)),
+                Source::Keyed(keyed) => keyed.resolve(&table.storage, writes),
+                Source::Derived { parent, operator } => {
+                    if !table.refreshing {
+                        continue;
+                    }
+                    let parent = &before[*parent];
+                    if let Some(cause) = &parent.failure {
+                        table.fail(Error::Upstream {
+                            table: table.description.clone(),
+                            cause: Arc::new(cause.clone()),
+                        });
+                        continue;
+                    }
+                    let Some(delta) = &parent.delta else {
+                        continue;
+                    };
+                    operator.process(&parent.storage, delta, &table.storage)
+                }
+            };
+            table.commit(result);
         }
         graph.cycle += 1;
         graph.cycle
@@ -165,11 +225,158 @@ impl Session {
             .expect("ursid graph lock poisoned by an earlier panic")
     }
 
-    fn pending(&self) -> std::sync::MutexGuard<'_, Vec<(usize, RecordBatch)>> {
+    fn pending(&self) -> MutexGuard<'_, Vec<(usize, Write)>> {
         self.inner
             .pending
             .lock()
-            .expect("ursid append queue poisoned by an earlier panic")
+            .expect("ursid write queue poisoned by an earlier panic")
+    }
+}
+
+impl TableState {
+    fn new(
+        description: String,
+        schema: SchemaRef,
+        refreshing: bool,
+        add_only: bool,
+        source: Source,
+    ) -> Self {
+        let storage = if add_only {
+            Storage::dense(schema.clone())
+        } else {
+            Storage::sparse(schema.clone())
+        };
+        Self {
+            description,
+            schema,
+            storage,
+            refreshing,
+            add_only,
+            failure: None,
+            delta: None,
+            source,
+        }
+    }
+
+    fn fail(&mut self, error: Error) {
+        self.failure = Some(error);
+        self.delta = None;
+    }
+
+    /// Applies a cycle's computed changes, or keeps the error: a failed table stops updating
+    /// and every table built from it fails too.
+    fn commit(&mut self, result: Result<Delta, ArrowError>) {
+        let applied = result.and_then(|delta| {
+            if !delta.is_empty() {
+                self.storage.apply(&delta)?;
+                self.delta = Some(delta);
+            }
+            Ok(())
+        });
+        if let Err(error) = applied {
+            let message = error.to_string();
+            self.fail(Error::Compute {
+                table: self.description.clone(),
+                message,
+            });
+        }
+    }
+}
+
+fn appended(storage: &Storage, writes: Vec<Write>) -> Delta {
+    let mut next = storage.next_key();
+    let added = writes
+        .into_iter()
+        .filter_map(|write| match write {
+            Write::Append(batch) => Some(batch),
+            Write::Upsert(_) | Write::Delete(_) => None,
+        })
+        .map(|batch| {
+            let count = batch.num_rows() as RowKey;
+            next += count;
+            Rows {
+                keys: (next - count..next).collect(),
+                batch,
+            }
+        })
+        .collect();
+    Delta {
+        added,
+        ..Delta::default()
+    }
+}
+
+impl Keyed {
+    /// Nets a cycle's upserts and deletes per key: the last write to a key wins, and a key
+    /// written and deleted within the cycle never appears.
+    fn resolve(&mut self, storage: &Storage, writes: Vec<Write>) -> Result<Delta, ArrowError> {
+        let mut upserts: Vec<RecordBatch> = Vec::new();
+        let mut latest: HashMap<Vec<u8>, Option<(usize, usize)>> = HashMap::new();
+        let mut order: Vec<Vec<u8>> = Vec::new();
+        for write in writes {
+            let (keys, batch) = match write {
+                Write::Upsert(batch) => (self.rows.encode(&batch)?, Some(batch)),
+                Write::Delete(batch) => (self.deletes.encode(&batch)?, None),
+                Write::Append(_) => continue,
+            };
+            let index = upserts.len();
+            let upserting = batch.is_some();
+            upserts.extend(batch);
+            for row in 0..keys.len() {
+                let target = upserting.then_some((index, row));
+                let key = keys.get(row);
+                if latest.insert(key.to_vec(), target).is_none() {
+                    order.push(key.to_vec());
+                }
+            }
+        }
+
+        let (mut added_keys, mut added_at) = (Vec::new(), Vec::new());
+        let (mut modified_keys, mut modified_at) = (Vec::new(), Vec::new());
+        let mut removed = Vec::new();
+        for key in order {
+            match (self.slots.get(&key).copied(), latest[&key]) {
+                (Some(slot), Some(at)) => {
+                    modified_keys.push(slot);
+                    modified_at.push(at);
+                }
+                (Some(slot), None) => {
+                    removed.push(slot);
+                    self.slots.remove(&key);
+                }
+                (None, Some(at)) => {
+                    let slot = self.next_slot;
+                    self.next_slot += 1;
+                    self.slots.insert(key, slot);
+                    added_keys.push(slot);
+                    added_at.push(at);
+                }
+                (None, None) => {}
+            }
+        }
+
+        let batches: Vec<&RecordBatch> = upserts.iter().collect();
+        let mut delta = Delta::default();
+        if !added_keys.is_empty() {
+            delta.added.push(Rows {
+                keys: added_keys,
+                batch: interleave_record_batch(&batches, &added_at)?,
+            });
+        }
+        if !modified_keys.is_empty() {
+            delta.modified.push(Modified {
+                previous: storage.gather(&modified_keys)?,
+                current: interleave_record_batch(&batches, &modified_at)?,
+                keys: modified_keys,
+            });
+        }
+        if !removed.is_empty() {
+            delta.removed.push(Rows {
+                batch: storage.gather(&removed)?,
+                keys: removed,
+            });
+        }
+        Ok(delta)
     }
 }
 
@@ -189,29 +396,41 @@ impl Table {
     /// Queues rows for the next cycle. Columns are matched by name; all batches are checked
     /// before any is queued.
     pub fn append(&self, batches: &[RecordBatch]) -> Result<(), Error> {
-        if !matches!(
-            self.session.read().tables[self.id].operator,
-            Operator::Input
-        ) {
-            return Err(Error::Unsupported(format!(
-                "only input tables accept appends; `{}` is derived",
-                self.description()
-            )));
-        }
+        self.expect_source("append", |s| matches!(s, Source::Append))?;
         let batches = conform_all(&self.schema, batches)?;
-        self.session
-            .pending()
-            .extend(batches.into_iter().map(|b| (self.id, b)));
+        self.queue(batches.into_iter().map(Write::Append));
+        Ok(())
+    }
+
+    /// Queues rows that replace the current row with the same key, or add one.
+    pub fn upsert(&self, batches: &[RecordBatch]) -> Result<(), Error> {
+        self.expect_source("upsert", |s| matches!(s, Source::Keyed(_)))?;
+        let batches = conform_all(&self.schema, batches)?;
+        self.queue(batches.into_iter().map(Write::Upsert));
+        Ok(())
+    }
+
+    /// Queues the removal of the rows with these keys; `batches` hold only the key columns.
+    pub fn delete(&self, batches: &[RecordBatch]) -> Result<(), Error> {
+        self.expect_source("delete", |s| matches!(s, Source::Keyed(_)))?;
+        let key_schema = match &self.session.read().tables[self.id].source {
+            Source::Keyed(keyed) => keyed.key_schema.clone(),
+            _ => unreachable!("checked above"),
+        };
+        let batches = conform_all(&key_schema, batches)?;
+        self.queue(batches.into_iter().map(Write::Delete));
         Ok(())
     }
 
     /// Rows for which `predicate` is true. NULL counts as false.
     pub fn filter(&self, predicate: &str) -> Result<Table, Error> {
         let expression = Expression::predicate(predicate, &self.schema)?;
+        let add_only = self.add_only();
         self.derive(
             format!("where({predicate})"),
             self.schema.clone(),
-            Derived::Where(expression),
+            add_only,
+            Operator::Where(Where::new(expression, add_only)),
         )
     }
 
@@ -245,48 +464,137 @@ impl Table {
             });
             schema = Arc::new(Schema::new(fields));
         }
+        let update = Update {
+            assignments: bound,
+            output: schema.clone(),
+        };
         self.derive(
             format!("update({})", assignments.join(", ")),
             schema,
-            Derived::Update(bound),
+            self.add_only(),
+            Operator::Update(update),
         )
     }
 
-    /// The table's current rows, or the error that failed it.
+    /// The last row (in arrival order) for each value of `columns`.
+    pub fn last_by(&self, columns: &[&str]) -> Result<Table, Error> {
+        let grouper = Grouper::new(&self.schema, columns)?;
+        self.derive(
+            format!("last_by({})", columns.join(", ")),
+            self.schema.clone(),
+            false,
+            Operator::LastBy(LastBy::new(grouper, self.add_only())),
+        )
+    }
+
+    /// One row per value of `columns`, with each `(name, "function(column)")` aggregation:
+    /// count, sum, mean, std, min, max, first, last. `count(*)` counts rows.
+    pub fn agg_by(&self, columns: &[&str], aggregations: &[(&str, &str)]) -> Result<Table, Error> {
+        if aggregations.is_empty() {
+            return Err(Error::Unsupported(
+                "agg_by needs at least one aggregation".into(),
+            ));
+        }
+        let grouper = Grouper::new(&self.schema, columns)?;
+        let mut parsed = Vec::with_capacity(aggregations.len());
+        let mut outputs = Vec::with_capacity(aggregations.len());
+        for (name, spec) in aggregations {
+            let (aggregation, data_type): (Aggregation, DataType) =
+                Aggregation::parse(spec, &self.schema)?;
+            parsed.push(aggregation);
+            outputs.push(((*name).to_owned(), data_type));
+        }
+        let output = agg_schema(&self.schema, &grouper, &outputs)?;
+        let specs: Vec<String> = aggregations
+            .iter()
+            .map(|(name, spec)| format!("{name}={spec}"))
+            .collect();
+        let description = format!("agg_by([{}], {})", columns.join(", "), specs.join(", "));
+        let operator = AggBy::new(grouper, parsed, self.add_only(), output.clone());
+        self.derive(description, output, false, Operator::AggBy(operator))
+    }
+
+    /// The table's current rows in key order, or the error that failed it.
     pub fn snapshot(&self) -> Result<Vec<RecordBatch>, Error> {
+        let graph = self.session.read();
+        let table = &graph.tables[self.id];
+        if let Some(error) = &table.failure {
+            return Err(error.clone());
+        }
+        table.storage.snapshot().map_err(|e| Error::Compute {
+            table: table.description.clone(),
+            message: e.to_string(),
+        })
+    }
+
+    pub fn num_rows(&self) -> Result<usize, Error> {
         let graph = self.session.read();
         let table = &graph.tables[self.id];
         match &table.failure {
             Some(error) => Err(error.clone()),
-            None => Ok(table.batches.clone()),
+            None => Ok(table.storage.len()),
         }
     }
 
-    pub fn num_rows(&self) -> Result<usize, Error> {
-        Ok(self.snapshot()?.iter().map(RecordBatch::num_rows).sum())
+    fn add_only(&self) -> bool {
+        self.session.read().tables[self.id].add_only
     }
 
-    /// Builds a table from this one and computes it from this table's current rows. Building on
-    /// a static table finishes here; building on a refreshing one also updates it every cycle.
-    fn derive(&self, description: String, schema: SchemaRef, op: Derived) -> Result<Table, Error> {
+    fn expect_source(&self, action: &str, accepts: fn(&Source) -> bool) -> Result<(), Error> {
+        let graph = self.session.read();
+        let table = &graph.tables[self.id];
+        if accepts(&table.source) {
+            return Ok(());
+        }
+        Err(Error::Unsupported(format!(
+            "`{}` does not accept {action}",
+            table.description
+        )))
+    }
+
+    fn queue(&self, writes: impl Iterator<Item = Write>) {
+        self.session.pending().extend(writes.map(|w| (self.id, w)));
+    }
+
+    /// Builds a table from this one, computed from this table's current rows. Building on a
+    /// static table finishes here; building on a refreshing one also updates it every cycle.
+    fn derive(
+        &self,
+        description: String,
+        schema: SchemaRef,
+        add_only: bool,
+        operator: Operator,
+    ) -> Result<Table, Error> {
         let mut graph = self.session.write();
         let parent = &graph.tables[self.id];
-        let mut state = TableState {
-            description,
-            schema: schema.clone(),
-            batches: Vec::new(),
-            refreshing: parent.refreshing,
-            failure: None,
-            operator: Operator::Derived {
-                parent: self.id,
-                consumed: 0,
-                op,
-            },
+        let source = Source::Derived {
+            parent: self.id,
+            operator,
         };
-        advance(parent, &mut state);
+        let mut state = TableState::new(
+            description,
+            schema.clone(),
+            parent.refreshing,
+            add_only,
+            source,
+        );
+        if let Some(cause) = &parent.failure {
+            return Err(Error::Upstream {
+                table: state.description,
+                cause: Arc::new(cause.clone()),
+            });
+        }
+        let result = parent.storage.as_added().and_then(|everything| {
+            let Source::Derived { operator, .. } = &mut state.source else {
+                unreachable!("built as derived above");
+            };
+            operator.process(&parent.storage, &everything, &state.storage)
+        });
+        state.commit(result);
         if let Some(error) = state.failure {
             return Err(error);
         }
+        state.delta = None;
         graph.tables.push(state);
         Ok(Table {
             session: self.session.clone(),
@@ -296,65 +604,25 @@ impl Table {
     }
 }
 
-/// Processes the parent batches `child` has not seen yet. A failure is kept on the table: it
-/// stops updating, and every table built from it fails too.
-fn advance(parent: &TableState, child: &mut TableState) {
-    let Operator::Derived { consumed, op, .. } = &mut child.operator else {
-        return;
-    };
-    if child.failure.is_some() {
-        return;
-    }
-    if let Some(cause) = &parent.failure {
-        child.failure = Some(Error::Upstream {
-            table: child.description.clone(),
-            cause: Arc::new(cause.clone()),
-        });
-        return;
-    }
-    for batch in &parent.batches[*consumed..] {
-        match op.apply(&child.schema, batch) {
-            Ok(out) if out.num_rows() > 0 => child.batches.push(out),
-            Ok(_) => {}
-            Err(error) => {
-                child.failure = Some(Error::Compute {
-                    table: child.description.clone(),
-                    message: error.to_string(),
-                });
-                return;
-            }
+fn nullable(schema: &Schema) -> Result<SchemaRef, Error> {
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone().with_nullable(true))
+        .collect();
+    for (i, field) in fields.iter().enumerate() {
+        if fields[..i].iter().any(|f| f.name() == field.name()) {
+            return Err(Error::Schema(format!(
+                "duplicate column `{}`",
+                field.name()
+            )));
         }
     }
-    *consumed = parent.batches.len();
+    Ok(Arc::new(Schema::new(fields)))
 }
 
-impl Derived {
-    fn apply(&self, output: &SchemaRef, batch: &RecordBatch) -> Result<RecordBatch, ArrowError> {
-        match self {
-            Derived::Where(predicate) => {
-                let mask = predicate.evaluate(batch)?;
-                filter_record_batch(batch, mask.as_boolean())
-            }
-            Derived::Update(assignments) => {
-                let rows = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-                let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
-                for assignment in assignments {
-                    let input = RecordBatch::try_new_with_options(
-                        assignment.input.clone(),
-                        columns.clone(),
-                        &rows,
-                    )?;
-                    let value = assignment.expression.evaluate(&input)?;
-                    if assignment.position == columns.len() {
-                        columns.push(value);
-                    } else {
-                        columns[assignment.position] = value;
-                    }
-                }
-                RecordBatch::try_new_with_options(output.clone(), columns, &rows)
-            }
-        }
-    }
+fn schema_error(error: ArrowError) -> Error {
+    Error::Schema(error.to_string())
 }
 
 /// Matches each batch's columns to `schema` by name and type; empty batches are dropped.
@@ -401,6 +669,5 @@ fn conform(schema: &SchemaRef, batch: &RecordBatch) -> Result<RecordBatch, Error
         )));
     }
     let rows = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-    RecordBatch::try_new_with_options(schema.clone(), columns, &rows)
-        .map_err(|e| Error::Schema(e.to_string()))
+    RecordBatch::try_new_with_options(schema.clone(), columns, &rows).map_err(schema_error)
 }

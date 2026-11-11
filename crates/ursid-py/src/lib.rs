@@ -41,6 +41,22 @@ fn read_batches(
     Ok((schema, batches))
 }
 
+/// A key given as one column name or a list of them.
+#[derive(FromPyObject)]
+enum Key {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Key {
+    fn names(self) -> Vec<String> {
+        match self {
+            Key::One(name) => vec![name],
+            Key::Many(names) => names,
+        }
+    }
+}
+
 /// An engine running inside this Python process.
 #[pyclass(module = "ursid", name = "Session", frozen)]
 pub struct Session(ursid_core::Session);
@@ -52,8 +68,11 @@ impl Session {
         Self(ursid_core::Session::new())
     }
 
-    /// A refreshing table with the given column names and types; rows arrive through `append`.
-    fn input_table(&self, columns: &Bound<'_, PyDict>) -> PyResult<Table> {
+    /// A refreshing table with the given column names and types. Without `key`, rows arrive
+    /// through `append`; with `key`, the table holds one row per key value, written through
+    /// `upsert` and `delete`.
+    #[pyo3(signature = (columns, key=None))]
+    fn input_table(&self, columns: &Bound<'_, PyDict>, key: Option<Key>) -> PyResult<Table> {
         let mut fields = Vec::with_capacity(columns.len());
         for (name, type_name) in columns.iter() {
             let name: String = name.extract()?;
@@ -61,11 +80,16 @@ impl Session {
             let data_type = ursid_core::parse_type(&type_name).map_err(engine_error)?;
             fields.push(Field::new(name, data_type, true));
         }
-        let table = self
-            .0
-            .input_table(&Schema::new(fields))
-            .map_err(engine_error)?;
-        Ok(Table(table))
+        let schema = Schema::new(fields);
+        let table = match key {
+            None => self.0.input_table(&schema),
+            Some(key) => {
+                let names = key.names();
+                let names: Vec<&str> = names.iter().map(String::as_str).collect();
+                self.0.keyed_input_table(&schema, &names)
+            }
+        };
+        Ok(Table(table.map_err(engine_error)?))
     }
 
     /// A table that never changes, from any Arrow table or record batch.
@@ -111,6 +135,18 @@ impl Table {
         self.0.append(&batches).map_err(engine_error)
     }
 
+    /// Queues rows that replace the row with the same key, or add one. Keyed tables only.
+    fn upsert(&self, data: AnyRecordBatch) -> PyResult<()> {
+        let (_, batches) = read_batches(data)?;
+        self.0.upsert(&batches).map_err(engine_error)
+    }
+
+    /// Queues removal of the rows with these keys; `data` holds only the key columns.
+    fn delete(&self, data: AnyRecordBatch) -> PyResult<()> {
+        let (_, batches) = read_batches(data)?;
+        self.0.delete(&batches).map_err(engine_error)
+    }
+
     /// Rows for which `predicate` is true; NULL counts as false.
     #[pyo3(name = "where")]
     fn where_(&self, py: Python<'_>, predicate: &str) -> PyResult<Table> {
@@ -126,6 +162,39 @@ impl Table {
         let assignments: Vec<&str> = assignments.iter().map(String::as_str).collect();
         let table = py
             .detach(|| self.0.update(&assignments))
+            .map_err(engine_error)?;
+        Ok(Table(table))
+    }
+
+    /// The last row, in arrival order, for each value of `columns`.
+    #[pyo3(signature = (*columns))]
+    fn last_by(&self, py: Python<'_>, columns: Vec<String>) -> PyResult<Table> {
+        let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
+        let table = py
+            .detach(|| self.0.last_by(&columns))
+            .map_err(engine_error)?;
+        Ok(Table(table))
+    }
+
+    /// One row per value of `columns`, with each `name="function(column)"` aggregation.
+    #[pyo3(signature = (*columns, **aggregations))]
+    fn agg_by(
+        &self,
+        py: Python<'_>,
+        columns: Vec<String>,
+        aggregations: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Table> {
+        let mut specs: Vec<(String, String)> = Vec::new();
+        for (name, spec) in aggregations.into_iter().flat_map(|d| d.iter()) {
+            specs.push((name.extract()?, spec.extract()?));
+        }
+        let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
+        let specs: Vec<(&str, &str)> = specs
+            .iter()
+            .map(|(n, s)| (n.as_str(), s.as_str()))
+            .collect();
+        let table = py
+            .detach(|| self.0.agg_by(&columns, &specs))
             .map_err(engine_error)?;
         Ok(Table(table))
     }

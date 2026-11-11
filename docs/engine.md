@@ -47,37 +47,45 @@ needs an attribute its input lacks is rejected at plan time with an error saying
 - Append-only sources use the global row position as the key.
 - State tables (`last_by`, `agg_by` outputs) use a slot number per group, assigned on first sight.
 - `merge` packs `(input index, input key)` into the key: input index in the top 8 bits.
-- `RowSet` is a sorted list of disjoint key ranges with rank/select (position ↔ key) by
-  binary search over cumulative range lengths. An append-only table is one range. If fragmented
-  row sets measure badly, the representation changes behind the type.
+- Tables index their keys densely when append-only (key = position, located by binary search
+  over chunk starts) and in a `BTreeMap` otherwise. Deltas carry key vectors aligned with their
+  row batches. A range-based row set arrives with viewports if a measurement calls for it.
 - Display order is separate from keys: a viewport asks for positions, which are ranks in the row
   set (or in a sort order, later).
 
-### 2.4 Column sources
+### 2.4 Storage
 
-| Source | Used by | Storage |
-|---|---|---|
-| Chunked | Append-only inputs; computed columns over append-only parents | Immutable Arrow arrays in chunks; key → (chunk, offset) by binary search over chunk starts. Small appends are coalesced to ~64Ki-row chunks at cycle end. |
-| Slot | State tables, keyed inputs, computed columns over them | Mutable typed vectors plus validity bitmap, indexed by slot; mutated in place. |
-| Redirected | `last_by`, `natural_join`, `as_of_join` outputs | A slot → parent row key map; values are read from the parent's columns, never copied. |
-| Filtered | `where` | M0 materializes the matching rows with Arrow's `filter`; a view over the parent replaces it only if memory measurements call for it. |
+Every table stores row versions in immutable Arrow chunks, with an index from key to the chunk
+and row holding its current version:
 
-Reading rows out (snapshots, viewports, operator inputs) produces Arrow `RecordBatch`es: zero-copy
-slices for contiguous chunk ranges, `take` for everything else.
+- An addition appends a chunk.
+- A modification appends the new version and re-points the key; the old version stays readable,
+  so previous values for the cycle cost nothing extra.
+- A removal drops the key from the index.
+
+Every operator materializes its output this way, including `where` (Arrow `filter`), `last_by`
+(the group's last row is copied), and `agg_by`. Redirected views over a parent's rows, slot
+columns mutated in place, chunk coalescing, and compaction of superseded versions are later
+optimizations, taken when memory measurements call for them.
+
+Reading rows out produces Arrow `RecordBatch`es: the chunks themselves for append-only tables,
+`interleave` for everything else.
 
 ## 3. Deltas
 
-One delta per table per cycle:
+One delta per table per cycle, carrying data:
 
 ```
-Update { added: RowSet, removed: RowSet, modified: RowSet, modified_columns: ColumnSet }
+Delta { added: [(keys, rows)], removed: [(keys, last rows)], modified: [(keys, previous, current)] }
 ```
 
 - `added`, `removed`, `modified` are disjoint. `removed` keys are gone after the cycle; `added`
-  keys are new; `modified` keys keep their identity with new values in `modified_columns`.
-- `modified_columns` is per table delta, not per row. Operators recompute only expressions whose
-  inputs intersect it and propagate the narrowest set they can.
+  keys are new; `modified` keys keep their identity.
+- Every column of a modified row counts as modified. Per-column change sets arrive when a
+  benchmark shows re-evaluating unchanged columns costs enough to matter.
 - A delta is observed exactly once per cycle by each child, during that cycle.
+- Keyed inputs net a cycle's writes per key: the last write wins, and a key added and deleted in
+  the same cycle never appears.
 
 ## 4. Update graph
 
@@ -107,10 +115,10 @@ keep no state) and an incremental path below. Static paths use the same kernels 
 
 | Operator | Incremental state | Incremental algorithm | M0 limits |
 |---|---|---|---|
-| `where(expr)` | Output row set | Added: evaluate, keep matches. Modified (if `expr` reads a modified column): re-evaluate; true→true is modified, false→true added, true→false removed. Removed: drop. | — |
-| `update(exprs)` / `select(exprs)` | Computed columns in the parent's key space | Added and modified (if inputs intersect `modified_columns`): evaluate and write. Removed: nothing. | — |
-| `last_by(keys)` | Hash map group → slot; slot → parent row key (redirection); per-group row set only if the parent is not `add_only` | Added: the row becomes its group's last if its key is greater; new group → added slot, changed last → modified slot. Removed or modified last row: recompute the group's last from its row set. | Order is by row key (arrival); `last_by` over a `ts` order comes with ticking sort. |
-| `agg_by(keys, aggs)` | Group map; per-group accumulators; per-group row set only if the parent is not `add_only` | `count`, `sum`, `mean`, `std` (Welford) are invertible: apply adds, subtract removes, remove-then-add for modifies. `min`, `max`, `first`, `last` apply adds directly; a remove or modify that touches the current extreme recomputes that group from its row set. Empty groups are removed. | — |
+| `where(expr)` | Over an `add_only` input: none, and the output numbers its own rows. Otherwise the output keeps the input's keys. | Added: evaluate, keep matches. Modified: re-evaluate; true→true is modified, false→true added, true→false removed. Removed: drop if present. | — |
+| `update(exprs)` / `select(exprs)` | None; same keys as the input | Added and modified: evaluate on the new values. Removed: removed. | — |
+| `last_by(keys)` | Group arena; per group, its newest row key (`add_only` input) or the set of its row keys | Groups touched in the cycle compare their current last key with the one published; new group → added, emptied group → removed, different last or a modified last row → modified (the row is copied from the input). | Order is by row key (arrival); `last_by` over a `ts` order comes with ticking sort. |
+| `agg_by(keys, aggs)` | Group arena; per group, accumulators and (unless the input is `add_only`) its row keys | Rows added in key order fold into the accumulators. A removed or modified row, or an addition older than the group's newest row, marks the group stale; stale groups are recomputed from their rows in key order. Folding always in key order makes incremental results bit-identical to the static path. `min`/`max`/`first`/`last` keep the winning row key and copy its value. Empty groups are removed. | Invertible updates (subtracting removed rows) come if recomputation shows up in a benchmark. |
 | `natural_join(right, on)` | Right: key → row key. Left: key → left row set. | Left added/modified-on-key: look up; output redirection to the right row. Right added/modified/removed for a key: every left row with that key is modified. A key matching more than one right row fails the table. | — |
 | `as_of_join(right, on, ts)` | Right: per key, sorted `(ts, row key)`. Left: per key, sorted `(ts, row key)`. | Left added: binary search the greatest right `ts ≤ left ts`. Right added at `ts = t`: left rows with that key, `ts ≥ t`, and current match `< t` rematch (modified). | Right must be `add_only`. |
 | `rolling(by, window, aggs)` | Per group: a ring buffer (row windows) or deque (time windows) with running accumulators | Added rows in key order: push, evict out-of-window, emit the aggregate as columns on the added row. Earlier rows never change. | Input must be `append_only`; windows look backward only. |
@@ -120,12 +128,12 @@ keep no state) and an incremental path below. Static paths use the same kernels 
 
 Grouping keys:
 
-- Single `int64`/`int32`/`date32`/`timestamp` key: `HashMap<i64, Slot>` fast path.
-- Single `utf8` key: map over string bytes.
-- Composite keys: `arrow::row::RowConverter` encodes the key columns to comparable bytes per row;
-  the map is over those bytes.
-- `hashbrown` with a fast non-cryptographic hasher (both already in the dependency tree via arrow
-  and parquet).
+- `arrow::row::RowConverter` encodes the key columns of each batch to comparable bytes; groups
+  are found by those bytes, borrowed from the encoded batch, in an `ahash` map (already in the
+  dependency tree through arrow-array). One hash lookup per row; groups are then addressed by
+  arena index, and emptied groups free their index.
+- Single-column fast paths (an `i64` map for integer and temporal keys) come if a benchmark
+  shows encoding dominates.
 
 ## 6. Expressions
 
@@ -143,8 +151,8 @@ Grouping keys:
 - M0 functions: `abs`, `round`, `floor`, `ceil`, `sqrt`, `ln`, `exp`, `power`, `least`,
   `greatest`, `coalesce`, `lower`, `upper`, `length`, `substring`, `now()`, `today()`,
   `date_trunc`.
-- The binder records which input columns an expression reads; `where` and `update` use it to
-  skip work when `modified_columns` doesn't intersect.
+- Later: the binder records which input columns an expression reads, so `where` and `update`
+  skip modified rows whose changed columns the expression doesn't read.
 
 ## 7. Python API (M0)
 
@@ -159,35 +167,27 @@ ticks = s.input_table(
         "price": us.float64(),
         "size": us.int64(),
         "ts": us.timestamp(),
-    },
-    kind="append",
+    }
 )
-refs = s.input_table(
-    {"sym": us.string(), "sector": us.string()}, kind="keyed", key="sym"
-)
+refs = s.input_table({"sym": us.string(), "sector": us.string()}, key="sym")
 
-ticks.append(
-    batch
-)  # anything with __arrow_c_stream__ / __arrow_c_array__, or a dict of lists
+ticks.append(batch)  # anything with __arrow_c_stream__ or __arrow_c_array__
 refs.upsert(batch)
-refs.delete(keys)
+refs.delete(keys)  # key columns only
 
-live = (
-    ticks.where("price > 0")
-    .update("notional = price * size")
-    .natural_join(refs, on="sym")
-)
+live = ticks.where("price > 0").update("notional = price * size")
 latest = live.last_by("sym")
-stats = live.agg_by("sector", n="count(*)", vwap="sum(notional) / sum(size)")
+stats = live.agg_by("sym", n="count(*)", notional="sum(notional)", size="sum(size)")
+vwap = stats.update("vwap = notional / size")
+
+s.step()  # one cycle
+pa.table(latest)  # snapshot through the Arrow PyCapsule interface
+
+# Still to come in M0:
+enriched = live.natural_join(refs, on="sym")
 vol = ticks.rolling("sym", rows=100, std_price="std(price)")
-
-s.step()  # one cycle; or s.start(period="100ms") / s.stop()
-latest.to_arrow()  # snapshot as an Arrow stream (PyCapsule); .to_pandas(), .to_polars()
+s.start(period="100ms")  # background cycles; s.stop()
 latest  # in Jupyter: ticking widget
-
-demo = us.sources.random_walk(
-    s, symbols=10_000, rows_per_sec=1_000_000
-)  # Rust-side source for demos and benchmarks
 ```
 
 - Every engine call releases the interpreter while Rust works.

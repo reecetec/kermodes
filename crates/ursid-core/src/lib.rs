@@ -4,7 +4,10 @@
 
 mod error;
 mod expr;
+mod groups;
+mod ops;
 mod session;
+mod storage;
 mod types;
 
 pub use error::Error;

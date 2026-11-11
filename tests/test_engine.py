@@ -69,3 +69,51 @@ def test_appends_must_match_the_table():
     wrong = pa.table({"sym": ["a"], "price": [1], "size": [1]})
     with pytest.raises(us.UrsidError, match="column `price` is int64"):
         src.append(wrong)
+
+
+def test_keyed_tables_follow_upserts_and_deletes():
+    s = us.local()
+    book = s.input_table(COLUMNS, key="sym")
+    rich = book.where("price > 10")
+    book.upsert(ticks(["a", "b"], [5.0, 20.0], [1, 2]))
+    s.step()
+    book.upsert(ticks(["a", "b"], [15.0, 8.0], [3, 4]))
+    book.delete(pa.table({"sym": ["c"]}))
+    s.step()
+    assert pa.table(book).to_pylist() == [
+        {"sym": "a", "price": 15.0, "size": 3},
+        {"sym": "b", "price": 8.0, "size": 4},
+    ]
+    assert pa.table(rich)["sym"].to_pylist() == ["a"]
+
+
+def test_last_by_and_agg_by_match_a_plain_python_recomputation():
+    s = us.local()
+    src = s.input_table(COLUMNS)
+    latest = src.last_by("sym")
+    stats = src.agg_by(
+        "sym", n="count(*)", total="sum(size)", avg="mean(price)", high="max(price)"
+    )
+    batches = [
+        ticks(["a", "b", "a"], [1.0, 2.0, 3.0], [1, 2, 3]),
+        ticks(["b", "c"], [5.0, 4.0], [None, 6]),
+    ]
+    for batch in batches:
+        src.append(batch)
+        s.step()
+
+    rows = [r for b in batches for r in b.to_pylist()]
+    by_sym: dict[str, list[dict]] = {}
+    for r in rows:
+        by_sym.setdefault(r["sym"], []).append(r)
+    assert pa.table(latest).to_pylist() == [group[-1] for group in by_sym.values()]
+    assert pa.table(stats).to_pylist() == [
+        {
+            "sym": sym,
+            "n": len(group),
+            "total": sum(r["size"] for r in group if r["size"] is not None),
+            "avg": sum(r["price"] for r in group) / len(group),
+            "high": max(r["price"] for r in group),
+        }
+        for sym, group in by_sym.items()
+    ]

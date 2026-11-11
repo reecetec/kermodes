@@ -135,6 +135,9 @@ Infrastructure crates are allowed where writing our own would add risk without v
 only runtime dependency is `log`). Writing and maintaining a SQL grammar ourselves would cost more
 than it saves.
 
+`ahash` (already compiled in through arrow-array) hashes group keys; using it directly adds no
+crate to the build.
+
 No embedded query engines (DataFusion, DuckDB, Polars). A new data-path dependency needs a written
 reason in this section.
 
