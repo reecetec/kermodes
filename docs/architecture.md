@@ -283,13 +283,17 @@ History
 
 Arrow Flight `DoPut`.
 
-- Flight descriptor: `{table_id, date, source_id, schema_version}`. Writers resolve `ns.table` on
-  their branch to a table ID and an endpoint once, through `GetFlightInfo` (§17).
-- Every record batch carries `app_metadata = {seq: u64}`. `seq` is strictly increasing per
-  `(table, date, source_id)`.
-- weir acknowledges on the `PutResult` stream with the highest `seq` that is durable (fsynced).
-- weir drops batches with `seq <= last_acked`. Resent batches are harmless.
-- On (re)connect the writer calls `GetFlightInfo` / an action `last_seq` and resumes the source from
+- Flight descriptor: a command naming the table and the source. weir assigns the date from the
+  batch's ingest time. In the cluster, writers resolve `ns.table` on their branch to a table ID
+  and an endpoint once, through `GetFlightInfo` (§17); with one server (`kermodes dev`) the name
+  is enough.
+- Every record batch carries `app_metadata = seq` (u64, little-endian). `seq` is strictly
+  increasing per `(table, date, source_id)`.
+- weir acknowledges each batch on the `PutResult` stream once it is durable (fsynced) or dropped:
+  the source's last `seq` and whether this batch was written. A writer's call returns only then.
+- weir drops batches with `seq <= last_seq`. Resent batches are harmless.
+- One writer per source at a time, server-wide: a second is refused until the first disconnects.
+- On (re)connect the writer reads the action `last_seq` and resumes the source from
   there. For log-structured sources (NATS JetStream, Kafka) the source offset is the `seq`, so
   connectors keep no state of their own.
 - The descriptor's `schema_version` may be any version compatible with the table's current one;
@@ -347,10 +351,11 @@ def parse_odds(msgs: km.Batch) -> km.Batch: ...
 ### 7.2 Serving
 
 - Subscribers are engine workers, not end users.
-- Subscribe = snapshot (all sealed segments + open segment up to now) then tail (new batches as
-  they are acked).
-- Transport: Flight `DoGet` for sealed segments (engine caches them locally), Flight
-  `DoExchange` for the tail.
+- Subscribe = snapshot (every committed batch) then tail (each new batch as it commits), in one
+  Flight `DoGet` stream per subscriber. A slow subscriber's batches queue on the server rather
+  than holding up writers.
+- Later: sealed segments over `DoGet` with the engine caching them locally, the tail over
+  `DoExchange` resumed by row position (§17).
 - Co-located workers may memory-map sealed segments directly; this is an optimization only.
 
 ### 7.3 Day roll
@@ -1136,7 +1141,10 @@ No JVM, Docker, or Kubernetes.
   Same protocols as pods, so behaviour matches the cluster.
 - The controller has a runtime trait (`Local`: child processes; `Kubernetes`: `KermodesWorker`) and a
   storage trait (SQLite, Postgres) with one conformance suite run against both.
-- `km.connect()` with no arguments targets a running `kermodes dev`, otherwise `KERMODES_URL`.
+- `kermodes dev` serves the web UI on port 8730 and the store over Flight on 8731 (`--port`,
+  `--flight-port`), and shows every stored table in the UI as it appears. `km.connect()` uses
+  `$KERMODES_URL`, else that local server; `Session.serve_store()` serves a store the same way
+  from any process that opened it.
 - Startup targets: `km.local()` under 100 ms; `kermodes dev` ready under 1 s.
 
 ## 17. Scaling and high availability

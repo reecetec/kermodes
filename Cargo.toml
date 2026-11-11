@@ -15,6 +15,7 @@ pyo3 = { version = "0.30.1", features = ["abi3-py312"] }
 pyo3-arrow = "0.21"
 sqlparser = { version = "0.64", default-features = false, features = ["std"] }
 kermodes-core = { path = "crates/kermodes-core" }
+kermodes-flight = { path = "crates/kermodes-flight" }
 kermodes-gateway = { path = "crates/kermodes-gateway" }
 kermodes-weir = { path = "crates/kermodes-weir" }
 

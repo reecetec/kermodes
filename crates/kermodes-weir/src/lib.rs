@@ -16,7 +16,7 @@ use std::path::Path;
 
 pub use catalog::TableEntry;
 pub use names::{SourceId, TableName};
-pub use store::{BRANCH, Store, Subscriber, Writer};
+pub use store::{BRANCH, Store, Subscriber, Writer, conform};
 
 #[derive(Debug)]
 pub enum Error {

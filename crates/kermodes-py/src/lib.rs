@@ -77,28 +77,108 @@ impl Key {
     }
 }
 
-/// An engine running inside this Python process, with the tables of a store directory if it
-/// opened one.
+/// An engine running inside this Python process, with stored tables if it opened a store
+/// directory or connected to a server.
 #[pyclass(module = "kermodes", name = "Session", frozen)]
 pub struct Session {
     engine: kermodes_core::Session,
-    store: Option<Arc<kermodes_weir::Store>>,
+    tables: Option<Tables>,
+}
+
+/// Where a session's stored tables are: a store this process owns, or a server's.
+enum Tables {
+    Local(Arc<kermodes_weir::Store>),
+    Remote(kermodes_flight::Client),
+}
+
+impl Tables {
+    fn create_table(
+        &self,
+        name: &kermodes_weir::TableName,
+        schema: &Schema,
+    ) -> Result<(), kermodes_weir::Error> {
+        match self {
+            Tables::Local(store) => store.create_table(name, schema).map(drop),
+            Tables::Remote(client) => client.create_table(name, schema).map(drop),
+        }
+    }
+
+    fn names(&self) -> Result<Vec<String>, kermodes_weir::Error> {
+        Ok(match self {
+            Tables::Local(store) => store.tables()?.iter().map(|t| t.name.to_string()).collect(),
+            Tables::Remote(client) => client
+                .tables()?
+                .iter()
+                .map(|(n, _)| n.to_string())
+                .collect(),
+        })
+    }
+
+    fn schema(
+        &self,
+        name: &kermodes_weir::TableName,
+    ) -> Result<arrow::datatypes::SchemaRef, kermodes_weir::Error> {
+        match self {
+            Tables::Local(store) => Ok(store.table(name)?.schema),
+            Tables::Remote(client) => client.table(name),
+        }
+    }
+
+    fn subscribe(
+        &self,
+        name: &kermodes_weir::TableName,
+        subscriber: kermodes_weir::Subscriber,
+    ) -> Result<(), kermodes_weir::Error> {
+        match self {
+            Tables::Local(store) => store.subscribe(name, subscriber).map(drop),
+            Tables::Remote(client) => client.subscribe(name, subscriber).map(drop),
+        }
+    }
+
+    fn writer(
+        &self,
+        name: &kermodes_weir::TableName,
+        source: &kermodes_weir::SourceId,
+    ) -> Result<SourceWriter, kermodes_weir::Error> {
+        Ok(match self {
+            Tables::Local(store) => SourceWriter::Local(store.writer(name, source)?),
+            Tables::Remote(client) => SourceWriter::Remote(Box::new(client.writer(name, source)?)),
+        })
+    }
+}
+
+enum SourceWriter {
+    Local(kermodes_weir::Writer),
+    Remote(Box<kermodes_flight::RemoteWriter>),
 }
 
 #[pymethods]
 impl Session {
-    /// An engine in this process; with `path`, also the store in that directory (created if
-    /// needed): its tables, their rows, and their writers' progress survive the process.
+    /// An engine in this process. With `path`, it also opens the store in that directory
+    /// (created if needed), whose tables, rows, and writers' progress survive the process; with
+    /// `url`, it uses the tables of the server there (`kermodes dev`) instead.
     #[new]
-    #[pyo3(signature = (path=None))]
-    fn new(py: Python<'_>, path: Option<PathBuf>) -> PyResult<Self> {
-        let store = path
-            .map(|path| py.detach(|| kermodes_weir::Store::open(&path)))
-            .transpose()
-            .map_err(store_error)?;
+    #[pyo3(signature = (path=None, url=None))]
+    fn new(py: Python<'_>, path: Option<PathBuf>, url: Option<String>) -> PyResult<Self> {
+        let tables = match (path, url) {
+            (Some(_), Some(_)) => {
+                return Err(PyValueError::new_err(
+                    "a session opens a store directory or connects to a server, not both",
+                ));
+            }
+            (Some(path), None) => Some(Tables::Local(Arc::new(
+                py.detach(|| kermodes_weir::Store::open(&path))
+                    .map_err(store_error)?,
+            ))),
+            (None, Some(url)) => Some(Tables::Remote(
+                py.detach(|| kermodes_flight::Client::connect(&url))
+                    .map_err(store_error)?,
+            )),
+            (None, None) => None,
+        };
         Ok(Self {
             engine: kermodes_core::Session::new(),
-            store: store.map(Arc::new),
+            tables,
         })
     }
 
@@ -191,30 +271,28 @@ impl Session {
         name: &str,
         columns: &Bound<'_, PyDict>,
     ) -> PyResult<()> {
-        let store = self.store()?;
+        let tables = self.stored()?;
         let name = kermodes_weir::TableName::parse(name).map_err(store_error)?;
         let schema = schema_from(columns)?;
-        py.detach(|| store.create_table(&name, &schema))
-            .map_err(store_error)?;
-        Ok(())
+        py.detach(|| tables.create_table(&name, &schema))
+            .map_err(store_error)
     }
 
     /// The stored tables' names.
     #[getter]
     fn tables(&self, py: Python<'_>) -> PyResult<Vec<String>> {
-        let store = self.store()?;
-        let tables = py.detach(|| store.tables()).map_err(store_error)?;
-        Ok(tables.iter().map(|t| t.name.to_string()).collect())
+        let tables = self.stored()?;
+        py.detach(|| tables.names()).map_err(store_error)
     }
 
     /// Writes rows of `name` for one source (one writer per source at a time).
     #[pyo3(signature = (name, source="default"))]
     fn writer(&self, py: Python<'_>, name: &str, source: &str) -> PyResult<Writer> {
-        let store = self.store()?;
+        let tables = self.stored()?;
         let name = kermodes_weir::TableName::parse(name).map_err(store_error)?;
         let source = kermodes_weir::SourceId::parse(source).map_err(store_error)?;
         let writer = py
-            .detach(|| store.writer(&name, &source))
+            .detach(|| tables.writer(&name, &source))
             .map_err(store_error)?;
         Ok(Writer(writer))
     }
@@ -222,15 +300,15 @@ impl Session {
     /// The stored table `name`, ticking: every row written so far, then each batch as it is
     /// written. Its rows come only from its writers.
     fn live_table(&self, py: Python<'_>, name: &str) -> PyResult<Table> {
-        let store = self.store()?;
+        let tables = self.stored()?;
         let name = kermodes_weir::TableName::parse(name).map_err(store_error)?;
         let table = py.detach(|| {
-            let entry = store.table(&name).map_err(store_error)?;
+            let schema = tables.schema(&name).map_err(store_error)?;
             let (table, feed) = self
                 .engine
-                .fed_table(&entry.schema, &format!("live {name}"))
+                .fed_table(&schema, &format!("live {name}"))
                 .map_err(engine_error)?;
-            store
+            tables
                 .subscribe(
                     &name,
                     Box::new(move |batch| {
@@ -242,19 +320,72 @@ impl Session {
         })?;
         Ok(Table(table))
     }
+
+    /// Serves this session's store to other processes over Arrow Flight on `host:port` (port 0
+    /// picks a free one); they connect with `km.connect(server.url)`. Only a session that opened
+    /// a store directory can serve it.
+    #[pyo3(signature = (port=0, host="127.0.0.1"))]
+    fn serve_store(&self, py: Python<'_>, port: u16, host: &str) -> PyResult<StoreServer> {
+        let Some(Tables::Local(store)) = &self.tables else {
+            return Err(KermodesError::new_err(
+                "only a session that opened a store directory (km.local(path)) can serve it",
+            ));
+        };
+        let addr: SocketAddr = format!("{host}:{port}")
+            .parse()
+            .map_err(|e| PyValueError::new_err(format!("cannot listen on {host}:{port}: {e}")))?;
+        let store = store.clone();
+        let server = py
+            .detach(|| kermodes_flight::serve(store, addr))
+            .map_err(|e| PyValueError::new_err(format!("cannot listen on {addr}: {e}")))?;
+        Ok(StoreServer(Mutex::new(server)))
+    }
 }
 
 impl Session {
-    fn store(&self) -> PyResult<Arc<kermodes_weir::Store>> {
-        self.store.clone().ok_or_else(|| {
-            KermodesError::new_err("this session keeps no tables: open a store with km.local(path)")
+    fn stored(&self) -> PyResult<&Tables> {
+        self.tables.as_ref().ok_or_else(|| {
+            KermodesError::new_err(
+                "this session keeps no tables: open a store with km.local(path), or connect to \
+                 one with km.connect(url)",
+            )
         })
+    }
+}
+
+/// A session's store served over Arrow Flight (`Session.serve_store`); stops when this object
+/// goes, or with `stop()`.
+#[pyclass(module = "kermodes", name = "StoreServer", frozen)]
+pub struct StoreServer(Mutex<kermodes_flight::Server>);
+
+#[pymethods]
+impl StoreServer {
+    /// Where other processes connect: `km.connect(server.url)`.
+    #[getter]
+    fn url(&self) -> String {
+        format!("grpc://{}", self.lock().addr())
+    }
+
+    fn stop(&self, py: Python<'_>) {
+        py.detach(|| self.lock().stop());
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<kermodes.StoreServer {}>", self.url())
+    }
+}
+
+impl StoreServer {
+    fn lock(&self) -> std::sync::MutexGuard<'_, kermodes_flight::Server> {
+        self.0
+            .lock()
+            .expect("kermodes server poisoned by an earlier panic")
     }
 }
 
 /// Writes one source's rows of a stored table (`Session.writer`).
 #[pyclass(module = "kermodes", name = "Writer", frozen)]
-pub struct Writer(kermodes_weir::Writer);
+pub struct Writer(SourceWriter);
 
 #[pymethods]
 impl Writer {
@@ -266,14 +397,21 @@ impl Writer {
         let (schema, batches) = read_batches(data)?;
         py.detach(|| {
             let batch = arrow::compute::concat_batches(&schema, &batches).map_err(arrow_error)?;
-            self.0.write(&batch, seq).map_err(store_error)
+            match &self.0 {
+                SourceWriter::Local(writer) => writer.write(&batch, seq),
+                SourceWriter::Remote(writer) => writer.write(&batch, seq),
+            }
+            .map_err(store_error)
         })
     }
 
     /// The last sequence number this source wrote (in its newest partition), or `None`.
     #[getter]
     fn last_seq(&self, py: Python<'_>) -> Option<u64> {
-        py.detach(|| self.0.last_seq())
+        py.detach(|| match &self.0 {
+            SourceWriter::Local(writer) => writer.last_seq(),
+            SourceWriter::Remote(writer) => writer.last_seq(),
+        })
     }
 }
 
@@ -822,7 +960,7 @@ impl Viewer {
 #[pymodule]
 mod _native {
     #[pymodule_export]
-    use super::{Server, Session, Table, Viewer, Writer, merge};
+    use super::{Server, Session, StoreServer, Table, Viewer, Writer, merge};
 
     use pyo3::prelude::*;
 

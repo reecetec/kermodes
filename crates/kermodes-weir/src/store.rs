@@ -113,6 +113,13 @@ impl Store {
         })
     }
 
+    /// `source`'s last sequence number for `name`, as its writer would resume from.
+    pub fn last_seq(&self, name: &TableName, source: &SourceId) -> Result<Option<u64>, Error> {
+        let log = self.log(name)?;
+        let log = lock(&log);
+        Ok(newest(&log, source).and_then(Partition::last_seq))
+    }
+
     /// Feeds `subscriber` every committed batch of `name`, then each new one as it commits;
     /// returns the table's schema.
     pub fn subscribe(
@@ -241,7 +248,7 @@ fn partition_dirs(dir: &Path) -> Result<Vec<(String, SourceId)>, Error> {
 }
 
 /// `batch` with the table's columns, matched by name: the same names, each of the same type.
-fn conform(schema: &SchemaRef, batch: &RecordBatch) -> Result<RecordBatch, Error> {
+pub fn conform(schema: &SchemaRef, batch: &RecordBatch) -> Result<RecordBatch, Error> {
     let incoming = batch.schema();
     if incoming.fields().len() != schema.fields().len() {
         return Err(Error::Schema(format!(

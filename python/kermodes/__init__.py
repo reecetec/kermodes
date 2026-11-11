@@ -1,5 +1,6 @@
 """Kermodes: live and historical tables on Arrow."""
 
+import os
 from os import PathLike
 
 from kermodes._native import KermodesError, Session, Table, Writer, merge
@@ -10,6 +11,7 @@ __all__ = [
     "Table",
     "Writer",
     "boolean",
+    "connect",
     "date32",
     "float64",
     "int32",
@@ -32,6 +34,22 @@ def local(path: str | PathLike[str] | None = None, *, manual: bool = False) -> S
     `step()` (tests, replay); `start()` and `stop()` switch between the two.
     """
     session = Session(path)
+    if not manual:
+        session.start()
+    return session
+
+
+def connect(url: str | None = None, *, manual: bool = False) -> Session:
+    """Start an engine inside this Python process that uses a server's tables.
+
+    `url` is a store server's (`kermodes dev`, or `Session.serve_store`); by default
+    `$KERMODES_URL`, else the local `kermodes dev`. Many processes can connect to one server:
+    it is the one writer of the store's files, and they are its clients.
+    """
+    from kermodes.cli import DEV_PORT
+
+    url = url or os.environ.get("KERMODES_URL") or f"grpc://127.0.0.1:{DEV_PORT + 1}"
+    session = Session(url=url)
     if not manual:
         session.start()
     return session

@@ -19,5 +19,6 @@ libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 pyo3.workspace = true
 pyo3-arrow.workspace = true
 kermodes-core.workspace = true
+kermodes-flight.workspace = true
 kermodes-gateway.workspace = true
 kermodes-weir.workspace = true
