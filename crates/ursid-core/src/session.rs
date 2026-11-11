@@ -11,10 +11,11 @@ use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
-use crate::agg::{Accumulator, AggBy, agg_schema};
+use crate::agg::{Accumulator, AggBy, Call, agg_schema, call_error};
 use crate::groups::{KeyKind, Membership, resolve};
 use crate::join::{AsOfJoin, Join, JoinShape, NaturalJoin, Tracking};
 use crate::ops::{Assignment, Edge, LastBy, Operator, Update, Where};
+use crate::rolling::{Aggregate, Function, Input, Rolling, Span, Window};
 use crate::sort::sorted;
 use crate::storage::{Delta, End, Modified, RowKey, Rows, Storage};
 use crate::types::check_types;
@@ -61,14 +62,26 @@ struct Graph {
     cycle: u64,
 }
 
+/// How a table's rows change, from least to most constrained; each step lets the operators built
+/// on the table keep less state.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Growth {
+    /// Rows are added, removed, and modified.
+    Changing,
+    /// Rows are only added (a merge's, under keys that are not positions).
+    AddOnly,
+    /// Rows are only added, each keyed by its position: row order is key order, cycle after
+    /// cycle. Such tables keep their rows as the chunks they arrive in.
+    AppendOnly,
+}
+
 struct TableState {
     description: String,
     schema: SchemaRef,
     /// The table's rows; `None` for a table that computes them on read (see `Reader`).
     storage: Option<Storage>,
     refreshing: bool,
-    /// Only ever gains rows; operators keep less state over such inputs.
-    add_only: bool,
+    growth: Growth,
     failure: Option<Error>,
     /// This cycle's changes, read by the tables built from this one.
     delta: Option<Delta>,
@@ -446,7 +459,7 @@ impl Session {
             "input".into(),
             schema,
             true,
-            true,
+            Growth::AppendOnly,
             Source::Append,
         )))
     }
@@ -475,7 +488,7 @@ impl Session {
             description,
             schema,
             true,
-            false,
+            Growth::Changing,
             Source::Keyed(Box::new(keyed)),
         )))
     }
@@ -686,7 +699,13 @@ impl TableState {
         schema: SchemaRef,
         batches: Vec<RecordBatch>,
     ) -> Result<Self, ArrowError> {
-        let mut state = TableState::new(description, schema, false, true, Source::Static);
+        let mut state = TableState::new(
+            description,
+            schema,
+            false,
+            Growth::AppendOnly,
+            Source::Static,
+        );
         let mut next = 0;
         let added = batches
             .into_iter()
@@ -710,13 +729,13 @@ impl TableState {
         description: String,
         schema: SchemaRef,
         refreshing: bool,
-        add_only: bool,
+        growth: Growth,
         source: Source,
     ) -> Self {
         let storage = match &source {
             Source::Join { operator, .. } if operator.computes_rows() => None,
             Source::Merge { .. } => None,
-            _ if add_only => Some(Storage::dense(schema.clone())),
+            _ if growth == Growth::AppendOnly => Some(Storage::dense(schema.clone())),
             _ => Some(Storage::sparse(schema.clone())),
         };
         Self {
@@ -724,7 +743,7 @@ impl TableState {
             schema,
             storage,
             refreshing,
-            add_only,
+            growth,
             failure: None,
             delta: None,
             changed: 0,
@@ -923,11 +942,16 @@ impl Table {
     /// Rows for which `predicate` is true. NULL counts as false.
     pub fn filter(&self, predicate: &str) -> Result<Table, Error> {
         let expression = Expression::predicate(predicate, &self.schema)?;
+        // Over an input that only gains rows, `where` numbers its own rows.
         let add_only = self.add_only();
         self.derive(
             format!("where({predicate})"),
             self.schema.clone(),
-            add_only,
+            if add_only {
+                Growth::AppendOnly
+            } else {
+                Growth::Changing
+            },
             Operator::Where(Where::new(expression, add_only)),
         )
     }
@@ -969,7 +993,7 @@ impl Table {
         self.derive(
             format!("update({})", assignments.join(", ")),
             schema,
-            self.add_only(),
+            self.growth(),
             Operator::Update(update),
         )
     }
@@ -1052,8 +1076,159 @@ impl Table {
         self.derive(
             format!("{name}({n})"),
             self.schema.clone(),
-            false,
+            Growth::Changing,
             Operator::Edge(Edge::new(end, n)),
+        )
+    }
+
+    /// Each row with aggregates over a backward window of its group's rows (grouped by `by`;
+    /// every row in one group without): count, sum, mean, std, min, or max, each
+    /// `(name, "function(column)")`, NULL values ignored. The table must only append rows,
+    /// since the window follows row order.
+    pub fn rolling(
+        &self,
+        by: &[&str],
+        window: Window<'_>,
+        aggregations: &[(&str, &str)],
+    ) -> Result<Table, Error> {
+        if self.growth() != Growth::AppendOnly {
+            return Err(Error::Unsupported(
+                "rolling needs a table that only appends rows: an append-only input, or \
+                 where/update over one"
+                    .into(),
+            ));
+        }
+        if aggregations.is_empty() {
+            return Err(Error::Unsupported(
+                "rolling needs at least one aggregation".into(),
+            ));
+        }
+        let span = match window {
+            Window::Rows(0) => {
+                return Err(Error::Unsupported(
+                    "a rolling window needs at least one row".into(),
+                ));
+            }
+            Window::Rows(n) => Span::Rows(n),
+            Window::Time { span, .. } if span <= 0 => {
+                return Err(Error::Unsupported(
+                    "a rolling time window needs a positive span".into(),
+                ));
+            }
+            Window::Time { at, span } => {
+                let at = resolve(&self.schema, &[at])?[0];
+                let data_type = self.schema.field(at).data_type();
+                if !matches!(
+                    data_type,
+                    DataType::Int32 | DataType::Int64 | DataType::Date32 | DataType::Timestamp(..)
+                ) {
+                    return Err(Error::Schema(format!(
+                        "a rolling time window needs an integer, date, or timestamp column; `{}` \
+                         is {}",
+                        self.schema.field(at).name(),
+                        type_name(data_type)
+                    )));
+                }
+                Span::Time { at, span }
+            }
+        };
+        let (mut inputs, mut aggregates) = (Vec::<Input>::new(), Vec::new());
+        let mut fields: Vec<Field> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        for (name, spec) in aggregations {
+            if fields.iter().any(|f| f.name() == name) {
+                return Err(Error::Schema(format!("column `{name}` already exists")));
+            }
+            let call = Call::parse(spec, &self.schema)?;
+            let function = match call.function {
+                "count" => Function::Count,
+                "sum" => Function::Sum,
+                "mean" => Function::Mean,
+                "std" => Function::Std,
+                "min" => Function::Min,
+                "max" => Function::Max,
+                other => {
+                    return Err(call_error(
+                        spec,
+                        format!(
+                            "rolling supports count, sum, mean, std, min, and max, not `{other}`"
+                        ),
+                    ));
+                }
+            };
+            let input_type = call.column.map(|c| self.schema.field(c).data_type());
+            if matches!(function, Function::Min | Function::Max)
+                && !matches!(
+                    input_type,
+                    Some(
+                        DataType::Int32
+                            | DataType::Int64
+                            | DataType::Float64
+                            | DataType::Date32
+                            | DataType::Timestamp(..)
+                    )
+                )
+            {
+                return Err(call_error(
+                    spec,
+                    "rolling min and max need a number, date, or timestamp".into(),
+                ));
+            }
+            let output = match (function, input_type) {
+                (Function::Count, _) => DataType::Int64,
+                (Function::Sum, Some(DataType::Float64)) => DataType::Float64,
+                (Function::Sum, _) => DataType::Int64,
+                (Function::Mean | Function::Std, _) => DataType::Float64,
+                (Function::Min | Function::Max, Some(data_type)) => data_type.clone(),
+                (Function::Min | Function::Max, None) => unreachable!("checked above"),
+            };
+            let input = call.column.map(|column| {
+                inputs
+                    .iter()
+                    .position(|i| i.column == column)
+                    .unwrap_or_else(|| {
+                        let float = self.schema.field(column).data_type() == &DataType::Float64;
+                        inputs.push(Input { column, float });
+                        inputs.len() - 1
+                    })
+            });
+            fields.push(Field::new(*name, output.clone(), true));
+            aggregates.push(Aggregate {
+                function,
+                input,
+                output,
+            });
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let window_text = match window {
+            Window::Rows(n) => format!("rows={n}"),
+            Window::Time { at, span } => format!("time={span} at {at}"),
+        };
+        let named: Vec<String> = aggregations
+            .iter()
+            .map(|(name, spec)| format!("{name}={spec}"))
+            .collect();
+        let operator = Rolling::new(
+            self.membership(by)?,
+            KeyKind::new(&self.schema, resolve(&self.schema, by)?).map_err(schema_error)?,
+            span,
+            inputs,
+            aggregates,
+            schema.clone(),
+        );
+        self.derive(
+            format!(
+                "rolling([{}], {window_text}, {})",
+                by.join(", "),
+                named.join(", ")
+            ),
+            schema,
+            Growth::AppendOnly,
+            Operator::Rolling(Box::new(operator)),
         )
     }
 
@@ -1065,7 +1240,7 @@ impl Table {
         self.derive(
             format!("last_by({})", columns.join(", ")),
             self.schema.clone(),
-            false,
+            Growth::Changing,
             Operator::LastBy(Box::new(LastBy::new(groups, keys, !self.add_only()))),
         )
     }
@@ -1098,7 +1273,12 @@ impl Table {
             .map(|(name, spec)| format!("{name}={spec}"))
             .collect();
         let description = format!("agg_by([{}], {})", columns.join(", "), named.join(", "));
-        self.derive(description, output, false, Operator::AggBy(operator))
+        self.derive(
+            description,
+            output,
+            Growth::Changing,
+            Operator::AggBy(operator),
+        )
     }
 
     fn membership(&self, columns: &[&str]) -> Result<Membership, Error> {
@@ -1296,7 +1476,12 @@ impl Table {
             description,
             schema.clone(),
             left.refreshing || other.refreshing,
-            left.add_only && !other.refreshing,
+            // Over a static right side, rows are the left side's rows under its keys.
+            if other.refreshing {
+                Growth::Changing
+            } else {
+                left.growth
+            },
             source,
         );
         let (left_rows, right_rows) = (
@@ -1400,7 +1585,14 @@ impl Table {
             format!("merge({} tables)", inputs.len()),
             schema.clone(),
             inputs.iter().any(|id| graph.tables[*id].refreshing),
-            inputs.iter().all(|id| graph.tables[*id].add_only),
+            if inputs
+                .iter()
+                .all(|id| graph.tables[*id].growth >= Growth::AddOnly)
+            {
+                Growth::AddOnly
+            } else {
+                Growth::Changing
+            },
             Source::Merge { inputs },
         );
         graph.tables.push(state);
@@ -1455,8 +1647,12 @@ impl Table {
         }
     }
 
+    fn growth(&self) -> Growth {
+        self.session.read().tables[self.id].growth
+    }
+
     fn add_only(&self) -> bool {
-        self.session.read().tables[self.id].add_only
+        self.growth() >= Growth::AddOnly
     }
 
     fn expect_source(&self, action: &str, accepts: fn(&Source) -> bool) -> Result<(), Error> {
@@ -1482,7 +1678,7 @@ impl Table {
         &self,
         description: String,
         schema: SchemaRef,
-        add_only: bool,
+        growth: Growth,
         operator: Operator,
     ) -> Result<Table, Error> {
         let mut graph = self.session.write();
@@ -1495,7 +1691,7 @@ impl Table {
             description,
             schema.clone(),
             parent.refreshing,
-            add_only,
+            growth,
             source,
         );
         if let Some(cause) = &parent.failure {

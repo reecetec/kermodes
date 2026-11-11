@@ -45,6 +45,7 @@ OPERATIONS = [
     "merge + agg_by",
     "tail",
     "sort",
+    "rolling",
 ]
 # Each result's row count plus a checksum: the sum (or non-null count) of one column.
 CHECKS = {
@@ -57,6 +58,7 @@ CHECKS = {
     "merge + agg_by": ("n", "sum"),
     "tail": ("price", "sum"),
     "sort": ("price", "sum"),
+    "rolling": ("avg", "sum"),
 }
 MB = 1 << 20
 
@@ -84,6 +86,9 @@ def operations(engine: str, ticks, quotes, refs):
             ),
             "tail": lambda: t.tail(1000),
             "sort": lambda: t.sort("sym", "ts desc"),
+            "rolling": lambda: t.rolling(
+                "sym", rows=100, avg="mean(price)", vol="std(price)"
+            ),
         }
     if engine == "duckdb":
         import duckdb
@@ -110,6 +115,9 @@ def operations(engine: str, ticks, quotes, refs):
             "(select * from ticks union all select * from ticks) group by sym",
             "tail": "select * from ticks where rowid >= (select max(rowid) - 999 from ticks)",
             "sort": "select * from ticks order by sym, ts desc",
+            "rolling": "select *, avg(price) over w as avg, stddev_samp(price) over w as vol "
+            "from ticks window w as (partition by sym order by rowid "
+            "rows between 99 preceding and current row)",
         }
 
         def query(text: str):
@@ -144,6 +152,10 @@ def operations(engine: str, ticks, quotes, refs):
         ),
         "tail": lambda: t.tail(1000),
         "sort": lambda: t.sort(["sym", "ts"], descending=[False, True]),
+        "rolling": lambda: t.with_columns(
+            avg=pl.col("price").rolling_mean(100, min_samples=1).over("sym"),
+            vol=pl.col("price").rolling_std(100, min_samples=1).over("sym"),
+        ),
     }
 
 

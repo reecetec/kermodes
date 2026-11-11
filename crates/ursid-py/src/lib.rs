@@ -128,24 +128,36 @@ impl Session {
     }
 }
 
-/// A period such as `"100ms"`, `"0.5s"`, or `"2s"`.
+/// A period such as `"100ms"`, `"0.5s"`, `"5m"`, or `"1h"`: a positive number and one of the
+/// units ns, us, ms, s, m, h, d.
 fn parse_period(text: &str) -> PyResult<Duration> {
     let text = text.trim();
-    let (number, scale) = if let Some(ms) = text.strip_suffix("ms") {
-        (ms, 1e-3)
-    } else if let Some(s) = text.strip_suffix('s') {
-        (s, 1.0)
-    } else {
-        (text, 0.0)
-    };
-    match number.trim().parse::<f64>() {
-        Ok(value) if scale > 0.0 && value.is_finite() && value > 0.0 => {
-            Ok(Duration::from_secs_f64(value * scale))
-        }
-        _ => Err(PyValueError::new_err(format!(
-            "period must look like \"100ms\" or \"1s\", not {text:?}"
-        ))),
-    }
+    let units = [
+        ("ns", 1e-9),
+        ("us", 1e-6),
+        ("ms", 1e-3),
+        ("s", 1.0),
+        ("m", 60.0),
+        ("h", 3600.0),
+        ("d", 86400.0),
+    ];
+    let parsed = units.iter().find_map(|(unit, scale)| {
+        let number = text.strip_suffix(unit)?.trim().parse::<f64>().ok()?;
+        (number.is_finite() && number > 0.0).then(|| Duration::from_secs_f64(number * scale))
+    });
+    parsed.ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "period must look like \"100ms\", \"5m\", or \"1h\" (units ns, us, ms, s, m, h, d), \
+             not {text:?}"
+        ))
+    })
+}
+
+/// A rolling time span: a period for timestamps, or a number in the `at` column's units.
+#[derive(FromPyObject)]
+enum Span {
+    Period(String),
+    Units(i64),
 }
 
 /// A table: static, or ticking with the session's cycles.
@@ -304,6 +316,52 @@ impl Table {
             .collect();
         let table = py
             .detach(|| self.0.agg_by(&columns, &specs))
+            .map_err(engine_error)?;
+        Ok(Table(table))
+    }
+
+    /// Each row with aggregates over a backward window of its group's rows (`by`; one group
+    /// without): the row and the `rows - 1` before it, or the rows whose `at` lies within
+    /// `time` before its own (`time` a period such as `"5m"` for timestamps, or a number in
+    /// `at`'s units). Each `name="function(column)"`: count, sum, mean, std, min, or max. The
+    /// table must only append rows.
+    #[pyo3(signature = (*by, rows=None, time=None, at=None, **aggregations))]
+    fn rolling(
+        &self,
+        py: Python<'_>,
+        by: Vec<String>,
+        rows: Option<usize>,
+        time: Option<Span>,
+        at: Option<String>,
+        aggregations: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Table> {
+        let window = match (rows, time, &at) {
+            (Some(n), None, None) => ursid_core::Window::Rows(n),
+            (None, Some(time), Some(at)) => ursid_core::Window::Time {
+                at,
+                span: match time {
+                    Span::Period(text) => i64::try_from(parse_period(&text)?.as_nanos())
+                        .map_err(|_| PyValueError::new_err("rolling time span is too long"))?,
+                    Span::Units(units) => units,
+                },
+            },
+            _ => {
+                return Err(PyValueError::new_err(
+                    "rolling takes rows=n, or time= with at= naming the time column",
+                ));
+            }
+        };
+        let mut specs: Vec<(String, String)> = Vec::new();
+        for (name, spec) in aggregations.into_iter().flat_map(|d| d.iter()) {
+            specs.push((name.extract()?, spec.extract()?));
+        }
+        let by: Vec<&str> = by.iter().map(String::as_str).collect();
+        let specs: Vec<(&str, &str)> = specs
+            .iter()
+            .map(|(n, s)| (n.as_str(), s.as_str()))
+            .collect();
+        let table = py
+            .detach(|| self.0.rolling(&by, window, &specs))
             .map_err(engine_error)?;
         Ok(Table(table))
     }

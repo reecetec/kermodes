@@ -33,6 +33,7 @@ OPERATIONS = [
     "as_of_join",
     "merge + agg_by",
     "tail",
+    "rolling",
 ]
 MB = 1 << 20
 
@@ -73,6 +74,9 @@ def worker(op: str, cycles: int, batch: int) -> dict:
             "sym", n="count(*)", avg="mean(price)"
         ),
         "tail": lambda: ticks.tail(1000),
+        "rolling": lambda: ticks.rolling(
+            "sym", rows=100, avg="mean(price)", vol="std(price)"
+        ),
     }[op]()
 
     def copy(table: pa.Table, start: int) -> pa.Table:

@@ -32,6 +32,7 @@ OPERATIONS = [
     "as_of_join",
     "merge + agg_by",
     "tail",
+    "rolling",
 ]
 WARM = 10
 MB = 1 << 20
@@ -48,6 +49,7 @@ def worker(op: str, cycles: int, batch: int) -> dict:
     from deephaven import dtypes as dht
     from deephaven.arrow import to_table
     from deephaven.update_graph import exclusive_lock
+    from deephaven.updateby import rolling_avg_tick, rolling_std_tick
 
     runtime = jpy.get_type("java.lang.Runtime").getRuntime()
     system = jpy.get_type("java.lang.System")
@@ -83,6 +85,13 @@ def worker(op: str, cycles: int, batch: int) -> dict:
             [agg.count_("n"), agg.avg("avg=price")], by="sym"
         ),
         "tail": lambda: ticks.tail(1000),
+        "rolling": lambda: ticks.update_by(
+            [
+                rolling_avg_tick("avg=price", rev_ticks=100),
+                rolling_std_tick("vol=price", rev_ticks=100),
+            ],
+            by="sym",
+        ),
     }[op]()
 
     times = []

@@ -228,3 +228,24 @@ def test_sort_orders_static_tables_with_nulls_last():
     assert pa.table(ordered)["size"].to_pylist() == [None, 3, 2, 1]
     with pytest.raises(us.UrsidError, match="ORDER BY"):
         s.input_table(COLUMNS).sort("sym")
+
+
+def test_rolling_follows_row_and_time_windows():
+    s = us.local(manual=True)
+    src = s.input_table(
+        {"sym": us.string(), "price": us.float64(), "ts": us.timestamp()}
+    )
+    pairs = src.rolling("sym", rows=2, total="sum(price)")
+    recent = src.rolling("sym", time="2s", at="ts", n="count(*)")
+    stamps = pa.array([t * 10**9 for t in (0, 1, 1, 3)], pa.timestamp("ns", tz="UTC"))
+    src.append(
+        pa.table(
+            {"sym": ["a", "a", "b", "a"], "price": [1.0, 2.0, 5.0, 4.0], "ts": stamps}
+        )
+    )
+    s.step()
+    assert pa.table(pairs)["total"].to_pylist() == [1.0, 3.0, 5.0, 6.0]
+    # `a` at 3s keeps only rows in (1s, 3s]: itself.
+    assert pa.table(recent)["n"].to_pylist() == [1, 2, 1, 1]
+    with pytest.raises(ValueError, match="rows=n"):
+        src.rolling("sym", rows=2, time="1s", at="ts", n="count(*)")

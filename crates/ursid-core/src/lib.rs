@@ -9,6 +9,7 @@ mod groups;
 mod join;
 mod ops;
 mod parallel;
+mod rolling;
 mod session;
 mod slots;
 mod sort;
@@ -17,5 +18,6 @@ mod types;
 
 pub use error::Error;
 pub use expr::Expression;
+pub use rolling::Window;
 pub use session::{Session, Table};
 pub use types::{parse_type, type_name};

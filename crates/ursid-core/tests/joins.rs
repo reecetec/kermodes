@@ -377,3 +377,38 @@ fn joins_reject_unclear_columns_and_unsuitable_tables() {
         .collect();
     assert_eq!(names, ["id", "sym", "ts", "x", "right_x", "right_ts"]);
 }
+
+/// A merge only gains rows, but its keys are not positions: a join over it against a static
+/// right side keeps the merged keys.
+#[test]
+fn a_join_over_a_merge_keeps_its_rows() {
+    let session = Session::new();
+    let (east, west) = (
+        session.input_table(&orders_schema()).unwrap(),
+        session.input_table(&orders_schema()).unwrap(),
+    );
+    let refs_schema = Schema::new(vec![
+        Field::new("sym", DataType::Utf8, true),
+        Field::new("sector", DataType::Utf8, true),
+    ]);
+    let refs = session
+        .static_table(
+            Arc::new(refs_schema),
+            vec![batch(vec![
+                ("sym", Arc::new(StringArray::from(vec!["a", "b"]))),
+                ("sector", Arc::new(StringArray::from(vec!["tech", "banks"]))),
+            ])],
+        )
+        .unwrap();
+    let joined = Table::merge(&[&east, &west])
+        .unwrap()
+        .natural_join(&refs, &["sym"], None)
+        .unwrap();
+    let mut rng = Random(3);
+    for _ in 0..3 {
+        west.append(&[orders(&mut rng, 2)]).unwrap();
+        east.append(&[orders(&mut rng, 3)]).unwrap();
+        session.step();
+    }
+    assert_eq!(joined.num_rows().unwrap(), 15);
+}

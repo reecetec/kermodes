@@ -86,14 +86,19 @@ pub(crate) struct Moments {
     m2: f64,
 }
 
-impl Accumulator {
-    /// Parses `function(column)`, returning the accumulator and its output type.
-    pub fn parse(spec: &str, schema: &Schema) -> Result<(Self, DataType), Error> {
-        let error = |message: String| Error::Expression {
-            text: spec.to_owned(),
-            column: None,
-            message,
-        };
+/// An aggregation call `function(column)`, checked against a schema: the function is known
+/// (aliases resolved), `*` only appears in `count(*)`, and the column exists and is a number for
+/// the functions that need one.
+pub(crate) struct Call {
+    /// One of count, sum, mean, std, min, max, first, last.
+    pub function: &'static str,
+    /// `None` for `count(*)`.
+    pub column: Option<usize>,
+}
+
+impl Call {
+    pub fn parse(spec: &str, schema: &Schema) -> Result<Self, Error> {
+        let error = |message: String| call_error(spec, message);
         let text = spec.trim();
         let (name, rest) = text
             .split_once('(')
@@ -102,24 +107,29 @@ impl Accumulator {
             .strip_suffix(')')
             .ok_or_else(|| error("expected `function(column)`".into()))?
             .trim();
-        let function = name.trim().to_ascii_lowercase();
-        let known = [
-            "count", "sum", "mean", "avg", "std", "stddev", "min", "max", "first", "last",
-        ];
-        if !known.contains(&function.as_str()) {
-            return Err(error(format!(
-                "unknown aggregation `{function}`; expected count, sum, mean, std, min, max, first, or last"
-            )));
-        }
+        let function = match name.trim().to_ascii_lowercase().as_str() {
+            "count" => "count",
+            "sum" => "sum",
+            "mean" | "avg" => "mean",
+            "std" | "stddev" => "std",
+            "min" => "min",
+            "max" => "max",
+            "first" => "first",
+            "last" => "last",
+            other => {
+                return Err(error(format!(
+                    "unknown aggregation `{other}`; expected count, sum, mean, std, min, max, first, or last"
+                )));
+            }
+        };
         if argument == "*" {
             if function != "count" {
                 return Err(error("only count accepts `*`".into()));
             }
-            let count = Accumulator::Count {
+            return Ok(Self {
+                function,
                 column: None,
-                n: Vec::new(),
-            };
-            return Ok((count, DataType::Int64));
+            });
         }
         let column = schema.index_of(argument).map_err(|_| {
             let known: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
@@ -128,19 +138,48 @@ impl Accumulator {
                 known.join(", ")
             ))
         })?;
-        let input_type = schema.field(column).data_type().clone();
+        let input_type = schema.field(column).data_type();
         let numeric = matches!(
             input_type,
             DataType::Int32 | DataType::Int64 | DataType::Float64
         );
-        if matches!(function.as_str(), "sum" | "mean" | "avg" | "std" | "stddev") && !numeric {
+        if matches!(function, "sum" | "mean" | "std") && !numeric {
             return Err(error(format!(
-                "`{name}` needs a number, but `{argument}` is {}",
-                type_name(&input_type)
+                "`{}` needs a number, but `{argument}` is {}",
+                name.trim(),
+                type_name(input_type)
             )));
         }
+        Ok(Self {
+            function,
+            column: Some(column),
+        })
+    }
+}
+
+/// An error in the aggregation `spec`.
+pub(crate) fn call_error(spec: &str, message: String) -> Error {
+    Error::Expression {
+        text: spec.to_owned(),
+        column: None,
+        message,
+    }
+}
+
+impl Accumulator {
+    /// Parses `function(column)`, returning the accumulator and its output type.
+    pub fn parse(spec: &str, schema: &Schema) -> Result<(Self, DataType), Error> {
+        let call = Call::parse(spec, schema)?;
+        let Some(column) = call.column else {
+            let count = Accumulator::Count {
+                column: None,
+                n: Vec::new(),
+            };
+            return Ok((count, DataType::Int64));
+        };
+        let input_type = schema.field(column).data_type().clone();
         let float_input = input_type == DataType::Float64;
-        Ok(match function.as_str() {
+        Ok(match call.function {
             "count" => (
                 Accumulator::Count {
                     column: Some(column),
@@ -156,15 +195,15 @@ impl Accumulator {
                 },
                 DataType::Int64,
             ),
-            "sum" | "mean" | "avg" => (
+            "sum" | "mean" => (
                 Accumulator::SumFloat {
                     column,
                     state: Vec::new(),
-                    mean: function != "sum",
+                    mean: call.function == "mean",
                 },
                 DataType::Float64,
             ),
-            "std" | "stddev" => (
+            "std" => (
                 Accumulator::Std {
                     column,
                     state: Vec::new(),
@@ -175,9 +214,9 @@ impl Accumulator {
                 Accumulator::Extreme {
                     column,
                     source: column,
-                    max: function == "max",
+                    max: call.function == "max",
                     converter: RowConverter::new(vec![SortField::new(input_type.clone())])
-                        .map_err(|e| error(e.to_string()))?,
+                        .map_err(|e| call_error(spec, e.to_string()))?,
                     data_type: input_type.clone(),
                     best: Vec::new(),
                 },
@@ -187,7 +226,7 @@ impl Accumulator {
                 Accumulator::Edge {
                     column,
                     source: column,
-                    last: function == "last",
+                    last: call.function == "last",
                     key: Vec::new(),
                 },
                 input_type,

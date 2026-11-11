@@ -42,6 +42,7 @@ def main() -> None:
     import jpy
     from deephaven import SortDirection, agg, merge
     from deephaven.arrow import to_arrow, to_table
+    from deephaven.updateby import rolling_avg_tick, rolling_std_tick
 
     runtime = jpy.get_type("java.lang.Runtime").getRuntime()
     system = jpy.get_type("java.lang.System")
@@ -86,6 +87,16 @@ def main() -> None:
                 ["sym", "ts"], [SortDirection.ASCENDING, SortDirection.DESCENDING]
             ),
             ("price", "sum"),
+        ),
+        "rolling": (
+            lambda: ticks.update_by(
+                [
+                    rolling_avg_tick("avg=price", rev_ticks=100),
+                    rolling_std_tick("vol=price", rev_ticks=100),
+                ],
+                by="sym",
+            ),
+            ("avg", "sum"),
         ),
     }
 

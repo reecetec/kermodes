@@ -14,6 +14,7 @@ use crate::Expression;
 use crate::agg::AggBy;
 use crate::groups::{KeyKind, LocalGroups, Membership};
 use crate::parallel::{PIECE_ROWS, row_pieces, run, threads_for};
+use crate::rolling::Rolling;
 use crate::session::Reader;
 use crate::storage::{Delta, End, Modified, RowKey, Rows, Storage, nearest};
 
@@ -23,6 +24,7 @@ pub(crate) enum Operator {
     LastBy(Box<LastBy>),
     AggBy(AggBy),
     Edge(Edge),
+    Rolling(Box<Rolling>),
 }
 
 impl Operator {
@@ -38,6 +40,7 @@ impl Operator {
             Operator::LastBy(op) => op.process(input, delta, own),
             Operator::AggBy(op) => op.process(input, delta, own),
             Operator::Edge(op) => op.process(input, delta, own),
+            Operator::Rolling(op) => op.process(delta),
         }
     }
 }
