@@ -23,8 +23,8 @@ ingesters, deployments. The same expression that builds a training set from hist
 incrementally on live data; replaying history through the engine is a backtest.
 
 **Arrow end to end.** Arrow in memory, Arrow Flight on the wire, Arrow IPC for intraday storage,
-Parquet for history. One engine evaluates both live and static queries. No embedded third-party
-query engine.
+Parquet for history. One engine evaluates live and historical data with the same operators,
+whether the query comes from the table API or SQL. No embedded third-party query engine.
 
 **Git is the source of truth.** Tables, deployments, jobs, feature views, and models are declared
 in project repositories, developed and tested locally, and delivered to the cluster by a pipeline
@@ -54,8 +54,8 @@ Non-goals (for now)
 - Distributing one update graph across nodes. One deployment = one engine process; scale by
   sharding deployments.
 - General incremental SQL (DBSP/differential dataflow). The engine supports a fixed operator set.
-- A SQL engine. The query surface is the Ursid expression language and table API; a SQL frontend
-  compiling to Ursid plans may come later.
+- A third-party SQL engine. SQL is a frontend that compiles to the same Ursid plan as the table
+  API (§9.8).
 - A custom historical file format. History is Parquet.
 - Web UI beyond catalog, table viewer, console, pipelines, jobs, and models until notebooks and
   agents work end to end.
@@ -126,6 +126,10 @@ workspace.
 Infrastructure crates are allowed where writing our own would add risk without value: `tokio`,
 `tonic` (via arrow-flight), `sqlx` (Postgres, SQLite), `kube`, `ort` (ONNX Runtime), `pyo3` +
 `pyo3-arrow`, `openidconnect`, `jsonwebtoken`, `clap`, `serde`, `tracing`/OpenTelemetry.
+
+`sqlparser` is the one parsing dependency: it turns SQL text into an AST and does nothing else (its
+only runtime dependency is `log`). Writing and maintaining a SQL grammar ourselves would cost more
+than it saves.
 
 No embedded query engines (DataFusion, DuckDB, Polars). A new data-path dependency needs a written
 reason in this section.
@@ -410,17 +414,20 @@ comparison, string) plus Ursid's own hash tables for joins and aggregations.
 
 Anything outside this set runs as Python jobs over Arrow batches.
 
-### 9.3 Expressions
+### 9.3 Plans and expressions
 
-The Ursid expression language is the only query language in the engine.
-
-- Small grammar: literals, column references, arithmetic, comparison, boolean logic, `in`,
-  null handling, casts, conditionals, and a function library (math, string, time, date
+- Every query is an **Ursid plan**: a serializable logical plan of operators (§9.2) over named
+  tables. The Python table API builds plans client-side; SQL compiles to the same plans (§9.8).
+  Plans are what workers execute, what `plan`/`EXPLAIN` show, and what clients send over Flight.
+- Scalar expressions use SQL expression syntax everywhere, including table API strings:
+  `t.where("price > 2.5 AND book IN ('a', 'b')")`, `t.update("edge = model_p - 1 / price")`.
+  Supported: literals, column references, arithmetic, comparison, boolean logic, `IN`,
+  `IS [NOT] NULL`, `CAST`, `CASE`, `COALESCE`, and a function library (math, string, time, date
   arithmetic).
-- Hand-written parser producing a typed AST; type checking against the input schema at plan
-  time, with errors carrying position and fix hints.
-- Evaluation compiles the AST to a tree of arrow-rs kernel calls per chunk. Constant folding and
-  common-subexpression reuse are the only optimizations initially.
+- Expression strings are parsed with `sqlparser` (`parse_expr`), so the table API and SQL share
+  one grammar, one binder, and one type checker. Type errors carry position and fix hints.
+- Evaluation compiles the typed expression to a tree of arrow-rs kernel calls per chunk. Constant
+  folding and common-subexpression reuse are the only optimizations initially.
 - Predicates on scan inputs are translated into Parquet pruning (§8.4).
 - Rust-native function registry; Python UDFs run in the Python sidecar per batch (§9.5).
 
@@ -462,6 +469,63 @@ state at cycle time.
   being OOM-killed.
 - Large static aggregations and joins process one `Date` partition at a time where the query
   allows. Spilling to local disk is a later addition.
+
+### 9.8 SQL
+
+SQL is a frontend onto the Ursid plan, the way Deephaven's SQL compiles to its table operations.
+A query ticks when any input it reads ticks, and is static otherwise; the same SQL works over live
+data, history, or both.
+
+```python
+edges = db.sql("""
+    SELECT o.game_id, o.book, o.price, f.pts_avg
+    FROM sports.odds o
+    ASOF JOIN sports.form f
+      MATCH_CONDITION (o.ts >= f.ts)
+      ON o.player_id = f.player_id
+    WHERE o.Date = today()
+""")                                            # reads today's live data: ticking
+
+monthly = db.sql("""
+    SELECT book, avg(price) AS avg_price, count(*) AS n
+    FROM sports.odds
+    WHERE Date BETWEEN '2026-10-01' AND '2026-10-31'
+    GROUP BY book
+""")                                            # merged dates only: static
+```
+
+Table resolution
+
+- `ns.table` resolves to `db.table` (history ∪ live). The binder prunes `Date` against the
+  catalog: if no unmerged date survives the filter, the plan reads only Parquet and is static; if
+  only today's date survives, it reads only weir.
+- `live.ns.table` and `hist.ns.table` pin one side explicitly.
+- `FOR SYSTEM_TIME AS OF '<timestamp>'` reads history at a catalog snapshot (§8.2).
+- In sessions, Python variables holding tables are visible to SQL by name, as in Deephaven.
+
+Supported subset, mapped to operators
+
+| SQL | Ursid operator |
+|---|---|
+| `WHERE` | `where` |
+| `SELECT` expressions, aliases | `select` / `update` |
+| `GROUP BY` with aggregates | `agg_by` |
+| `INNER JOIN` / `LEFT JOIN` on equality keys | hash join / `natural_join` |
+| `ASOF JOIN ... MATCH_CONDITION (...) ON ...` | `as_of_join` |
+| `SELECT DISTINCT ON (key) ... ORDER BY ts DESC` | `last_by` |
+| Window functions over `ROWS` / `RANGE` frames | `rolling` |
+| `ORDER BY`, `LIMIT` | `sort`, `head` |
+| `UNION ALL` | `merge` |
+| CTEs (`WITH`), subqueries in `FROM` | inlined into the plan |
+
+- Anything else (full outer joins, non-equi joins, correlated subqueries, recursive CTEs) is
+  rejected at bind time with an error naming the construct and the closest supported form.
+- `ORDER BY` / `LIMIT` on ticking inputs are maintained incrementally, as in Deephaven; on static
+  inputs they run once.
+- `EXPLAIN` prints the Ursid plan with pruning decisions (dates, files, row groups) and whether
+  each subtree runs on the static or incremental path.
+- SQL works everywhere a plan does: sessions (`db.sql`), deployments (a deployment may be one SQL
+  file in the project), feature views, the web console, and ranger.
 
 ## 10. Control plane
 
@@ -749,7 +813,7 @@ def form(games):
 MCP server over the control plane, pipeline, and query surface.
 
 - Catalog: search namespaces/tables, describe schema, sample rows, lineage.
-- Query: bounded static queries and bounded live snapshots in the Ursid expression language.
+- Query: bounded static queries and bounded live snapshots, in SQL or the table API.
 - Scratch: validate / plan / apply directly in the agent's scratch namespace.
 - Managed namespaces: agents work on a branch, run `test` and `plan`, push, and open a pull request;
   the preview target shows their outputs in shadow; humans merge.
@@ -805,7 +869,7 @@ namespaces).
 ### 15.1 Python SDK and notebooks
 
 - `us.connect()` — remote cluster or a running `ursid dev`; `us.local()` — in-process engine from
-  the same Rust crate.
+  the same Rust crate. `db.sql(...)` and the table API build the same plans (§9.3, §9.8).
 - Tables convert to pyarrow, pandas, and polars without copying where possible (Arrow PyCapsule
   interface).
 - Ticking tables render in Jupyter via an anywidget-based widget subscribed to a viewport.
@@ -829,8 +893,8 @@ namespaces).
 - The production build ships inside the `ursid` wheel and is served by the gateway, so local mode
   and the cluster serve the same UI with no separate web server.
 - v1 surfaces: catalog (schemas, versions, lineage), live and historical table viewer, console
-  (expression editor on CodeMirror 6), pipelines (commit → deploy per target), job runs and logs
-  (live from `sys.*`), models and aliases, agent chat backed by ranger.
+  (SQL and table-API editor on CodeMirror 6, `EXPLAIN` view), pipelines (commit → deploy per
+  target), job runs and logs (live from `sys.*`), models and aliases, agent chat backed by ranger.
 
 ## 16. Runtime and deployment
 
@@ -973,7 +1037,7 @@ failure; `plan` warns when a non-replayable source has no replicated ack.
 | RPC | `arrow-flight` (tonic, HTTP/2) |
 | Historical files | `parquet` |
 | Object storage | `object_store` (S3 / rustfs, local filesystem) |
-| Expressions | Own grammar, parser, and kernel compiler (§9.3) |
+| Query frontends | Python table API and SQL (`sqlparser` for parsing), both compiled to the Ursid plan (§9.3, §9.8) |
 | Catalog and control-plane DB | Postgres (cluster) / SQLite (local) via `sqlx` |
 | Inference | ONNX Runtime via `ort`; Python sidecar for other flavors |
 | Kubernetes | `kube` |
@@ -995,7 +1059,7 @@ uv.lock
 crates/
   ursid-core      Arrow tables, row sets, update graph, clocks, memory accounting
   ursid-ops       static and incremental operators
-  ursid-expr      expression language: parser, type checker, kernel compiler
+  ursid-plan      Ursid plan, SQL and expression binder (via sqlparser), type checker, kernel compiler
   ursid-flight    Flight server, delta protocol
   ursid-weir      ingest server and segment store
   ursid-lake      Parquet reader/writer, pruning, catalog, merge
@@ -1042,7 +1106,7 @@ Verified against maturin 1.16, PyO3 0.30, and uv.
 |---|---|---|
 | M0 | Engine crate: chunks, update graph, static + incremental operators, expression language; PyO3 module; notebook widget | Random-walk ticker → rolling mean/vol, live in Jupyter |
 | M1 | weir (DoPut, segments, seq dedup, epochs, snapshot + tail); `db.live_table`; WebSocket connector; `ursid dev`; Helm chart (weir + engine) | Synthetic ticker over WebSocket → weir → engine, on a laptop and in the cluster |
-| M2 | Parquet writer and pruned reader, catalog with snapshots, merge job, `db.historical_table`, `db.table`, replay clock; column IDs and compatible schema changes | Ticker merged nightly, replayed as a backtest; add a column mid-day |
+| M2 | Parquet writer and pruned reader, catalog with snapshots, merge job, `db.historical_table`, `db.table`, replay clock; SQL frontend with `EXPLAIN`; column IDs and compatible schema changes | Same SQL query over last month (static) and today (ticking); ticker merged nightly, replayed as a backtest |
 | M3 | Projects: `ursid init` / `dev` / `test` / `plan`, manifest discovery, environments, pipeline (build, test, plan, deploy), targets and promotion, preview/shadow; scheduler and `sys.*` tables | Toy ticker project: push to `main` deploys to staging, promotion to prod, PR shadow preview with `ursid diff` |
 | M4 | Multi-user: OIDC, RBAC, `UrsidWorker` controller, gateway, worker classes, sandboxes; ranger MCP; web UI v1 | Two users with their own sessions; an agent opens a PR that previews in shadow |
 | M5 | den: register sklearn LinearRegression → ONNX → `predict`; torch MLP; aliases, shadow mode | Live prediction; swap champion without restart |
@@ -1056,8 +1120,6 @@ Verified against maturin 1.16, PyO3 0.30, and uv.
 3. Derived-state checkpointing: replay from start of day vs periodic engine snapshots.
 4. weir placement policy once sharded: hashing vs explicit assignment (deferred; §17 keeps it
    additive).
-5. SQL frontend: whether agents and users need SQL in addition to the expression language and
-   table API, compiled to Ursid plans if so.
 
 ## 22. Risks
 
@@ -1077,6 +1139,9 @@ Verified against maturin 1.16, PyO3 0.30, and uv.
   that window. Accepted initially; §17 invariants keep sharding and replication additive.
 - **Two control-plane stores.** SQLite (local) and Postgres (cluster) can diverge; one conformance
   suite runs against both, and the storage trait stays narrow.
+- **SQL expectations.** Users will try SQL the engine doesn't support. The subset is documented,
+  rejected constructs fail at bind time with the nearest supported form, and the subset grows only
+  when an incremental implementation exists.
 - **Pipeline scope.** Ursid runs its own build/test/deploy pipeline rather than delegating to an
   external CI; keep it to the five stages in §11.3 and leave generic CI to the git host.
 - **Rewrite cost.** Incompatible schema changes on long histories are expensive; `plan` must show
