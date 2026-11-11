@@ -23,6 +23,8 @@ from ursid._native import Table, UrsidError
 BUNDLE = Path(__file__).parent / "static" / "widget.js"
 # Rows sent beyond the visible ones on each side, so small scrolls need no round trip.
 MARGIN = 100
+# Most rows one "fetch" (a copy of a selection beyond the loaded window) returns.
+FETCH_LIMIT = 100_000
 
 _COMPARISON = re.compile(r"(>=|<=|!=|=|>|<)?\s*(.*)", re.DOTALL)
 _NUMBER = re.compile(r"[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?")
@@ -126,11 +128,29 @@ class TableView(anywidget.AnyWidget):
             self._derive(
                 list(self.sort), {c: t for c, t in entries.items() if t.strip()}
             )
+        elif kind == "fetch":
+            self._fetch(
+                int(content["id"]), int(content["start"]), int(content["count"])
+            )
+            return
         else:
             return
         table = self._table()
         if table is not None:
             self.push(table)
+
+    def _fetch(self, request: int, start: int, count: int) -> None:
+        """Answers a "fetch" with exactly the rows asked for, from the table shown."""
+        table = self._table()
+        if table is None:
+            return
+        with self._lock:
+            shown = self._shown if self._shown is not None else table
+            data, keys, total = shown._viewport(start, min(count, FETCH_LIMIT))
+            self.send(
+                {"type": "fetched", "id": request, "start": start, "total": total},
+                [data, keys],
+            )
 
     def _derive(self, sort: list[dict], filters: dict[str, str]) -> None:
         table = self._table()

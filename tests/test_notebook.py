@@ -3,7 +3,7 @@ import array
 import pyarrow as pa
 import ursid as us
 from IPython.core.interactiveshell import InteractiveShell
-from ursid._widget import MARGIN, TableView
+from ursid._widget import FETCH_LIMIT, MARGIN, TableView
 
 
 def test_rerunning_a_cell_replaces_the_table_it_built():
@@ -113,3 +113,14 @@ def test_the_viewer_sorts_and_filters_in_the_engine_and_keeps_row_keys():
     view.ask(type="filter", filters={})
     _, rows, _ = view.ask(type="sort", by=[])
     assert rows["sym"].to_pylist() == pa.table(src)["sym"].to_pylist()
+
+
+def test_the_viewer_fetches_exact_rows_for_copying_up_to_a_limit():
+    s = us.local(manual=True)
+    fixed = s.static_table(pa.table({"n": pa.array(range(300_000), pa.int64())}))
+    view = _Recorded(fixed)
+    header, rows, _ = view.ask(type="fetch", id=7, start=250, count=5)
+    assert (header["type"], header["id"], header["start"]) == ("fetched", 7, 250)
+    assert rows["n"].to_pylist() == [250, 251, 252, 253, 254]
+    _, rows, _ = view.ask(type="fetch", id=8, start=0, count=10**9)
+    assert rows.num_rows == FETCH_LIMIT
