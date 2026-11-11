@@ -101,8 +101,7 @@ Delta { added: [(keys, rows)], removed: [(keys, last rows)], modified: [(keys, p
   - periodic: a background thread runs a cycle every period (default 100 ms) when a source has
     pending data.
 - Cycles run tables one after another. `agg_by` spreads a large delta (64k+ rows) over every core
-  by sharding its groups (§5); other operators are single-threaded until a profile shows the
-  need.
+  in two phases (§5); other operators are single-threaded until a profile shows the need.
 - Failure: if an operator errors, its table and everything downstream of it enter a failed state
   holding the error; the rest of the graph keeps running. Snapshots of a failed table raise the
   error in Python.
@@ -119,7 +118,7 @@ keep no state) and an incremental path below. Static paths use the same kernels 
 | `where(expr)` | Over an `add_only` input: none, and the output numbers its own rows. Otherwise the output keeps the input's keys. | Added: evaluate, keep matches. Modified: re-evaluate; true→true is modified, false→true added, true→false removed. Removed: drop if present. | — |
 | `update(exprs)` / `select(exprs)` | None; same keys as the input | Added and modified: evaluate on the new values. Removed: removed. | — |
 | `last_by(keys)` | Group arena; per group, its newest row key (`add_only` input) or the set of its row keys | Groups touched in the cycle compare their current last key with the one published; new group → added, emptied group → removed, different last or a modified last row → modified (the row is copied from the input). | Order is by row key (arrival); `last_by` over a `ts` order comes with ticking sort. |
-| `agg_by(keys, aggs)` | Groups sharded by key hash, one shard per core; per shard, per-group accumulators stored column-wise and (unless the input is `add_only`) each group's row keys | Each batch becomes a vector of group ids, then each aggregation folds the batch in one typed loop. Rows added in key order fold in; a removed or modified row, or an addition older than the group's newest row, marks the group stale, and stale groups are recomputed from their rows in key order. Folding always in key order keeps incremental results bit-identical to the static path, on any number of cores. `min`/`max`/`first`/`last` keep the winning row key and copy its value. Empty groups are removed. Output row order is unspecified, as in SQL `GROUP BY`. | Invertible updates (subtracting removed rows) come if recomputation shows up in a profile. |
+| `agg_by(keys, aggs)` | Groups sharded by key hash, one shard per core; per shard, per-group accumulator states (one struct per group per aggregation) and (unless the input is `add_only`) each group's row keys | Two phases, as in DuckDB. Added rows are cut into fixed 256k-row pieces; each piece is grouped and folded on its own into partial states, reading rows sequentially and hashing each key once. Each shard then merges the partials of its groups in piece order (sums add; `std` combines Welford states with Chan et al.'s formula). Removed and modified rows are routed to their group's shard and mark the group stale; stale groups are recomputed from their rows in key order. `first`/`last` take the smallest/largest row key, and `min`/`max` break ties by the smaller row key, so they are exact in any order. Float `sum`/`mean`/`std` round differently depending on where piece boundaries fall, so ticking and static results can differ in the last bits; boundaries never depend on core count. Empty groups are removed. Output row order is unspecified, as in SQL `GROUP BY`. | Invertible updates (subtracting removed rows) come if recomputation shows up in a profile. |
 | `natural_join(right, on)` | Right: key → row key. Left: key → left row set. | Left added/modified-on-key: look up; output redirection to the right row. Right added/modified/removed for a key: every left row with that key is modified. A key matching more than one right row fails the table. | — |
 | `as_of_join(right, on, ts)` | Right: per key, sorted `(ts, row key)`. Left: per key, sorted `(ts, row key)`. | Left added: binary search the greatest right `ts ≤ left ts`. Right added at `ts = t`: left rows with that key, `ts ≥ t`, and current match `< t` rematch (modified). | Right must be `add_only`. |
 | `rolling(by, window, aggs)` | Per group: a ring buffer (row windows) or deque (time windows) with running accumulators | Added rows in key order: push, evict out-of-window, emit the aggregate as columns on the added row. Earlier rows never change. | Input must be `append_only`; windows look backward only. |
@@ -129,13 +128,14 @@ keep no state) and an incremental path below. Static paths use the same kernels 
 
 Grouping keys:
 
-- A single integer, date, or timestamp key is hashed as an `i64`; a single string key as its
-  bytes; anything else through `arrow::row::RowConverter`'s comparable encoding. Maps use
-  `ahash` (already in the dependency tree through arrow-array). Groups are then addressed by
-  dense ids, and emptied groups free their id.
-- Shards: a delta's rows are hashed to shards in parallel 64k-row pieces; each shard then reads
-  its rows in place through index lists. A sampling profile (`samply`) of a 10M-row static
-  `agg_by` shows the shards' scattered reads of keys and values as the dominant cost.
+- Each key is packed into fixed-width words: integers directly, strings and row-encoded keys of
+  up to 16 bytes exactly (first and last bytes loaded with overlapping fixed-size reads), longer
+  ones by their first and last 8 bytes plus length. Piece-local tables store the packed key in
+  the entry, so a probe compares in place and only keys over 16 bytes are compared in full. The
+  hash comes from the packed words (the full bytes for long keys) with `ahash` under fixed seeds,
+  computed once per row and reused for shard routing, piece tables, and shard tables. Groups are
+  addressed by dense ids, and emptied groups free their id.
+- Multi-column and other key types go through `arrow::row::RowConverter`'s comparable encoding.
 
 ## 6. Expressions
 
@@ -213,8 +213,9 @@ latest  # in Jupyter: ticking widget
 - **Oracle:** for every operator and for random compositions, a seeded generator produces update
   sequences (appends; upserts and deletes on keyed inputs; small key spaces to force collisions;
   random nulls). After every cycle, each incremental table is compared with its static path run on
-  snapshots of the same inputs, as sets of rows (order matters only for `head`/`tail`). A failure
-  prints the seed and the minimal cycle that diverged.
+  snapshots of the same inputs, as sets of rows (order matters only for `head`/`tail`). Float
+  columns compare to a relative 1e-9, since partial aggregation rounds by piece; everything else
+  compares exactly. A failure prints the seed and the cycle that diverged.
 - **Expressions:** decision tables per kernel family (null semantics, overflow, casts), and the
   same expressions checked against pandas in Python tests.
 - **Python:** pytest over the public API on `us.local()`, stepping manually.

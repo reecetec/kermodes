@@ -1,6 +1,15 @@
-//! `agg_by`: aggregations per group. Groups are split into shards by a hash of their key; each
-//! shard folds its rows in input-key order, so shards can run on separate cores and every
-//! result is bit-identical to folding the same rows one by one.
+//! `agg_by`: aggregations per group, in two phases.
+//!
+//! Added rows are cut into fixed 256k-row pieces. Each piece is aggregated on its own into
+//! partial states, reading its rows sequentially and hashing each key once. Groups are sharded by
+//! key hash; each shard then merges the partials of its groups in piece order. Removed and
+//! modified rows are routed to their group's shard and the groups they touch are recomputed from
+//! their rows.
+//!
+//! Counts, integer sums, min/max, and first/last are exact. Float sums, means, and standard
+//! deviations depend on where piece boundaries fall, so a ticking table and a static
+//! recomputation can differ in the last bits; piece boundaries never depend on the number of
+//! cores, so results do not either.
 
 use std::num::NonZero;
 use std::sync::Arc;
@@ -14,21 +23,21 @@ use arrow::compute::take;
 use arrow::datatypes::{DataType, Field, Float64Type, Int32Type, Int64Type, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
-use arrow::row::{OwnedRow, RowConverter, SortField};
+use arrow::row::{OwnedRow, RowConverter, Rows as EncodedRows, SortField};
+use hashbrown::HashTable;
 
-use crate::groups::{Membership, Sharder};
+use crate::groups::{KeyKind, LocalEntry, LocalGroups, Membership, shard_of, split};
 use crate::ops::{pick_column, push_removed};
 use crate::storage::{Delta, Modified, RowKey, Rows, Storage};
 use crate::{Error, type_name};
 
-/// Below this many rows in a cycle's delta, shards run one after another on the calling thread.
+/// Below this many rows in a cycle's delta, the phases run on the calling thread.
 const PARALLEL_ROWS: usize = 1 << 16;
 
-/// Rows per piece when hashing a delta's rows into shards; pieces spread that work over threads.
-const PIECE_ROWS: usize = 1 << 16;
+/// Rows per piece. Fixed, so results never depend on the number of cores.
+const PIECE_ROWS: usize = 1 << 18;
 
-/// One aggregation's state for every group in a shard, one vector per field, indexed by group
-/// id. Rows are always folded in input-key order.
+/// One aggregation's state for every group, one vector per field, indexed by group id.
 pub(crate) enum Accumulator {
     /// `count(*)` when `column` is `None`, otherwise non-null values.
     Count { column: Option<usize>, n: Vec<i64> },
@@ -40,33 +49,44 @@ pub(crate) enum Accumulator {
     /// `sum` of a float column, or `mean` of any numeric column.
     SumFloat {
         column: usize,
-        sum: Vec<f64>,
-        n: Vec<i64>,
+        state: Vec<FloatSum>,
         mean: bool,
     },
     /// Welford's running mean and sum of squared deviations.
-    Std {
-        column: usize,
-        n: Vec<i64>,
-        mean: Vec<f64>,
-        m2: Vec<f64>,
-    },
-    /// `min` or `max`: the winning value (comparable encoding) and its row key. `column` is
-    /// read when folding; `source` is the input column the value is copied from.
+    Std { column: usize, state: Vec<Moments> },
+    /// `min` or `max`: the winning value (comparable encoding) and its row key; ties go to the
+    /// smaller key. `column` is read when folding; `source` is the input column the value is
+    /// copied from.
     Extreme {
         column: usize,
         source: usize,
         max: bool,
+        data_type: DataType,
         converter: RowConverter,
         best: Vec<Option<(OwnedRow, RowKey)>>,
     },
-    /// `first` or `last`: the row key, nulls included.
+    /// `first` or `last`: the smallest or largest row key, nulls included.
     Edge {
         column: usize,
         source: usize,
         last: bool,
         key: Vec<Option<RowKey>>,
     },
+}
+
+/// One group's float sum and count, kept together so a fold touches one cache line per row.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FloatSum {
+    sum: f64,
+    n: i64,
+}
+
+/// One group's Welford state, kept together for the same reason.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Moments {
+    n: i64,
+    mean: f64,
+    m2: f64,
 }
 
 impl Accumulator {
@@ -142,8 +162,7 @@ impl Accumulator {
             "sum" | "mean" | "avg" => (
                 Accumulator::SumFloat {
                     column,
-                    sum: Vec::new(),
-                    n: Vec::new(),
+                    state: Vec::new(),
                     mean: function != "sum",
                 },
                 DataType::Float64,
@@ -151,9 +170,7 @@ impl Accumulator {
             "std" | "stddev" => (
                 Accumulator::Std {
                     column,
-                    n: Vec::new(),
-                    mean: Vec::new(),
-                    m2: Vec::new(),
+                    state: Vec::new(),
                 },
                 DataType::Float64,
             ),
@@ -164,6 +181,7 @@ impl Accumulator {
                     max: function == "max",
                     converter: RowConverter::new(vec![SortField::new(input_type.clone())])
                         .map_err(|e| error(e.to_string()))?,
+                    data_type: input_type.clone(),
                     best: Vec::new(),
                 },
                 input_type,
@@ -180,6 +198,55 @@ impl Accumulator {
         })
     }
 
+    /// An accumulator for the same aggregation, holding no groups.
+    fn fresh(&self) -> Result<Self, ArrowError> {
+        Ok(match self {
+            Accumulator::Count { column, .. } => Accumulator::Count {
+                column: *column,
+                n: Vec::new(),
+            },
+            Accumulator::SumInt { column, .. } => Accumulator::SumInt {
+                column: *column,
+                sum: Vec::new(),
+                n: Vec::new(),
+            },
+            Accumulator::SumFloat { column, mean, .. } => Accumulator::SumFloat {
+                column: *column,
+                state: Vec::new(),
+                mean: *mean,
+            },
+            Accumulator::Std { column, .. } => Accumulator::Std {
+                column: *column,
+                state: Vec::new(),
+            },
+            Accumulator::Extreme {
+                column,
+                source,
+                max,
+                data_type,
+                ..
+            } => Accumulator::Extreme {
+                column: *column,
+                source: *source,
+                max: *max,
+                converter: RowConverter::new(vec![SortField::new(data_type.clone())])?,
+                data_type: data_type.clone(),
+                best: Vec::new(),
+            },
+            Accumulator::Edge {
+                column,
+                source,
+                last,
+                ..
+            } => Accumulator::Edge {
+                column: *column,
+                source: *source,
+                last: *last,
+                key: Vec::new(),
+            },
+        })
+    }
+
     /// The input column folded, if any.
     fn column(&self) -> Option<usize> {
         match self {
@@ -192,7 +259,7 @@ impl Accumulator {
         }
     }
 
-    /// Points the folded column at its position within the projected batches shards see.
+    /// Points the folded column at its position within the projected batches.
     fn project(&mut self, projection: &[usize]) {
         let at = |c: &mut usize| *c = projection.binary_search(c).expect("projected column");
         match self {
@@ -217,15 +284,8 @@ impl Accumulator {
                 sum.resize(len, 0);
                 n.resize(len, 0);
             }
-            Accumulator::SumFloat { sum, n, .. } => {
-                sum.resize(len, 0.0);
-                n.resize(len, 0);
-            }
-            Accumulator::Std { n, mean, m2, .. } => {
-                n.resize(len, 0);
-                mean.resize(len, 0.0);
-                m2.resize(len, 0.0);
-            }
+            Accumulator::SumFloat { state, .. } => state.resize(len, FloatSum::default()),
+            Accumulator::Std { state, .. } => state.resize(len, Moments::default()),
             Accumulator::Extreme { best, .. } => best.resize(len, None),
             Accumulator::Edge { key, .. } => key.resize(len, None),
         }
@@ -235,33 +295,27 @@ impl Accumulator {
         match self {
             Accumulator::Count { n, .. } => n[group] = 0,
             Accumulator::SumInt { sum, n, .. } => (sum[group], n[group]) = (0, 0),
-            Accumulator::SumFloat { sum, n, .. } => (sum[group], n[group]) = (0.0, 0),
-            Accumulator::Std { n, mean, m2, .. } => {
-                (n[group], mean[group], m2[group]) = (0, 0.0, 0.0);
-            }
+            Accumulator::SumFloat { state, .. } => state[group] = FloatSum::default(),
+            Accumulator::Std { state, .. } => state[group] = Moments::default(),
             Accumulator::Extreme { best, .. } => best[group] = None,
             Accumulator::Edge { key, .. } => key[group] = None,
         }
     }
 
     /// Folds rows of `batch` into the groups in `ids`, in order: every row, or the selected
-    /// `rows` (`ids[i]` is the group of `rows[i]`). Groups marked in `skip` are left alone.
+    /// `rows` (`ids[i]` is the group of `rows[i]`).
     fn fold(
         &mut self,
         batch: &RecordBatch,
         keys: &[RowKey],
         ids: &[u32],
         rows: Option<&[u32]>,
-        skip: Option<&[bool]>,
     ) -> Result<(), ArrowError> {
-        let skipped = |group: u32| skip.is_some_and(|s| s[group as usize]);
-        let row_of = |i: usize| row_at(rows, i);
+        let row_of = |i: usize| rows.map_or(i, |r| r[i] as usize);
         match self {
             Accumulator::Count { column: None, n } => {
                 for &group in ids {
-                    if !skipped(group) {
-                        n[group as usize] += 1;
-                    }
+                    n[group as usize] += 1;
                 }
             }
             Accumulator::Count {
@@ -270,60 +324,39 @@ impl Accumulator {
             } => {
                 let array = batch.column(*column);
                 for (i, &group) in ids.iter().enumerate() {
-                    if !skipped(group) && array.is_valid(row_of(i)) {
+                    if array.is_valid(row_of(i)) {
                         n[group as usize] += 1;
                     }
                 }
             }
             Accumulator::SumInt { column, sum, n } => {
                 let mut overflow = false;
-                each_i64(
-                    batch.column(*column).as_ref(),
-                    ids,
-                    rows,
-                    skip,
-                    |group, value| {
-                        match sum[group].checked_add(value) {
-                            Some(total) => sum[group] = total,
-                            None => overflow = true,
-                        }
-                        n[group] += 1;
-                    },
-                );
+                each_i64(batch.column(*column).as_ref(), ids, rows, |group, value| {
+                    match sum[group].checked_add(value) {
+                        Some(total) => sum[group] = total,
+                        None => overflow = true,
+                    }
+                    n[group] += 1;
+                });
                 if overflow {
-                    return Err(ArrowError::ComputeError("Overflow happened in sum".into()));
+                    return Err(overflow_error());
                 }
             }
-            Accumulator::SumFloat { column, sum, n, .. } => {
-                each_f64(
-                    batch.column(*column).as_ref(),
-                    ids,
-                    rows,
-                    skip,
-                    |group, value| {
-                        sum[group] += value;
-                        n[group] += 1;
-                    },
-                );
+            Accumulator::SumFloat { column, state, .. } => {
+                each_f64(batch.column(*column).as_ref(), ids, rows, |group, value| {
+                    let s = &mut state[group];
+                    s.sum += value;
+                    s.n += 1;
+                });
             }
-            Accumulator::Std {
-                column,
-                n,
-                mean,
-                m2,
-            } => {
-                each_f64(
-                    batch.column(*column).as_ref(),
-                    ids,
-                    rows,
-                    skip,
-                    |group, x| {
-                        n[group] += 1;
-                        let delta = x - mean[group];
-                        mean[group] += delta / n[group] as f64;
-                        m2[group] += delta * (x - mean[group]);
-                    },
-                );
+            Accumulator::Std { column, state } => {
+                each_f64(batch.column(*column).as_ref(), ids, rows, |group, x| {
+                    let s = &mut state[group];
+                    s.n += 1;
+                    let delta = x - s.mean;
+                    s.mean += delta / s.n as f64;
+                    s.m2 += delta * (x - s.mean);
+                });
             }
             Accumulator::Extreme {
                 column,
@@ -342,32 +375,94 @@ impl Accumulator {
                 };
                 let encoded = converter.convert_columns(std::slice::from_ref(&array))?;
                 for (i, &group) in ids.iter().enumerate() {
-                    if skipped(group) || array.is_null(i) {
+                    if array.is_null(i) {
                         continue;
                     }
                     let candidate = encoded.row(i);
+                    let key = keys[row_of(i)];
                     let current = &mut best[group as usize];
                     let better = match current {
                         None => true,
-                        Some((value, _)) if *max => candidate > value.row(),
-                        Some((value, _)) => candidate < value.row(),
+                        Some((value, held)) => beats(*max, candidate.cmp(&value.row()), key, *held),
                     };
                     if better {
-                        *current = Some((candidate.owned(), keys[row_of(i)]));
+                        *current = Some((candidate.owned(), key));
                     }
                 }
             }
             Accumulator::Edge { last, key, .. } => {
                 for (i, &group) in ids.iter().enumerate() {
-                    if skipped(group) {
-                        continue;
-                    }
+                    let candidate = keys[row_of(i)];
                     let current = &mut key[group as usize];
-                    if *last || current.is_none() {
-                        *current = Some(keys[row_of(i)]);
+                    let better = match current {
+                        None => true,
+                        Some(held) if *last => candidate > *held,
+                        Some(held) => candidate < *held,
+                    };
+                    if better {
+                        *current = Some(candidate);
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Merges group `from` of `other` (the same aggregation) into group `into` of this one.
+    fn merge(&mut self, into: usize, other: &Accumulator, from: usize) -> Result<(), ArrowError> {
+        match (self, other) {
+            (Accumulator::Count { n, .. }, Accumulator::Count { n: m, .. }) => n[into] += m[from],
+            (Accumulator::SumInt { sum, n, .. }, Accumulator::SumInt { sum: s, n: m, .. }) => {
+                sum[into] = sum[into].checked_add(s[from]).ok_or_else(overflow_error)?;
+                n[into] += m[from];
+            }
+            (Accumulator::SumFloat { state, .. }, Accumulator::SumFloat { state: theirs, .. }) => {
+                let (s, t) = (&mut state[into], theirs[from]);
+                s.sum += t.sum;
+                s.n += t.n;
+            }
+            (Accumulator::Std { state, .. }, Accumulator::Std { state: theirs, .. }) => {
+                // Chan, Golub, and LeVeque's update for combining two partial variances.
+                let (s, t) = (&mut state[into], theirs[from]);
+                if t.n == 0 {
+                    return Ok(());
+                }
+                if s.n == 0 {
+                    *s = t;
+                    return Ok(());
+                }
+                let (a, b) = (s.n as f64, t.n as f64);
+                let delta = t.mean - s.mean;
+                s.mean += delta * (b / (a + b));
+                s.m2 += t.m2 + delta * delta * (a * b / (a + b));
+                s.n += t.n;
+            }
+            (Accumulator::Extreme { max, best, .. }, Accumulator::Extreme { best: theirs, .. }) => {
+                if let Some((value, key)) = &theirs[from] {
+                    let better = match &best[into] {
+                        None => true,
+                        Some((held, held_key)) => {
+                            beats(*max, value.row().cmp(&held.row()), *key, *held_key)
+                        }
+                    };
+                    if better {
+                        best[into] = Some((value.clone(), *key));
+                    }
+                }
+            }
+            (Accumulator::Edge { last, key, .. }, Accumulator::Edge { key: theirs, .. }) => {
+                if let Some(candidate) = theirs[from] {
+                    let better = match key[into] {
+                        None => true,
+                        Some(held) if *last => candidate > held,
+                        Some(held) => candidate < held,
+                    };
+                    if better {
+                        key[into] = Some(candidate);
+                    }
+                }
+            }
+            _ => unreachable!("partials come from the same aggregation"),
         }
         Ok(())
     }
@@ -382,14 +477,16 @@ impl Accumulator {
             Accumulator::SumInt { sum, n, .. } => Arc::new(Int64Array::from_iter(
                 at.map(|g| (n[g] > 0).then_some(sum[g])),
             )),
-            Accumulator::SumFloat { sum, n, mean, .. } => {
+            Accumulator::SumFloat { state, mean, .. } => {
                 Arc::new(Float64Array::from_iter(at.map(|g| {
-                    (n[g] > 0).then(|| if *mean { sum[g] / n[g] as f64 } else { sum[g] })
+                    let s = state[g];
+                    (s.n > 0).then(|| if *mean { s.sum / s.n as f64 } else { s.sum })
                 })))
             }
-            Accumulator::Std { n, m2, .. } => Arc::new(Float64Array::from_iter(
-                at.map(|g| (n[g] > 1).then(|| (m2[g] / (n[g] - 1) as f64).sqrt())),
-            )),
+            Accumulator::Std { state, .. } => Arc::new(Float64Array::from_iter(at.map(|g| {
+                let s = state[g];
+                (s.n > 1).then(|| (s.m2 / (s.n - 1) as f64).sqrt())
+            }))),
             Accumulator::Extreme { source, best, .. } => {
                 let keys: Vec<_> = at.map(|g| best[g].as_ref().map(|(_, key)| *key)).collect();
                 pick_column(input, *source, &keys)?
@@ -402,20 +499,27 @@ impl Accumulator {
     }
 }
 
-/// Calls `f(group, value)` for each row with a value whose group is not skipped, in order: every
-/// row of `array`, or the selected `rows`.
+fn overflow_error() -> ArrowError {
+    ArrowError::ComputeError("Overflow happened in sum".into())
+}
+
+/// Whether a candidate beats the held value: by value, then the smaller row key on ties.
+fn beats(max: bool, order: std::cmp::Ordering, candidate: RowKey, held: RowKey) -> bool {
+    let order = if max { order } else { order.reverse() };
+    order.is_gt() || (order.is_eq() && candidate < held)
+}
+
+/// Calls `f(group, value)` for each row with a value, in order: every row of `array`, or the
+/// selected `rows`.
 fn each<T: ArrowPrimitiveType>(
     array: &PrimitiveArray<T>,
     ids: &[u32],
     rows: Option<&[u32]>,
-    skip: Option<&[bool]>,
     mut f: impl FnMut(usize, T::Native),
 ) {
     let values = array.values();
-    let checked = array.null_count() > 0 || skip.is_some();
-    let keep =
-        |row: usize, group: u32| !(array.is_null(row) || skip.is_some_and(|s| s[group as usize]));
-    match (rows, checked) {
+    let nulls = array.null_count() > 0;
+    match (rows, nulls) {
         (None, false) => {
             for (&group, &value) in ids.iter().zip(values.iter()) {
                 f(group as usize, value);
@@ -423,19 +527,14 @@ fn each<T: ArrowPrimitiveType>(
         }
         (None, true) => {
             for (row, (&group, &value)) in ids.iter().zip(values.iter()).enumerate() {
-                if keep(row, group) {
+                if array.is_valid(row) {
                     f(group as usize, value);
                 }
             }
         }
-        (Some(rows), false) => {
+        (Some(rows), _) => {
             for (&group, &row) in ids.iter().zip(rows) {
-                f(group as usize, values[row as usize]);
-            }
-        }
-        (Some(rows), true) => {
-            for (&group, &row) in ids.iter().zip(rows) {
-                if keep(row as usize, group) {
+                if !nulls || array.is_valid(row as usize) {
                     f(group as usize, values[row as usize]);
                 }
             }
@@ -443,71 +542,45 @@ fn each<T: ArrowPrimitiveType>(
     }
 }
 
-fn each_f64(
-    array: &dyn Array,
-    ids: &[u32],
-    rows: Option<&[u32]>,
-    skip: Option<&[bool]>,
-    mut f: impl FnMut(usize, f64),
-) {
+fn each_f64(array: &dyn Array, ids: &[u32], rows: Option<&[u32]>, mut f: impl FnMut(usize, f64)) {
     match array.data_type() {
-        DataType::Int32 => each(
-            array.as_primitive::<Int32Type>(),
-            ids,
-            rows,
-            skip,
-            |g, v| {
-                f(g, f64::from(v));
-            },
-        ),
-        DataType::Int64 => each(
-            array.as_primitive::<Int64Type>(),
-            ids,
-            rows,
-            skip,
-            |g, v| {
-                f(g, v as f64);
-            },
-        ),
-        _ => each(array.as_primitive::<Float64Type>(), ids, rows, skip, f),
+        DataType::Int32 => each(array.as_primitive::<Int32Type>(), ids, rows, |g, v| {
+            f(g, f64::from(v));
+        }),
+        DataType::Int64 => each(array.as_primitive::<Int64Type>(), ids, rows, |g, v| {
+            f(g, v as f64);
+        }),
+        _ => each(array.as_primitive::<Float64Type>(), ids, rows, f),
     }
 }
 
-fn each_i64(
-    array: &dyn Array,
-    ids: &[u32],
-    rows: Option<&[u32]>,
-    skip: Option<&[bool]>,
-    mut f: impl FnMut(usize, i64),
-) {
+fn each_i64(array: &dyn Array, ids: &[u32], rows: Option<&[u32]>, mut f: impl FnMut(usize, i64)) {
     match array.data_type() {
-        DataType::Int32 => each(
-            array.as_primitive::<Int32Type>(),
-            ids,
-            rows,
-            skip,
-            |g, v| {
-                f(g, i64::from(v));
-            },
-        ),
-        _ => each(array.as_primitive::<Int64Type>(), ids, rows, skip, f),
+        DataType::Int32 => each(array.as_primitive::<Int32Type>(), ids, rows, |g, v| {
+            f(g, i64::from(v));
+        }),
+        _ => each(array.as_primitive::<Int64Type>(), ids, rows, f),
     }
 }
 
 /// What every shard needs to know about the operator.
 struct Context {
-    /// Input columns the shards see, sorted: the group columns and aggregated columns.
+    /// Input columns the operator reads, sorted: the group columns and aggregated columns.
     projection: Vec<usize>,
     /// Group columns in the input schema, for output rows.
     group_columns: Vec<usize>,
+    /// How the group key is read from projected batches.
+    keys: KeyKind,
     output: SchemaRef,
+    add_only: bool,
 }
 
-/// Aggregations per group, sharded by key hash.
+/// Aggregations per group: partials per piece, merged per shard.
 pub(crate) struct AggBy {
-    sharder: Sharder,
-    shards: Vec<Shard>,
     context: Context,
+    /// Empty accumulators to copy for each piece's partials.
+    templates: Vec<Accumulator>,
+    shards: Vec<Shard>,
 }
 
 impl AggBy {
@@ -519,16 +592,17 @@ impl AggBy {
         output: SchemaRef,
     ) -> Result<Self, Error> {
         let schema_error = |e: ArrowError| Error::Schema(e.to_string());
-        let parse_all = || -> Result<Vec<Accumulator>, Error> {
-            specs
-                .iter()
-                .map(|spec| Accumulator::parse(spec, input).map(|(a, _)| a))
-                .collect()
-        };
+        let mut templates = specs
+            .iter()
+            .map(|spec| Accumulator::parse(spec, input).map(|(a, _)| a))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut projection = group_columns.clone();
-        projection.extend(parse_all()?.iter().filter_map(Accumulator::column));
+        projection.extend(templates.iter().filter_map(Accumulator::column));
         projection.sort_unstable();
         projection.dedup();
+        for template in &mut templates {
+            template.project(&projection);
+        }
         let projected = input.project(&projection).map_err(schema_error)?;
         let local_groups: Vec<usize> = group_columns
             .iter()
@@ -542,23 +616,23 @@ impl AggBy {
         let count = thread::available_parallelism()
             .map_or(1, NonZero::get)
             .min(64);
-        let sharder =
-            Sharder::new(&projected, local_groups.clone(), count).map_err(schema_error)?;
         let mut shards = Vec::with_capacity(count);
-        for shard in 0..count {
-            let mut accumulators = parse_all()?;
-            for accumulator in &mut accumulators {
-                accumulator.project(&projection);
-            }
+        for index in 0..count {
             let groups = Membership::new(
                 &projected,
                 local_groups.clone(),
                 add_only,
-                shard as RowKey,
+                index as RowKey,
                 count as RowKey,
             )
             .map_err(schema_error)?;
+            let accumulators = templates
+                .iter()
+                .map(Accumulator::fresh)
+                .collect::<Result<_, _>>()
+                .map_err(schema_error)?;
             shards.push(Shard {
+                index,
                 groups,
                 accumulators,
                 published: Vec::new(),
@@ -566,13 +640,15 @@ impl AggBy {
             });
         }
         Ok(Self {
-            sharder,
-            shards,
             context: Context {
+                keys: KeyKind::new(&projected, local_groups).map_err(schema_error)?,
                 projection,
                 group_columns,
                 output,
+                add_only,
             },
+            templates,
+            shards,
         })
     }
 
@@ -584,39 +660,47 @@ impl AggBy {
     ) -> Result<Delta, ArrowError> {
         let view = View::new(delta, &self.context.projection)?;
         let threads = if view.rows() >= PARALLEL_ROWS {
-            self.sharder.shards()
+            self.shards.len()
         } else {
             1
         };
+        let context = &self.context;
+        let shard_count = self.shards.len();
 
-        // Bucket every batch's rows by shard, piece by piece in parallel. Shards then read their
-        // rows in place through these index lists.
-        let segments = view.segments();
+        // Removed and modified rows: route each to the shard owning its group.
+        let routed = view.routed();
         let mut pieces = Vec::new();
-        for (segment, batch) in segments.iter().enumerate() {
-            let mut offset = 0;
-            while offset < batch.num_rows() {
-                let len = PIECE_ROWS.min(batch.num_rows() - offset);
+        for (segment, batch) in routed.iter().enumerate() {
+            for (offset, len) in pieces_of(batch.num_rows()) {
                 pieces.push((segment, offset, len));
-                offset += len;
             }
         }
-        let sharder = &self.sharder;
-        let pieces = run(threads, pieces, |(segment, offset, len)| {
-            let shards = sharder.split(&segments[segment].slice(offset, len), offset as u32)?;
-            Ok::<_, ArrowError>(Piece { segment, shards })
+        let routes = run(threads, pieces, |(), (segment, offset, len)| {
+            let batch = routed[segment].slice(offset, len);
+            let shards = split(&context.keys, &batch, offset as u32, shard_count)?;
+            Ok::<_, ArrowError>(Route { segment, shards })
         })
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
 
-        let context = &self.context;
-        let shards: Vec<(usize, &mut Shard)> = self.shards.iter_mut().enumerate().collect();
-        let outputs = run(threads, shards, |(index, shard)| {
-            let part = view.part(&pieces, index);
-            if part.is_empty() {
-                return Ok(Delta::default());
+        // Added rows: aggregate each piece into partial states.
+        let mut pieces = Vec::new();
+        for (keys, batch) in &view.added {
+            for (offset, len) in pieces_of(batch.num_rows()) {
+                pieces.push((&keys[offset..offset + len], batch.slice(offset, len)));
             }
-            shard.process(context, input, &part, own)
+        }
+        let templates = &self.templates;
+        let partials = run(threads, pieces, |table, (keys, batch)| {
+            Partial::build(context, templates, table, keys, batch, shard_count)
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+
+        let shards: Vec<&mut Shard> = self.shards.iter_mut().collect();
+        let outputs = run(threads, shards, |(), shard| {
+            let part = view.part(&routes, shard.index);
+            shard.process(context, input, &part, &partials, own)
         });
         let mut out = Delta::default();
         for part in outputs {
@@ -629,11 +713,26 @@ impl AggBy {
     }
 }
 
+/// Fixed pieces `(offset, len)` covering `rows` rows.
+fn pieces_of(rows: usize) -> impl Iterator<Item = (usize, usize)> {
+    (0..rows)
+        .step_by(PIECE_ROWS)
+        .map(move |offset| (offset, PIECE_ROWS.min(rows - offset)))
+}
+
 /// Runs `f` over `items`, spread across up to `threads` scoped threads, returning results in
-/// item order.
-fn run<I: Send, T: Send>(threads: usize, items: Vec<I>, f: impl Fn(I) -> T + Sync) -> Vec<T> {
+/// item order. Each thread passes `f` its own scratch state, reused across its items.
+fn run<I: Send, T: Send, S: Default>(
+    threads: usize,
+    items: Vec<I>,
+    f: impl Fn(&mut S, I) -> T + Sync,
+) -> Vec<T> {
     if threads <= 1 || items.len() <= 1 {
-        return items.into_iter().map(f).collect();
+        let mut scratch = S::default();
+        return items
+            .into_iter()
+            .map(|item| f(&mut scratch, item))
+            .collect();
     }
     let count = items.len();
     let mut queues: Vec<Vec<(usize, I)>> = (0..threads).map(|_| Vec::new()).collect();
@@ -647,9 +746,10 @@ fn run<I: Send, T: Send>(threads: usize, items: Vec<I>, f: impl Fn(I) -> T + Syn
             .into_iter()
             .map(|queue| {
                 scope.spawn(move || {
+                    let mut scratch = S::default();
                     queue
                         .into_iter()
-                        .map(|(index, item)| (index, f(item)))
+                        .map(|(index, item)| (index, f(&mut scratch, item)))
                         .collect::<Vec<_>>()
                 })
             })
@@ -666,24 +766,84 @@ fn run<I: Send, T: Send>(threads: usize, items: Vec<I>, f: impl Fn(I) -> T + Syn
         .collect()
 }
 
-/// A delta with batches projected to the columns the shards read.
+/// One piece of added rows, aggregated on its own.
+struct Partial {
+    batch: RecordBatch,
+    encoded: Option<EncodedRows>,
+    groups: LocalGroups,
+    accumulators: Vec<Accumulator>,
+    /// Per local group: its largest row key.
+    last: Vec<RowKey>,
+    /// Per local group, every row key, when the input is not append-only.
+    keys: Option<Vec<Vec<RowKey>>>,
+    /// Local groups per shard, in first-appearance order.
+    by_shard: Vec<Vec<u32>>,
+}
+
+impl Partial {
+    fn build(
+        context: &Context,
+        templates: &[Accumulator],
+        table: &mut HashTable<LocalEntry>,
+        row_keys: &[RowKey],
+        batch: RecordBatch,
+        shards: usize,
+    ) -> Result<Self, ArrowError> {
+        let encoded = context.keys.encode(&batch)?;
+        let keys = context.keys.keys(&batch, encoded.as_ref());
+        let groups = LocalGroups::build(&keys, batch.num_rows(), table);
+        let count = groups.len();
+        let mut accumulators = templates
+            .iter()
+            .map(Accumulator::fresh)
+            .collect::<Result<Vec<_>, _>>()?;
+        for accumulator in &mut accumulators {
+            accumulator.resize(count);
+            accumulator.fold(&batch, row_keys, &groups.ids, None)?;
+        }
+        let mut last = vec![0; count];
+        let mut all = (!context.add_only).then(|| vec![Vec::new(); count]);
+        for (&id, &key) in groups.ids.iter().zip(row_keys) {
+            let group = id as usize;
+            last[group] = last[group].max(key);
+            if let Some(all) = &mut all {
+                all[group].push(key);
+            }
+        }
+        let mut by_shard = vec![Vec::new(); shards];
+        for (group, hash) in groups.hash.iter().enumerate() {
+            by_shard[shard_of(*hash, shards)].push(group as u32);
+        }
+        Ok(Self {
+            batch,
+            encoded,
+            groups,
+            accumulators,
+            last,
+            keys: all,
+            by_shard,
+        })
+    }
+}
+
+/// A delta with batches projected to the columns the operator reads.
 struct View<'a> {
     removed: Vec<(&'a [RowKey], RecordBatch)>,
     modified: Vec<(&'a [RowKey], RecordBatch, RecordBatch)>,
     added: Vec<(&'a [RowKey], RecordBatch)>,
 }
 
-/// One piece of a delta batch: the indices of its rows in each shard.
-struct Piece {
+/// The rows of one routed batch piece in each shard.
+struct Route {
     segment: usize,
     shards: Vec<Vec<u32>>,
 }
 
-/// Rows of one batch that belong to a shard: every row, or the selected indices, in order.
+/// Rows of one batch that belong to a shard, by index, in order.
 struct Selected<'a> {
     keys: &'a [RowKey],
     batch: &'a RecordBatch,
-    rows: Option<Vec<u32>>,
+    rows: Vec<u32>,
 }
 
 /// Modified rows that stay within a shard.
@@ -694,19 +854,13 @@ struct SelectedModified<'a> {
     rows: Vec<u32>,
 }
 
-/// One shard's part of a delta. A modified row that changes shard is removed from its old shard
-/// and added to its new one.
+/// One shard's removed and modified rows. A modified row that changes shard is removed from its
+/// old shard and added to its new one.
 #[derive(Default)]
 struct Part<'a> {
     removed: Vec<Selected<'a>>,
     modified: Vec<SelectedModified<'a>>,
     added: Vec<Selected<'a>>,
-}
-
-impl Part<'_> {
-    fn is_empty(&self) -> bool {
-        self.removed.is_empty() && self.modified.is_empty() && self.added.is_empty()
-    }
 }
 
 impl<'a> View<'a> {
@@ -746,40 +900,34 @@ impl<'a> View<'a> {
             + self.added.iter().map(|(k, _)| k.len()).sum::<usize>()
     }
 
-    /// Every batch, in the order `part` reads them: removed, modified previous, modified
-    /// current, added.
-    fn segments(&self) -> Vec<&RecordBatch> {
+    /// The batches routed by key: removed, modified previous, modified current.
+    fn routed(&self) -> Vec<&RecordBatch> {
         self.removed
             .iter()
             .map(|(_, b)| b)
             .chain(self.modified.iter().map(|(_, previous, _)| previous))
             .chain(self.modified.iter().map(|(_, _, current)| current))
-            .chain(self.added.iter().map(|(_, b)| b))
             .collect()
     }
 
-    /// The rows of `shard`, given every piece in segment and row order.
-    fn part<'p>(&'p self, pieces: &[Piece], shard: usize) -> Part<'p> {
-        let segments = self.removed.len() + 2 * self.modified.len() + self.added.len();
+    /// The routed rows of `shard`, given every route in segment and row order.
+    fn part(&self, routes: &[Route], shard: usize) -> Part<'_> {
+        let segments = self.removed.len() + 2 * self.modified.len();
         let mut rows: Vec<Vec<u32>> = vec![Vec::new(); segments];
-        for piece in pieces {
-            rows[piece.segment].extend_from_slice(&piece.shards[shard]);
+        for route in routes {
+            rows[route.segment].extend_from_slice(&route.shards[shard]);
         }
         let mut rows = rows.into_iter();
         let mut part = Part::default();
         let selected = |keys, batch, rows: Vec<u32>| {
-            (!rows.is_empty()).then_some(Selected {
-                keys,
-                batch,
-                rows: Some(rows),
-            })
+            (!rows.is_empty()).then_some(Selected { keys, batch, rows })
         };
         for (keys, batch) in &self.removed {
             let mine = rows.next().expect("one row list per segment");
             part.removed.extend(selected(*keys, batch, mine));
         }
         let previous: Vec<Vec<u32>> = rows.by_ref().take(self.modified.len()).collect();
-        let current: Vec<Vec<u32>> = rows.by_ref().take(self.modified.len()).collect();
+        let current: Vec<Vec<u32>> = rows.collect();
         for (((keys, before, after), old), new) in self.modified.iter().zip(previous).zip(current) {
             let (stay, leave, enter) = compare(&old, &new);
             if !stay.is_empty() {
@@ -793,16 +941,8 @@ impl<'a> View<'a> {
             part.removed.extend(selected(*keys, before, leave));
             part.added.extend(selected(*keys, after, enter));
         }
-        for ((keys, batch), mine) in self.added.iter().zip(rows) {
-            part.added.extend(selected(*keys, batch, mine));
-        }
         part
     }
-}
-
-/// The batch row of the `i`th selected row: `i` itself when every row is selected.
-fn row_at(rows: Option<&[u32]>, i: usize) -> usize {
-    rows.map_or(i, |r| r[i] as usize)
 }
 
 /// Splits two ascending row lists into rows in both, only the first, and only the second.
@@ -836,20 +976,17 @@ fn compare(old: &[u32], new: &[u32]) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
 
 /// The groups whose key hashes to one shard.
 struct Shard {
+    index: usize,
     groups: Membership,
     accumulators: Vec<Accumulator>,
     published: Vec<bool>,
-    /// Recompute from members this cycle: a row left, or arrived out of key order.
+    /// Recompute from members this cycle, because a row left the group.
     stale: Vec<bool>,
 }
 
 impl Shard {
-    fn assign(
-        &mut self,
-        batch: &RecordBatch,
-        rows: Option<&[u32]>,
-    ) -> Result<Vec<u32>, ArrowError> {
-        let ids = self.groups.assign(batch, rows)?;
+    /// Grows per-group vectors to the membership's ids and resets newly created groups.
+    fn sync(&mut self) {
         let len = self.groups.capacity();
         self.published.resize(len, false);
         self.stale.resize(len, false);
@@ -864,28 +1001,32 @@ impl Shard {
                 accumulator.reset(group);
             }
         }
+    }
+
+    fn assign(&mut self, batch: &RecordBatch, rows: &[u32]) -> Result<Vec<u32>, ArrowError> {
+        let ids = self.groups.assign(batch, Some(rows))?;
+        self.sync();
         Ok(ids)
     }
 
-    /// Processes this shard's part of a delta; batches are projected.
     fn process(
         &mut self,
         context: &Context,
         input: &Storage,
         part: &Part<'_>,
+        partials: &[Partial],
         own: &Storage,
     ) -> Result<Delta, ArrowError> {
         for selected in &part.removed {
-            let rows = selected.rows.as_deref();
-            let ids = self.assign(selected.batch, rows)?;
-            for (i, &id) in ids.iter().enumerate() {
-                self.groups.members[id as usize].remove(selected.keys[row_at(rows, i)])?;
+            let ids = self.assign(selected.batch, &selected.rows)?;
+            for (&id, &row) in ids.iter().zip(&selected.rows) {
+                self.groups.members[id as usize].remove(selected.keys[row as usize])?;
                 self.stale[id as usize] = true;
             }
         }
         for modified in &part.modified {
-            let before = self.assign(modified.previous, Some(&modified.rows))?;
-            let after = self.assign(modified.current, Some(&modified.rows))?;
+            let before = self.assign(modified.previous, &modified.rows)?;
+            let after = self.assign(modified.current, &modified.rows)?;
             for ((&old, &new), &row) in before.iter().zip(&after).zip(&modified.rows) {
                 let key = modified.keys[row as usize];
                 self.groups.members[old as usize].remove(key)?;
@@ -895,22 +1036,16 @@ impl Shard {
             }
         }
         for selected in &part.added {
-            let rows = selected.rows.as_deref();
-            let ids = self.assign(selected.batch, rows)?;
-            let mut any_stale = false;
-            for (i, &id) in ids.iter().enumerate() {
-                let key = selected.keys[row_at(rows, i)];
-                let members = &mut self.groups.members[id as usize];
-                if members.last().is_some_and(|last| key < last) {
-                    self.stale[id as usize] = true;
-                }
-                members.insert(key);
-                any_stale |= self.stale[id as usize];
+            let ids = self.assign(selected.batch, &selected.rows)?;
+            for (&id, &row) in ids.iter().zip(&selected.rows) {
+                self.groups.members[id as usize].insert(selected.keys[row as usize]);
             }
-            let skip = any_stale.then_some(self.stale.as_slice());
             for accumulator in &mut self.accumulators {
-                accumulator.fold(selected.batch, selected.keys, &ids, rows, skip)?;
+                accumulator.fold(selected.batch, selected.keys, &ids, Some(&selected.rows))?;
             }
+        }
+        for partial in partials {
+            self.merge(context, partial)?;
         }
 
         let touched = self.groups.take_touched();
@@ -946,6 +1081,39 @@ impl Shard {
         Ok(out)
     }
 
+    /// Merges one piece's partial states for this shard's groups.
+    fn merge(&mut self, context: &Context, partial: &Partial) -> Result<(), ArrowError> {
+        let keys = context.keys.keys(&partial.batch, partial.encoded.as_ref());
+        let mine = &partial.by_shard[self.index];
+        let ids: Vec<u32> = mine
+            .iter()
+            .map(|&local| {
+                let row = partial.groups.first_row[local as usize] as usize;
+                self.groups.group(
+                    partial.groups.hash[local as usize],
+                    |key| keys.matches(row, key),
+                    || keys.owned(row),
+                )
+            })
+            .collect();
+        self.sync();
+        for (&local, &id) in mine.iter().zip(&ids) {
+            let (local, group) = (local as usize, id as usize);
+            let members = &mut self.groups.members[group];
+            match &partial.keys {
+                Some(all) => all[local].iter().for_each(|key| members.insert(*key)),
+                None => members.insert(partial.last[local]),
+            }
+            if self.stale[group] {
+                continue;
+            }
+            for (accumulator, theirs) in self.accumulators.iter_mut().zip(&partial.accumulators) {
+                accumulator.merge(group, theirs, local)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Recomputes every stale, non-empty touched group from its rows, in key order.
     fn recompute_stale(
         &mut self,
@@ -972,7 +1140,7 @@ impl Shard {
         }
         let batch = input.gather(&keys)?.project(&context.projection)?;
         for accumulator in &mut self.accumulators {
-            accumulator.fold(&batch, &keys, &ids, None, None)?;
+            accumulator.fold(&batch, &keys, &ids, None)?;
         }
         Ok(())
     }

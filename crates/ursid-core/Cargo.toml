@@ -8,4 +8,5 @@ publish.workspace = true
 [dependencies]
 ahash = { version = "0.8", default-features = false }
 arrow.workspace = true
+hashbrown = { version = "0.17", default-features = false }
 sqlparser.workspace = true

@@ -1,10 +1,11 @@
-//! Grouping rows by key: each batch becomes a vector of group ids in one pass, with direct
-//! hashing for a single integer-like or string column and Arrow's row encoding otherwise.
+//! Grouping rows by key. Every key is hashed with one engine-wide hasher, so a hash computed once
+//! serves shard routing, piece-local tables, and the owning shard's table alike.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use std::sync::LazyLock;
 
 use ahash::RandomState;
-use arrow::array::{Array, ArrayRef, ArrowPrimitiveType, AsArray, PrimitiveArray, UInt32Array};
+use arrow::array::{Array, ArrayRef, AsArray, StringArray, UInt32Array};
 use arrow::compute::take_record_batch;
 use arrow::datatypes::{
     DataType, Date32Type, Int32Type, Int64Type, Schema, TimeUnit, TimestampNanosecondType,
@@ -12,11 +13,27 @@ use arrow::datatypes::{
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use arrow::row::{RowConverter, Rows, SortField};
+use hashbrown::HashTable;
 
 use crate::Error;
 use crate::storage::RowKey;
 
-/// Encodes key columns as comparable bytes, one key per row.
+static HASHER: LazyLock<RandomState> = LazyLock::new(|| {
+    RandomState::with_seeds(
+        0x243f_6a88_85a3_08d3,
+        0x1319_8a2e_0370_7344,
+        0xa409_3822_299f_31d0,
+        0x082e_fa98_ec4e_6c89,
+    )
+});
+
+/// The shard of a key hash. Uses the high bits, which hash tables do not use for bucket indices,
+/// so keys within one shard still spread over that shard's table.
+pub(crate) fn shard_of(hash: u64, shards: usize) -> usize {
+    (((hash >> 32) * shards as u64) >> 32) as usize
+}
+
+/// Encodes key columns as comparable bytes, one key per row. Used by keyed input tables.
 pub(crate) struct Grouper {
     columns: Vec<usize>,
     converter: RowConverter,
@@ -72,20 +89,20 @@ pub(crate) fn resolve(schema: &Schema, names: &[&str]) -> Result<Vec<usize>, Err
     Ok(columns)
 }
 
-/// How a key is read from a batch.
-enum KeyKind {
+/// How a group key is read from a batch.
+pub(crate) enum KeyKind {
     /// No key columns: every row has the same key.
     None,
-    /// One integer, date, or timestamp column.
+    /// One integer, date, or timestamp column, read as `i64`.
     Int(usize),
     /// One string column.
     Str(usize),
-    /// Anything else: Arrow's row encoding.
+    /// Anything else: Arrow's row encoding of the key columns.
     Rows(Grouper),
 }
 
 impl KeyKind {
-    fn new(schema: &Schema, columns: Vec<usize>) -> Result<Self, ArrowError> {
+    pub fn new(schema: &Schema, columns: Vec<usize>) -> Result<Self, ArrowError> {
         Ok(match columns.as_slice() {
             [] => KeyKind::None,
             [column] => match schema.field(*column).data_type() {
@@ -99,89 +116,239 @@ impl KeyKind {
             _ => KeyKind::Rows(Grouper::by_position(schema, columns)?),
         })
     }
-}
 
-/// Calls `f(row)` for every row of a batch of `len` rows, or only the selected `rows`.
-pub(crate) fn for_rows(rows: Option<&[u32]>, len: usize, mut f: impl FnMut(usize)) {
-    match rows {
-        None => (0..len).for_each(f),
-        Some(rows) => rows.iter().for_each(|row| f(*row as usize)),
-    }
-}
-
-/// Calls `f(value)` for an integer-like column read as `i64`, `None` for nulls, over all rows
-/// or the selected ones.
-fn each_int(array: &dyn Array, rows: Option<&[u32]>, f: impl FnMut(Option<i64>)) {
-    fn walk<T: ArrowPrimitiveType>(
-        array: &PrimitiveArray<T>,
-        rows: Option<&[u32]>,
-        mut f: impl FnMut(Option<i64>),
-    ) where
-        T::Native: Into<i64>,
-    {
-        let values = array.values();
-        for_rows(rows, array.len(), |row| {
-            f(array.is_valid(row).then(|| values[row].into()));
-        });
-    }
-    match array.data_type() {
-        DataType::Int32 => walk(array.as_primitive::<Int32Type>(), rows, f),
-        DataType::Int64 => walk(array.as_primitive::<Int64Type>(), rows, f),
-        DataType::Date32 => walk(array.as_primitive::<Date32Type>(), rows, f),
-        _ => walk(array.as_primitive::<TimestampNanosecondType>(), rows, f),
-    }
-}
-
-/// Splits rows into shards by a hash of their key: the same key always lands in the same shard.
-pub(crate) struct Sharder {
-    key: KeyKind,
-    hasher: RandomState,
-    shards: usize,
-}
-
-impl Sharder {
-    pub fn new(schema: &Schema, columns: Vec<usize>, shards: usize) -> Result<Self, ArrowError> {
-        Ok(Self {
-            key: KeyKind::new(schema, columns)?,
-            hasher: RandomState::with_seeds(
-                0x243f_6a88_85a3_08d3,
-                0x1319_8a2e_0370_7344,
-                0xa409_3822_299f_31d0,
-                0x082e_fa98_ec4e_6c89,
-            ),
-            shards,
-        })
-    }
-
-    pub fn shards(&self) -> usize {
-        self.shards
-    }
-
-    /// The rows of `batch` in each shard, as row indices plus `offset`, in row order.
-    pub fn split(&self, batch: &RecordBatch, offset: u32) -> Result<Vec<Vec<u32>>, ArrowError> {
-        let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); self.shards];
-        let mut row = offset;
-        let mut put = |hash: u64| {
-            buckets[(hash % self.shards as u64) as usize].push(row);
-            row += 1;
-        };
-        match &self.key {
-            KeyKind::None => (0..batch.num_rows()).for_each(|_| put(0)),
-            KeyKind::Int(column) => each_int(batch.column(*column).as_ref(), None, |value| {
-                put(self.hasher.hash_one(value));
-            }),
-            KeyKind::Str(column) => {
-                for value in batch.column(*column).as_string::<i32>().iter() {
-                    put(self.hasher.hash_one(value));
-                }
-            }
-            KeyKind::Rows(grouper) => {
-                for encoded in grouper.encode(batch)?.iter() {
-                    put(self.hasher.hash_one(encoded.data()));
-                }
-            }
+    /// The row encoding of `batch`'s keys, for kinds that need one.
+    pub fn encode(&self, batch: &RecordBatch) -> Result<Option<Rows>, ArrowError> {
+        match self {
+            KeyKind::Rows(grouper) => grouper.encode(batch).map(Some),
+            _ => Ok(None),
         }
-        Ok(buckets)
+    }
+
+    /// A view of `batch`'s keys; `encoded` is what `encode` returned for the same batch.
+    pub fn keys<'a>(&self, batch: &'a RecordBatch, encoded: Option<&'a Rows>) -> Keys<'a> {
+        match self {
+            KeyKind::None => Keys::None,
+            KeyKind::Int(column) => Keys::Int(batch.column(*column).as_ref()),
+            KeyKind::Str(column) => Keys::Str(batch.column(*column).as_string::<i32>()),
+            KeyKind::Rows(_) => Keys::Rows(encoded.expect("row-encoded keys are encoded first")),
+        }
+    }
+}
+
+/// The keys of one batch.
+pub(crate) enum Keys<'a> {
+    None,
+    Int(&'a dyn Array),
+    Str(&'a StringArray),
+    Rows(&'a Rows),
+}
+
+/// A group's key, kept by the table that owns the group.
+pub(crate) enum OwnedKey {
+    All,
+    Null,
+    Int(i64),
+    Str(Box<str>),
+    Bytes(Box<[u8]>),
+}
+
+impl Keys<'_> {
+    fn int(array: &dyn Array, row: usize) -> i64 {
+        match array.data_type() {
+            DataType::Int32 => i64::from(array.as_primitive::<Int32Type>().value(row)),
+            DataType::Int64 => array.as_primitive::<Int64Type>().value(row),
+            DataType::Date32 => i64::from(array.as_primitive::<Date32Type>().value(row)),
+            _ => array.as_primitive::<TimestampNanosecondType>().value(row),
+        }
+    }
+
+    /// The key of `row`, packed. See [`Packed`].
+    #[inline(always)]
+    pub fn pack(&self, row: usize) -> Packed {
+        match self {
+            Keys::None => Packed::default(),
+            Keys::Int(array) if array.is_null(row) => Packed::NULL,
+            Keys::Int(array) => Packed {
+                lo: Self::int(*array, row) as u64,
+                ..Packed::default()
+            },
+            Keys::Str(array) if array.is_null(row) => Packed::NULL,
+            Keys::Str(array) => Packed::bytes(array.value(row).as_bytes()),
+            Keys::Rows(rows) => Packed::bytes(rows.row(row).data()),
+        }
+    }
+
+    /// The engine-wide hash of the key of `row`, whose packing is `packed`.
+    #[inline(always)]
+    pub fn hash_packed(&self, row: usize, packed: Packed) -> u64 {
+        if !packed.exact() {
+            return match self {
+                Keys::Str(array) => HASHER.hash_one(array.value(row).as_bytes()),
+                Keys::Rows(rows) => HASHER.hash_one(rows.row(row).data()),
+                Keys::None | Keys::Int(_) => unreachable!("fixed-width keys pack exactly"),
+            };
+        }
+        HASHER.hash_one((packed.lo, packed.hi, packed.tag))
+    }
+
+    pub fn hash(&self, row: usize) -> u64 {
+        self.hash_packed(row, self.pack(row))
+    }
+
+    /// Whether rows `a` and `b` have the same key, given that their packings are equal.
+    fn same_packed(&self, a: usize, b: usize, packed: Packed) -> bool {
+        packed.exact()
+            || match self {
+                Keys::Str(array) => array.value(a) == array.value(b),
+                Keys::Rows(rows) => rows.row(a) == rows.row(b),
+                Keys::None | Keys::Int(_) => unreachable!("fixed-width keys pack exactly"),
+            }
+    }
+
+    pub fn matches(&self, row: usize, key: &OwnedKey) -> bool {
+        match (self, key) {
+            (Keys::None, OwnedKey::All) => true,
+            (Keys::Int(array), OwnedKey::Null) => array.is_null(row),
+            (Keys::Str(array), OwnedKey::Null) => array.is_null(row),
+            (Keys::Int(array), OwnedKey::Int(value)) => {
+                array.is_valid(row) && Self::int(*array, row) == *value
+            }
+            (Keys::Str(array), OwnedKey::Str(text)) => {
+                array.is_valid(row) && array.value(row) == text.as_ref()
+            }
+            (Keys::Rows(rows), OwnedKey::Bytes(bytes)) => rows.row(row).data() == bytes.as_ref(),
+            _ => false,
+        }
+    }
+
+    pub fn owned(&self, row: usize) -> OwnedKey {
+        match self {
+            Keys::None => OwnedKey::All,
+            Keys::Int(array) if array.is_null(row) => OwnedKey::Null,
+            Keys::Int(array) => OwnedKey::Int(Self::int(*array, row)),
+            Keys::Str(array) if array.is_null(row) => OwnedKey::Null,
+            Keys::Str(array) => OwnedKey::Str(array.value(row).into()),
+            Keys::Rows(rows) => OwnedKey::Bytes(rows.row(row).data().into()),
+        }
+    }
+}
+
+/// A key packed into fixed-width words. Equal keys pack equally; keys of at most 16 bytes pack
+/// distinctly, so equal packings mean equal keys without reading the keys again. Longer keys
+/// keep their first and last 8 bytes, which only rules out most unequal keys.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Packed {
+    lo: u64,
+    hi: u64,
+    /// Byte length, or `NULL_TAG`.
+    tag: u32,
+}
+
+const NULL_TAG: u32 = u32::MAX;
+
+impl Packed {
+    const NULL: Self = Self {
+        lo: 0,
+        hi: 0,
+        tag: NULL_TAG,
+    };
+
+    /// Packs with fixed-size loads only: short ranges overlap rather than branch per byte.
+    #[inline(always)]
+    fn bytes(b: &[u8]) -> Self {
+        let len = b.len();
+        let u32_at = |at: usize| u64::from(u32::from_le_bytes(b[at..at + 4].try_into().unwrap()));
+        let u64_at = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+        let (lo, hi) = match len {
+            0 => (0, 0),
+            1..=3 => (
+                u64::from(b[0]) | u64::from(b[len / 2]) << 8 | u64::from(b[len - 1]) << 16,
+                0,
+            ),
+            4..=7 => (u32_at(0) | u32_at(len - 4) << 32, 0),
+            _ => (u64_at(0), u64_at(len - 8)),
+        };
+        Self {
+            lo,
+            hi,
+            tag: u32::try_from(len).map_or(NULL_TAG - 1, |l| l.min(NULL_TAG - 1)),
+        }
+    }
+
+    /// Whether equal packings imply equal keys.
+    fn exact(self) -> bool {
+        self.tag == NULL_TAG || self.tag <= 16
+    }
+}
+
+/// A piece-local table entry: a group's packed key beside its id, so probes compare in place.
+pub(crate) struct LocalEntry {
+    packed: Packed,
+    id: u32,
+}
+
+/// The rows of `batch` in each shard, as row indices plus `offset`, in row order.
+pub(crate) fn split(
+    kind: &KeyKind,
+    batch: &RecordBatch,
+    offset: u32,
+    shards: usize,
+) -> Result<Vec<Vec<u32>>, ArrowError> {
+    let encoded = kind.encode(batch)?;
+    let keys = kind.keys(batch, encoded.as_ref());
+    let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); shards];
+    for row in 0..batch.num_rows() {
+        buckets[shard_of(keys.hash(row), shards)].push(offset + row as u32);
+    }
+    Ok(buckets)
+}
+
+/// Groups of contiguous rows within one batch, for piece-local aggregation: a group id per row,
+/// and per group its hash and the first row holding its key.
+pub(crate) struct LocalGroups {
+    pub ids: Vec<u32>,
+    pub hash: Vec<u64>,
+    pub first_row: Vec<u32>,
+}
+
+impl LocalGroups {
+    /// Groups the rows, using `table` as scratch: it is cleared but keeps its capacity.
+    pub fn build(keys: &Keys<'_>, rows: usize, table: &mut HashTable<LocalEntry>) -> Self {
+        table.clear();
+        let mut groups = Self {
+            ids: Vec::with_capacity(rows),
+            hash: Vec::new(),
+            first_row: Vec::new(),
+        };
+        for row in 0..rows {
+            let packed = keys.pack(row);
+            let hash = keys.hash_packed(row, packed);
+            let first_row = &groups.first_row;
+            let found = table.find(hash, |entry| {
+                entry.packed == packed
+                    && keys.same_packed(first_row[entry.id as usize] as usize, row, packed)
+            });
+            let id = match found {
+                Some(entry) => entry.id,
+                None => {
+                    let id = groups.hash.len() as u32;
+                    groups.hash.push(hash);
+                    groups.first_row.push(row as u32);
+                    let hashes = &groups.hash;
+                    table.insert_unique(hash, LocalEntry { packed, id }, |entry| {
+                        hashes[entry.id as usize]
+                    });
+                    id
+                }
+            };
+            groups.ids.push(id);
+        }
+        groups
+    }
+
+    pub fn len(&self) -> usize {
+        self.hash.len()
     }
 }
 
@@ -240,37 +407,12 @@ impl Members {
     }
 }
 
-/// A group's key, kept so the group can be forgotten when it empties.
-enum OwnedKey {
-    Null,
-    Int(i64),
-    Str(Box<str>),
-    Bytes(Box<[u8]>),
-}
-
-/// Key value → group id.
-enum KeyMap {
-    All(Option<u32>),
-    Int {
-        column: usize,
-        map: HashMap<i64, u32, RandomState>,
-        null: Option<u32>,
-    },
-    Str {
-        column: usize,
-        map: HashMap<Box<str>, u32, RandomState>,
-        null: Option<u32>,
-    },
-    Rows {
-        grouper: Grouper,
-        map: HashMap<Box<[u8]>, u32, RandomState>,
-    },
-}
-
 /// Groups of an input's rows: ids, membership, output slots, and which groups a cycle touched.
 /// Ids of emptied groups are reused; output slots never are.
 pub(crate) struct Membership {
-    keys: KeyMap,
+    kind: KeyKind,
+    table: HashTable<u32>,
+    hashes: Vec<u64>,
     owned: Vec<OwnedKey>,
     pub slot: Vec<RowKey>,
     pub members: Vec<Members>,
@@ -294,25 +436,10 @@ impl Membership {
         slot_offset: RowKey,
         slot_stride: RowKey,
     ) -> Result<Self, ArrowError> {
-        let keys = match KeyKind::new(schema, columns)? {
-            KeyKind::None => KeyMap::All(None),
-            KeyKind::Int(column) => KeyMap::Int {
-                column,
-                map: HashMap::default(),
-                null: None,
-            },
-            KeyKind::Str(column) => KeyMap::Str {
-                column,
-                map: HashMap::default(),
-                null: None,
-            },
-            KeyKind::Rows(grouper) => KeyMap::Rows {
-                grouper,
-                map: HashMap::default(),
-            },
-        };
         Ok(Self {
-            keys,
+            kind: KeyKind::new(schema, columns)?,
+            table: HashTable::new(),
+            hashes: Vec::new(),
             owned: Vec::new(),
             slot: Vec::new(),
             members: Vec::new(),
@@ -338,81 +465,90 @@ impl Membership {
         batch: &RecordBatch,
         rows: Option<&[u32]>,
     ) -> Result<Vec<u32>, ArrowError> {
-        let mut allocator = Allocator {
-            owned: &mut self.owned,
-            slot: &mut self.slot,
-            members: &mut self.members,
-            created: &mut self.created,
-            free: &mut self.free,
-            next_slot: &mut self.next_slot,
-            slot_stride: self.slot_stride,
-            add_only: self.add_only,
+        let selected = match rows {
+            Some(rows) if matches!(self.kind, KeyKind::Rows(_)) => {
+                Some(take_record_batch(batch, &UInt32Array::from(rows.to_vec()))?)
+            }
+            _ => None,
         };
-        let count = rows.map_or(batch.num_rows(), <[u32]>::len);
-        let mut ids = Vec::with_capacity(count);
-        match &mut self.keys {
-            KeyMap::All(id) => {
-                let id = *id.get_or_insert_with(|| allocator.new_group(OwnedKey::Null));
-                ids.resize(count, id);
+        let (batch, rows) = match &selected {
+            Some(taken) => (taken, None),
+            None => (batch, rows),
+        };
+        let kind = std::mem::replace(&mut self.kind, KeyKind::None);
+        let result = kind.encode(batch).map(|encoded| {
+            let keys = kind.keys(batch, encoded.as_ref());
+            let mut ids = Vec::with_capacity(rows.map_or(batch.num_rows(), <[u32]>::len));
+            let mut each = |row: usize| {
+                let id = self.group(
+                    keys.hash(row),
+                    |key| keys.matches(row, key),
+                    || keys.owned(row),
+                );
+                ids.push(id);
+            };
+            match rows {
+                None => (0..batch.num_rows()).for_each(&mut each),
+                Some(rows) => rows.iter().for_each(|row| each(*row as usize)),
             }
-            KeyMap::Int { column, map, null } => {
-                each_int(batch.column(*column).as_ref(), rows, |value| {
-                    let id = match value {
-                        None => *null.get_or_insert_with(|| allocator.new_group(OwnedKey::Null)),
-                        Some(value) => *map
-                            .entry(value)
-                            .or_insert_with(|| allocator.new_group(OwnedKey::Int(value))),
-                    };
-                    ids.push(id);
-                });
+            ids
+        });
+        self.kind = kind;
+        result
+    }
+
+    /// The id of the group whose key `matches`, created with key `make()` if none does, marked
+    /// touched. `hash` is the key's engine-wide hash.
+    pub fn group(
+        &mut self,
+        hash: u64,
+        matches: impl Fn(&OwnedKey) -> bool,
+        make: impl FnOnce() -> OwnedKey,
+    ) -> u32 {
+        let owned = &self.owned;
+        let id = match self.table.find(hash, |id| matches(&owned[*id as usize])) {
+            Some(id) => *id,
+            None => {
+                let id = self.allocate(hash, make());
+                let hashes = &self.hashes;
+                self.table
+                    .insert_unique(hash, id, |id| hashes[*id as usize]);
+                id
             }
-            KeyMap::Str { column, map, null } => {
-                let array = batch.column(*column).as_string::<i32>();
-                for_rows(rows, array.len(), |row| {
-                    let id = if array.is_null(row) {
-                        *null.get_or_insert_with(|| allocator.new_group(OwnedKey::Null))
-                    } else {
-                        let text = array.value(row);
-                        match map.get(text) {
-                            Some(id) => *id,
-                            None => {
-                                let id = allocator.new_group(OwnedKey::Str(text.into()));
-                                map.insert(text.into(), id);
-                                id
-                            }
-                        }
-                    };
-                    ids.push(id);
-                });
-            }
-            KeyMap::Rows { grouper, map } => {
-                let selected = match rows {
-                    None => batch.clone(),
-                    Some(rows) => take_record_batch(batch, &UInt32Array::from(rows.to_vec()))?,
-                };
-                for row in grouper.encode(&selected)?.iter() {
-                    let bytes = row.data();
-                    let id = match map.get(bytes) {
-                        Some(id) => *id,
-                        None => {
-                            let id = allocator.new_group(OwnedKey::Bytes(bytes.into()));
-                            map.insert(bytes.into(), id);
-                            id
-                        }
-                    };
-                    ids.push(id);
-                }
-            }
+        };
+        if id as usize >= self.touched.len() {
+            self.touched.resize(self.slot.len(), false);
         }
-        self.touched.resize(self.slot.len(), false);
-        for &id in &ids {
-            let seen = &mut self.touched[id as usize];
-            if !*seen {
-                *seen = true;
-                self.touched_list.push(id);
-            }
+        let seen = &mut self.touched[id as usize];
+        if !*seen {
+            *seen = true;
+            self.touched_list.push(id);
         }
-        Ok(ids)
+        id
+    }
+
+    fn allocate(&mut self, hash: u64, key: OwnedKey) -> u32 {
+        let slot = self.next_slot;
+        self.next_slot += self.slot_stride;
+        let id = match self.free.pop() {
+            Some(id) => {
+                let i = id as usize;
+                self.hashes[i] = hash;
+                self.owned[i] = key;
+                self.slot[i] = slot;
+                self.members[i] = Members::new(self.add_only);
+                id
+            }
+            None => {
+                self.hashes.push(hash);
+                self.owned.push(key);
+                self.slot.push(slot);
+                self.members.push(Members::new(self.add_only));
+                (self.slot.len() - 1) as u32
+            }
+        };
+        self.created.push(id);
+        id
     }
 
     /// Groups touched since the last call, in first-touch order.
@@ -431,57 +567,13 @@ impl Membership {
 
     /// Forgets an emptied group; its id may be reused by a later key.
     pub fn release(&mut self, id: u32) {
-        let owned = std::mem::replace(&mut self.owned[id as usize], OwnedKey::Null);
-        match (&mut self.keys, owned) {
-            (KeyMap::All(group), _) => *group = None,
-            (KeyMap::Int { map, .. }, OwnedKey::Int(value)) => {
-                map.remove(&value);
-            }
-            (KeyMap::Str { map, .. }, OwnedKey::Str(text)) => {
-                map.remove(&text);
-            }
-            (KeyMap::Rows { map, .. }, OwnedKey::Bytes(bytes)) => {
-                map.remove(&bytes);
-            }
-            (KeyMap::Int { null, .. } | KeyMap::Str { null, .. }, OwnedKey::Null) => *null = None,
-            _ => {}
+        if let Ok(entry) = self
+            .table
+            .find_entry(self.hashes[id as usize], |other| *other == id)
+        {
+            entry.remove();
         }
+        self.owned[id as usize] = OwnedKey::Null;
         self.free.push(id);
-    }
-}
-
-/// Hands out group ids, reusing freed ones, and sets up their membership.
-struct Allocator<'a> {
-    owned: &'a mut Vec<OwnedKey>,
-    slot: &'a mut Vec<RowKey>,
-    members: &'a mut Vec<Members>,
-    created: &'a mut Vec<u32>,
-    free: &'a mut Vec<u32>,
-    next_slot: &'a mut RowKey,
-    slot_stride: RowKey,
-    add_only: bool,
-}
-
-impl Allocator<'_> {
-    fn new_group(&mut self, key: OwnedKey) -> u32 {
-        let slot = *self.next_slot;
-        *self.next_slot += self.slot_stride;
-        let id = match self.free.pop() {
-            Some(id) => {
-                let i = id as usize;
-                self.owned[i] = key;
-                self.slot[i] = slot;
-                self.members[i] = Members::new(self.add_only);
-                id
-            }
-            None => {
-                self.owned.push(key);
-                self.slot.push(slot);
-                self.members.push(Members::new(self.add_only));
-                (self.slot.len() - 1) as u32
-            }
-        };
-        self.created.push(id);
-        id
     }
 }

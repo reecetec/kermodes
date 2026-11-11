@@ -1,11 +1,13 @@
 //! The static path is the oracle: after every cycle, each ticking table must equal the same
-//! pipeline computed once over a static copy of its input.
+//! pipeline computed once over a static copy of its input. Float aggregates may differ in the
+//! last bits (partials merge where piece boundaries fall), so float columns are compared to a
+//! relative 1e-9; everything else must match exactly.
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow::compute::{SortColumn, concat_batches, lexsort_to_indices, take_record_batch};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Float64Type, Schema};
 use arrow::record_batch::RecordBatch;
 use ursid_core::{Session, Table};
 
@@ -152,16 +154,48 @@ fn contents(table: &Table) -> RecordBatch {
     take_record_batch(&all, &order).unwrap()
 }
 
+/// Asserts two sorted tables hold the same rows, floats to within a relative 1e-9.
+fn assert_same(got: &RecordBatch, want: &RecordBatch, context: &str) {
+    assert_eq!(got.schema(), want.schema(), "{context}: schemas differ");
+    assert_eq!(
+        got.num_rows(),
+        want.num_rows(),
+        "{context}: row counts differ"
+    );
+    for (index, field) in got.schema().fields().iter().enumerate() {
+        let (a, b) = (got.column(index), want.column(index));
+        if field.data_type() != &DataType::Float64 {
+            assert_eq!(a, b, "{context}: column `{}` differs", field.name());
+            continue;
+        }
+        let (a, b) = (
+            a.as_primitive::<Float64Type>(),
+            b.as_primitive::<Float64Type>(),
+        );
+        for row in 0..a.len() {
+            assert_eq!(
+                a.is_null(row),
+                b.is_null(row),
+                "{context}: `{}` row {row} nulls differ",
+                field.name()
+            );
+            if a.is_null(row) {
+                continue;
+            }
+            let (x, y): (f64, f64) = (a.value(row), b.value(row));
+            let close = (x - y).abs() <= 1e-9 * x.abs().max(y.abs()) + 1e-12;
+            assert!(close, "{context}: `{}` row {row}: {x} vs {y}", field.name());
+        }
+    }
+}
+
 fn check(session: &Session, input: &Table, ticking: &[Table], seed: u64, cycle: usize) {
     let snapshot = session
         .static_table(input.schema().clone(), input.snapshot().unwrap())
         .unwrap();
     for ((name, build), table) in PIPELINES.iter().zip(ticking) {
-        assert_eq!(
-            contents(table),
-            contents(&build(&snapshot)),
-            "pipeline `{name}` diverged: seed {seed}, cycle {cycle}"
-        );
+        let context = format!("pipeline `{name}`, seed {seed}, cycle {cycle}");
+        assert_same(&contents(table), &contents(&build(&snapshot)), &context);
     }
 }
 
@@ -212,12 +246,7 @@ fn parallel_aggregation_matches_cycle_by_cycle_aggregation() {
         everything.agg_by(&[], AGGREGATIONS).unwrap(),
     ];
     for (ticking, fixed) in grouped.iter().zip(&all_at_once) {
-        assert_eq!(
-            contents(ticking),
-            contents(fixed),
-            "{}",
-            fixed.description()
-        );
+        assert_same(&contents(ticking), &contents(fixed), &fixed.description());
     }
 }
 

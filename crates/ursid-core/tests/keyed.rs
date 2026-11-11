@@ -222,3 +222,44 @@ fn bad_aggregations_are_explained() {
         assert!(error.to_string().contains(message), "{error}");
     }
 }
+
+#[test]
+fn distinct_keys_stay_distinct_groups() {
+    // Keys of every length, differing in one byte: first, middle, or last, and long keys that
+    // share their first and last eight bytes.
+    let distinct = [
+        None,
+        Some(""),
+        Some("a"),
+        Some("b"),
+        Some("ab"),
+        Some("ba"),
+        Some("aaa"),
+        Some("aba"),
+        Some("abb"),
+        Some("bba"),
+        Some("abcd"),
+        Some("abce"),
+        Some("abcdefg"),
+        Some("abcxefg"),
+        Some("abcdefgh"),
+        Some("abcdefgh1"),
+        Some("0123456789abcdef"),
+        Some("0123456789abcdeF"),
+        Some("01234567x9abcdef"),
+        Some("aaaaaaaa-x-bbbbbbbb"),
+        Some("aaaaaaaa-y-bbbbbbbb"),
+        Some("aaaaaaaa-xx-bbbbbbbb"),
+    ];
+    let twice: Vec<Option<&str>> = distinct.iter().chain(&distinct).copied().collect();
+    let column: ArrayRef = Arc::new(StringArray::from(twice));
+    let batch = RecordBatch::try_from_iter([("sym", column)]).unwrap();
+    let session = Session::new();
+    let table = session.static_table(batch.schema(), vec![batch]).unwrap();
+    let counts = table.agg_by(&["sym"], &[("n", "count(*)")]).unwrap();
+    let expected: Vec<String> = distinct
+        .iter()
+        .map(|sym| format!("sym={}, n=2", sym.unwrap_or("null")))
+        .collect();
+    assert_eq!(sorted(rows(&counts)), sorted(expected));
+}
