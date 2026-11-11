@@ -183,6 +183,12 @@ def main() -> None:
     parser.add_argument("--threads", type=int, help="cores per engine (default: all)")
     parser.add_argument("--rows", type=int, default=data.ROWS)
     parser.add_argument(
+        "--operation",
+        action="append",
+        choices=OPERATIONS,
+        help="run only these (repeatable)",
+    )
+    parser.add_argument(
         "--worker", nargs=2, metavar=("ENGINE", "OPERATION"), help=argparse.SUPPRESS
     )
     args = parser.parse_args()
@@ -190,11 +196,12 @@ def main() -> None:
         print(json.dumps(worker(*args.worker, args.rows)))
         return
 
+    operations_to_run = args.operation or OPERATIONS
     env = dict(os.environ)
     if args.threads:
         env["POLARS_MAX_THREADS"] = env["URSID_THREADS"] = str(args.threads)
     results = {}
-    for op in OPERATIONS:
+    for op in operations_to_run:
         for engine in ENGINES:
             command = [
                 sys.executable,
@@ -227,7 +234,7 @@ def main() -> None:
         "| operation | engine | ms | inputs MB | peak MB | retained MB | rows | checksum |"
     )
     print("|---|---|---|---|---|---|---|---|")
-    for op in OPERATIONS:
+    for op in operations_to_run:
         for engine in ENGINES:
             r = results[op, engine]
             print(

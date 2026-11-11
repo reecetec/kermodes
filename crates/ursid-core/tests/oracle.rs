@@ -250,9 +250,9 @@ fn parallel_aggregation_matches_cycle_by_cycle_aggregation() {
     }
 }
 
-/// The same for row-at-a-time operators: a 300k-row static input runs `where`, `update`, and
-/// joins against a static right side in parallel pieces; 2k-row cycles run on one thread. An
-/// append-only `where` must also keep its input's row order.
+/// The same for row-at-a-time operators: a 300k-row static input runs `where`, `update`,
+/// `last_by`, and joins against a static right side in parallel pieces; 2k-row cycles run on one
+/// thread. An append-only `where` must also keep its input's row order.
 #[test]
 fn parallel_row_operators_match_cycle_by_cycle_results() {
     let mut rng = Rng(11);
@@ -285,6 +285,8 @@ fn parallel_row_operators_match_cycle_by_cycle_results() {
                     Some(&["q_price=price", "q_id=id"]),
                 )
                 .unwrap(),
+            table.last_by(&["sym"]).unwrap(),
+            table.last_by(&["sym", "flag"]).unwrap(),
         ]
     };
     let input = session.input_table(&schema()).unwrap();

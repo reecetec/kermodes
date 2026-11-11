@@ -8,17 +8,18 @@ use arrow::compute::{filter_record_batch, take_record_batch};
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use arrow::row::Rows as EncodedRows;
 
 use crate::Expression;
 use crate::agg::AggBy;
-use crate::groups::Membership;
+use crate::groups::{KeyKind, LocalGroups, Membership};
 use crate::parallel::{PIECE_ROWS, row_pieces, run, threads_for};
 use crate::storage::{Delta, Modified, RowKey, Rows, Storage};
 
 pub(crate) enum Operator {
     Where(Where),
     Update(Update),
-    LastBy(LastBy),
+    LastBy(Box<LastBy>),
     AggBy(AggBy),
 }
 
@@ -192,25 +193,97 @@ impl Update {
 /// The last row of each group, by input key (arrival order).
 pub(crate) struct LastBy {
     groups: Membership,
+    /// Reads the group key from input batches, for grouping added rows piece by piece.
+    keys: KeyKind,
+    /// Whether groups keep every row key (the input can lose rows), not just the newest.
+    keep_all: bool,
     /// Per group id: the input key whose values the output row currently shows.
     published: Vec<Option<RowKey>>,
 }
 
+/// One piece of added rows grouped on its own, kept per local group only (per-row group ids are
+/// dropped once used): its hash, a row holding its key, its newest row key, and every row key
+/// when groups keep them all.
+struct LocalLast {
+    batch: RecordBatch,
+    encoded: Option<EncodedRows>,
+    hash: Vec<u64>,
+    first_row: Vec<u32>,
+    newest: Vec<RowKey>,
+    all: Option<Vec<Vec<RowKey>>>,
+}
+
 impl LastBy {
-    pub fn new(groups: Membership) -> Self {
+    pub fn new(groups: Membership, keys: KeyKind, keep_all: bool) -> Self {
         Self {
             groups,
+            keys,
+            keep_all,
             published: Vec::new(),
+        }
+    }
+
+    fn sync(&mut self) {
+        self.published.resize(self.groups.capacity(), None);
+        for id in self.groups.take_created() {
+            self.published[id as usize] = None;
         }
     }
 
     fn assign(&mut self, batch: &RecordBatch) -> Result<Vec<u32>, ArrowError> {
         let ids = self.groups.assign(batch, None)?;
-        self.published.resize(self.groups.capacity(), None);
-        for id in self.groups.take_created() {
-            self.published[id as usize] = None;
-        }
+        self.sync();
         Ok(ids)
+    }
+
+    /// Groups added rows in two phases: pieces group their rows in parallel, each keeping its
+    /// groups' newest row keys; then the membership takes one entry per local group instead of
+    /// one per row.
+    fn add(&mut self, added: &[Rows]) -> Result<(), ArrowError> {
+        let pieces = row_pieces(added, PIECE_ROWS);
+        let threads = threads_for(pieces.iter().map(|(keys, _)| keys.len()).sum());
+        let (kind, keep_all) = (&self.keys, self.keep_all);
+        let locals = run(threads, pieces, |table, (keys, batch)| {
+            let encoded = kind.encode(&batch)?;
+            let view = kind.keys(&batch, encoded.as_ref());
+            let groups = LocalGroups::build(&view, batch.num_rows(), table);
+            let mut newest = vec![0; groups.len()];
+            let mut all = keep_all.then(|| vec![Vec::new(); groups.len()]);
+            for (id, key) in groups.ids.iter().zip(keys) {
+                let group = *id as usize;
+                newest[group] = newest[group].max(*key);
+                if let Some(all) = &mut all {
+                    all[group].push(*key);
+                }
+            }
+            Ok::<_, ArrowError>(LocalLast {
+                batch,
+                encoded,
+                hash: groups.hash,
+                first_row: groups.first_row,
+                newest,
+                all,
+            })
+        });
+        for local in locals {
+            let local = local?;
+            let view = self.keys.keys(&local.batch, local.encoded.as_ref());
+            for group in 0..local.hash.len() {
+                let row = local.first_row[group] as usize;
+                let id = self.groups.group(
+                    local.hash[group],
+                    |key| view.matches(row, key),
+                    || view.owned(row),
+                );
+                let members = &mut self.groups.members[id as usize];
+                match &local.all {
+                    Some(all) => all[group].iter().for_each(|key| members.insert(*key)),
+                    None => members.insert(local.newest[group]),
+                }
+            }
+        }
+        self.sync();
+        Ok(())
     }
 
     fn process(
@@ -237,12 +310,7 @@ impl LastBy {
                 modified_rows.insert(*key);
             }
         }
-        for rows in &delta.added {
-            let ids = self.assign(&rows.batch)?;
-            for (id, key) in ids.iter().zip(&rows.keys) {
-                self.groups.members[*id as usize].insert(*key);
-            }
-        }
+        self.add(&delta.added)?;
 
         let (mut added, mut changed, mut removed) = (Vec::new(), Vec::new(), Vec::new());
         for id in self.groups.take_touched() {

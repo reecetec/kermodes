@@ -650,11 +650,13 @@ impl Table {
     /// The last row (in arrival order) for each value of `columns`.
     pub fn last_by(&self, columns: &[&str]) -> Result<Table, Error> {
         let groups = self.membership(columns)?;
+        let keys =
+            KeyKind::new(&self.schema, resolve(&self.schema, columns)?).map_err(schema_error)?;
         self.derive(
             format!("last_by({})", columns.join(", ")),
             self.schema.clone(),
             false,
-            Operator::LastBy(LastBy::new(groups)),
+            Operator::LastBy(Box::new(LastBy::new(groups, keys, !self.add_only()))),
         )
     }
 
