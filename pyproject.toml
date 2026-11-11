@@ -31,3 +31,7 @@ cache-keys = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ty.src]
+# Comparison scripts run against other engines in their own environments.
+exclude = ["bench"]

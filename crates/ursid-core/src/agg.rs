@@ -408,6 +408,112 @@ impl Accumulator {
         Ok(())
     }
 
+    /// Takes the selected `rows` of `batch` (`ids[i]` is the group of `rows[i]`) out of their
+    /// groups. Counts and sums subtract; `std` reverses Welford's update. `min`/`max`/`first`/
+    /// `last` cannot be undone, so a group losing its winning row is marked in `stale` for
+    /// recomputation; losing any other row changes nothing.
+    fn unfold(
+        &mut self,
+        batch: &RecordBatch,
+        keys: &[RowKey],
+        ids: &[u32],
+        rows: &[u32],
+        stale: &mut [bool],
+    ) -> Result<(), ArrowError> {
+        match self {
+            Accumulator::Count { column: None, n } => {
+                for &group in ids {
+                    n[group as usize] -= 1;
+                }
+            }
+            Accumulator::Count {
+                column: Some(column),
+                n,
+            } => {
+                let array = batch.column(*column);
+                for (&group, &row) in ids.iter().zip(rows) {
+                    if array.is_valid(row as usize) {
+                        n[group as usize] -= 1;
+                    }
+                }
+            }
+            Accumulator::SumInt { column, sum, n } => {
+                let mut overflow = false;
+                each_i64(
+                    batch.column(*column).as_ref(),
+                    ids,
+                    Some(rows),
+                    |group, value| {
+                        match sum[group].checked_sub(value) {
+                            Some(total) => sum[group] = total,
+                            None => overflow = true,
+                        }
+                        n[group] -= 1;
+                    },
+                );
+                if overflow {
+                    return Err(overflow_error());
+                }
+            }
+            Accumulator::SumFloat { column, state, .. } => {
+                each_f64(
+                    batch.column(*column).as_ref(),
+                    ids,
+                    Some(rows),
+                    |group, value| {
+                        let s = &mut state[group];
+                        s.n -= 1;
+                        // An emptied group restarts exactly, shedding accumulated rounding.
+                        s.sum = if s.n == 0 { 0.0 } else { s.sum - value };
+                    },
+                );
+            }
+            Accumulator::Std { column, state } => {
+                each_f64(
+                    batch.column(*column).as_ref(),
+                    ids,
+                    Some(rows),
+                    |group, x| {
+                        let s = &mut state[group];
+                        s.n -= 1;
+                        if s.n == 0 {
+                            *s = Moments::default();
+                            return;
+                        }
+                        let mean = s.mean - (x - s.mean) / s.n as f64;
+                        // Rounding can push a sum of squares just below zero; one value has none.
+                        s.m2 = if s.n == 1 {
+                            0.0
+                        } else {
+                            (s.m2 - (x - mean) * (x - s.mean)).max(0.0)
+                        };
+                        s.mean = mean;
+                    },
+                );
+            }
+            Accumulator::Extreme { best, .. } => {
+                for (&group, &row) in ids.iter().zip(rows) {
+                    let group = group as usize;
+                    if best[group]
+                        .as_ref()
+                        .is_some_and(|(_, key)| *key == keys[row as usize])
+                    {
+                        stale[group] = true;
+                    }
+                }
+            }
+            Accumulator::Edge { key, .. } => {
+                for (&group, &row) in ids.iter().zip(rows) {
+                    let group = group as usize;
+                    if key[group] == Some(keys[row as usize]) {
+                        stale[group] = true;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Merges group `from` of `other` (the same aggregation) into group `into` of this one.
     fn merge(&mut self, into: usize, other: &Accumulator, from: usize) -> Result<(), ArrowError> {
         match (self, other) {
@@ -1021,7 +1127,15 @@ impl Shard {
             let ids = self.assign(selected.batch, &selected.rows)?;
             for (&id, &row) in ids.iter().zip(&selected.rows) {
                 self.groups.members[id as usize].remove(selected.keys[row as usize])?;
-                self.stale[id as usize] = true;
+            }
+            for accumulator in &mut self.accumulators {
+                accumulator.unfold(
+                    selected.batch,
+                    selected.keys,
+                    &ids,
+                    &selected.rows,
+                    &mut self.stale,
+                )?;
             }
         }
         for modified in &part.modified {
@@ -1031,8 +1145,21 @@ impl Shard {
                 let key = modified.keys[row as usize];
                 self.groups.members[old as usize].remove(key)?;
                 self.groups.members[new as usize].insert(key);
-                self.stale[old as usize] = true;
-                self.stale[new as usize] = true;
+            }
+            for accumulator in &mut self.accumulators {
+                accumulator.unfold(
+                    modified.previous,
+                    modified.keys,
+                    &before,
+                    &modified.rows,
+                    &mut self.stale,
+                )?;
+                accumulator.fold(
+                    modified.current,
+                    modified.keys,
+                    &after,
+                    Some(&modified.rows),
+                )?;
             }
         }
         for selected in &part.added {
