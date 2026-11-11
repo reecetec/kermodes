@@ -35,6 +35,8 @@ Goals
 - Multi-user from the start: OIDC login, namespace RBAC, per-user isolated worker pods.
 - Schema changes as first-class, planned operations across live data, history, and dependents.
 - Kubernetes-native: Helm install; the controller runs every worker as its own pod.
+- Clean local start: `pip install ursid` or one static binary. No JVM, Docker, or Kubernetes
+  required.
 
 Non-goals (for now)
 
@@ -42,7 +44,8 @@ Non-goals (for now)
   sharding deployments.
 - General incremental SQL (DBSP/differential dataflow). The engine supports a fixed operator set.
 - A custom historical file format. History is Parquet.
-- Browser UI before notebooks and agents work end to end.
+- Web UI beyond catalog, table viewer, console, jobs, and models until notebooks and agents work
+  end to end.
 
 ## 3. Prior art mapping
 
@@ -273,7 +276,7 @@ writes to `D`. Writers have already rolled to `D+1` because `date` comes from in
 
 - Initial: single writer per internal partition on a Longhorn PVC (replicated block storage).
   weir is a StatefulSet.
-- Later: copy sealed segments to S3 (rustfs) so node loss costs at most the open segment.
+- Later: copy sealed segments to S3 (rustfs) so node loss costs at most the open segment (§16).
 - Retention: intraday partitions are deleted N days after their merge validates.
 
 ## 8. Historical store
@@ -502,7 +505,9 @@ Isolation and quotas
 Later: row filters, column masking, multiple tenants (tenant-scoped namespaces and Kubernetes
 namespaces).
 
-## 14. Python SDK and notebooks
+## 14. Clients
+
+### 14.1 Python SDK and notebooks
 
 - `us.connect()` — remote cluster; `us.local()` — in-process engine from the same Rust crate.
 - Tables convert to pyarrow, pandas, and polars without copying where possible.
@@ -510,12 +515,32 @@ namespaces).
 - Decorators: `@us.job`, `@us.feature_view`; registry: `us.models.register(...)`; ingest:
   `us.ingest.writer(...)`.
 
-## 15. Kubernetes runtime and deployment
+### 14.2 Web UI
+
+- React + TypeScript, Vite, Bun (package manager, scripts, tests), shadcn/ui on Tailwind CSS,
+  lucide icons, React Router — juicebear's web baseline plus shadcn.
+- `@ursid/client`: TypeScript package speaking the delta protocol over WebSocket and decoding Arrow
+  IPC with `apache-arrow`. Used by the UI and any other TypeScript consumer.
+- Ticking tables: viewport subscription rendered with TanStack Virtual; updates applied once per
+  animation frame; only visible rows are in the DOM. A canvas grid is an optimization to adopt only
+  if profiling demands it. Static lists (catalog, jobs, models) use TanStack Table with shadcn
+  table components.
+- Auth: OIDC authorization code + PKCE (`oidc-client-ts`). Local mode skips login.
+- The production build is embedded in the `ursid` binary and served by the gateway, so local mode
+  and the cluster serve the same UI with no separate web server.
+- v1 surfaces: catalog (schemas, versions, lineage), live and historical table viewer, console
+  (expression editor on CodeMirror 6), job runs and logs (live from `sys.*`), models and aliases,
+  agent chat backed by ranger.
+
+## 15. Runtime and deployment
+
+Every server role (control plane, gateway, weir, worker) is a subcommand of one Rust binary,
+`ursid`. Two runtimes host it: Kubernetes (§15.1–15.5) and local (§15.6).
 
 ### 15.1 Packaging
 
 - Helm chart `ursid` in this repo (`deploy/helm/ursid`), published to the Gitea OCI registry,
-  one image per component.
+  as one `ursid` image (all server roles) plus `ursid-python` for Python sidecars and jobs.
 - The Argo CD repo consumes it like other upstream charts (values in
   `components/ursid/helm/values.yaml`); Kargo promotes chart versions.
 - The chart installs: CRDs, `ursid-control`, `ursid-gateway`, weir, ServiceAccounts and RBAC,
@@ -526,7 +551,7 @@ namespaces).
 
 ### 15.2 Controller
 
-- `ursid-control` is one binary: API, scheduler, reconciler, ranger. It runs with several
+- `ursid control` runs API, scheduler, reconciler, and ranger. It runs with several
   replicas; scheduler and reconciler loops use leader election via a Kubernetes `Lease`, and every
   replica serves the API.
 - Two layers of state:
@@ -581,7 +606,57 @@ namespaces).
 Telemetry: OpenTelemetry traces to Tempo, logs to Loki, metrics to Prometheus; platform state stays
 in `sys.*` tables.
 
-## 16. Technology choices
+### 15.6 Local mode
+
+No JVM, Docker, or Kubernetes.
+
+| Entry point | What runs | Use |
+|---|---|---|
+| `us.local()` | Engine inside the Python process (PyO3) | Notebooks, tests, experiments |
+| `ursid dev` | One supervisor process: control plane, gateway + UI, weir, workers as child processes | Full platform on a laptop |
+| Kubernetes | Same binary, one role per pod | Cluster |
+
+- Install: `pip install ursid` ships the SDK, the in-process engine, and the `ursid` binary in one
+  wheel (the ruff/uv pattern). A standalone binary is also published.
+- `ursid dev` keeps state in `./.ursid/` (or `--data-dir`): weir segments on local disk; the lake
+  is DuckLake with a SQLite catalog file (multi-process safe, unlike a DuckDB catalog file) and
+  local Parquet; control-plane state in SQLite; a single implicit user, OIDC optional.
+- Workers are `ursid worker` child processes; Python sidecars are child processes in a uv-managed
+  environment. They speak the same protocols as pods, so behaviour matches the cluster.
+- The controller has a runtime trait (`Local`: child processes; `Kubernetes`: `UrsidWorker`) and a
+  storage trait (SQLite, Postgres) with one conformance suite run against both.
+- `us.connect()` with no arguments targets a running `ursid dev`, otherwise `URSID_URL`.
+- Startup targets: `us.local()` under 100 ms; `ursid dev` ready under 1 s.
+
+## 16. Scaling and high availability
+
+Not built initially: one weir, restart-based recovery. These invariants are built from M1 so that
+sharding and HA are additive later instead of a redesign.
+
+| Invariant | Enables |
+|---|---|
+| Clients resolve endpoints per internal partition via Flight `GetFlightInfo`; no client hardcodes a weir address | Moving partitions between weir shards without client changes |
+| Placement unit is the internal partition `(table, date, source_id)`; weir never coordinates across partitions | Spreading partitions over any number of shards |
+| Each partition's owner holds an epoch (fencing token) from the control plane; segments and acks record it; stale-epoch writes are rejected | Failover without split-brain |
+| Sealed segments are immutable and self-describing (schema version, seq range, row range, epoch) | Serving them from any node or from S3 |
+| Subscriptions resume by `(partition, row position)` | Readers reconnecting to a different weir mid-stream |
+| Derived publications record the input positions they cover | Restarted workers resuming output without duplicates |
+| Control plane and gateway hold no local state | Horizontal replicas behind leader election |
+
+Ingesters declare whether their source is replayable (NATS JetStream, Kafka, files) or not (raw
+WebSocket feeds). Replayable sources recover losslessly from weir's `last_seq` after any weir
+failure; `plan` warns when a non-replayable source has no replicated ack.
+
+| Component | Initial behaviour on failure | Later |
+|---|---|---|
+| weir | Single StatefulSet on a Longhorn-replicated volume; pod reschedules and volume reattaches (minutes); writers buffer and resume from `last_seq` | Shards via a placement map in Postgres; sealed segments copied to S3; `ack: replicated` (primary + follower for open segments) |
+| Ingesters | Restart; replayable sources lose nothing; non-replayable sources lose the outage window | Replicated ack; standby ingester |
+| Engine deployments | Restart and rebuild from weir and history; recovery time = rebuild time | State checkpoints; hot standby with input-driven (deterministic) cycles |
+| Sessions | Lost with the pod | — |
+| Control plane, gateway | 2+ replicas | — |
+| Postgres, lake | CNPG replicas; rustfs | — |
+
+## 17. Technology choices
 
 | Concern | Choice |
 |---|---|
@@ -598,8 +673,11 @@ in `sys.*` tables.
 | Notebook widget | anywidget |
 | Auth | OIDC (`openidconnect`), JWT (`jsonwebtoken`) |
 | Packaging | Helm chart, OCI registry on Gitea |
+| Web UI | React, TypeScript, Vite, Bun, shadcn/ui, Tailwind CSS, React Router |
+| Browser data | `apache-arrow` (JS), TanStack Virtual, TanStack Table, CodeMirror 6 |
+| Local-mode storage | SQLite (control plane, DuckLake catalog) |
 
-## 17. Planned repository layout
+## 18. Planned repository layout
 
 ```
 crates/
@@ -611,33 +689,37 @@ crates/
   ursid-lake      DuckLake catalog, Parquet writer, merge
   ursid-control   spec API, scheduler, registry, MCP
   ursid-gateway   authenticated Flight/WebSocket proxy
+  ursid-cli       the `ursid` binary: dev, control, gateway, weir, worker subcommands
   ursid-py        PyO3 bindings
 python/ursid      SDK, widgets, decorators
+web/app           React UI (Bun workspace)
+web/client        @ursid/client TypeScript package
 deploy/helm/ursid Helm chart: CRDs, control plane, gateway, weir
 docs/
 ```
 
-## 18. Roadmap
+## 19. Roadmap
 
 | Milestone | Deliverable | Toy example |
 |---|---|---|
 | M0 | Engine crate: chunks, update graph, initial operators, expressions; PyO3 wheel; notebook widget | Random-walk ticker → rolling mean/vol, live in Jupyter |
-| M1 | weir (DoPut, segments, seq dedup, snapshot + tail); `db.live_table`; WebSocket connector; Helm chart (weir + engine) | Synthetic ticker over WebSocket → weir → engine |
+| M1 | weir (DoPut, segments, seq dedup, epochs, snapshot + tail); `db.live_table`; WebSocket connector; `ursid dev`; Helm chart (weir + engine) | Synthetic ticker over WebSocket → weir → engine, on a laptop and in the cluster |
 | M2 | Merge job, DuckLake commit, `db.historical_table`, `db.table`, DuckDB pushdown, replay clock; column IDs and compatible schema changes | Ticker merged nightly, replayed as a backtest; add a column mid-day |
-| M3 | Control plane: specs, validate/plan/apply, scheduler, `sys.*` tables, ranger MCP; OIDC, RBAC, `UrsidWorker` controller, gateway; schema plans with dependents and rewrites | Two users, each with their own sessions; agent creates a DAG; retries visible live |
+| M3 | Control plane: specs, validate/plan/apply, scheduler, `sys.*` tables, ranger MCP; OIDC, RBAC, `UrsidWorker` controller, gateway; schema plans with dependents and rewrites; web UI v1 | Two users, each with their own sessions; agent creates a DAG; retries visible live in the UI |
 | M4 | den: register sklearn LinearRegression → ONNX → `predict`; torch MLP; aliases, shadow mode | Live prediction; swap champion without restart |
 | M5 | forage: feature views, training sets, online `last_by`, served-feature logging | Toy sportsbook: simulated games + odds → form features → live win probability vs implied odds |
 | M6 | Port juicebear sportsflow features and models | Real data |
 
-## 19. Open questions
+## 20. Open questions
 
 1. Latency target per event (assumed 100 ms–1 s cycles).
 2. Peak rows/sec and live state size for juicebear — validates single-process deployments.
 3. Derived-state checkpointing: replay from start of day vs periodic engine snapshots.
 4. User Python packaging: uv install at start vs built images as the default.
-5. weir sharding: how tables are assigned to weir replicas once one StatefulSet is not enough.
+5. weir placement policy once sharded: hashing vs explicit assignment (deferred; §16 keeps it
+   additive).
 
-## 20. Risks
+## 21. Risks
 
 - **Engine scope.** A general Deephaven-class engine is years of work; hold the operator set fixed
   until M5.
@@ -645,8 +727,10 @@ docs/
   lateness rules from M0.
 - **Python in the hot path.** Batch-per-cycle is mandatory for Python inference and UDFs.
 - **Two SQL dialects.** Mitigated by the expression language and conformance corpus (§9.3).
-- **Single weir writer.** Node loss stalls ingest for that partition until the PVC reattaches;
-  acceptable initially, revisit with S3 segment replication.
+- **Single weir.** Node loss stalls ingest until the volume reattaches; non-replayable sources lose
+  that window. Accepted initially; §16 invariants keep sharding and replication additive.
+- **Two control-plane stores.** SQLite (local) and Postgres (cluster) can diverge; one conformance
+  suite runs against both, and the storage trait stays narrow.
 - **Rewrite cost.** Incompatible schema changes on long histories are expensive; `plan` must show
   partitions and bytes to rewrite, and the backfill must be resumable per date.
 - **Two state layers.** Postgres intent and Kubernetes runtime objects can drift; the reconciler
