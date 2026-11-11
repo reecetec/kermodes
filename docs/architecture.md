@@ -745,7 +745,7 @@ flowchart LR
 1. **Resolve**: fetch the commit, run discovery in the environment, store the manifest.
 2. **Build**: environment image (cached by hash, §10.6) and code snapshot (content-addressed by
    SHA and path). Manifest + image digest + snapshot = the **artifact**, built once per commit.
-3. **Test**: pytest and replay tests as an Kermodes job using the artifact's image and worker class,
+3. **Test**: pytest and replay tests as a Kermodes job using the artifact's image and worker class,
    against production history read-only. A failed test stops the pipeline for that commit.
 4. **Plan**: per target; schema change classes and cross-project impact.
 5. **Deploy**: per target policy (§11.4), always deploying the artifact, never rebuilding.
@@ -866,7 +866,7 @@ Identity
 Workload identity
 
 - Every worker and job pod runs under its own Kubernetes ServiceAccount. The pod's projected
-  ServiceAccount token (audience `kermodes`) is exchanged at the control plane for an Kermodes token
+  ServiceAccount token (audience `kermodes`) is exchanged at the control plane for a Kermodes token
   scoped to the resource's project and grants. No long-lived credentials in pods.
 
 Authorization
@@ -1175,7 +1175,7 @@ Verified against maturin 1.16, PyO3 0.30, and uv.
 | M4 | Multi-user: OIDC, RBAC, `KermodesWorker` controller, gateway, worker classes, sandboxes; ranger MCP; web UI v1 | Two users with their own sessions; an agent opens a PR that previews in shadow |
 | M5 | den: register sklearn LinearRegression → ONNX → `predict`; torch MLP; aliases, shadow mode | Live prediction; swap champion without restart |
 | M6 | forage: feature views, training sets, online `last_by`, served-feature logging | Toy sportsbook: simulated games + odds → form features → live win probability vs implied odds |
-| M7 | Port juicebear sportsflow as an Kermodes project | Real data |
+| M7 | Port juicebear sportsflow as a Kermodes project | Real data |
 
 ## 21. Open questions
 
