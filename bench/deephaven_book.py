@@ -5,10 +5,11 @@
 
 Needs Java 17+ on the path. A keyed input table holds 1M orders over 100 symbols; each cycle
 writes 100k changes (80% modify a live order's price and size, 10% delete one, 10% insert a new
-one) through `InputTable.add` and `InputTable.delete`, timed together. The same writes run three
-times: into the input table alone, then with an `agg_by(sym)` of count, sum, mean, and std (twice,
-the second JIT-warm); the difference between the runs is the aggregation's cost, so these calls
-wait for downstream tables. Cycle times exclude the first 10 cycles of each run.
+one) through `InputTable.add` and `InputTable.delete`, timed together until the update graph
+finishes the cycle (its exclusive lock; `add` itself returns once the input table has the rows).
+The same writes run three times: into the input table alone, then with an `agg_by(sym)` of count,
+sum, mean, and std (twice, the second JIT-warm). Cycle times exclude the first 10 cycles of each
+run.
 """
 
 import time
@@ -22,6 +23,7 @@ import numpy as np
 from deephaven import agg, input_table, new_table
 from deephaven import dtypes as dht
 from deephaven.column import double_col, long_col, string_col
+from deephaven.update_graph import exclusive_lock
 
 ORDERS, SYMBOLS, WRITES, CYCLES, WARM = 1_000_000, 100, 100_000, 40, 10
 rng = np.random.default_rng(7)
@@ -76,12 +78,16 @@ def run(name, aggregate):
     stats = book.agg_by(AGGREGATIONS, by="sym") if aggregate else None
     start = time.perf_counter()
     book.add(load)
+    with exclusive_lock(book):
+        pass
     load_ms = (time.perf_counter() - start) * 1000
     cycles = []
     for upserts, deletes in plans:
         start = time.perf_counter()
         book.add(upserts)
         book.delete(deletes)
+        with exclusive_lock(book):
+            pass
         cycles.append((time.perf_counter() - start) * 1000)
     timed = np.array(cycles[WARM:])
     groups = stats.size if stats is not None else 0

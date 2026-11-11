@@ -18,7 +18,7 @@ use arrow::error::ArrowError;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
 use crate::groups::{KeyKind, Membership};
-use crate::ops::{pick_columns, push_removed};
+use crate::ops::push_removed;
 use crate::storage::{Delta, Modified, RowKey, Rows, Storage};
 
 /// What a join reads and writes.
@@ -40,7 +40,7 @@ impl JoinShape {
         matches: &[Option<RowKey>],
     ) -> Result<RecordBatch, ArrowError> {
         let mut columns = left.columns().to_vec();
-        columns.extend(pick_columns(right, &self.right_columns, matches)?);
+        columns.extend(right.columns_at(&self.right_columns, matches)?);
         let options = RecordBatchOptions::new().with_row_count(Some(left.num_rows()));
         RecordBatch::try_new_with_options(self.output.clone(), columns, &options)
     }
@@ -76,16 +76,12 @@ fn times(kind: &KeyKind, batch: &RecordBatch) -> Vec<Option<i64>> {
     (0..batch.num_rows()).map(|row| keys.int(row)).collect()
 }
 
-/// Grows per-group state to the membership's ids and clears groups created or reused since.
-fn sync<T: Default>(groups: &mut Membership, states: &mut [&mut Vec<T>]) {
-    let len = groups.capacity();
-    for state in states.iter_mut() {
-        state.resize_with(len, T::default);
-    }
-    for id in groups.take_created() {
-        for state in states.iter_mut() {
-            state[id as usize] = T::default();
-        }
+/// Grows one piece of per-group state to `len` groups and clears the groups in `created` (new or
+/// reused since the last call to `Membership::take_created`).
+fn sync<T: Default>(len: usize, created: &[u32], state: &mut Vec<T>) {
+    state.resize_with(len, T::default);
+    for id in created {
+        state[*id as usize] = T::default();
     }
 }
 
@@ -176,9 +172,10 @@ impl NaturalJoin {
             &self.shape.right_keys
         };
         let ids = group_ids(kind, &mut self.groups, batch)?;
-        sync(&mut self.groups, &mut [&mut self.right_rows]);
-        sync(&mut self.groups, &mut [&mut self.appended]);
-        sync(&mut self.groups, &mut [&mut self.changing]);
+        let (len, created) = (self.groups.capacity(), self.groups.take_created());
+        sync(len, &created, &mut self.right_rows);
+        sync(len, &created, &mut self.appended);
+        sync(len, &created, &mut self.changing);
         Ok(ids)
     }
 
@@ -321,8 +318,9 @@ pub(crate) struct AsOfJoin {
     left_at: KeyKind,
     right_at: KeyKind,
     groups: Membership,
-    /// Per group: right rows by `(time, row key)`; rows with a NULL time never match.
-    right_rows: Vec<BTreeSet<(i64, RowKey)>>,
+    /// Per group: right rows by `(time, row key)`, sorted; rows with a NULL time never match.
+    /// Rows mostly arrive in time order, so a sorted vector usually just grows at the end.
+    right_rows: Vec<Vec<(i64, RowKey)>>,
     /// Per group: left rows with a time, by `(time, row key)`, when tracked.
     left_rows: Vec<BTreeSet<(i64, RowKey)>>,
 }
@@ -359,19 +357,16 @@ impl AsOfJoin {
         };
         let ids = group_ids(kind, &mut self.groups, batch)?;
         let times = times(at, batch);
-        sync(
-            &mut self.groups,
-            &mut [&mut self.right_rows, &mut self.left_rows],
-        );
+        let (len, created) = (self.groups.capacity(), self.groups.take_created());
+        sync(len, &created, &mut self.right_rows);
+        sync(len, &created, &mut self.left_rows);
         Ok(ids.into_iter().zip(times).collect())
     }
 
     fn matched(&self, group: u32, time: Option<i64>) -> Option<RowKey> {
-        let time = time?;
-        self.right_rows[group as usize]
-            .range(..=(time, RowKey::MAX))
-            .next_back()
-            .map(|(_, key)| *key)
+        let (rows, time) = (&self.right_rows[group as usize], time?);
+        let after = rows.partition_point(|row| *row <= (time, RowKey::MAX));
+        after.checked_sub(1).map(|at| rows[at].1)
     }
 
     fn process(
@@ -394,7 +389,13 @@ impl AsOfJoin {
         for rows in &right_delta.added {
             for ((id, time), key) in self.locate(false, &rows.batch)?.into_iter().zip(&rows.keys) {
                 if let Some(time) = time {
-                    self.right_rows[id as usize].insert((time, *key));
+                    let rows = &mut self.right_rows[id as usize];
+                    let row = (time, *key);
+                    if rows.last().is_none_or(|last| *last <= row) {
+                        rows.push(row);
+                    } else {
+                        rows.insert(rows.partition_point(|other| *other < row), row);
+                    }
                     points.push((id, time));
                 }
             }
@@ -410,10 +411,10 @@ impl AsOfJoin {
             for (id, time) in points {
                 let group = id as usize;
                 let matched = self.matched(id, Some(time));
-                let next = self.right_rows[group]
-                    .range((Bound::Excluded((time, RowKey::MAX)), Bound::Unbounded))
-                    .next()
-                    .map(|(next, _)| *next);
+                let rows = &self.right_rows[group];
+                let next = rows
+                    .get(rows.partition_point(|row| row.0 <= time))
+                    .map(|row| row.0);
                 let end = next.map_or(Bound::Unbounded, |next| Bound::Excluded((next, 0)));
                 rematched.extend(
                     self.left_rows[group]

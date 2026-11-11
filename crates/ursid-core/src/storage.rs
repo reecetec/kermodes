@@ -6,7 +6,8 @@
 //! Deltas carry previous values as their own copies, taken before a cycle is applied.
 
 use ahash::RandomState;
-use arrow::compute::interleave_record_batch;
+use arrow::array::{Array, ArrayRef, new_null_array};
+use arrow::compute::{interleave, interleave_record_batch};
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
@@ -72,6 +73,19 @@ fn no_row(key: RowKey) -> ArrowError {
     ArrowError::InvalidArgumentError(format!("no row {key}"))
 }
 
+/// Where a dense table keeps `key`: its chunk and row within it.
+fn dense_location(
+    starts: &[RowKey],
+    len: RowKey,
+    key: RowKey,
+) -> Result<(usize, usize), ArrowError> {
+    if key >= len {
+        return Err(no_row(key));
+    }
+    let chunk = starts.partition_point(|start| *start <= key) - 1;
+    Ok((chunk, (key - starts[chunk]) as usize))
+}
+
 impl Storage {
     /// For tables that only ever append, keyed by position.
     pub fn dense(schema: SchemaRef) -> Self {
@@ -128,13 +142,7 @@ impl Storage {
             } => {
                 let indices = keys
                     .iter()
-                    .map(|&key| {
-                        if key >= *len {
-                            return Err(no_row(key));
-                        }
-                        let chunk = starts.partition_point(|start| *start <= key) - 1;
-                        Ok((chunk, (key - starts[chunk]) as usize))
-                    })
+                    .map(|&key| dense_location(starts, *len, key))
                     .collect::<Result<Vec<_>, _>>()?;
                 let chunks: Vec<&RecordBatch> = chunks.iter().collect();
                 interleave_record_batch(&chunks, &indices)
@@ -146,12 +154,66 @@ impl Storage {
                     .iter()
                     .map(|key| slot_of.get(key).copied().ok_or_else(|| no_row(*key)))
                     .collect::<Result<Vec<_>, _>>()?;
+                let all: Vec<usize> = (0..columns.width()).collect();
                 let options = RecordBatchOptions::new().with_row_count(Some(slots.len()));
                 RecordBatch::try_new_with_options(
                     self.schema.clone(),
-                    columns.read(&slots)?,
+                    columns.read(&all, &slots)?,
                     &options,
                 )
+            }
+        }
+    }
+
+    /// The current values of `keys` in each of `columns`, one array per column, NULL where a key
+    /// is `None`. Each key is located once, and only the requested columns are built.
+    pub fn columns_at(
+        &self,
+        columns: &[usize],
+        keys: &[Option<RowKey>],
+    ) -> Result<Vec<ArrayRef>, ArrowError> {
+        match &self.index {
+            Index::Dense {
+                chunks,
+                starts,
+                len,
+            } => {
+                // Missing keys point at a one-row NULL array placed after the chunks.
+                let indices = keys
+                    .iter()
+                    .map(|key| match key {
+                        Some(key) => dense_location(starts, *len, *key),
+                        None => Ok((chunks.len(), 0)),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                columns
+                    .iter()
+                    .map(|column| {
+                        let null = new_null_array(self.schema.field(*column).data_type(), 1);
+                        let mut arrays: Vec<&dyn Array> =
+                            chunks.iter().map(|c| c.column(*column).as_ref()).collect();
+                        arrays.push(null.as_ref());
+                        interleave(&arrays, &indices)
+                    })
+                    .collect()
+            }
+            Index::Sparse {
+                slot_of,
+                columns: values,
+                ..
+            } => {
+                let slots = keys
+                    .iter()
+                    .map(|key| match key {
+                        Some(key) => slot_of
+                            .get(key)
+                            .copied()
+                            .map(Some)
+                            .ok_or_else(|| no_row(*key)),
+                        None => Ok(None),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                values.read(columns, &slots)
             }
         }
     }

@@ -116,7 +116,8 @@ Delta { added: [(keys, rows)], removed: [(keys, last rows)], modified: [(keys, p
 - Each table records the cycle that last changed its rows (or failed it); viewers poll that to
   re-render only what changed.
 - Cycles run tables one after another. `agg_by` spreads a large delta (64k+ rows) over every core
-  in two phases (§5); other operators are single-threaded until a profile shows the need.
+  in two phases (§5), or over `URSID_THREADS` cores if that is set; other operators are
+  single-threaded until a profile shows the need.
 - Failure: if an operator errors, its table and everything downstream of it enter a failed state
   holding the error; the rest of the graph keeps running. Snapshots of a failed table raise the
   error in Python.
@@ -237,13 +238,30 @@ vol = ticks.rolling("sym", rows=100, std_price="std(price)")
   compares exactly. A failure prints the seed and the cycle that diverged.
 - **Expressions:** decision tables per kernel family (null semantics, overflow, casts), and the
   same expressions checked against pandas in Python tests.
-- **Python:** pytest over the public API on `us.local()`, stepping manually.
+- **Python:** pytest over the public API on `us.local(manual=True)`, stepping manually.
 - **Determinism:** no test depends on wall-clock time or thread scheduling.
 
 ## 10. Benchmarks
 
-A benchmark binary in the workspace (`ursid-bench`) and Python comparison scripts under `bench/`.
-Numbers go in commit messages with the machine; nothing is checked in as a baseline file.
+A benchmark binary in the workspace (`ursid-bench`: profiling-friendly ticker and order-book
+workloads) and comparison scripts under `bench/`, all reading the same seeded data
+(`bench/data.py`):
+
+- `compare.py`: every static operator in Ursid, DuckDB, and Polars, all cores or `--threads N`.
+  Each (engine, operator) runs in its own process, measuring time (best of three) and memory:
+  RSS the engine adds when loading its inputs, the peak RSS during the operator (sampled every
+  2 ms), and the RSS retained with its result alive. Row counts and checksums must agree across
+  engines.
+- `deephaven_compare.py`: the same operators in Deephaven Community, memory as JVM heap in use
+  after a full collection.
+- `ticking.py` / `deephaven_ticking.py`: each operator ticking alone over 100 cycles of 100k
+  appended rows; cycle time p50/p99 and memory growth. Deephaven cycles are timed until its update
+  graph finishes them (its exclusive lock), not until `add` returns.
+- `deephaven_book.py`: the `ursid-bench book` workload in Deephaven.
+
+Python comparisons need a release build of Ursid (`maturin develop --release`); `uv sync` builds
+a faster-to-compile profile. Numbers go in commit messages with the machine; nothing is checked in
+as a baseline file.
 
 Targets (release build, on the development laptop):
 

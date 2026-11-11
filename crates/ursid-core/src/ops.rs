@@ -3,8 +3,8 @@
 
 use std::collections::HashSet;
 
-use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, UInt32Array, new_null_array};
-use arrow::compute::{filter_record_batch, interleave, take_record_batch};
+use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, UInt32Array};
+use arrow::compute::{filter_record_batch, take_record_batch};
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
@@ -269,37 +269,7 @@ pub(crate) fn pick_column(
     column: usize,
     keys: &[Option<RowKey>],
 ) -> Result<ArrayRef, ArrowError> {
-    Ok(pick_columns(input, &[column], keys)?.remove(0))
-}
-
-/// Input columns at `keys`, one array per column, NULL where there is no key. The rows are read
-/// once for all columns.
-pub(crate) fn pick_columns(
-    input: &Storage,
-    columns: &[usize],
-    keys: &[Option<RowKey>],
-) -> Result<Vec<ArrayRef>, ArrowError> {
-    let present: Vec<RowKey> = keys.iter().flatten().copied().collect();
-    let rows = input.gather(&present)?;
-    let mut next = 0;
-    let indices: Vec<(usize, usize)> = keys
-        .iter()
-        .map(|key| match key {
-            Some(_) => {
-                next += 1;
-                (0, next - 1)
-            }
-            None => (1, 0),
-        })
-        .collect();
-    columns
-        .iter()
-        .map(|column| {
-            let values = rows.column(*column);
-            let null = new_null_array(values.data_type(), 1);
-            interleave(&[values.as_ref(), null.as_ref()], &indices)
-        })
-        .collect()
+    Ok(input.columns_at(&[column], keys)?.remove(0))
 }
 
 pub(crate) fn take_rows(batch: &RecordBatch, rows: &[usize]) -> Result<RecordBatch, ArrowError> {

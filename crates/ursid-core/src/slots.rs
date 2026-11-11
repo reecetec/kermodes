@@ -126,12 +126,18 @@ impl Strings {
         self.dead = 0;
     }
 
-    fn read(&self, slots: &[u32], nulls: Option<NullBuffer>) -> Result<StringArray, ArrowError> {
+    fn read<S: SlotRef>(
+        &self,
+        slots: &[S],
+        nulls: Option<NullBuffer>,
+    ) -> Result<StringArray, ArrowError> {
         let mut offsets = Vec::with_capacity(slots.len() + 1);
         let mut data = Vec::new();
         offsets.push(0i32);
         for slot in slots {
-            data.extend_from_slice(self.get(*slot as usize));
+            if let Some(slot) = slot.slot() {
+                data.extend_from_slice(self.get(slot));
+            }
             let end = i32::try_from(data.len())
                 .map_err(|_| ArrowError::ComputeError("strings over 2 GiB in one batch".into()))?;
             offsets.push(end);
@@ -180,11 +186,31 @@ fn scatter<T: Copy>(values: &mut [T], from: &[T], slots: &[u32]) {
     }
 }
 
-fn gather<T: ArrowNativeType>(values: &[T], slots: &[u32]) -> ScalarBuffer<T> {
+/// A slot to read from: every row has one (`u32`), or a row may have none and reads as NULL
+/// (`Option<u32>`).
+pub(crate) trait SlotRef: Copy {
+    fn slot(self) -> Option<usize>;
+}
+
+impl SlotRef for u32 {
+    #[inline]
+    fn slot(self) -> Option<usize> {
+        Some(self as usize)
+    }
+}
+
+impl SlotRef for Option<u32> {
+    #[inline]
+    fn slot(self) -> Option<usize> {
+        self.map(|slot| slot as usize)
+    }
+}
+
+fn gather<T: ArrowNativeType, S: SlotRef>(values: &[T], slots: &[S]) -> ScalarBuffer<T> {
     ScalarBuffer::from(
         slots
             .iter()
-            .map(|slot| values[*slot as usize])
+            .map(|slot| slot.slot().map_or_else(T::default, |slot| values[slot]))
             .collect::<Vec<_>>(),
     )
 }
@@ -247,12 +273,18 @@ impl Column {
         }
     }
 
-    fn read(&self, slots: &[u32]) -> Result<ArrayRef, ArrowError> {
-        let valid = BooleanBuffer::from_iter(slots.iter().map(|s| self.valid.get(*s as usize)));
+    fn read<S: SlotRef>(&self, slots: &[S]) -> Result<ArrayRef, ArrowError> {
+        let valid = BooleanBuffer::from_iter(
+            slots
+                .iter()
+                .map(|s| s.slot().is_some_and(|s| self.valid.get(s))),
+        );
         let nulls = Some(NullBuffer::new(valid)).filter(|n| n.null_count() > 0);
         Ok(match (&self.values, &self.data_type) {
             (Values::Bool(bits), _) => Arc::new(BooleanArray::new(
-                BooleanBuffer::from_iter(slots.iter().map(|s| bits.get(*s as usize))),
+                BooleanBuffer::from_iter(
+                    slots.iter().map(|s| s.slot().is_some_and(|s| bits.get(s))),
+                ),
                 nulls,
             )),
             (Values::I32(values), DataType::Date32) => Arc::new(PrimitiveArray::<Date32Type>::new(
@@ -314,9 +346,20 @@ impl Slots {
         }
     }
 
-    /// The values in `slots`, one array per column.
-    pub fn read(&self, slots: &[u32]) -> Result<Vec<ArrayRef>, ArrowError> {
-        self.columns.iter().map(|c| c.read(slots)).collect()
+    /// The values in `slots` of each of `columns`, one array per column.
+    pub fn read<S: SlotRef>(
+        &self,
+        columns: &[usize],
+        slots: &[S],
+    ) -> Result<Vec<ArrayRef>, ArrowError> {
+        columns
+            .iter()
+            .map(|c| self.columns[*c].read(slots))
+            .collect()
+    }
+
+    pub fn width(&self) -> usize {
+        self.columns.len()
     }
 
     /// Empties a slot whose row was removed.

@@ -719,9 +719,7 @@ impl AggBy {
             })
             .collect();
 
-        let count = thread::available_parallelism()
-            .map_or(1, NonZero::get)
-            .min(64);
+        let count = threads().min(64);
         let mut shards = Vec::with_capacity(count);
         for index in 0..count {
             let groups = Membership::new(
@@ -817,6 +815,16 @@ impl AggBy {
         }
         Ok(out)
     }
+}
+
+/// Cores to use: the `URSID_THREADS` environment variable if it holds a positive number (as
+/// DuckDB's `threads` setting or `POLARS_MAX_THREADS`), else every core.
+fn threads() -> usize {
+    std::env::var("URSID_THREADS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|count| *count > 0)
+        .unwrap_or_else(|| thread::available_parallelism().map_or(1, NonZero::get))
 }
 
 /// Fixed pieces `(offset, len)` covering `rows` rows.
