@@ -310,14 +310,19 @@ coerced to the table schema by weir, same `seq` semantics.
 ### 6.2 Ingesters
 
 An ingester is a managed deployment that reads a source and speaks the ingest protocol. It is
-declared in a project like any other resource.
+declared in a project like any other resource, and its writer's source is named after it.
 
 ```python
-@km.ingester(
-    target="sports.odds", source=km.nats(subject="odds.>", durable="kermodes-odds")
+ticks = km.ingester(
+    "ticks",
+    target="md.ticks",
+    source=km.websocket("wss://feed.example/ticks"),
+    columns={"sym": km.string(), "price": km.float64()},  # created if it does not exist
 )
-def parse_odds(msgs: km.Batch) -> km.Batch: ...
 ```
+
+A source that needs code (parsing, joining reference data) is a deployment holding a writer:
+`@km.deployment() def odds(db): ...` with `db.writer("sports.odds", source="odds", wait=True)`.
 
 - Built-in Rust connectors (`kermodes-ingest`): NATS JetStream, Kafka, WebSocket, HTTP poll,
   file drop. Connectors are Tolerant Readers: fields map to columns by name, unknown fields are
@@ -419,6 +424,10 @@ outlive what Kubernetes believes.
 - Initial: single writer per internal partition on a Longhorn PVC (replicated block storage).
   weir is a StatefulSet with one replica; draining its node is a brief outage (§17.1).
 - Later: copy sealed segments to S3 (rustfs) so node loss costs at most the open segment (§17).
+- Once weir replicates itself (§17), its volumes become local and unreplicated (Longhorn single
+  replica, or local disks): Longhorn's replicas under weir's own would add network round-trips
+  to every acknowledged write and triple the storage. The switch lands with replication, never
+  before, and measured acknowledgement latency on both storage classes decides it.
 - Retention: intraday partitions are deleted N days after their merge validates.
 
 ## 8. Historical store
@@ -797,10 +806,12 @@ replay = [{ tables = ["sports.odds", "sports.games"], dates = "2026-10-01..2026-
 ttl = "3d"
 ```
 
-Resources are declared in Python with decorators (`km.table`, `@km.ingester`, `@km.deployment`,
-`@km.job`, `@km.feature_view`, `km.model`). Discovery imports `entry` in the project's environment
-and emits a **manifest**: the resolved specs as JSON. The manifest, not the Python source, is what
-`plan` and `apply` consume.
+Resources are declared in Python (`km.table`, `km.ingester(...)`, `@km.deployment()`, `@km.job`,
+`@km.feature_view`, `km.model`). Discovery imports `entry` in the project's environment, fresh
+each time, and emits a **manifest**: the resolved specs as JSON (`kermodes manifest`). The
+manifest, not the Python source, is what `plan` and `apply` consume. Discovery refuses what the
+platform could not run: duplicate names, unknown policies, and an ingester writing outside the
+project's namespaces.
 
 `kermodes init` scaffolds a project with an example deployment, a test, and `kermodes.toml`.
 
@@ -817,8 +828,11 @@ flowchart LR
 ```
 
 - `kermodes run <resource>` runs one deployment, ingester, or job from the working tree in a local
-  process; `kermodes dev` runs the whole project on the local platform (§16.6) and restarts what
-  changed on file save.
+  process. `kermodes dev --project <dir>` (or in a directory with `kermodes.toml`) also runs the
+  whole project on the local platform (§16.6): each resource in its own process, restarted when
+  it dies, and rolled onto every saved change as the cluster rolls a commit (§11.4): the new run
+  starts, becomes ready, then the old one stops and hands over its sources. Discovery and runs
+  compile the project from source each time, never from cached bytecode.
 - Inputs, in increasing realism:
   - synthetic sources declared in the project (`@km.source` generators) for tests and demos;
   - `kermodes data pull sports.odds --dates 2026-11-01..2026-11-07` copies Parquet partitions from the

@@ -2,12 +2,15 @@
 
 import argparse
 import itertools
+import json
 import signal
 import time
 from collections.abc import Callable
 from pathlib import Path
 
 import kermodes as km
+from kermodes import project as projects
+from kermodes.supervisor import Supervisor
 
 DEV_PORT = 8730
 """`kermodes dev`'s web UI port; its Flight server listens on the next one."""
@@ -20,10 +23,12 @@ def main(argv: list[str] | None = None) -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     dev = commands.add_parser(
         "dev",
-        help="run Kermodes locally: a store, its Flight server, and the web UI",
+        help="run Kermodes locally: a store, its Flight server, the web UI, and a project",
         description=(
             "Opens the store in --data-dir and serves it: processes connect with "
-            "km.connect() to create, write, and read tables, and the web UI shows every table."
+            "km.connect() to create, write, and read tables, and the web UI shows every table. "
+            "With a project (--project, or a kermodes.toml in the current directory), runs "
+            "each of its resources and rolls them onto every change to its files."
         ),
     )
     dev.add_argument("--data-dir", type=Path, default=Path(".kermodes"))
@@ -32,6 +37,7 @@ def main(argv: list[str] | None = None) -> None:
     dev.add_argument(
         "--flight-port", type=int, help="Flight port (default: --port + 1)"
     )
+    dev.add_argument("--project", type=Path, help="the project to run")
 
     weir = commands.add_parser(
         "weir",
@@ -99,11 +105,48 @@ def main(argv: list[str] | None = None) -> None:
     feed.add_argument("--rate", type=int, default=1_000, help="ticks a second")
     feed.add_argument("--symbols", type=int, default=100)
 
+    manifest = commands.add_parser(
+        "manifest",
+        help="print a project's resources as JSON",
+        description="Discovers the project (its kermodes.toml and entry module) and prints its "
+        "manifest: the resources the platform plans and deploys.",
+    )
+    manifest.add_argument("--project", type=Path, default=Path("."))
+
+    run = commands.add_parser(
+        "run",
+        help="run one of a project's resources in this process",
+        description="Runs an ingester or deployment from the working tree until it fails or is "
+        "stopped, on a server's tables (--server, $KERMODES_URL, else kermodes dev) or a local "
+        "store (--data-dir).",
+    )
+    run.add_argument("resource")
+    run.add_argument("--project", type=Path, default=Path("."))
+    where = run.add_mutually_exclusive_group()
+    where.add_argument("--server", help="the store server")
+    where.add_argument(
+        "--data-dir", type=Path, help="a local store instead of a server"
+    )
+    run.add_argument(
+        "--ready-file",
+        type=Path,
+        help="created once the run can take over from one it replaces (readiness probes)",
+    )
+
     args = parser.parse_args(argv)
     # A supervisor stops a process with SIGTERM: shut down as on Ctrl-C.
     signal.signal(signal.SIGTERM, signal.default_int_handler)
     if args.command == "dev":
-        run_dev(args.data_dir, args.host, args.port, args.flight_port or args.port + 1)
+        project = args.project or (
+            Path(".") if Path("kermodes.toml").exists() else None
+        )
+        run_dev(
+            args.data_dir,
+            args.host,
+            args.port,
+            args.flight_port or args.port + 1,
+            project,
+        )
     elif args.command == "weir":
         run_weir(args.data_dir, args.host, args.port)
     elif args.command == "ui":
@@ -114,9 +157,33 @@ def main(argv: list[str] | None = None) -> None:
         )
     elif args.command == "demo":
         run_ticker(args.host, args.port, args.rate, args.symbols)
+    elif args.command == "manifest":
+        print(json.dumps(projects.discover(args.project).manifest(), indent=2))
+    elif args.command == "run":
+        run_resource(
+            args.project, args.resource, args.server, args.data_dir, args.ready_file
+        )
 
 
-def run_dev(data_dir: Path, host: str, port: int, flight_port: int) -> None:
+def run_resource(
+    project: Path,
+    name: str,
+    server: str | None,
+    data_dir: Path | None,
+    ready: Path | None,
+) -> None:
+    resource = projects.discover(project).resource(name)
+    db = km.local(data_dir) if data_dir else km.connect(server)
+    print(f"running {name}; Ctrl-C to stop", flush=True)
+    try:
+        projects.run(resource, db, ready)
+    except KeyboardInterrupt:
+        pass
+
+
+def run_dev(
+    data_dir: Path, host: str, port: int, flight_port: int, project: Path | None
+) -> None:
     session = km.local(data_dir)
     flight = session.serve_store(port=flight_port, host=host)
     ui = session.serve(port=port, host=host)
@@ -126,10 +193,15 @@ def run_dev(data_dir: Path, host: str, port: int, flight_port: int) -> None:
         f"  connect  km.connect({flight.url!r})",
         flush=True,
     )
+    supervisor = None
     try:
-        follow(session, ui.publish)
+        supervisor = Supervisor(project, flight.url) if project else None
+        follow(session, ui.publish, supervisor.tick if supervisor else None)
     except KeyboardInterrupt:
         pass
+    finally:
+        if supervisor:
+            supervisor.stop()
 
 
 def run_weir(data_dir: Path, host: str, port: int) -> None:
@@ -153,7 +225,11 @@ def run_ui(server: str | None, host: str, port: int) -> None:
         pass
 
 
-def follow(session: km.Session, publish: Callable[[str, km.Table], None]) -> None:
+def follow(
+    session: km.Session,
+    publish: Callable[[str, km.Table], None],
+    every_second: Callable[[], None] | None = None,
+) -> None:
     """Publishes every stored table, including those created later, until one fails.
 
     A live table fails when it loses the store it follows; the KermodesError that `len` raises
@@ -167,6 +243,8 @@ def follow(session: km.Session, publish: Callable[[str, km.Table], None]) -> Non
                 publish(name, live[name])
         for table in live.values():
             len(table)
+        if every_second:
+            every_second()
         time.sleep(1)
 
 

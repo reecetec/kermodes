@@ -86,6 +86,7 @@ pub struct Session {
 }
 
 /// Where a session's stored tables are: a store this process owns, or a server's.
+#[derive(Clone)]
 enum Tables {
     Local(Arc<kermodes_weir::Store>),
     Remote(kermodes_flight::Client),
@@ -335,8 +336,12 @@ impl Session {
     /// Reads the WebSocket feed at `url` into `table` through a writer for `source`, until
     /// stopped: each message a JSON object or an array of them, fields matched to columns by name
     /// (others ignored, missing ones NULL, an unreadable record skipped and counted). Rows are
-    /// written every `flush` or `max_rows`, whichever comes first.
-    #[pyo3(signature = (url, table, source="websocket", flush="100ms", max_rows=10_000))]
+    /// written every `flush` or `max_rows`, whichever comes first. Reading starts at once; with
+    /// `wait`, the writer waits for the source's current writer to go (a handover), and the
+    /// connector is `connected` meanwhile.
+    #[pyo3(signature = (url, table, source="websocket", flush="100ms", max_rows=10_000, wait=false))]
+    // Each parameter is a Python keyword argument; grouping them would change the Python API.
+    #[allow(clippy::too_many_arguments)]
     fn ingest_websocket(
         &self,
         py: Python<'_>,
@@ -345,8 +350,9 @@ impl Session {
         source: &str,
         flush: &str,
         max_rows: usize,
+        wait: bool,
     ) -> PyResult<Ingest> {
-        let tables = self.stored()?;
+        let tables = self.stored()?.clone();
         let name = kermodes_weir::TableName::parse(table).map_err(store_error)?;
         let source = kermodes_weir::SourceId::parse(source).map_err(store_error)?;
         let options = kermodes_ingest::Options {
@@ -355,12 +361,17 @@ impl Session {
         };
         let ingest = py.detach(|| {
             let schema = tables.schema(&name).map_err(store_error)?;
-            let writer = tables.writer(&name, &source, false).map_err(store_error)?;
             kermodes_ingest::websocket(
                 url,
                 schema,
                 options,
-                Box::new(move |batch| writer.write(batch, None)),
+                Box::new(move || {
+                    let writer = tables.writer(&name, &source, wait)?;
+                    Ok(
+                        Box::new(move |batch: &RecordBatch| writer.write(batch, None))
+                            as kermodes_ingest::Write,
+                    )
+                }),
             )
             .map_err(|e| KermodesError::new_err(format!("cannot start the connector: {e}")))
         })?;
@@ -493,6 +504,8 @@ impl Ingest {
             skipped: stats.skipped,
             batches: stats.batches,
             reconnects: stats.reconnects,
+            connected: stats.connected,
+            writing: stats.writing,
             failed: stats.failed,
             last_error: stats.last_error,
         }
@@ -524,6 +537,10 @@ pub struct IngestStats {
     batches: u64,
     /// Times the feed was reconnected after it dropped.
     reconnects: u64,
+    /// The feed's connection is open: the connector is ready, holding its source or not.
+    connected: bool,
+    /// The writer is open and holds the source's lease.
+    writing: bool,
     /// A write failed and the connector stopped: its store went.
     failed: bool,
     last_error: Option<String>,

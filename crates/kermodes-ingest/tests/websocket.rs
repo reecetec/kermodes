@@ -11,7 +11,7 @@ use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Field, Float64Type, Schema, SchemaRef, TimeUnit};
 use futures::SinkExt;
-use kermodes_ingest::{Options, Stats, ticker, websocket};
+use kermodes_ingest::{Open, Options, Stats, Write, ticker, websocket};
 use kermodes_weir::{SourceId, Store, TableName};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -63,6 +63,13 @@ fn wait_for(what: &str, done: impl Fn() -> bool) {
     }
 }
 
+/// A writer that is open at once.
+fn opened(
+    write: impl FnMut(&RecordBatch) -> Result<bool, kermodes_weir::Error> + Send + 'static,
+) -> Open {
+    Box::new(move || Ok(Box::new(write) as Write))
+}
+
 #[test]
 fn feeds_are_read_tolerantly_and_reconnected() {
     let text = |s: &str| Message::Text(s.into());
@@ -89,7 +96,7 @@ fn feeds_are_read_tolerantly_and_reconnected() {
         &url,
         schema(),
         options,
-        Box::new(move |batch| {
+        opened(move |batch| {
             sink.lock().unwrap().push(batch.clone());
             Ok(true)
         }),
@@ -154,7 +161,7 @@ fn a_ticker_feed_lands_in_a_store() {
         &format!("ws://{}/", feed.addr()),
         schema(),
         Options::default(),
-        Box::new(move |batch| writer.write(batch, None)),
+        opened(move |batch| writer.write(batch, None)),
     )
     .unwrap();
     wait_for("1,000 rows", || ingest.stats().rows >= 1_000);
@@ -205,7 +212,7 @@ fn a_failed_write_stops_the_connector() {
         options,
         // The store goes on the second batch and is back for the third: rows after a failure
         // must not be written as if nothing happened.
-        Box::new(move |batch| {
+        opened(move |batch| {
             if count.fetch_add(1, Ordering::Relaxed) == 1 {
                 return Err(kermodes_weir::Error::Io("the store went".into()));
             }
@@ -220,4 +227,47 @@ fn a_failed_write_stops_the_connector() {
     assert_eq!(calls.load(Ordering::Relaxed), 2, "{stats:?}");
     assert_eq!(stats.rows, written.load(Ordering::Relaxed));
     assert_eq!(stats.batches, 1);
+}
+
+/// A rolling handover: the new connector is connected (ready) while the old writer still holds
+/// the source, writes nothing until it lets go, then takes over.
+#[test]
+fn a_connector_is_ready_before_it_holds_its_source() {
+    let dir = TempDir(
+        std::env::temp_dir().join(format!("kermodes-ingest-handover-{}", std::process::id())),
+    );
+    let store = Arc::new(Store::open(&dir.0).unwrap());
+    let name = TableName::parse("md.ticks").unwrap();
+    store.create_table(&name, &schema()).unwrap();
+    let source = SourceId::parse("ticker").unwrap();
+    let old = store.writer(&name, &source, false).unwrap();
+
+    let feed = ticker("127.0.0.1:0".parse().unwrap(), 5_000, 10).unwrap();
+    let mut ingest = {
+        let (store, name, source) = (store.clone(), name.clone(), source.clone());
+        websocket(
+            &format!("ws://{}/", feed.addr()),
+            schema(),
+            Options::default(),
+            Box::new(move || {
+                let writer = store.writer(&name, &source, true)?;
+                Ok(Box::new(move |batch: &RecordBatch| writer.write(batch, None)) as Write)
+            }),
+        )
+        .unwrap()
+    };
+    wait_for("the feed", || {
+        let stats = ingest.stats();
+        stats.connected && stats.messages > 0
+    });
+    let stats = ingest.stats();
+    assert_eq!((stats.writing, stats.rows), (false, 0), "{stats:?}");
+
+    drop(old);
+    wait_for("the handover", || {
+        let stats = ingest.stats();
+        stats.writing && stats.rows > 0
+    });
+    ingest.stop();
+    assert!(!ingest.stats().failed);
 }

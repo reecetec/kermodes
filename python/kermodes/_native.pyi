@@ -35,6 +35,7 @@ class Session:
         source: str = "websocket",
         flush: str = "100ms",
         max_rows: int = 10_000,
+        wait: bool = False,
     ) -> Ingest: ...
 
 class Ingest:
@@ -48,6 +49,8 @@ class IngestStats:
     skipped: int
     batches: int
     reconnects: int
+    connected: bool
+    writing: bool
     failed: bool
     last_error: str | None
 

@@ -19,7 +19,9 @@ use tonic::transport::Channel;
 
 use crate::{columns_json, error_from_status, schema_from_json};
 
-/// Connected to a store's Flight server. Calls block until the server answers.
+/// Connected to a store's Flight server. Calls block until the server answers. Clones share the
+/// connection.
+#[derive(Clone)]
 pub struct Client {
     runtime: Arc<Runtime>,
     flight: FlightServiceClient<Channel>,

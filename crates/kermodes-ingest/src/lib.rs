@@ -29,6 +29,9 @@ pub use ticker::{Ticker, ticker};
 /// Writes one batch durably (a store's or a server's writer).
 pub type Write = Box<dyn FnMut(&RecordBatch) -> Result<bool, Error> + Send>;
 
+/// Opens the writer, taking the source's lease: it may wait for another writer to let go.
+pub type Open = Box<dyn FnOnce() -> Result<Write, Error> + Send>;
+
 /// When buffered rows are written: after `flush` since the first of them, or at `max_rows`.
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
@@ -58,6 +61,10 @@ pub struct Stats {
     pub batches: u64,
     /// Times the feed was reconnected after it dropped.
     pub reconnects: u64,
+    /// The feed's connection is open: the connector is ready, holding the lease or not.
+    pub connected: bool,
+    /// The writer is open and holds the source's lease.
+    pub writing: bool,
     /// A write failed and the connector stopped: its store went. Rows it had not written are
     /// lost (the feed cannot be replayed); whoever runs it restarts it against the store.
     pub failed: bool,
@@ -71,6 +78,8 @@ struct Counters {
     skipped: AtomicU64,
     batches: AtomicU64,
     reconnects: AtomicU64,
+    connected: AtomicBool,
+    writing: AtomicBool,
     failed: AtomicBool,
     last_error: Mutex<Option<String>>,
 }
@@ -100,6 +109,8 @@ impl Ingest {
             skipped: c.skipped.load(Ordering::Relaxed),
             batches: c.batches.load(Ordering::Relaxed),
             reconnects: c.reconnects.load(Ordering::Relaxed),
+            connected: c.connected.load(Ordering::Relaxed),
+            writing: c.writing.load(Ordering::Relaxed),
             failed: c.failed.load(Ordering::Relaxed),
             last_error: c
                 .last_error
@@ -109,11 +120,18 @@ impl Ingest {
         }
     }
 
-    /// Stops reading, writes what is buffered, and returns once both are done.
+    /// Stops reading, writes what is buffered, and returns once both are done. A writer still
+    /// waiting for its lease holds nothing and is left to end with the process.
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        for thread in self.threads.drain(..) {
-            let _ = thread.join();
+        let mut threads = self.threads.drain(..);
+        if let Some(reader) = threads.next() {
+            let _ = reader.join();
+        }
+        if let Some(writer) = threads.next()
+            && self.counters.writing.load(Ordering::Acquire)
+        {
+            let _ = writer.join();
         }
     }
 }
@@ -124,24 +142,39 @@ impl Drop for Ingest {
     }
 }
 
-/// Reads the WebSocket feed at `url` into rows of `schema`, written through `write`. Each message
-/// is a JSON object or an array of them.
+/// Reads the WebSocket feed at `url` into rows of `schema`, written through the writer `open`
+/// returns. Each message is a JSON object or an array of them. Reading starts at once; the writer
+/// opens on its own thread, so a connector can be connected (ready) while it waits for another
+/// writer to hand over the source.
 pub fn websocket(
     url: &str,
     schema: SchemaRef,
     options: Options,
-    mut write: Write,
+    open: Open,
 ) -> std::io::Result<Ingest> {
     let stop = Arc::new(AtomicBool::new(false));
     let counters = Arc::new(Counters::default());
     // Remote writes block on their server, so they run on a plain thread, fed through a bounded
-    // queue: a slow writer slows the reader down rather than growing memory.
+    // queue: a slow writer (or one waiting for its lease) slows the reader down rather than
+    // growing memory.
     let (batches, mut queue) = mpsc::channel::<RecordBatch>(16);
     let writer = {
         let (counters, stop) = (counters.clone(), stop.clone());
         thread::Builder::new()
             .name("kermodes-ingest-write".into())
             .spawn(move || {
+                // A writer whose store went stays broken; reading on would only drop rows.
+                // Stopping lets a supervisor restart the connector.
+                let fail = |message: String| {
+                    counters.error(message);
+                    counters.failed.store(true, Ordering::Release);
+                    stop.store(true, Ordering::Release);
+                };
+                let mut write = match open() {
+                    Ok(write) => write,
+                    Err(e) => return fail(format!("cannot open the writer: {e}")),
+                };
+                counters.writing.store(true, Ordering::Release);
                 while let Some(batch) = queue.blocking_recv() {
                     match write(&batch) {
                         Ok(_) => {
@@ -150,14 +183,7 @@ pub fn websocket(
                                 .rows
                                 .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
                         }
-                        Err(e) => {
-                            // A writer whose store went stays broken; reading on would only drop
-                            // rows. Stopping lets a supervisor restart the connector.
-                            counters.error(format!("write failed: {e}"));
-                            counters.failed.store(true, Ordering::Release);
-                            stop.store(true, Ordering::Release);
-                            return;
-                        }
+                        Err(e) => return fail(format!("write failed: {e}")),
                     }
                 }
             })?
@@ -207,6 +233,7 @@ async fn read(
             counters.reconnects.fetch_add(1, Ordering::Relaxed);
         }
         connected_before = true;
+        counters.connected.store(true, Ordering::Release);
         backoff = Duration::from_millis(250);
         let mut ticks = tokio::time::interval(options.flush.min(Duration::from_millis(50)));
         loop {
@@ -236,14 +263,33 @@ async fn read(
                 _ = ticks.tick() => {}
             }
             if let Some(batch) = buffer.take_if_due(&counters)
-                && batches.send(batch).await.is_err()
+                && !queue(&batches, batch, &stop).await
             {
+                counters.connected.store(false, Ordering::Release);
                 return;
             }
         }
+        counters.connected.store(false, Ordering::Release);
     }
     if let Some(batch) = buffer.take(&counters) {
-        let _ = batches.send(batch).await;
+        queue(&batches, batch, &stop).await;
+    }
+}
+
+/// Queues `batch` for the writer, waiting while the queue is full (a slow writer, or one waiting
+/// for its lease); `false` once there is no writer to wait for: it stopped, or the connector is
+/// stopping.
+async fn queue(batches: &mpsc::Sender<RecordBatch>, batch: RecordBatch, stop: &AtomicBool) -> bool {
+    loop {
+        match tokio::time::timeout(Duration::from_millis(50), batches.reserve()).await {
+            Ok(Ok(permit)) => {
+                permit.send(batch);
+                return true;
+            }
+            Ok(Err(_)) => return false,
+            Err(_) if stop.load(Ordering::Acquire) => return false,
+            Err(_) => {}
+        }
     }
 }
 

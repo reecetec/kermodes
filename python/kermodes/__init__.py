@@ -5,6 +5,7 @@ from os import PathLike
 
 from kermodes import demo
 from kermodes._native import KermodesError, Session, Table, Writer, merge
+from kermodes.project import deployment, ingester, websocket
 
 __all__ = [
     "KermodesError",
@@ -15,13 +16,16 @@ __all__ = [
     "connect",
     "date32",
     "demo",
+    "deployment",
     "float64",
+    "ingester",
     "int32",
     "int64",
     "local",
     "merge",
     "string",
     "timestamp",
+    "websocket",
 ]
 
 

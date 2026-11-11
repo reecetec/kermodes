@@ -1,0 +1,7 @@
+# A synthetic market-data feed, ingested into md.ticks. Locally: `kermodes demo ticker`, then
+# `kermodes run ticks --project examples/ticker` against `kermodes dev`.
+[project]
+name = "ticker"
+entry = "ticker.app"
+namespaces = ["md"]
+mainline = "master"
