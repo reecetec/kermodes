@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: arc
+    container:
+      image: ghcr.io/astral-sh/uv:0.13.7-python3.14-trixie-slim
+    env:
+      CARGO_HOME: /usr/local/cargo
+      RUSTUP_HOME: /usr/local/rustup
+      UV_LINK_MODE: copy
+
+    steps:
+      - name: Install system packages
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ca-certificates curl git nodejs
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          set-safe-directory: true
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+            --profile minimal --default-toolchain 1.98.1 --component clippy,rustfmt
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run Rust tests
+        run: cargo test --workspace --locked
+
+      - name: Check for a second arrow-rs major
+        run: |
+          if cargo tree --workspace --locked --duplicates --edges normal | grep -E '^arrow'; then
+            echo "arrow-rs crates appear at more than one version" >&2
+            exit 1
+          fi
+
+      - name: Build the Python package
+        run: uv sync --locked
+
+      - name: Run Ruff
+        run: |
+          uv run --no-sync ruff check
+          uv run --no-sync ruff format --check
+
+      - name: Run ty
+        run: uv run --no-sync ty check
+
+      - name: Run Python tests
+        run: uv run --no-sync pytest

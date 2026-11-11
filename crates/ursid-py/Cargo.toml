@@ -1,0 +1,19 @@
+[package]
+name = "ursid-py"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "_native"
+crate-type = ["cdylib", "rlib"]
+# Exercised through the Python test suite; a Rust test binary would need libpython at link time.
+test = false
+doctest = false
+
+[dependencies]
+arrow.workspace = true
+pyo3.workspace = true
+pyo3-arrow.workspace = true
+ursid-core.workspace = true

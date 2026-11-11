@@ -170,9 +170,9 @@ view: `live_table(...).last_by("key")`. Storage never mutates rows.
 ```python
 db = us.connect().db
 
-odds = db.live_table("sports", "odds")                    # unmerged intraday partitions, ticking
-hist = db.historical_table("sports", "odds")              # merged dates, static
-full = db.table("sports", "odds")                         # historical ∪ live, disjoint by Date
+odds = db.live_table("sports", "odds")  # unmerged intraday partitions, ticking
+hist = db.historical_table("sports", "odds")  # merged dates, static
+full = db.table("sports", "odds")  # historical ∪ live, disjoint by Date
 ```
 
 `db.live_table` contains every intraday partition not yet merged; callers usually filter
@@ -192,9 +192,9 @@ odds = us.table(
     columns={
         "game_id": us.string(),
         "book": us.string(),
-        "price": us.float64(),       # renamed from "px": same column ID
-        "size": us.int64(),          # widened from int32
-        "venue": us.string(default=None),   # added
+        "price": us.float64(),  # renamed from "px": same column ID
+        "size": us.int64(),  # widened from int32
+        "venue": us.string(default=None),  # added
     },
     keys=["game_id", "book"],
     ts="ts",
@@ -271,7 +271,9 @@ An ingester is a managed deployment that reads a source and speaks the ingest pr
 declared in a project like any other resource.
 
 ```python
-@us.ingester(target="sports.odds", source=us.nats(subject="odds.>", durable="ursid-odds"))
+@us.ingester(
+    target="sports.odds", source=us.nats(subject="odds.>", durable="ursid-odds")
+)
 def parse_odds(msgs: us.Batch) -> us.Batch: ...
 ```
 
@@ -488,14 +490,14 @@ edges = db.sql("""
       MATCH_CONDITION (o.ts >= f.ts)
       ON o.player_id = f.player_id
     WHERE o.Date = today()
-""")                                            # reads today's live data: ticking
+""")  # reads today's live data: ticking
 
 monthly = db.sql("""
     SELECT book, avg(price) AS avg_price, count(*) AS n
     FROM sports.odds
     WHERE Date BETWEEN '2026-10-01' AND '2026-10-31'
     GROUP BY book
-""")                                            # merged dates only: static
+""")  # merged dates only: static
 ```
 
 Table resolution
@@ -586,15 +588,17 @@ and merge to the lake daily.
 Every deployment, ingester, job, and session declares the worker it runs on.
 
 ```python
-@us.deployment(worker=us.worker(
-    worker_class="medium",   # admin-defined preset
-    memory="16Gi",           # pod total
-    engine_memory="12Gi",    # engine budget, kept below the container limit (§9.7)
-    python_memory="4Gi",     # python sidecar container
-    cpu=4,
-    gpu=0,
-    cache_disk="50Gi",
-))
+@us.deployment(
+    worker=us.worker(
+        worker_class="medium",  # admin-defined preset
+        memory="16Gi",  # pod total
+        engine_memory="12Gi",  # engine budget, kept below the container limit (§9.7)
+        python_memory="4Gi",  # python sidecar container
+        cpu=4,
+        gpu=0,
+        cache_disk="50Gi",
+    )
+)
 def edges(db): ...
 ```
 
@@ -800,8 +804,9 @@ A feature view is a keyed, timestamped table expression.
 ```python
 @us.feature_view(entity="player_id", ts="ts")
 def form(games):
-    return (games.rolling(by="player_id", rows=10)
-                 .agg(pts_avg=us.mean("pts"), mins_avg=us.mean("mins")))
+    return games.rolling(by="player_id", rows=10).agg(
+        pts_avg=us.mean("pts"), mins_avg=us.mean("mins")
+    )
 ```
 
 - Offline: `us.training_set(labels, features=[...], ts=...)` evaluates the view over

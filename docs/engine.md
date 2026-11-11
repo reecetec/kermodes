@@ -60,7 +60,7 @@ needs an attribute its input lacks is rejected at plan time with an error saying
 | Chunked | Append-only inputs; computed columns over append-only parents | Immutable Arrow arrays in chunks; key → (chunk, offset) by binary search over chunk starts. Small appends are coalesced to ~64Ki-row chunks at cycle end. |
 | Slot | State tables, keyed inputs, computed columns over them | Mutable typed vectors plus validity bitmap, indexed by slot; mutated in place. |
 | Redirected | `last_by`, `natural_join`, `as_of_join` outputs | A slot → parent row key map; values are read from the parent's columns, never copied. |
-| Filtered | `where` over a non-static parent | The parent's columns under a smaller row set. |
+| Filtered | `where` | M0 materializes the matching rows with Arrow's `filter`; a view over the parent replaces it only if memory measurements call for it. |
 
 Reading rows out (snapshots, viewports, operator inputs) produces Arrow `RecordBatch`es: zero-copy
 slices for contiguous chunk ranges, `take` for everything else.
@@ -81,9 +81,9 @@ Update { added: RowSet, removed: RowSet, modified: RowSet, modified_columns: Col
 
 ## 4. Update graph
 
-- One graph per process session; every refreshing table belongs to it. Each node has a level
-  (1 + max parent level); a cycle runs nodes in level order, each consuming its parents' deltas
-  for the cycle and producing its own.
+- One graph per process session; every refreshing table belongs to it. Tables run in creation
+  order, which is topological because a table is built only from existing tables; each consumes
+  its parents' deltas for the cycle and produces its own.
 - Sources accept writes from any thread into a queue. A cycle starts by draining the queues into
   the source tables, then propagates.
 - One `RwLock` guards graph state: a cycle holds the write lock; snapshot readers hold the read
@@ -151,30 +151,43 @@ Grouping keys:
 ```python
 import ursid as us
 
-s = us.local()                                     # in-process engine and update graph
+s = us.local()  # in-process engine and update graph
 
 ticks = s.input_table(
-    {"sym": us.string(), "price": us.float64(), "size": us.int64(), "ts": us.timestamp()},
+    {
+        "sym": us.string(),
+        "price": us.float64(),
+        "size": us.int64(),
+        "ts": us.timestamp(),
+    },
     kind="append",
 )
-refs = s.input_table({"sym": us.string(), "sector": us.string()}, kind="keyed", key="sym")
+refs = s.input_table(
+    {"sym": us.string(), "sector": us.string()}, kind="keyed", key="sym"
+)
 
-ticks.append(batch)            # anything with __arrow_c_stream__ / __arrow_c_array__, or a dict of lists
-refs.upsert(batch); refs.delete(keys)
+ticks.append(
+    batch
+)  # anything with __arrow_c_stream__ / __arrow_c_array__, or a dict of lists
+refs.upsert(batch)
+refs.delete(keys)
 
-live = (ticks
-        .where("price > 0")
-        .update("notional = price * size")
-        .natural_join(refs, on="sym"))
+live = (
+    ticks.where("price > 0")
+    .update("notional = price * size")
+    .natural_join(refs, on="sym")
+)
 latest = live.last_by("sym")
 stats = live.agg_by("sector", n="count(*)", vwap="sum(notional) / sum(size)")
 vol = ticks.rolling("sym", rows=100, std_price="std(price)")
 
-s.step()                       # one cycle; or s.start(period="100ms") / s.stop()
-latest.to_arrow()              # snapshot as an Arrow stream (PyCapsule); .to_pandas(), .to_polars()
-latest                         # in Jupyter: ticking widget
+s.step()  # one cycle; or s.start(period="100ms") / s.stop()
+latest.to_arrow()  # snapshot as an Arrow stream (PyCapsule); .to_pandas(), .to_polars()
+latest  # in Jupyter: ticking widget
 
-demo = us.sources.random_walk(s, symbols=10_000, rows_per_sec=1_000_000)   # Rust-side source for demos and benchmarks
+demo = us.sources.random_walk(
+    s, symbols=10_000, rows_per_sec=1_000_000
+)  # Rust-side source for demos and benchmarks
 ```
 
 - Every engine call releases the interpreter while Rust works.
@@ -225,7 +238,8 @@ Targets (release build, on the development laptop):
   expressions. One crate until a boundary or compile times justify splitting it.
 - `crates/ursid-py`: the PyO3 module `ursid._native`.
 - `crates/ursid-bench`: the benchmark binary.
-- `python/ursid`: the Python API, widget, and `cli.py`.
+- `python/ursid`: the Python API and widget. `cli.py` arrives with the first real command
+  (`ursid dev`, M1).
 
 ## 12. What M0 will tell us
 

@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[workspace.dependencies]
+arrow = { version = "60.1", default-features = false }
+pyo3 = { version = "0.30.1", features = ["abi3-py312"] }
+pyo3-arrow = "0.21"
+sqlparser = { version = "0.64", default-features = false, features = ["std"] }
+ursid-core = { path = "crates/ursid-core" }
+
+# Editable Python builds (uv sync): optimised enough to use the engine, fast to rebuild.
+[profile.dev-py]
+inherits = "release"
+lto = false
+incremental = true
+codegen-units = 256

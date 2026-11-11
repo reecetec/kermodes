@@ -1,0 +1,33 @@
+[project]
+name = "ursid"
+version = "0.1.0"
+description = "Live and historical tables on Arrow"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = ["pyarrow", "pytest", "ruff", "ty"]
+
+[build-system]
+requires = ["maturin>=1.16,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+manifest-path = "crates/ursid-py/Cargo.toml"
+module-name = "ursid._native"
+python-source = "python"
+editable-profile = "dev-py"
+
+[tool.uv]
+# uv rebuilds the extension only when one of these changes.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "Cargo.lock" },
+    { file = "crates/**/Cargo.toml" },
+    { file = "crates/**/*.rs" },
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
