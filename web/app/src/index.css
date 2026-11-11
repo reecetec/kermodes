@@ -1,0 +1,97 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
+@custom-variant dark (&:is(.dark *));
+
+/* shadcn/ui tokens, tuned to the table viewer's Deephaven-like palette */
+:root {
+  --radius: 0.5rem;
+  --background: #f6f6f7;
+  --foreground: #1a171a;
+  --card: #ffffff;
+  --card-foreground: #1a171a;
+  --popover: #ffffff;
+  --popover-foreground: #1a171a;
+  --primary: #2f5bc4;
+  --primary-foreground: #ffffff;
+  --secondary: #ececee;
+  --secondary-foreground: #1a171a;
+  --muted: #ececee;
+  --muted-foreground: #6b686c;
+  --accent: #e6e8ef;
+  --accent-foreground: #1a171a;
+  --destructive: #d0204b;
+  --success: #198754;
+  --warning: #b7791f;
+  --border: #dcdbdc;
+  --input: #d2d1d3;
+  --ring: #2f5bc4;
+  --sidebar: #ffffff;
+}
+
+.dark {
+  --background: #121012;
+  --foreground: #f0f0ee;
+  --card: #1a171a;
+  --card-foreground: #f0f0ee;
+  --popover: #211f22;
+  --popover-foreground: #f0f0ee;
+  --primary: #4c7dee;
+  --primary-foreground: #ffffff;
+  --secondary: #2d2a2e;
+  --secondary-foreground: #f0f0ee;
+  --muted: #211f22;
+  --muted-foreground: #929192;
+  --accent: #2a2730;
+  --accent-foreground: #f0f0ee;
+  --destructive: #f95d84;
+  --success: #4fd18b;
+  --warning: #f0b252;
+  --border: #2d2a2e;
+  --input: #373438;
+  --ring: #4c7dee;
+  --sidebar: #171517;
+}
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html,
+  body,
+  #root {
+    @apply h-full;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+  }
+}

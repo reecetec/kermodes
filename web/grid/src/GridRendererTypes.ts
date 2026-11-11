@@ -4,6 +4,7 @@ import type GridMetrics from './GridMetrics';
 import type GridModel from './GridModel';
 import { type GridTheme } from './GridTheme';
 import { type GridSeparator } from './mouse-handlers/GridSeparatorMouseHandler';
+import { type DraggingColumn } from './mouse-handlers/GridColumnMoveMouseHandler';
 import type { GestureMode, Selection } from './Selection';
 
 // Default font width in pixels if it cannot be retrieved from the context
@@ -33,7 +34,8 @@ export type GridRenderState = {
   // Current selection. Owns the cursor and shift/drag endpoint.
   selection: Selection;
 
-  // Column separator being dragged to resize
+  // Column being dragged to a new position, and the separator being dragged to resize
+  draggingColumn: DraggingColumn | null;
   draggingColumnSeparator: GridSeparator | null;
 
   isDraggingHorizontalScrollBar: boolean;

@@ -5,3 +5,5 @@ export { default as GridHorizontalScrollBarMouseHandler } from './GridHorizontal
 export { default as GridScrollBarCornerMouseHandler } from './GridScrollBarCornerMouseHandler';
 export { default as GridVerticalScrollBarMouseHandler } from './GridVerticalScrollBarMouseHandler';
 export * from './GridSeparatorMouseHandler';
+export { default as GridColumnMoveMouseHandler } from './GridColumnMoveMouseHandler';
+export type { DraggingColumn } from './GridColumnMoveMouseHandler';

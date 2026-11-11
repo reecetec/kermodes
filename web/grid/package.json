@@ -7,7 +7,6 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "scripts": {
-    "dev": "vite demo",
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },
@@ -25,7 +24,6 @@
     "@types/react-dom": "^19.0.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "typescript": "^5.9.0",
-    "vite": "^7.0.0"
+    "typescript": "^5.9.0"
   }
 }

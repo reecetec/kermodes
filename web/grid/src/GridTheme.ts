@@ -87,6 +87,17 @@ export type GridTheme = {
   selectionOutlineColor: GridColor;
   selectionOutlineCasingColor: GridColor;
 
+  // A column being dragged: how far it lifts and the shadow under it
+  reorderOffset: number;
+  shadowBlur: number;
+  shadowColor: GridColor;
+
+  // Background a changed or copied cell flashes before it fades out
+  flashColor: GridColor;
+
+  // Outline and text of a quick filter entry that could not be applied
+  errorColor: GridColor;
+
   // Default row height/column width
   rowHeight: number;
   columnWidth: number;
@@ -165,6 +176,11 @@ export const darkTheme: GridTheme = Object.freeze({
   selectionColor: '#4c7dee33',
   selectionOutlineColor: '#4c7dee',
   selectionOutlineCasingColor: '#1a171a',
+  reorderOffset: 2,
+  shadowBlur: 8,
+  shadowColor: '#000000',
+  flashColor: '#4c7dee99',
+  errorColor: '#f95d84',
   scrollBarSelectionTick: true,
   scrollBarSelectionTickColor: '#4c7dee66',
   scrollBarActiveSelectionTickColor: '#4c7deecc',
@@ -212,6 +228,9 @@ export const lightTheme: GridTheme = Object.freeze({
   selectionColor: '#2f5bc426',
   selectionOutlineColor: '#2f5bc4',
   selectionOutlineCasingColor: '#ffffff',
+  shadowColor: '#00000066',
+  flashColor: '#2f5bc466',
+  errorColor: '#d0204b',
   scrollBarSelectionTickColor: '#2f5bc466',
   scrollBarActiveSelectionTickColor: '#2f5bc4cc',
   floatingGridColumnColor: '#e6e5e6',

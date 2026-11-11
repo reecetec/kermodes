@@ -180,6 +180,8 @@ export class GridRenderer {
 
     this.drawFooters(context, state);
 
+    this.drawDraggingColumn(context, state);
+
     this.drawScrollBars(context, state);
 
     context.restore();
@@ -206,12 +208,12 @@ export class GridRenderer {
   }
 
   drawGrid(context: CanvasRenderingContext2D, state: GridRenderState): void {
-    const { metrics } = state;
+    const { metrics, draggingColumn } = state;
     const { gridX, gridY } = metrics;
 
     context.translate(gridX, gridY);
 
-    this.drawGridBackground(context, state, true);
+    this.drawGridBackground(context, state, draggingColumn == null);
 
     this.drawCellContents(context, state);
 
@@ -250,7 +252,9 @@ export class GridRenderer {
       );
     }
 
-    this.drawFloatingMouseRowHover(context, state);
+    if (state.draggingColumn == null) {
+      this.drawFloatingMouseRowHover(context, state);
+    }
 
     this.drawGridLinesForItems(
       context,
@@ -347,7 +351,9 @@ export class GridRenderer {
       );
     }
 
-    this.drawFloatingMouseRowHover(context, state);
+    if (state.draggingColumn == null) {
+      this.drawFloatingMouseRowHover(context, state);
+    }
 
     // Clip floated column grid lines.
     context.save();
@@ -927,9 +933,31 @@ export class GridRenderer {
 
     context.font = theme.headerFont;
 
+    this.drawFilterBar(context, state);
+
     this.drawColumnHeaders(context, state);
 
     this.drawRowHeaders(context, state);
+  }
+
+  /** Background of the bar between the headers and the rows that holds the filter inputs */
+  drawFilterBar(
+    context: CanvasRenderingContext2D,
+    state: GridRenderState
+  ): void {
+    const { metrics, theme } = state;
+    const { gridY, columnHeaderHeight, columnHeaderMaxDepth, width } = metrics;
+    const top = columnHeaderHeight * columnHeaderMaxDepth;
+    if (gridY <= top) {
+      return;
+    }
+    context.fillStyle = theme.headerBackgroundColor;
+    context.fillRect(0, top, width, gridY - top);
+    context.strokeStyle = theme.headerSeparatorColor;
+    context.beginPath();
+    context.moveTo(0, gridY - 0.5);
+    context.lineTo(width, gridY - 0.5);
+    context.stroke();
   }
 
   drawFooters(context: CanvasRenderingContext2D, state: GridRenderState): void {
@@ -1346,6 +1374,8 @@ export class GridRenderer {
       backgroundColor?: string;
       textColor?: string;
       separatorColor?: string;
+      // Room kept free at the right of the header for an indicator, eg. the sort
+      textInsetRight?: number;
     },
     bounds?: { minX?: number; maxX?: number }
   ): void {
@@ -1363,13 +1393,14 @@ export class GridRenderer {
     } = theme;
     const { fontWidthsLower, fontWidthsUpper, width } = metrics;
 
-    const maxWidth = columnWidth - headerHorizontalPadding * 2;
-
     const {
       backgroundColor = headerBackgroundColor,
       separatorColor = headerSeparatorColor,
       textColor = headerColor,
+      textInsetRight = 0,
     } = style ?? {};
+    const textAreaWidth = columnWidth - textInsetRight;
+    const maxWidth = textAreaWidth - headerHorizontalPadding * 2;
 
     let { minX = 0, maxX = width } = bounds ?? {};
 
@@ -1416,14 +1447,14 @@ export class GridRenderer {
       fontWidthUpper
     );
 
-    let x = columnX + columnWidth * 0.5;
+    let x = columnX + textAreaWidth * 0.5;
     const y = columnHeaderHeight * 0.5;
     minX += headerHorizontalPadding;
     maxX -= headerHorizontalPadding;
 
     const columnLeft = columnX + headerHorizontalPadding;
     const visibleLeft = clamp(columnLeft, minX, maxX);
-    const columnRight = columnX + columnWidth - headerHorizontalPadding;
+    const columnRight = columnX + textAreaWidth - headerHorizontalPadding;
     const visibleRight = clamp(columnRight, minX, maxX);
     const visibleWidth = visibleRight - visibleLeft;
 
@@ -2066,6 +2097,84 @@ export class GridRenderer {
     context.lineTo(x, y + r);
     context.quadraticCurveTo(x, y, x + r, y);
     context.closePath();
+  }
+
+  drawDraggingColumn(
+    context: CanvasRenderingContext2D,
+    state: GridRenderState
+  ): void {
+    const { draggingColumn, metrics, mouseX, theme } = state;
+    if (draggingColumn == null || mouseX == null) {
+      return;
+    }
+
+    const {
+      gridX,
+      gridY,
+      allColumnXs,
+      allColumnWidths,
+      height,
+      width,
+      floatingLeftWidth,
+    } = metrics;
+    const [startIndex, endIndex] = draggingColumn.range;
+    const originalLeft = getOrThrow(allColumnXs, startIndex);
+    const originalRight =
+      getOrThrow(allColumnXs, endIndex) + getOrThrow(allColumnWidths, endIndex);
+    const originalWidth = originalRight - originalLeft;
+    const { backgroundColor, font, headerFont, reorderOffset, shadowBlur, shadowColor } =
+      theme;
+
+    context.save();
+
+    context.translate(gridX, 0);
+
+    // First, draw over where the column is coming from, without covering frozen columns
+    context.save();
+    context.beginPath();
+    context.rect(floatingLeftWidth, 0, width, height);
+    context.clip();
+    context.fillStyle = backgroundColor;
+    context.fillRect(originalLeft, 0, originalWidth, height);
+    context.restore();
+
+    // Then draw the shadow of the moving column
+    context.translate(0, reorderOffset);
+    context.save();
+    context.shadowColor = shadowColor;
+    context.shadowBlur = shadowBlur;
+    context.fillStyle = backgroundColor;
+    context.fillRect(
+      draggingColumn.left,
+      reorderOffset,
+      draggingColumn.width,
+      height
+    );
+    context.restore();
+
+    // Now clip to the moving column and redraw its header and contents there
+    context.beginPath();
+    context.rect(draggingColumn.left, 0, draggingColumn.width + 1, height);
+    context.clip();
+
+    // The header drawing functions expect the context to be at the edge of the canvas
+    // We offset it by how much the user has dragged
+    context.translate(draggingColumn.left - originalLeft - gridX, 0);
+    context.font = headerFont;
+    this.drawColumnHeadersForRange(context, state, [startIndex, endIndex], {
+      minX: originalLeft,
+      maxX: width,
+    });
+
+    // Move to the top-left of the cells and draw the column's background and contents
+    context.translate(gridX, gridY);
+    context.font = font;
+    this.drawGridBackground(context, state);
+    for (let i = startIndex; i <= endIndex; i += 1) {
+      this.drawColumnCellContents(context, state, i);
+    }
+
+    context.restore();
   }
 
   drawScrollBars(

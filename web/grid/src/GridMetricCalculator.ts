@@ -14,6 +14,7 @@ import type {
 } from './GridMetrics';
 import GridUtils from './GridUtils';
 import { type GridFont, type GridTheme } from './GridTheme';
+import { type DraggingColumn } from './mouse-handlers/GridColumnMoveMouseHandler';
 
 /* eslint class-methods-use-this: "off" */
 /* eslint react/destructuring-assignment: "off" */
@@ -51,6 +52,12 @@ export interface GridMetricState {
   // Whether the scrollbars are currently being dragged
   isDraggingHorizontalScrollBar: boolean;
   isDraggingVerticalScrollBar: boolean;
+
+  // The column being dragged to a new position, if any
+  draggingColumn: DraggingColumn | null;
+
+  // Height of the bar under the column headers that holds the quick filter inputs, 0 when hidden
+  filterBarHeight: number;
 }
 
 /**
@@ -216,6 +223,7 @@ export class GridMetricCalculator {
       model,
       movedRows,
       movedColumns,
+      draggingColumn,
     } = state;
     const {
       rowHeight,
@@ -363,7 +371,7 @@ export class GridMetricCalculator {
     const hasVerticalBar = lastTop > 0;
     const verticalBarWidth = hasVerticalBar ? scrollBarSize : 0;
     const barLeft = gridX;
-    const barTop = columnHeaderMaxDepth * columnHeaderHeight;
+    const barTop = gridY;
     const barWidth = width - barLeft - verticalBarWidth;
     const barHeight = height - barTop - horizontalBarHeight;
 
@@ -446,8 +454,28 @@ export class GridMetricCalculator {
       ),
     ]);
 
+    // A dragged column is drawn wherever the mouse is, so it needs metrics even when scrolled out
+    const draggingColumns: VisibleIndex[] = [];
+    if (draggingColumn) {
+      for (
+        let i = draggingColumn.range[0];
+        i <= draggingColumn.range[1];
+        i += 1
+      ) {
+        draggingColumns.push(i);
+        if (!allColumnWidths.has(i)) {
+          allColumnWidths.set(i, this.getVisibleColumnWidth(i, state));
+        }
+        if (!allColumnXs.has(i)) {
+          allColumnXs.set(i, 0);
+        }
+      }
+    }
+
     const allRows = visibleRows.concat(floatingRows);
-    const allColumns = visibleColumns.concat(floatingColumns);
+    const allColumns = visibleColumns
+      .concat(floatingColumns)
+      .concat(draggingColumns);
     const modelRows = this.getModelRows(allRows, state);
     const modelColumns = this.getModelColumns(allColumns, state);
 
@@ -658,11 +686,11 @@ export class GridMetricCalculator {
    * @returns y value of the top side of the first cell
    */
   getGridY(state: GridMetricState): Coordinate {
-    const { theme, model } = state;
+    const { theme, model, filterBarHeight } = state;
     const { columnHeaderHeight } = theme;
     const { columnHeaderMaxDepth } = model;
 
-    return columnHeaderMaxDepth * columnHeaderHeight;
+    return columnHeaderMaxDepth * columnHeaderHeight + filterBarHeight;
   }
 
   /**

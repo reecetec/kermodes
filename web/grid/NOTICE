@@ -24,6 +24,7 @@ specific language governing permissions and limitations under the License.
 Files adapted from Deephaven carry the header comment
 "Adapted from @deephaven/grid (Apache-2.0), web-client-ui 0bab596" and were
 modified: tree rows, data bars, links and token boxes, cell editing and paste,
-row and column moving, row resizing, the accessibility fallback, and the mock
-models were removed; @deephaven/utils, lodash.clamp, memoizee and color-convert
-were replaced with small local helpers; the theme was rewritten.
+row moving, row resizing, column header groups in column moving, the
+accessibility fallback, and the mock models were removed; @deephaven/utils,
+lodash.clamp, memoizee and color-convert were replaced with small local
+helpers; the theme was rewritten.

@@ -22,12 +22,14 @@ import GridRenderer from './GridRenderer';
 import GridUtils, { type GridPoint } from './GridUtils';
 import {
   GridSelectionMouseHandler,
+  GridColumnMoveMouseHandler,
   GridColumnSeparatorMouseHandler,
   GridHorizontalScrollBarMouseHandler,
   GridScrollBarCornerMouseHandler,
   GridVerticalScrollBarMouseHandler,
   type GridSeparator,
 } from './mouse-handlers';
+import { type DraggingColumn } from './mouse-handlers/GridColumnMoveMouseHandler';
 import injectGridStyles from './GridStyles';
 import {
   type GridKeyHandlerFunctionName,
@@ -109,6 +111,10 @@ export type GridProps = typeof Grid.defaultProps & {
   // Renderer for the grid canvas
   renderer?: GridRenderer;
 
+  // Height of a bar between the column headers and the rows, for quick filter inputs the
+  // host renders as children; 0 for none
+  filterBarHeight?: number;
+
   // Optional state override to pass in to the metric and render state
   // Can be used to add custom properties as well
   stateOverride?: Record<string, unknown>;
@@ -124,6 +130,9 @@ export type GridState = {
   // The scroll offset of the top/left cell. 0,0 means the cell is at the top left
   topOffset: number; // Should be less than the height of the row
   leftOffset: number; // Should be less than the width of the column
+
+  // current column that user is dragging
+  draggingColumn: DraggingColumn | null;
 
   // When drawing header separators for resizing
   // Keeps hover style when mouse is in buffer before resize starts
@@ -210,6 +219,7 @@ class Grid extends PureComponent<GridProps, GridState> {
     mouseHandlers: EMPTY_ARRAY as readonly GridMouseHandler[],
     movedColumns: EMPTY_ARRAY as readonly MoveOperation[],
     movedRows: EMPTY_ARRAY as readonly MoveOperation[],
+    filterBarHeight: 0,
     onError: (): void => undefined,
     onSelectionChange: (_selection: Selection): void => undefined,
     onViewChanged: (metrics: GridMetrics): void => undefined,
@@ -394,6 +404,7 @@ class Grid extends PureComponent<GridProps, GridState> {
     this.keyHandlers = [new SelectionKeyHandler(500)];
     this.mouseHandlers = [
       new GridColumnSeparatorMouseHandler(200),
+      new GridColumnMoveMouseHandler(400),
       new GridVerticalScrollBarMouseHandler(500),
       new GridHorizontalScrollBarMouseHandler(600),
       new GridScrollBarCornerMouseHandler(700),
@@ -413,6 +424,9 @@ class Grid extends PureComponent<GridProps, GridState> {
       // Should be less than the width of the column
       topOffset: 0,
       leftOffset: 0,
+
+      // current column that user is dragging
+      draggingColumn: null,
 
       // When drawing header separators for resizing
       draggingColumnSeparator: null,
@@ -616,7 +630,7 @@ class Grid extends PureComponent<GridProps, GridState> {
 
   getMetricState(state = this.state): GridMetricState {
     const theme = this.getTheme();
-    const { model, stateOverride } = this.props;
+    const { model, stateOverride, filterBarHeight } = this.props;
     if (!this.canvasContext || !this.canvas) {
       throw new Error('Canvas and context must be defined to get metrics');
     }
@@ -635,6 +649,7 @@ class Grid extends PureComponent<GridProps, GridState> {
       movedRows,
       isDraggingHorizontalScrollBar,
       isDraggingVerticalScrollBar,
+      draggingColumn,
     } = state;
 
     return {
@@ -653,6 +668,8 @@ class Grid extends PureComponent<GridProps, GridState> {
       movedRows,
       isDraggingHorizontalScrollBar,
       isDraggingVerticalScrollBar,
+      draggingColumn,
+      filterBarHeight,
       ...stateOverride,
     };
   }
@@ -1833,6 +1850,7 @@ class Grid extends PureComponent<GridProps, GridState> {
     if (!this.canvasContext) throw new Error('context not set');
 
     const {
+      draggingColumn,
       draggingColumnSeparator,
       gestureMode,
       isDraggingHorizontalScrollBar,
@@ -1861,6 +1879,7 @@ class Grid extends PureComponent<GridProps, GridState> {
       mouseX,
       mouseY,
       selection,
+      draggingColumn,
       draggingColumnSeparator,
       isDraggingHorizontalScrollBar,
       isDraggingVerticalScrollBar,
