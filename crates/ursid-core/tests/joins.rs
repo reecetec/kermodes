@@ -1,5 +1,6 @@
 //! Joins against a brute-force reference: after every cycle of random writes, each ticking join
-//! must hold exactly the rows a nested-loop join of its inputs' current rows gives.
+//! must hold exactly the rows a nested-loop join of its inputs' current rows gives, and tables
+//! built on it must match the same tables built on a static copy of it.
 
 use std::sync::Arc;
 
@@ -124,6 +125,42 @@ fn reference(
         .collect()
 }
 
+/// Tables built on a join that rely on its deltas' previous values: `agg_by` subtracts the old
+/// values of removed and modified rows, `filter` drops a row whose new values stop passing, and
+/// `last_by` reads the join's rows back through it.
+fn downstream(joined: &Table, right_column: &str) -> Vec<Table> {
+    let sum = format!("sum({right_column})");
+    vec![
+        joined
+            .agg_by(&["sym"], &[("n", "count(*)"), ("x", "sum(x)"), ("r", &sum)])
+            .unwrap(),
+        joined.filter(&format!("{right_column} > 1")).unwrap(),
+        joined.last_by(&["sym"]).unwrap(),
+    ]
+}
+
+/// Each of `built` (from `downstream` on the ticking `joined`) equals the same table built on a
+/// static copy of `joined`'s current rows.
+fn assert_downstream(
+    session: &Session,
+    joined: &Table,
+    built: &[Table],
+    right_column: &str,
+    context: &str,
+) {
+    let copy = session
+        .static_table(joined.schema().clone(), joined.snapshot().unwrap())
+        .unwrap();
+    for (ticking, fixed) in built.iter().zip(downstream(&copy, right_column)) {
+        assert_eq!(
+            sorted(cells(ticking)),
+            sorted(cells(&fixed)),
+            "{context}: {}",
+            fixed.description()
+        );
+    }
+}
+
 #[test]
 fn natural_join_matches_a_nested_loop_join_through_random_updates() {
     let refs_schema = Schema::new(vec![
@@ -141,6 +178,10 @@ fn natural_join_matches_a_nested_loop_join_through_random_updates() {
         let log = session.input_table(&orders_schema()).unwrap();
         let joined = left.natural_join(&refs, &["sym"], None).unwrap();
         let logged = log.natural_join(&refs, &["sym"], None).unwrap();
+        let built: Vec<_> = [&joined, &logged]
+            .iter()
+            .map(|t| downstream(t, "w"))
+            .collect();
         for cycle in 0..30 {
             churn(&mut rng, &left, &log);
             if rng.below(2) == 0 {
@@ -175,6 +216,10 @@ fn natural_join_matches_a_nested_loop_join_through_random_updates() {
                     "seed {seed}, cycle {cycle}"
                 );
             }
+            for (output, built) in [&joined, &logged].into_iter().zip(&built) {
+                let context = format!("seed {seed}, cycle {cycle}");
+                assert_downstream(&session, output, built, "w", &context);
+            }
         }
         let fixed_left = session
             .static_table(left.schema().clone(), left.snapshot().unwrap())
@@ -206,6 +251,10 @@ fn as_of_join_matches_a_nested_loop_join_through_random_updates() {
         let log = session.input_table(&orders_schema()).unwrap();
         let joined = left.as_of_join(&quotes, &["sym"], "ts", None).unwrap();
         let logged = log.as_of_join(&quotes, &["sym"], "ts", None).unwrap();
+        let built: Vec<_> = [&joined, &logged]
+            .iter()
+            .map(|t| downstream(t, "q"))
+            .collect();
         for cycle in 0..30 {
             churn(&mut rng, &left, &log);
             if rng.below(3) != 0 {
@@ -245,6 +294,10 @@ fn as_of_join_matches_a_nested_loop_join_through_random_updates() {
                     sorted(expected),
                     "seed {seed}, cycle {cycle}"
                 );
+            }
+            for (output, built) in [&joined, &logged].into_iter().zip(&built) {
+                let context = format!("seed {seed}, cycle {cycle}");
+                assert_downstream(&session, output, built, "q", &context);
             }
         }
         let fixed_left = session

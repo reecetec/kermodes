@@ -27,6 +27,7 @@ use hashbrown::HashTable;
 use crate::groups::{KeyKind, LocalEntry, LocalGroups, Membership, shard_of, split};
 use crate::ops::{pick_column, push_removed};
 use crate::parallel::{PARALLEL_ROWS, offsets, run, threads};
+use crate::session::Reader;
 use crate::storage::{Delta, Modified, RowKey, Rows, Storage};
 use crate::{Error, type_name};
 
@@ -570,7 +571,7 @@ impl Accumulator {
     }
 
     /// The output column for `groups`, in that order.
-    fn output(&self, groups: &[u32], input: &Storage) -> Result<ArrayRef, ArrowError> {
+    fn output(&self, groups: &[u32], input: Reader<'_>) -> Result<ArrayRef, ArrowError> {
         let at = groups.iter().map(|g| *g as usize);
         Ok(match self {
             Accumulator::Count { n, .. } => {
@@ -754,7 +755,7 @@ impl AggBy {
 
     pub fn process(
         &mut self,
-        input: &Storage,
+        input: Reader<'_>,
         delta: &Delta,
         own: &Storage,
     ) -> Result<Delta, ArrowError> {
@@ -1059,7 +1060,7 @@ impl Shard {
     fn process(
         &mut self,
         context: &Context,
-        input: &Storage,
+        input: Reader<'_>,
         part: &Part<'_>,
         partials: &[Partial],
         own: &Storage,
@@ -1186,7 +1187,7 @@ impl Shard {
     fn recompute_stale(
         &mut self,
         context: &Context,
-        input: &Storage,
+        input: Reader<'_>,
         touched: &[u32],
     ) -> Result<(), ArrowError> {
         let (mut keys, mut ids) = (Vec::new(), Vec::new());
@@ -1217,7 +1218,7 @@ impl Shard {
     fn output_rows(
         &self,
         context: &Context,
-        input: &Storage,
+        input: Reader<'_>,
         ids: &[u32],
     ) -> Result<(Vec<RowKey>, RecordBatch), ArrowError> {
         let representatives: Vec<RowKey> = ids

@@ -14,6 +14,7 @@ use crate::Expression;
 use crate::agg::AggBy;
 use crate::groups::{KeyKind, LocalGroups, Membership};
 use crate::parallel::{PIECE_ROWS, row_pieces, run, threads_for};
+use crate::session::Reader;
 use crate::storage::{Delta, Modified, RowKey, Rows, Storage};
 
 pub(crate) enum Operator {
@@ -26,7 +27,7 @@ pub(crate) enum Operator {
 impl Operator {
     pub fn process(
         &mut self,
-        input: &Storage,
+        input: Reader<'_>,
         delta: &Delta,
         own: &Storage,
     ) -> Result<Delta, ArrowError> {
@@ -288,7 +289,7 @@ impl LastBy {
 
     fn process(
         &mut self,
-        input: &Storage,
+        input: Reader<'_>,
         delta: &Delta,
         own: &Storage,
     ) -> Result<Delta, ArrowError> {
@@ -350,7 +351,7 @@ impl LastBy {
 
 /// One input column's values at `keys`, NULL where there is no key.
 pub(crate) fn pick_column(
-    input: &Storage,
+    input: Reader<'_>,
     column: usize,
     keys: &[Option<RowKey>],
 ) -> Result<ArrayRef, ArrowError> {

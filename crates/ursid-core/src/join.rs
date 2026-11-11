@@ -9,18 +9,30 @@
 //! against the new right rows directly, so the only rows the re-match must skip are those the
 //! left side removed or modified this cycle. Left rows are kept per group only when the right
 //! side can change: against a static right side, nothing ever re-matches.
+//!
+//! When the right side can change, the join stores no rows: a row is read as its left row plus
+//! the right row the join's state matches it with (see `session::Reader`). Previous values are
+//! therefore never read back from the output. They are built from the cycle's deltas: the left
+//! row's previous values, and the right columns of its previous match as they were before the
+//! cycle.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::ops::Bound;
 
+use ahash::RandomState;
+use arrow::array::{Array, ArrayRef};
+use arrow::compute::interleave;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
 use crate::groups::{KeyKind, Membership};
-use crate::ops::push_removed;
 use crate::parallel::{PIECE_ROWS, row_pieces, run, threads_for};
-use crate::storage::{Delta, Modified, RowKey, Rows, Storage};
+use crate::session::Reader;
+use crate::storage::{Delta, Modified, RowKey, Rows};
+
+type Map<K, V> = hashbrown::HashMap<K, V, RandomState>;
+type Set<K> = hashbrown::HashSet<K, RandomState>;
 
 /// What a join reads and writes.
 pub(crate) struct JoinShape {
@@ -37,13 +49,90 @@ impl JoinShape {
     fn rows(
         &self,
         left: &RecordBatch,
-        right: &Storage,
+        right: Reader<'_>,
         matches: &[Option<RowKey>],
     ) -> Result<RecordBatch, ArrowError> {
+        self.output(left, right.columns_at(&self.right_columns, matches)?)
+    }
+
+    /// Output rows as they were before the cycle: `left` holds the left rows' previous values
+    /// and `matches` their previous matches.
+    fn previous(
+        &self,
+        left: &RecordBatch,
+        right: Reader<'_>,
+        before: &PreviousRight<'_>,
+        matches: &[Option<RowKey>],
+    ) -> Result<RecordBatch, ArrowError> {
+        self.output(left, before.columns(right, &self.right_columns, matches)?)
+    }
+
+    fn output(&self, left: &RecordBatch, right: Vec<ArrayRef>) -> Result<RecordBatch, ArrowError> {
         let mut columns = left.columns().to_vec();
-        columns.extend(right.columns_at(&self.right_columns, matches)?);
+        columns.extend(right);
         let options = RecordBatchOptions::new().with_row_count(Some(left.num_rows()));
         RecordBatch::try_new_with_options(self.output.clone(), columns, &options)
+    }
+}
+
+/// Right rows as they were before the cycle: the rows it removed or modified are read from the
+/// right side's delta, the rest from its current rows.
+struct PreviousRight<'a> {
+    batches: Vec<&'a RecordBatch>,
+    /// Per changed right row: its batch in `batches` and row within it.
+    at: Map<RowKey, (usize, usize)>,
+}
+
+impl<'a> PreviousRight<'a> {
+    fn new(delta: &'a Delta) -> Self {
+        let changed = delta
+            .removed
+            .iter()
+            .map(|r| (&r.keys, &r.batch))
+            .chain(delta.modified.iter().map(|m| (&m.keys, &m.previous)));
+        let (mut batches, mut at) = (Vec::new(), Map::default());
+        for (keys, batch) in changed.filter(|(keys, _)| !keys.is_empty()) {
+            for (row, key) in keys.iter().enumerate() {
+                at.insert(*key, (batches.len(), row));
+            }
+            batches.push(batch);
+        }
+        Self { batches, at }
+    }
+
+    /// As `Reader::columns_at`, with each key's values from before the cycle.
+    fn columns(
+        &self,
+        right: Reader<'_>,
+        columns: &[usize],
+        keys: &[Option<RowKey>],
+    ) -> Result<Vec<ArrayRef>, ArrowError> {
+        if self.at.is_empty() {
+            return right.columns_at(columns, keys);
+        }
+        // Unchanged rows come from current values (array 0), changed ones from their delta batch.
+        let unchanged: Vec<_> = keys
+            .iter()
+            .map(|key| key.filter(|key| !self.at.contains_key(key)))
+            .collect();
+        let indices: Vec<(usize, usize)> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| match key.and_then(|key| self.at.get(&key)) {
+                Some((batch, row)) => (batch + 1, *row),
+                None => (0, i),
+            })
+            .collect();
+        let current = right.columns_at(columns, &unchanged)?;
+        columns
+            .iter()
+            .zip(current)
+            .map(|(column, current)| {
+                let mut arrays: Vec<&dyn Array> = vec![current.as_ref()];
+                arrays.extend(self.batches.iter().map(|b| b.column(*column).as_ref()));
+                interleave(&arrays, &indices)
+            })
+            .collect()
     }
 }
 
@@ -138,7 +227,7 @@ fn gallop(rows: &[(i64, RowKey)], time: i64) -> usize {
 
 /// The left rows a cycle removed or modified: re-matches skip them, since they are emitted (or
 /// gone) already.
-fn changed_left(delta: &Delta) -> HashSet<RowKey> {
+fn changed_left(delta: &Delta) -> Set<RowKey> {
     delta
         .removed
         .iter()
@@ -148,22 +237,28 @@ fn changed_left(delta: &Delta) -> HashSet<RowKey> {
         .collect()
 }
 
-/// Appends re-matched left rows as modified rows, with current left values and new matches.
+/// Appends re-matched left rows (with their previous and new matches) as modified rows. Their
+/// left values did not change this cycle.
 fn push_rematched(
     out: &mut Delta,
     shape: &JoinShape,
-    left: &Storage,
-    right: &Storage,
-    own: &Storage,
-    rematched: Vec<(RowKey, Option<RowKey>)>,
+    (left, right): (Reader<'_>, Reader<'_>),
+    before: &PreviousRight<'_>,
+    rematched: Vec<(RowKey, Option<RowKey>, Option<RowKey>)>,
 ) -> Result<(), ArrowError> {
     if rematched.is_empty() {
         return Ok(());
     }
-    let (keys, matches): (Vec<_>, Vec<_>) = rematched.into_iter().unzip();
+    let (mut keys, mut was, mut now) = (Vec::new(), Vec::new(), Vec::new());
+    for (key, previous, current) in rematched {
+        keys.push(key);
+        was.push(previous);
+        now.push(current);
+    }
+    let rows = left.gather(&keys)?;
     out.modified.push(Modified {
-        previous: own.gather(&keys)?,
-        current: shape.rows(&left.gather(&keys)?, right, &matches)?,
+        previous: shape.previous(&rows, right, before, &was)?,
+        current: shape.rows(&rows, right, &now)?,
         keys,
     });
     Ok(())
@@ -177,15 +272,45 @@ pub(crate) enum Join {
 impl Join {
     pub fn process(
         &mut self,
-        left: &Storage,
+        left: Reader<'_>,
         left_delta: &Delta,
-        right: &Storage,
+        right: Reader<'_>,
         right_delta: &Delta,
-        own: &Storage,
     ) -> Result<Delta, ArrowError> {
         match self {
-            Join::Natural(join) => join.process(left, left_delta, right, right_delta, own),
-            Join::AsOf(join) => join.process(left, left_delta, right, right_delta, own),
+            Join::Natural(join) => join.process(left, left_delta, right, right_delta),
+            Join::AsOf(join) => join.process(left, left_delta, right, right_delta),
+        }
+    }
+
+    /// Whether the output computes its rows on read rather than storing them: when the right
+    /// side can change, stored rows would copy every left column for each row, while the join
+    /// already keeps what a read needs (its groups and their right rows).
+    pub fn computes_rows(&self) -> bool {
+        match self {
+            Join::Natural(join) => join.tracking != Tracking::None,
+            Join::AsOf(join) => join.tracking,
+        }
+    }
+
+    /// The current output rows for current `left` rows.
+    pub fn rows(&self, left: &RecordBatch, right: Reader<'_>) -> Result<RecordBatch, ArrowError> {
+        match self {
+            Join::Natural(join) => {
+                let matches: Vec<_> = find_ids(&join.shape.left_keys, &join.groups, left)?
+                    .into_iter()
+                    .map(|id| id.and_then(|id| join.matched(id)))
+                    .collect();
+                join.shape.rows(left, right, &matches)
+            }
+            Join::AsOf(join) => {
+                let matches: Vec<_> = find_ids(&join.shape.left_keys, &join.groups, left)?
+                    .into_iter()
+                    .zip(times(&join.left_at, left))
+                    .map(|(id, time)| id.and_then(|id| join.matched(id, time)))
+                    .collect();
+                join.shape.rows(left, right, &matches)
+            }
         }
     }
 }
@@ -234,6 +359,14 @@ impl NaturalJoin {
         self.right_rows[group as usize].first().copied()
     }
 
+    /// A group's match before this cycle: as recorded in `was` before the cycle changed the
+    /// group's right rows, or its current match if it did not.
+    fn previous_match(&self, was: &Map<u32, Option<RowKey>>, group: u32) -> Option<RowKey> {
+        was.get(&group)
+            .copied()
+            .unwrap_or_else(|| self.matched(group))
+    }
+
     fn insert_left(&mut self, group: u32, key: RowKey) {
         match self.tracking {
             Tracking::None => {}
@@ -252,36 +385,38 @@ impl NaturalJoin {
 
     fn process(
         &mut self,
-        left: &Storage,
+        left: Reader<'_>,
         left_delta: &Delta,
-        right: &Storage,
+        right: Reader<'_>,
         right_delta: &Delta,
-        own: &Storage,
     ) -> Result<Delta, ArrowError> {
-        let mut changed = Vec::new();
+        // Each group the right side changes, with its match before its first change.
+        let mut was = Map::default();
         for rows in &right_delta.removed {
             for (id, key) in self.ids(false, &rows.batch)?.into_iter().zip(&rows.keys) {
+                was.entry(id).or_insert_with(|| self.matched(id));
                 self.right_rows[id as usize].remove(key);
-                changed.push(id);
             }
         }
         for modified in &right_delta.modified {
             let before = self.ids(false, &modified.previous)?;
             let after = self.ids(false, &modified.current)?;
             for ((old, new), key) in before.into_iter().zip(after).zip(&modified.keys) {
+                for id in [old, new] {
+                    was.entry(id).or_insert_with(|| self.matched(id));
+                }
                 self.right_rows[old as usize].remove(key);
                 self.right_rows[new as usize].insert(*key);
-                changed.extend([old, new]);
             }
         }
         for (keys, batch) in row_pieces(&right_delta.added, PIECE_ROWS) {
             for (id, key) in self.ids(false, &batch)?.into_iter().zip(keys) {
+                was.entry(id).or_insert_with(|| self.matched(id));
                 self.right_rows[id as usize].insert(*key);
-                changed.push(id);
             }
         }
+        let mut changed: Vec<u32> = was.keys().copied().collect();
         changed.sort_unstable();
-        changed.dedup();
         if let Some(&id) = changed
             .iter()
             .find(|id| self.right_rows[**id as usize].len() > 1)
@@ -297,36 +432,53 @@ impl NaturalJoin {
         if self.tracking != Tracking::None && !changed.is_empty() {
             let skip = changed_left(left_delta);
             for id in changed {
-                let matched = self.matched(id);
+                let (previous, matched) = (was[&id], self.matched(id));
                 let group = id as usize;
                 let keys: Box<dyn Iterator<Item = &RowKey>> = match self.tracking {
                     Tracking::Appended => Box::new(self.appended[group].iter()),
                     _ => Box::new(self.changing[group].iter()),
                 };
                 rematched.extend(
-                    keys.filter(|key| !skip.contains(key))
-                        .map(|key| (*key, matched)),
+                    keys.filter(|key| !skip.contains(*key))
+                        .map(|key| (*key, previous, matched)),
                 );
             }
         }
 
+        let before = PreviousRight::new(right_delta);
         let mut out = Delta::default();
         for rows in &left_delta.removed {
-            for (id, key) in self.ids(true, &rows.batch)?.into_iter().zip(&rows.keys) {
-                self.remove_left(id, *key);
+            let ids = self.ids(true, &rows.batch)?;
+            for (id, key) in ids.iter().zip(&rows.keys) {
+                self.remove_left(*id, *key);
             }
-            push_removed(&mut out, own, rows.keys.clone())?;
+            let previous: Vec<_> = ids
+                .iter()
+                .map(|id| self.previous_match(&was, *id))
+                .collect();
+            out.removed.push(Rows {
+                keys: rows.keys.clone(),
+                batch: self
+                    .shape
+                    .previous(&rows.batch, right, &before, &previous)?,
+            });
         }
         for modified in &left_delta.modified {
-            let before = self.ids(true, &modified.previous)?;
-            let after = self.ids(true, &modified.current)?;
-            for ((old, new), key) in before.into_iter().zip(&after).zip(&modified.keys) {
-                self.remove_left(old, *key);
+            let old_ids = self.ids(true, &modified.previous)?;
+            let new_ids = self.ids(true, &modified.current)?;
+            for ((old, new), key) in old_ids.iter().zip(&new_ids).zip(&modified.keys) {
+                self.remove_left(*old, *key);
                 self.insert_left(*new, *key);
             }
-            let matches: Vec<_> = after.iter().map(|id| self.matched(*id)).collect();
+            let previous: Vec<_> = old_ids
+                .iter()
+                .map(|id| self.previous_match(&was, *id))
+                .collect();
+            let matches: Vec<_> = new_ids.iter().map(|id| self.matched(*id)).collect();
             out.modified.push(Modified {
-                previous: own.gather(&modified.keys)?,
+                previous: self
+                    .shape
+                    .previous(&modified.previous, right, &before, &previous)?,
                 current: self.shape.rows(&modified.current, right, &matches)?,
                 keys: modified.keys.clone(),
             });
@@ -361,7 +513,7 @@ impl NaturalJoin {
                 });
             }
         }
-        push_rematched(&mut out, &self.shape, left, right, own, rematched)?;
+        push_rematched(&mut out, &self.shape, (left, right), &before, rematched)?;
 
         for id in self.groups.take_touched() {
             let group = id as usize;
@@ -439,13 +591,29 @@ impl AsOfJoin {
         after.checked_sub(1).map(|at| rows[at].1)
     }
 
+    /// A row's match before this cycle: as `matched`, among the right rows that existed then.
+    /// Right rows are never removed or modified, so only those `added` this cycle are skipped.
+    fn previous_matched(
+        &self,
+        added: &Set<RowKey>,
+        group: u32,
+        time: Option<i64>,
+    ) -> Option<RowKey> {
+        let (rows, time) = (&self.right_rows[group as usize], time?);
+        let after = rows.partition_point(|row| row.0 <= time);
+        rows[..after]
+            .iter()
+            .rev()
+            .find(|(_, key)| !added.contains(key))
+            .map(|(_, key)| *key)
+    }
+
     fn process(
         &mut self,
-        left: &Storage,
+        left: Reader<'_>,
         left_delta: &Delta,
-        right: &Storage,
+        right: Reader<'_>,
         right_delta: &Delta,
-        own: &Storage,
     ) -> Result<Delta, ArrowError> {
         if right_delta.removed.iter().any(|r| !r.keys.is_empty())
             || right_delta.modified.iter().any(|m| !m.keys.is_empty())
@@ -455,7 +623,9 @@ impl AsOfJoin {
                     .into(),
             ));
         }
-        let mut points = Vec::new();
+        // Right rows new this cycle, which previous matches skip. Only a ticking right side needs
+        // them: a static one gains rows only as the join is built, when the left side only adds.
+        let (mut points, mut new_right) = (Vec::new(), Set::default());
         for (keys, batch) in row_pieces(&right_delta.added, PIECE_ROWS) {
             for ((id, time), key) in self.locate(false, &batch)?.into_iter().zip(keys) {
                 if let Some(time) = time {
@@ -467,6 +637,9 @@ impl AsOfJoin {
                         rows.insert(rows.partition_point(|other| *other < row), row);
                     }
                     points.push((id, time));
+                    if self.tracking {
+                        new_right.insert(*key);
+                    }
                 }
             }
         }
@@ -490,41 +663,64 @@ impl AsOfJoin {
                     self.left_rows[group]
                         .range((Bound::Included((time, 0)), end))
                         .filter(|(_, key)| !skip.contains(key))
-                        .map(|(_, key)| (*key, matched)),
+                        .map(|(at, key)| {
+                            (
+                                *key,
+                                self.previous_matched(&new_right, id, Some(*at)),
+                                matched,
+                            )
+                        }),
                 );
             }
         }
 
+        // Right values never change, so previous right columns are current ones.
+        let before = PreviousRight::new(right_delta);
         let mut out = Delta::default();
         for rows in &left_delta.removed {
             let located = self.locate(true, &rows.batch)?;
             if self.tracking {
-                for ((id, time), key) in located.into_iter().zip(&rows.keys) {
+                for ((id, time), key) in located.iter().zip(&rows.keys) {
                     if let Some(time) = time {
-                        self.left_rows[id as usize].remove(&(time, *key));
+                        self.left_rows[*id as usize].remove(&(*time, *key));
                     }
                 }
             }
-            push_removed(&mut out, own, rows.keys.clone())?;
+            let previous: Vec<_> = located
+                .iter()
+                .map(|(id, time)| self.previous_matched(&new_right, *id, *time))
+                .collect();
+            out.removed.push(Rows {
+                keys: rows.keys.clone(),
+                batch: self
+                    .shape
+                    .previous(&rows.batch, right, &before, &previous)?,
+            });
         }
         for modified in &left_delta.modified {
-            let before = self.locate(true, &modified.previous)?;
+            let before_rows = self.locate(true, &modified.previous)?;
             let after = self.locate(true, &modified.current)?;
             if self.tracking {
                 for (((old, was), (new, now)), key) in
-                    before.into_iter().zip(&after).zip(&modified.keys)
+                    before_rows.iter().zip(&after).zip(&modified.keys)
                 {
                     if let Some(was) = was {
-                        self.left_rows[old as usize].remove(&(was, *key));
+                        self.left_rows[*old as usize].remove(&(*was, *key));
                     }
                     if let Some(now) = now {
                         self.left_rows[*new as usize].insert((*now, *key));
                     }
                 }
             }
+            let previous: Vec<_> = before_rows
+                .iter()
+                .map(|(id, time)| self.previous_matched(&new_right, *id, *time))
+                .collect();
             let matches: Vec<_> = after.iter().map(|(id, t)| self.matched(*id, *t)).collect();
             out.modified.push(Modified {
-                previous: own.gather(&modified.keys)?,
+                previous: self
+                    .shape
+                    .previous(&modified.previous, right, &before, &previous)?,
                 current: self.shape.rows(&modified.current, right, &matches)?,
                 keys: modified.keys.clone(),
             });
@@ -577,7 +773,7 @@ impl AsOfJoin {
                 });
             }
         }
-        push_rematched(&mut out, &self.shape, left, right, own, rematched)?;
+        push_rematched(&mut out, &self.shape, (left, right), &before, rematched)?;
 
         for id in self.groups.take_touched() {
             let group = id as usize;

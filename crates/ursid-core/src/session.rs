@@ -5,7 +5,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLock
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use arrow::compute::interleave_record_batch;
+use arrow::array::{ArrayRef, new_null_array};
+use arrow::compute::{interleave, interleave_record_batch};
 use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
@@ -62,7 +63,8 @@ struct Graph {
 struct TableState {
     description: String,
     schema: SchemaRef,
-    storage: Storage,
+    /// The table's rows; `None` for a table that computes them on read (see `Reader`).
+    storage: Option<Storage>,
     refreshing: bool,
     /// Only ever gains rows; operators keep less state over such inputs.
     add_only: bool,
@@ -87,6 +89,143 @@ enum Source {
         right: usize,
         operator: Box<Join>,
     },
+}
+
+const STORED: &str = "only joins compute their rows; inputs and derived tables store theirs";
+
+/// A table's current rows, wherever they are. Most tables store theirs. A join whose right side
+/// ticks stores none: a row is computed on read from its left row, the join's current match for
+/// it, and that right row, so the join costs no memory per row. Reads resolve through earlier
+/// tables, so `tables` holds every table up to the one read.
+#[derive(Clone, Copy)]
+pub(crate) struct Reader<'a> {
+    tables: &'a [TableState],
+    id: usize,
+}
+
+enum Place<'a> {
+    Stored(&'a Storage),
+    Joined {
+        join: &'a Join,
+        left: Reader<'a>,
+        right: Reader<'a>,
+    },
+}
+
+impl<'a> Reader<'a> {
+    fn new(tables: &'a [TableState], id: usize) -> Self {
+        Self { tables, id }
+    }
+
+    fn place(self) -> Place<'a> {
+        let table = &self.tables[self.id];
+        match (&table.storage, &table.source) {
+            (Some(storage), _) => Place::Stored(storage),
+            (
+                None,
+                Source::Join {
+                    left,
+                    right,
+                    operator,
+                },
+            ) => Place::Joined {
+                join: operator,
+                left: Self::new(self.tables, *left),
+                right: Self::new(self.tables, *right),
+            },
+            (None, _) => unreachable!("{STORED}"),
+        }
+    }
+
+    pub fn len(self) -> usize {
+        match self.place() {
+            Place::Stored(storage) => storage.len(),
+            Place::Joined { left, .. } => left.len(),
+        }
+    }
+
+    /// Current values of `keys`, in that order.
+    pub fn gather(self, keys: &[RowKey]) -> Result<RecordBatch, ArrowError> {
+        match self.place() {
+            Place::Stored(storage) => storage.gather(keys),
+            Place::Joined { join, left, right } => join.rows(&left.gather(keys)?, right),
+        }
+    }
+
+    /// The current values of `keys` in each of `columns`, one array per column, NULL where a key
+    /// is `None`.
+    pub fn columns_at(
+        self,
+        columns: &[usize],
+        keys: &[Option<RowKey>],
+    ) -> Result<Vec<ArrayRef>, ArrowError> {
+        if let Place::Stored(storage) = self.place() {
+            return storage.columns_at(columns, keys);
+        }
+        let present: Vec<RowKey> = keys.iter().flatten().copied().collect();
+        let rows = self.gather(&present)?;
+        if present.len() == keys.len() {
+            return Ok(columns.iter().map(|c| rows.column(*c).clone()).collect());
+        }
+        // Missing keys point at a one-row NULL array placed after the gathered rows.
+        let mut next = 0;
+        let indices: Vec<(usize, usize)> = keys
+            .iter()
+            .map(|key| match key {
+                Some(_) => {
+                    next += 1;
+                    (0, next - 1)
+                }
+                None => (1, 0),
+            })
+            .collect();
+        columns
+            .iter()
+            .map(|c| {
+                let values = rows.column(*c);
+                let null = new_null_array(values.data_type(), 1);
+                interleave(&[values.as_ref(), null.as_ref()], &indices)
+            })
+            .collect()
+    }
+
+    /// The first `n` rows in key order.
+    pub fn head(self, n: usize) -> Result<RecordBatch, ArrowError> {
+        self.gather(&self.head_keys(n))
+    }
+
+    fn head_keys(self, n: usize) -> Vec<RowKey> {
+        match self.place() {
+            Place::Stored(storage) => storage.head_keys(n),
+            Place::Joined { left, .. } => left.head_keys(n),
+        }
+    }
+
+    /// Current rows in key order.
+    pub fn snapshot(self) -> Result<Vec<RecordBatch>, ArrowError> {
+        match self.place() {
+            Place::Stored(storage) => storage.snapshot(),
+            Place::Joined { join, left, right } => left
+                .snapshot()?
+                .iter()
+                .map(|batch| join.rows(batch, right))
+                .collect(),
+        }
+    }
+
+    /// Every current row as an addition: how a newly built table catches up with its input.
+    pub fn as_added(self) -> Result<Delta, ArrowError> {
+        match self.place() {
+            Place::Stored(storage) => storage.as_added(),
+            Place::Joined { join, left, right } => {
+                let mut delta = left.as_added()?;
+                for rows in &mut delta.added {
+                    rows.batch = join.rows(&rows.batch, right)?;
+                }
+                Ok(delta)
+            }
+        }
+    }
 }
 
 /// A join's resolved columns: its shape, the left `on` columns, and the `at` columns if any.
@@ -197,6 +336,8 @@ impl Session {
             .collect();
         state
             .storage
+            .as_mut()
+            .expect(STORED)
             .apply(&Delta {
                 added,
                 ..Delta::default()
@@ -224,13 +365,15 @@ impl Session {
             }
             let result = match &mut table.source {
                 Source::Static => continue,
-                Source::Append => Ok(appended(&table.storage, writes)),
-                Source::Keyed(keyed) => keyed.resolve(&table.storage, writes),
+                Source::Append => Ok(appended(table.storage.as_ref().expect(STORED), writes)),
+                Source::Keyed(keyed) => {
+                    keyed.resolve(table.storage.as_ref().expect(STORED), writes)
+                }
                 Source::Derived { parent, operator } => {
                     if !table.refreshing {
                         continue;
                     }
-                    let parent = &before[*parent];
+                    let (id, parent) = (*parent, &before[*parent]);
                     if let Some(cause) = &parent.failure {
                         table.fail(Error::Upstream {
                             table: table.description.clone(),
@@ -242,7 +385,11 @@ impl Session {
                     let Some(delta) = &parent.delta else {
                         continue;
                     };
-                    operator.process(&parent.storage, delta, &table.storage)
+                    operator.process(
+                        Reader::new(before, id),
+                        delta,
+                        table.storage.as_ref().expect(STORED),
+                    )
                 }
                 Source::Join {
                     left,
@@ -252,7 +399,7 @@ impl Session {
                     if !table.refreshing {
                         continue;
                     }
-                    let (left, right) = (&before[*left], &before[*right]);
+                    let (ids, left, right) = ((*left, *right), &before[*left], &before[*right]);
                     if let Some(cause) = left.failure.as_ref().or(right.failure.as_ref()) {
                         table.fail(Error::Upstream {
                             table: table.description.clone(),
@@ -266,11 +413,10 @@ impl Session {
                     }
                     let unchanged = Delta::default();
                     operator.process(
-                        &left.storage,
+                        Reader::new(before, ids.0),
                         left.delta.as_ref().unwrap_or(&unchanged),
-                        &right.storage,
+                        Reader::new(before, ids.1),
                         right.delta.as_ref().unwrap_or(&unchanged),
-                        &table.storage,
                     )
                 }
             };
@@ -400,10 +546,10 @@ impl TableState {
         add_only: bool,
         source: Source,
     ) -> Self {
-        let storage = if add_only {
-            Storage::dense(schema.clone())
-        } else {
-            Storage::sparse(schema.clone())
+        let storage = match &source {
+            Source::Join { operator, .. } if operator.computes_rows() => None,
+            _ if add_only => Some(Storage::dense(schema.clone())),
+            _ => Some(Storage::sparse(schema.clone())),
         };
         Self {
             description,
@@ -420,7 +566,8 @@ impl TableState {
 
     /// Finishes building a derived table: its first rows are applied, so their delta goes. A
     /// table that never refreshes never runs its operator again, so the operator's state (join
-    /// indexes, aggregation shards, group tables) goes too, leaving only the rows.
+    /// indexes, aggregation shards, group tables) goes too, leaving only the rows. (A join that
+    /// computes its rows always refreshes: its right side ticks.)
     fn settle(&mut self) {
         self.delta = None;
         if !self.refreshing {
@@ -438,7 +585,9 @@ impl TableState {
     fn commit(&mut self, result: Result<Delta, ArrowError>) {
         let applied = result.and_then(|delta| {
             if !delta.is_empty() {
-                self.storage.apply(&delta)?;
+                if let Some(storage) = &mut self.storage {
+                    storage.apply(&delta)?;
+                }
                 self.delta = Some(delta);
             }
             Ok(())
@@ -899,18 +1048,16 @@ impl Table {
             left.add_only && !other.refreshing,
             source,
         );
-        let result = left.storage.as_added().and_then(|left_rows| {
-            let right_rows = other.storage.as_added()?;
+        let (left_rows, right_rows) = (
+            Reader::new(&graph.tables, self.id),
+            Reader::new(&graph.tables, right.id),
+        );
+        let result = left_rows.as_added().and_then(|left_added| {
+            let right_added = right_rows.as_added()?;
             let Source::Join { operator, .. } = &mut state.source else {
                 unreachable!("built as a join above");
             };
-            operator.process(
-                &left.storage,
-                &left_rows,
-                &other.storage,
-                &right_rows,
-                &state.storage,
-            )
+            operator.process(left_rows, &left_added, right_rows, &right_added)
         });
         state.commit(result);
         if let Some(error) = state.failure {
@@ -932,10 +1079,12 @@ impl Table {
         if let Some(error) = &table.failure {
             return Err(error.clone());
         }
-        table.storage.snapshot().map_err(|e| Error::Compute {
-            table: table.description.clone(),
-            message: e.to_string(),
-        })
+        Reader::new(&graph.tables, self.id)
+            .snapshot()
+            .map_err(|e| Error::Compute {
+                table: table.description.clone(),
+                message: e.to_string(),
+            })
     }
 
     /// The first `n` rows in key order, or the error that failed the table.
@@ -945,10 +1094,12 @@ impl Table {
         if let Some(error) = &table.failure {
             return Err(error.clone());
         }
-        table.storage.head(n).map_err(|e| Error::Compute {
-            table: table.description.clone(),
-            message: e.to_string(),
-        })
+        Reader::new(&graph.tables, self.id)
+            .head(n)
+            .map_err(|e| Error::Compute {
+                table: table.description.clone(),
+                message: e.to_string(),
+            })
     }
 
     /// The cycle that last changed this table's rows or failed it; 0 if none has.
@@ -961,7 +1112,7 @@ impl Table {
         let table = &graph.tables[self.id];
         match &table.failure {
             Some(error) => Err(error.clone()),
-            None => Ok(table.storage.len()),
+            None => Ok(Reader::new(&graph.tables, self.id).len()),
         }
     }
 
@@ -1014,11 +1165,12 @@ impl Table {
                 cause: Arc::new(cause.clone()),
             });
         }
-        let result = parent.storage.as_added().and_then(|everything| {
+        let input = Reader::new(&graph.tables, self.id);
+        let result = input.as_added().and_then(|everything| {
             let Source::Derived { operator, .. } = &mut state.source else {
                 unreachable!("built as derived above");
             };
-            operator.process(&parent.storage, &everything, &state.storage)
+            operator.process(input, &everything, state.storage.as_ref().expect(STORED))
         });
         state.commit(result);
         if let Some(error) = state.failure {
