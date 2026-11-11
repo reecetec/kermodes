@@ -17,7 +17,7 @@ COLUMNS = {
 @km.deployment()
 def ticks(db):
     db.create_table("md.ticks", COLUMNS)
-    feed = km.demo.ticker(rate=1_000, symbols=100)
+    feed = km.demo.ticker(rate=1_500, symbols=100)
     # Waits for the run it replaces to hand over md.ticks (a rolling update).
     ingest = db.ingest_websocket(feed.url, "md.ticks", source="ticks", wait=True)
     # The feed and its connector run as long as this function holds them.
