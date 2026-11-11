@@ -280,10 +280,17 @@ impl Session {
     }
 
     /// Serves this session's published tables to the web UI on `host:port` (port 0 picks a
-    /// free one): the app at `server.url`, tables published with `server.publish(name, table)`.
+    /// free one): the app at `server.url`, tables published with `server.publish(name, table)`,
+    /// and the programs of `control`, `kermodes control`'s URL, if given.
     /// Local use: there is no authentication, so it listens on 127.0.0.1 unless told otherwise.
-    #[pyo3(signature = (port=0, host="127.0.0.1"))]
-    fn serve(&self, py: Python<'_>, port: u16, host: &str) -> PyResult<Server> {
+    #[pyo3(signature = (port=0, host="127.0.0.1", control=None))]
+    fn serve(
+        &self,
+        py: Python<'_>,
+        port: u16,
+        host: &str,
+        control: Option<String>,
+    ) -> PyResult<Server> {
         let addr: SocketAddr = format!("{host}:{port}")
             .parse()
             .map_err(|e| PyValueError::new_err(format!("cannot listen on {host}:{port}: {e}")))?;
@@ -292,7 +299,7 @@ impl Session {
         let app = package.parent().map(|dir| dir.join("static").join("app"));
         let session = self.engine.clone();
         let server = py
-            .detach(|| kermodes_gateway::serve(session, addr, app))
+            .detach(|| kermodes_gateway::serve(session, addr, app, control))
             .map_err(|e| PyValueError::new_err(format!("cannot listen on {addr}: {e}")))?;
         Ok(Server(Mutex::new(server)))
     }

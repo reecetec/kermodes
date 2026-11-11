@@ -1101,6 +1101,11 @@ namespaces).
   or the server stops). It listens on 127.0.0.1 and has no authentication; the WebSocket
   protocol is in `kermodes-gateway`'s module doc. `kermodes dev` and `kermodes ui` start the same
   server.
+- Programs, the first of the deployments surface: with `kermodes ui --control URL` (the chart sets
+  it when the controller is enabled), the server passes `GET /api/programs` and manual rollouts
+  through to `kermodes control`, and the app shows each project's running commit, a commit whose
+  discovery failed with its error, and each resource's update policy, rollout state, and
+  available update, with Roll out for `manual` ones. Without a controller the page is absent.
 - v1 surfaces: catalog (schemas, versions, lineage), live and historical table viewer, console
   (SQL and table-API editor on CodeMirror 6, `EXPLAIN` view), pipelines (commit → build → test →
   plan → roll out), deployments (running commit, available update, rollout state, Restart and Roll

@@ -116,6 +116,25 @@ impl State {
             }))
     }
 
+    /// The newest synced commit, discovered or not: the mainline as the controller last saw it.
+    pub async fn latest(&mut self, project: &str) -> Result<Option<Commit>, String> {
+        Ok(self
+            .client()
+            .await?
+            .query_opt(
+                "SELECT commit, manifest, error FROM kermodes_control_commits
+                 WHERE project = $1 ORDER BY synced_at DESC LIMIT 1",
+                &[&project],
+            )
+            .await
+            .map_err(sql)?
+            .map(|row| Commit {
+                commit: row.get(0),
+                manifest: row.get(1),
+                error: row.get(2),
+            }))
+    }
+
     /// The newest synced commit whose discovery succeeded: what the project should run.
     pub async fn latest_discovered(&mut self, project: &str) -> Result<Option<Commit>, String> {
         Ok(self
@@ -277,6 +296,12 @@ mod tests {
             .unwrap();
         let latest = state.latest_discovered("ticker").await.unwrap().unwrap();
         assert_eq!(latest.commit, "a");
+        // The mainline is at the failed commit; it shows as failed, not as what runs.
+        let head = state.latest("ticker").await.unwrap().unwrap();
+        assert_eq!(
+            (head.commit.as_str(), head.error.as_deref()),
+            ("b", Some("SyntaxError"))
+        );
         assert_eq!(
             state
                 .commit("ticker", "b")

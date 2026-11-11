@@ -46,6 +46,12 @@ spec:
           image: {{ include "kermodes.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: [ui, --server, {{ include "kermodes.weirUrl" . | quote }}, --host, 0.0.0.0, --port, "8730"]
+          {{- if .Values.control.enabled }}
+          env:
+            # The programs page reads the controller through the UI's server.
+            - name: KERMODES_CONTROL
+              value: http://{{ include "kermodes.fullname" . }}-control:8732
+          {{- end }}
           ports:
             - name: http
               containerPort: 8730

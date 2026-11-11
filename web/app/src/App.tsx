@@ -15,6 +15,7 @@ import {
   type KermodesConnection,
 } from '@kermodes/client';
 import { TableViewer, gridThemes, type GridThemeName } from '@kermodes/grid';
+import { ProgramsPage, usePrograms } from '@/Programs';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -31,6 +32,7 @@ import { cn } from '@/lib/utils';
 const THEME_KEY = 'kermodes-theme';
 
 type Tab = { key: string; view: SocketView };
+type Page = 'tables' | 'programs';
 
 /** Re-render when the connection's status, tables, or last error change */
 function useConnection(connection: KermodesConnection): void {
@@ -91,10 +93,16 @@ function TopBar({
   connection,
   themeName,
   onToggleTheme,
+  page,
+  onPage,
+  hasPrograms,
 }: {
   connection: KermodesConnection;
   themeName: GridThemeName;
   onToggleTheme: () => void;
+  page: Page;
+  onPage: (page: Page) => void;
+  hasPrograms: boolean;
 }) {
   return (
     <header className="flex h-12 shrink-0 items-center gap-3 border-b bg-sidebar px-4">
@@ -102,7 +110,22 @@ function TopBar({
         <PawPrint className="size-4" />
       </div>
       <span className="text-[15px] font-semibold tracking-tight">Kermodes</span>
-      <span className="text-sm text-muted-foreground">Tables</span>
+      {hasPrograms ? (
+        <nav className="flex items-center gap-1">
+          {(['tables', 'programs'] as const).map(name => (
+            <Button
+              key={name}
+              variant={page === name ? 'secondary' : 'ghost'}
+              size="sm"
+              onClick={() => onPage(name)}
+            >
+              {name === 'tables' ? 'Tables' : 'Programs'}
+            </Button>
+          ))}
+        </nav>
+      ) : (
+        <span className="text-sm text-muted-foreground">Tables</span>
+      )}
       <div className="ml-auto flex items-center gap-2">
         <ConnectionPill status={connection.status} error={connection.lastError} />
         <Tooltip>
@@ -234,6 +257,9 @@ export default function App({ connection }: { connection: KermodesConnection }) 
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [active, setActive] = useState<string | null>(null);
   const theme = gridThemes[themeName];
+  const [page, setPage] = useState<Page>('tables');
+  const [programs, refreshPrograms] = usePrograms();
+  const hasPrograms = programs.state === 'ok' || programs.state === 'error';
 
   const openTable = useCallback(
     (table: string) => {
@@ -278,8 +304,20 @@ export default function App({ connection }: { connection: KermodesConnection }) 
           connection={connection}
           themeName={themeName}
           onToggleTheme={toggleTheme}
+          page={hasPrograms ? page : 'tables'}
+          onPage={setPage}
+          hasPrograms={hasPrograms}
         />
-        <div className="flex min-h-0 flex-1">
+        {hasPrograms && page === 'programs' && (
+          <ProgramsPage programs={programs} onChanged={refreshPrograms} />
+        )}
+        {/* Hidden rather than unmounted, so open tables keep their views. */}
+        <div
+          className={cn(
+            'flex min-h-0 flex-1',
+            hasPrograms && page === 'programs' && 'hidden'
+          )}
+        >
           <Sidebar
             tables={connection.tables}
             activeTable={activeTable}

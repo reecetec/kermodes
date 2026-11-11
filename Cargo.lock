@@ -1321,6 +1321,8 @@ dependencies = [
  "arrow",
  "axum",
  "futures-util",
+ "http-body-util",
+ "hyper-util",
  "kermodes-core",
  "serde_json",
  "tokio",

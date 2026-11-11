@@ -339,9 +339,15 @@ pub async fn status(controller: &Controller) -> Result<Value, String> {
     let mut projects = Vec::new();
     for project in &controller.config.projects {
         let mut state = controller.state.lock().await;
+        let head = state.latest(&project.name).await?;
         let latest = state.latest_discovered(&project.name).await?;
         let deployed = state.deployed(&project.name).await?;
         drop(state);
+        // The mainline's newest commit, when its discovery failed: what runs stays on `commit`.
+        let failed = head.and_then(|head| {
+            let error = head.error?;
+            Some(json!({"commit": head.commit, "error": error}))
+        });
         let mut resources = Vec::new();
         if let Some(latest) = &latest {
             let manifest = Manifest::parse(latest.manifest.as_deref().unwrap_or_default())?;
@@ -364,6 +370,7 @@ pub async fn status(controller: &Controller) -> Result<Value, String> {
             "branch": project.branch,
             "path": project.path,
             "commit": latest.map(|c| c.commit),
+            "failed": failed,
             "resources": resources,
         }));
     }

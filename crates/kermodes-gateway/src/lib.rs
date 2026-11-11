@@ -22,11 +22,16 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use axum::Router;
+use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as UrlPath, State};
-use axum::http::{StatusCode, header};
+use axum::http::{Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
+use http_body_util::Full;
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::TokioExecutor;
 use kermodes_core::viewer::{Frame, Request, SortKey, Viewer};
 use kermodes_core::{Session, Table, type_name};
 use serde_json::{Value, json};
@@ -34,6 +39,8 @@ use tokio::sync::{oneshot, watch};
 
 /// How long the cycle watcher waits before checking whether the server is stopping.
 const CYCLE_WAIT: Duration = Duration::from_millis(500);
+/// How long the controller may take to answer the programs page.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A running server; stops when dropped.
 pub struct Server {
@@ -54,6 +61,13 @@ struct Shared {
     cycles: watch::Sender<u64>,
     /// The built web app (`index.html` and its assets), if any.
     app: Option<PathBuf>,
+    /// `kermodes control`, whose API the programs page reads through this server.
+    control: Option<Control>,
+}
+
+struct Control {
+    url: String,
+    client: Client<HttpConnector, Full<Bytes>>,
 }
 
 impl Shared {
@@ -64,8 +78,14 @@ impl Shared {
     }
 }
 
-/// Serves `session` on `addr` (port 0 picks a free one), with the web app in `app`.
-pub fn serve(session: Session, addr: SocketAddr, app: Option<PathBuf>) -> io::Result<Server> {
+/// Serves `session` on `addr` (port 0 picks a free one), with the web app in `app` and the
+/// programs of `control`, `kermodes control`'s URL, if there is one.
+pub fn serve(
+    session: Session,
+    addr: SocketAddr,
+    app: Option<PathBuf>,
+    control: Option<String>,
+) -> io::Result<Server> {
     let listener = TcpListener::bind(addr)?;
     listener.set_nonblocking(true)?;
     let addr = listener.local_addr()?;
@@ -74,6 +94,10 @@ pub fn serve(session: Session, addr: SocketAddr, app: Option<PathBuf>) -> io::Re
         catalog: watch::Sender::new(0),
         cycles: watch::Sender::new(0),
         app,
+        control: control.map(|url| Control {
+            url: url.trim_end_matches('/').to_owned(),
+            client: Client::builder(TokioExecutor::new()).build_http(),
+        }),
     });
     let stopping = Arc::new(AtomicBool::new(false));
     let watcher = {
@@ -99,6 +123,8 @@ pub fn serve(session: Session, addr: SocketAddr, app: Option<PathBuf>) -> io::Re
     let (shutdown, stopped) = oneshot::channel::<()>();
     let router = Router::new()
         .route("/ws", get(upgrade))
+        .route("/api/programs", get(programs))
+        .route("/api/programs/{project}/{resource}/rollout", post(roll_out))
         .route("/", get(index))
         .route("/{*path}", get(asset))
         .with_state(shared.clone());
@@ -172,6 +198,62 @@ impl Drop for Server {
 
 async fn index(State(shared): State<Arc<Shared>>) -> Response {
     file(&shared, Path::new("index.html")).await
+}
+
+/// Every program the controller runs, as `kermodes control` reports them (`GET /api/status`).
+async fn programs(State(shared): State<Arc<Shared>>) -> Response {
+    to_control(&shared, Method::GET, "/api/status").await
+}
+
+/// Rolls a resource out to its project's newest deployable commit (`update="manual"`).
+async fn roll_out(
+    State(shared): State<Arc<Shared>>,
+    UrlPath((project, resource)): UrlPath<(String, String)>,
+) -> Response {
+    // Names, never paths: nothing else of the controller's API is reachable from here.
+    let plain = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    };
+    if !plain(&project) || !plain(&resource) {
+        return control_error(StatusCode::BAD_REQUEST, "not a project and resource name");
+    }
+    let path = format!("/api/projects/{project}/resources/{resource}/rollout");
+    to_control(&shared, Method::POST, &path).await
+}
+
+/// Passes a request to the controller and its answer back.
+async fn to_control(shared: &Shared, method: Method, path: &str) -> Response {
+    let Some(control) = &shared.control else {
+        return control_error(
+            StatusCode::NOT_FOUND,
+            "no controller: programs run under `kermodes control`",
+        );
+    };
+    let request = axum::http::Request::builder()
+        .method(method)
+        .uri(format!("{}{path}", control.url))
+        .body(Full::new(Bytes::new()))
+        .expect("a request from a parsed URL");
+    match tokio::time::timeout(CONTROL_TIMEOUT, control.client.request(request)).await {
+        Ok(Ok(response)) => {
+            let (parts, body) = response.into_parts();
+            Response::from_parts(parts, Body::new(body))
+        }
+        Ok(Err(e)) => control_error(
+            StatusCode::BAD_GATEWAY,
+            &format!("cannot reach the controller at {}: {e}", control.url),
+        ),
+        Err(_) => control_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            &format!("the controller at {} did not answer", control.url),
+        ),
+    }
+}
+
+fn control_error(status: StatusCode, message: &str) -> Response {
+    (status, axum::Json(json!({"error": message}))).into_response()
 }
 
 async fn asset(State(shared): State<Arc<Shared>>, UrlPath(path): UrlPath<String>) -> Response {

@@ -100,7 +100,8 @@ async fn the_app_lists_opens_filters_and_follows_published_tables() {
         .unwrap();
     session.step();
     let mut server =
-        kermodes_gateway::serve(session.clone(), "127.0.0.1:0".parse().unwrap(), None).unwrap();
+        kermodes_gateway::serve(session.clone(), "127.0.0.1:0".parse().unwrap(), None, None)
+            .unwrap();
     server.publish("book", &book);
 
     let url = format!("ws://{}/ws", server.addr());
@@ -193,6 +194,7 @@ async fn the_app_is_served_from_its_directory_only() {
         Session::new(),
         "127.0.0.1:0".parse().unwrap(),
         Some(app.clone()),
+        None,
     )
     .unwrap();
     let get = |path: &str| {

@@ -78,6 +78,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     ui.add_argument("--host", default="127.0.0.1")
     ui.add_argument("--port", type=int, default=DEV_PORT)
+    ui.add_argument(
+        "--control",
+        default=os.environ.get("KERMODES_CONTROL"),
+        help="kermodes control's URL, for the programs page (default: $KERMODES_CONTROL)",
+    )
 
     ingest = commands.add_parser("ingest", help="run a built-in connector into a table")
     connectors = ingest.add_subparsers(dest="connector", required=True)
@@ -183,7 +188,7 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "weir":
         run_weir(args.data_dir, args.host, args.port, args.catalog, args.branch)
     elif args.command == "ui":
-        run_ui(args.server, args.host, args.port)
+        run_ui(args.server, args.host, args.port, args.control)
     elif args.command == "ingest":
         run_websocket(
             args.url, args.table, args.source, args.columns, args.server, args.flush
@@ -288,9 +293,9 @@ def run_weir(
         pass
 
 
-def run_ui(server: str | None, host: str, port: int) -> None:
+def run_ui(server: str | None, host: str, port: int, control: str | None) -> None:
     session = km.connect(server)
-    ui = session.serve(port=port, host=host)
+    ui = session.serve(port=port, host=host, control=control)
     print(f"kermodes ui: {ui.url}", flush=True)
     try:
         follow(session, ui.publish)
