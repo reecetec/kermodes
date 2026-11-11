@@ -157,8 +157,15 @@ reason in this section.
 
 ### 5.1 Tables and schemas
 
-- A table is identified by `namespace.table` and is owned by exactly one project (§11), which
-  declares it. Other projects read it.
+- A table is named `namespace.table` and is owned by exactly one project (§11), which declares
+  it. Other projects read it. Names have two levels, lowercase `[a-z][a-z0-9_]*`; `sys` is
+  reserved.
+- The catalog keys a table by **branch** and name (§10.1) and gives it a stable table ID. Names
+  are labels, as column names are (§5.4): renaming a table or moving it to another namespace
+  changes the catalog, not the data.
+- A table's storage location is fixed when it is created, from its branch, name, and ID
+  (`{branch}/{namespace}/{table}.{id}`), and recorded in the catalog. weir and the lake use it;
+  nothing derives a path from a name.
 - Schemas are Arrow schemas with stable column IDs, versioned in the catalog. Live and historical
   share the schema history. Changes are planned operations (§5.4).
 - Column partition: `Date` (UTC, string `YYYY-MM-DD`), assigned from **ingest time**, not event
@@ -200,8 +207,8 @@ historical at a cycle boundary; the rows are identical, so downstream sees no ch
 ### 5.4 Schema evolution
 
 Table schemas are declared in the owning project. Changing one is a code change that goes through
-the pipeline: the plan classifies it, and applying the commit applies the change. Scratch
-namespaces also accept direct changes from the SDK, CLI, or an agent.
+the pipeline: the plan classifies it, and applying the commit applies the change. Sandbox
+branches (§10.1) also accept direct changes from the SDK, CLI, or an agent.
 
 ```python
 odds = km.table(
@@ -243,6 +250,10 @@ Dependents
 - A change that would break a feature view or model signature in the same project is rejected
   unless the same commit updates it. Breaking changes to tables other projects read require those
   projects to be compatible first (expand → migrate consumers → contract).
+- Consumer contracts: a project declares what it reads from tables other projects own (columns,
+  types, and optionally keys and freshness) under `[reads]` in `kermodes.toml`. The owner's
+  `plan` checks every contract on its tables and fails a change that breaks one, so the producer
+  learns before merging, not when a consumer fails in production.
 
 Live data
 
@@ -267,7 +278,8 @@ History
 
 Arrow Flight `DoPut`.
 
-- Flight descriptor: `{namespace, table, date, source_id, schema_version}`.
+- Flight descriptor: `{table_id, date, source_id, schema_version}`. Writers resolve `ns.table` on
+  their branch to a table ID and an endpoint once, through `GetFlightInfo` (§17).
 - Every record batch carries `app_metadata = {seq: u64}`. `seq` is strictly increasing per
   `(table, date, source_id)`.
 - weir acknowledges on the `PutResult` stream with the highest `seq` that is durable (fsynced).
@@ -305,7 +317,7 @@ def parse_odds(msgs: km.Batch) -> km.Batch: ...
 ### 7.1 Storage
 
 ```
-/data/weir/{namespace}/{table}/{date}/{source_id}/
+/data/weir/{location}/{date}/{source_id}/     location = {branch}/{namespace}/{table}.{id} (§5.1)
   seg-000042.arrow      sealed: Arrow IPC file (footer present), immutable
   seg-000042.idx        batch offsets, seq range, ingest-time range, row range, epoch
   seg-000043.arrows     open: Arrow IPC stream, append + fsync
@@ -351,7 +363,7 @@ Parquet files written by Kermodes to object storage (rustfs in the cluster, a lo
 local mode) through `object_store`.
 
 ```
-{lake}/{namespace}/{table}/Date={date}/part-{n}.parquet
+{lake}/{location}/Date={date}/part-{n}.parquet
 ```
 
 Per-table layout config, applied by the merge writer:
@@ -368,7 +380,8 @@ Per-table layout config, applied by the merge writer:
 The catalog lives in the control-plane database (Postgres in the cluster, SQLite locally). It is
 the only record of what history exists.
 
-- Tables: namespace, name, owning project, current schema version, layout config.
+- Tables: ID, branch, namespace, name, location, owning project, current schema version, layout
+  config.
 - Schema versions: columns by ID with name, type, default, and the version that introduced them.
 - Data files: path, `Date`, row count, byte size, schema version, per-column min/max for key and
   `ts` columns, merge run ID.
@@ -407,6 +420,8 @@ Files use a plain Hive-style layout with standard Parquet, so external tools (Du
 pyarrow, Spark) can read them directly with read access to the bucket. The catalog is the source
 of truth for which files are current; an export of catalog snapshots to an open table format
 (DuckLake or Iceberg metadata) is a later addition if external tools need snapshot consistency.
+Locations are fixed at creation, so a renamed table's files keep their first path; the catalog
+(`kermodes data locate ns.table`) gives the current one.
 
 ## 9. Engine
 
@@ -439,7 +454,7 @@ Anything outside this set runs as Python jobs over Arrow batches.
 
 ### 9.3 Plans and expressions
 
-- Every query is an **Kermodes plan**: a serializable logical plan of operators (§9.2) over named
+- Every query is a **Kermodes plan**: a serializable logical plan of operators (§9.2) over named
   tables. The Python table API builds plans client-side; SQL compiles to the same plans (§9.8).
   Plans are what workers execute, what `plan`/`EXPLAIN` show, and what clients send over Flight.
 - Scalar expressions use SQL expression syntax everywhere, including table API strings:
@@ -453,6 +468,11 @@ Anything outside this set runs as Python jobs over Arrow batches.
   folding and common-subexpression reuse are the only optimizations initially.
 - Predicates on scan inputs are translated into Parquet pruning (§8.4).
 - Rust-native function registry; Python UDFs run in the Python sidecar per batch (§9.5).
+- Plans are language-neutral. Python is the first SDK and SQL the second front end; another
+  language (a Rust or TypeScript SDK) is one more plan builder speaking Flight, with no engine
+  change. User code in other languages runs as a sidecar speaking the same Arrow-over-socket
+  protocol as Python's (§9.5). Code inside the engine process, if ever needed, would be WASM,
+  never native plugins: a user's crash must not take the engine down.
 
 ### 9.4 Clocks and replay
 
@@ -559,11 +579,27 @@ Every resource is a typed spec (Rust types, JSON Schema generated from them):
 `FeatureView`, `Model`, `ModelVersion`, `Alias`, `WorkerClass`, `Environment`, `Repository`,
 `Target`, `Secret` reference.
 
-| Namespace kind | Source of truth | How changes arrive |
+Tables live on **branches** of the catalog, as code lives on branches of a repository. Code always
+names tables `ns.table`; the branch comes from where it runs.
+
+| Branch | Source of truth | How changes arrive |
 |---|---|---|
-| Managed (`sports`, …) | A project repository at a commit | Only through the pipeline (§11) |
-| Scratch (`scratch.<user>`) | The control plane | Direct apply from SDK, CLI, or agents |
-| Preview (`<ns>@pr-<n>`) | The pull request's head commit | Pipeline preview target, expires with the PR |
+| `prod` | A project repository at a commit | Only through the pipeline (§11) |
+| `staging` | The mainline commit being promoted | The pipeline |
+| `pr-<n>` (preview) | The pull request's head commit | The pipeline; expires with the PR |
+| `sandbox-<user>` | The control plane | Direct apply from the SDK, CLI, or agents; `kermodes deploy --target sandbox` |
+
+- Every branch but `prod` is an overlay on a parent (`prod` unless stated): reading a table the
+  branch does not produce reads the parent's, live and historical. A branch writes only the
+  tables it produces, so nothing outside `prod` can change `prod`'s data; the catalog enforces
+  it.
+- A shadowing branch (previews, and staging by default) runs no ingesters: it reads ingested
+  tables from its parent, so a source is never consumed twice.
+- `ns.table@branch` names a table on another branch, and is only needed across branches:
+  `kermodes diff`, comparisons in a notebook, reads a grant allows.
+- One install hosts every branch. Worker classes, quotas, and optionally node pools keep
+  non-prod work off prod's resources. A separate install is for upgrading the platform itself
+  (Kargo promotes it through its own staging) or for isolation a regulator demands.
 
 Postgres holds the catalog, what is deployed where and from which commit, run history, and audit.
 It never holds the only copy of a managed resource's definition.
@@ -571,7 +607,7 @@ It never holds the only copy of a managed resource's definition.
 ### 10.2 validate → plan → apply
 
 - `validate`: type-check specs; infer output schemas using the engine's planner.
-- `plan`: diff desired state (a commit, or a scratch spec) against what is deployed on a target;
+- `plan`: diff desired state (a commit, or a sandbox spec) against what is deployed on a target;
   inferred schemas, schema change classes (§5.4), sample rows (bounded), cost and cardinality
   estimates, environment status, affected downstream resources across projects.
 - `apply`: execute the plan. For managed namespaces only the pipeline applies, using a commit's
@@ -599,6 +635,11 @@ def retrain(ctx): ...
 `sys.job_runs`, `sys.task_runs`, `sys.task_logs`, `sys.deployments`, `sys.pipeline_runs`,
 `sys.ingest_stats`, `sys.audit`, `sys.lineage`, `sys.model_events`. All are ordinary live tables
 and merge to the lake daily.
+
+`sys.delivery`, a view over `sys.deployments` and `sys.pipeline_runs`, gives each project the
+delivery measures from *Accelerate* (Forsgren, Humble, Kim): lead time from commit to prod,
+deploy frequency, change failure rate (deploys followed by a rollback or a forward fix), and time
+to restore. The web UI shows them per project, so "rapid and safe" is a number, not a claim.
 
 ### 10.5 Worker configuration
 
@@ -633,7 +674,7 @@ s = km.connect().session(env="sportsflow@main", worker_class="medium", memory="8
 An environment is an immutable, prebuilt Python environment. Nothing is installed when a worker
 starts.
 
-- Source: the project's `pyproject.toml` + `uv.lock` at the commit. Scratch sessions may instead
+- Source: the project's `pyproject.toml` + `uv.lock` at the commit. Sandbox sessions may instead
   use an inline dependency list, which the control plane resolves with uv into a lock stored with
   the `Environment` version.
 - Identity: hash of `uv.lock`, `pyproject.toml`, Python version, Kermodes version, and platform.
@@ -644,7 +685,7 @@ starts.
   daemon, no privileged builder) to the Gitea OCI registry as `kermodes-env:<hash>`.
 - Workers reference the image by digest. The kubelet's image cache makes later starts on a node
   instant; an optional pre-pull DaemonSet warms environments marked hot.
-- Sessions may `%pip install` into a scratch overlay for exploration. The session is then marked
+- Sessions may `%pip install` into a session-only overlay for exploration. The session is then marked
   dirty; the dependency has to land in the project's lock to be deployed.
 - Unreferenced environment images are garbage-collected, keeping the last N per project.
 
@@ -676,12 +717,18 @@ name = "sportsflow"
 entry = "sportsflow.kermodes_app"       # module whose decorators declare resources
 namespaces = ["sports"]              # namespaces this project owns
 
+[sources]                            # code from other repositories, mounted on PYTHONPATH (§11.7)
+quant = { git = "https://git.rcolclough.com/rcolclough/quant-lib", rev = "main", path = "src" }
+
+[reads."md.ticks"]                   # a consumer contract, checked by md's plan (§5.4)
+columns = { sym = "utf8", price = "float64", ts = "timestamp" }
+
 [tests]
 replay = [{ tables = ["sports.odds", "sports.games"], dates = "2026-10-01..2026-10-07" }]
 
 [targets.preview]
 on = "pull_request"
-mode = "shadow"                      # read production inputs, write to sports@pr-<n>
+mode = "shadow"                      # read prod's inputs, write to branch pr-<n>
 ttl = "3d"
 
 [targets.staging]
@@ -722,7 +769,7 @@ flowchart LR
   the dates in `kermodes.toml` with the replay clock (§9.4).
 - `kermodes plan --target <t>` diffs the working tree against what is deployed on `t`.
 - `kermodes deploy --target sandbox` deploys the working tree, including uncommitted changes, to the
-  user's personal sandbox (a scratch namespace in the cluster), marked dirty. Shared targets only
+  user's sandbox branch in the cluster (§10.1), marked dirty. Shared targets only
   accept pipeline deployments of pushed commits.
 
 ### 11.3 Pipeline
@@ -766,15 +813,19 @@ flowchart LR
   `sandbox`.
 - Promotion deploys the same artifact to the next target once its gate passes: health for a
   duration (deployments caught up, no errors), approval by a role, or both.
-- Staging and prod differ by namespace mapping and worker classes, not by code or environment.
+- Staging and prod differ by branch and worker classes, not by code or environment.
 - Kargo continues to promote the Kermodes platform itself (Helm chart); Kermodes promotes user projects.
 
 ### 11.5 Preview and shadow deployments
 
-- `mode = "shadow"` deploys the PR's artifact with production inputs read-only and outputs
-  redirected to `<ns>@pr-<n>`. Production consumers never see shadow outputs.
-- `kermodes diff sports.edges --against sports@pr-123.edges --window 1h` compares preview outputs with
-  production on live or replayed data — the test in a clone of production.
+- `mode = "shadow"` deploys the PR's artifact on branch `pr-<n>`: it reads prod's inputs and
+  writes its own outputs (§10.1). Production consumers never see them.
+- `kermodes diff sports.edges --branch pr-123 --window 1h` compares the branch's table with
+  prod's over the same inputs: row counts, keys on one side only, and per-column differences
+  (count, maximum absolute and relative error), with sample rows for each.
+- The pipeline's gate diffs on replayed history, where both sides see identical inputs under the
+  replay clock (§9.4) and any difference is the code's. Diffs of live shadow output are a sanity
+  check only: timing alone makes them differ.
 - Model changes can additionally run as a challenger alias in production (§12.1) to hide work in
   progress behind a flag.
 - Previews expire with the PR or after `ttl`.
@@ -785,6 +836,12 @@ Rollback deploys a previous artifact to the target. Environment images and snaps
 so it is a restart, not a rebuild. Schema changes are the exception: rollback across a
 contract or rewrite change requires a forward fix, and `plan` says so.
 
+A bad release can also write bad data, which a restart does not undo. `sys.lineage` records which
+derived partitions each deployment wrote, by artifact and input positions, so
+`kermodes repair <deployment> --since <time>` lists the affected tables and dates and recomputes
+them with the fixed artifact on the replay clock, committing each date atomically as a rewrite
+(§5.4). Ingested data is never rewritten this way; a bad ingester is fixed forward.
+
 ### 11.7 Repositories and credentials
 
 - A `Repository` registers a git remote (Gitea first), its credentials (secret reference), and a
@@ -792,6 +849,10 @@ contract or rewrite change requires a forward fix, and `plan` says so.
 - Code snapshots reach workers through an init container with a short-lived token and are mounted
   read-only. The project's package is placed on `PYTHONPATH`, so a code-only change is a snapshot
   download, not an environment build.
+- Source dependencies (`[sources]` in `kermodes.toml`) are snapshotted the same way: pinned to a
+  commit at build time, recorded in the artifact, and mounted beside the project's package.
+  Editing shared code is then a snapshot download, not an environment build, as long as it adds
+  no third-party packages; those belong in the lock.
 - Every deployment, job run, and session records the commit it ran (`sys.deployments`,
   `sys.task_runs`, `sys.audit`).
 - The pipeline acts as the project's service identity with grants on the project's namespaces;
@@ -810,9 +871,9 @@ A model version is:
 - the commit and job run that trained it;
 - link to an MLflow run (MLflow stays as experiment tracking).
 
-Models are registered by jobs (training runs from a project commit) or from notebooks into scratch
-namespaces. Aliases (`champion`, `challenger`) are pointers to versions; alias changes on managed
-namespaces go through the pipeline or an approval and are events in `sys.model_events`.
+Models are registered by jobs (training runs from a project commit) or from notebooks into sandbox
+branches. Aliases (`champion`, `challenger`) are pointers to versions; alias changes on `prod` go
+through the pipeline or an approval and are events in `sys.model_events`.
 
 ### 12.2 Feature store (forage)
 
@@ -840,9 +901,9 @@ MCP server over the control plane, pipeline, and query surface.
 
 - Catalog: search namespaces/tables, describe schema, sample rows, lineage.
 - Query: bounded static queries and bounded live snapshots, in SQL or the table API.
-- Scratch: validate / plan / apply directly in the agent's scratch namespace.
-- Managed namespaces: agents work on a branch, run `test` and `plan`, push, and open a pull request;
-  the preview target shows their outputs in shadow; humans merge.
+- Sandbox: validate / plan / apply directly on the agent's sandbox branch.
+- Managed namespaces: agents work on a git branch, run `test` and `plan`, push, and open a pull
+  request; its preview branch shows their outputs in shadow; humans merge.
 - Pipeline: read runs, logs, test failures, plans; re-run stages.
 - Sandboxes: agent sessions run in their own engine processes with memory, CPU, and time quotas.
 - Agents act with a delegated, optionally narrowed token from their user (§14); they never exceed
@@ -872,10 +933,10 @@ Workload identity
 Authorization
 
 - RBAC per namespace. Roles: `viewer` (read tables), `writer` (ingest, publish derived tables),
-  `editor` (scratch resources, sandbox deploys, PR previews), `admin` (gate approvals, grants,
+  `editor` (sandbox resources, sandbox deploys, PR previews), `admin` (gate approvals, grants,
   purges).
 - Bindings map users or OIDC groups to roles.
-- Managed resources run with their project's grants; scratch resources with their owner's.
+- Managed resources run with their project's grants; sandbox resources with their owner's.
 - `sys.*` rows are filtered to namespaces the caller can view.
 
 Enforcement points: control plane (spec operations, pipeline), gateway (which workers a caller may
@@ -988,7 +1049,7 @@ local (§16.6).
   several replicas; scheduler, pipeline, and reconciler loops use leader election via a Kubernetes
   `Lease`, and every replica serves the API.
 - Two layers of state:
-  - **Intent**: managed resources come from project commits (§11); scratch resources, catalog,
+  - **Intent**: managed resources come from project commits (§11); sandbox resources, catalog,
     deployments, runs, and audit are in Postgres.
   - **Runtime** in Kubernetes: custom resources the controller writes from intent and reconciles
     into native objects. `kubectl get kermodesworkers` shows what is running.
@@ -1047,7 +1108,8 @@ No JVM, Docker, or Kubernetes.
 
 | Entry point | What runs | Use |
 |---|---|---|
-| `km.local()` | Engine inside the Python process (PyO3) | Notebooks, tests, experiments |
+| `km.local()` | Engine inside the Python process (PyO3), in memory | Notebooks, tests, experiments |
+| `km.local("./.kermodes")` | The same, plus weir, the lake, and the catalog in-process on that directory: tables survive restarts | One notebook or script working with its own data, like `duckdb.connect("x.duckdb")` |
 | `kermodes dev` | One supervisor process: control plane, gateway + UI, weir, workers as child processes; hot reload of the current project | Development |
 | Kubernetes | Same package, one role per pod | Cluster |
 
@@ -1055,6 +1117,10 @@ No JVM, Docker, or Kubernetes.
   every server role, and the `kermodes` command (§19.1).
 - `kermodes dev` keeps state in `./.kermodes/` (or `--data-dir`): weir segments on local disk; the lake as
   local Parquet; catalog and control-plane state in SQLite; a single implicit user, OIDC optional.
+  It is the same directory layout `km.local(path)` opens, and the bucket's layout in the cluster.
+- One process owns a directory at a time (a lock file): a second process opening it would write
+  the same files behind the first one's back. To share data between processes, run `kermodes dev`
+  and connect with `km.connect()`; weir is then the one writer and every process is its client.
 - Workers are `kermodes worker` child processes; Python sidecars are child processes using the
   environment built by uv into `.kermodes/envs/<hash>` (same hash as §10.6, built once, then reused).
   Same protocols as pods, so behaviour matches the cluster.
