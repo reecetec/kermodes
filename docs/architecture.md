@@ -881,6 +881,9 @@ flowchart LR
 - Triggers: polling (every 30 s by default), and a push webhook any git host can call:
   `POST /hooks/sync` with a shared secret in `X-Kermodes-Secret`. A host adapter (§11.7) adds that
   host's own webhook signature. A lost webhook only delays a sync.
+- A commit that leaves the project's directory as it was (the same git tree) is not a new version
+  of the project: nothing is discovered or rolled out, so commits elsewhere in a shared
+  repository restart nothing.
 - With a host adapter (§11.7), results go back to the host as commit statuses (`kermodes/test`,
   `kermodes/plan`) and a PR comment with the plan.
 - Every stage is a row in `sys.pipeline_runs`. The UI shows commit → build → test → plan → roll out,

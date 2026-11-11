@@ -2,7 +2,7 @@
 //! discover a new commit in a Job, and reconcile every resource by its update policy. A commit
 //! whose discovery fails is never rolled out; what runs keeps running.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -75,6 +75,9 @@ pub struct Controller {
     pub kube: Kube,
     /// Wakes the loop early (the sync webhook).
     pub wake: Notify,
+    /// Per project, the mainline head last seen leaving the project's directory as it was, so
+    /// it is not fetched again at every poll.
+    unchanged: Mutex<HashMap<String, String>>,
 }
 
 /// Runs the controller on a runtime of its own until SIGTERM or SIGINT, blocking the caller.
@@ -95,6 +98,7 @@ pub async fn run(config: Config) -> Result<(), String> {
         kube: Kube::connect(&config.namespace).await?,
         config,
         wake: Notify::new(),
+        unchanged: Mutex::new(HashMap::new()),
     });
     let listener = tokio::net::TcpListener::bind(&controller.config.listen)
         .await
@@ -164,6 +168,9 @@ async fn sync(controller: &Controller, project: &ProjectConfig) -> Result<(), St
             .await
             .map_err(|e| e.to_string())??
     };
+    if controller.unchanged.lock().await.get(&project.name) == Some(&head) {
+        return reconcile(controller, project).await;
+    }
     let known = controller
         .state
         .lock()
@@ -173,21 +180,40 @@ async fn sync(controller: &Controller, project: &ProjectConfig) -> Result<(), St
     let pending = match known {
         None => {
             let scratch = tempdir()?;
-            let (commit, tar) = tokio::task::spawn_blocking(move || {
+            let snapshot = tokio::task::spawn_blocking(move || {
                 let result = git::snapshot(&repo, credentials.as_ref(), &scratch);
                 let _ = std::fs::remove_dir_all(&scratch);
                 result
             })
             .await
             .map_err(|e| e.to_string())??;
-            controller
-                .state
-                .lock()
-                .await
-                .add_commit(&project.name, &commit, &tar)
+            let mut state = controller.state.lock().await;
+            // A commit elsewhere in the repository is not a new version of the project: what
+            // runs keeps running, with nothing to discover or roll out.
+            let latest = state.latest(&project.name).await?;
+            if latest.and_then(|c| c.tree).as_deref() == Some(snapshot.tree.as_str()) {
+                drop(state);
+                controller
+                    .unchanged
+                    .lock()
+                    .await
+                    .insert(project.name.clone(), snapshot.commit);
+                return reconcile(controller, project).await;
+            }
+            state
+                .add_commit(
+                    &project.name,
+                    &snapshot.commit,
+                    &snapshot.tree,
+                    &snapshot.tar,
+                )
                 .await?;
-            eprintln!("kermodes control: {}: synced {commit}", project.name);
-            Some(commit)
+            drop(state);
+            eprintln!(
+                "kermodes control: {}: synced {}",
+                project.name, snapshot.commit
+            );
+            Some(snapshot.commit)
         }
         // Discovery was interrupted (the controller restarted): run it again.
         Some(c) if c.manifest.is_none() && c.error.is_none() => Some(c.commit),

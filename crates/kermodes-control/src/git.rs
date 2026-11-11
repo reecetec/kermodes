@@ -37,13 +37,21 @@ pub fn head(repo: &Repository, credentials: Option<&Credentials>) -> Result<Stri
         .ok_or_else(|| format!("{} has no branch {}", repo.url, repo.branch))
 }
 
-/// The project's directory at the mainline's head, as a tar of its files (paths relative to the
-/// repository's root), and the commit it is.
+/// A project's directory at one commit.
+pub struct Snapshot {
+    pub commit: String,
+    /// The directory's git tree: two commits with the same tree have the same code.
+    pub tree: String,
+    /// Its files as a tar, paths relative to the repository's root.
+    pub tar: Vec<u8>,
+}
+
+/// The project's directory at the mainline's head.
 pub fn snapshot(
     repo: &Repository,
     credentials: Option<&Credentials>,
     scratch: &Path,
-) -> Result<(String, Vec<u8>), String> {
+) -> Result<Snapshot, String> {
     let dir = scratch
         .to_str()
         .ok_or("a scratch directory that is not UTF-8")?;
@@ -63,13 +71,21 @@ pub fn snapshot(
     let commit = git(Some(scratch), None, &["rev-parse", "FETCH_HEAD"])?
         .trim()
         .to_owned();
-    let mut args = vec!["archive", "--format=tar", "FETCH_HEAD"];
     let path = repo.path.trim_matches('/');
+    let tree = git(
+        Some(scratch),
+        None,
+        &["rev-parse", &format!("FETCH_HEAD:{path}")],
+    )
+    .map_err(|e| format!("{} has no directory `{path}` at {commit}: {e}", repo.url))?
+    .trim()
+    .to_owned();
+    let mut args = vec!["archive", "--format=tar", "FETCH_HEAD"];
     if !path.is_empty() {
         args.push(path);
     }
     let tar = run(git_command(Some(scratch), None, &args))?;
-    Ok((commit, tar))
+    Ok(Snapshot { commit, tree, tar })
 }
 
 fn branch_ref(repo: &Repository) -> String {
@@ -180,8 +196,9 @@ mod tests {
         let second = commit(&origin, "examples/ticker/src/app.py", "two");
         assert_eq!(head(&repo, None).unwrap(), second);
         let work = scratch("work");
-        let (at, tar) = snapshot(&repo, None, &work).unwrap();
-        assert_eq!(at, second);
+        let taken = snapshot(&repo, None, &work).unwrap();
+        assert_eq!(taken.commit, second);
+        let tar = taken.tar;
         let listing = Command::new("tar")
             .args(["-t"])
             .stdin(std::process::Stdio::piped())
@@ -208,12 +225,30 @@ mod tests {
             ]
         );
 
+        // A commit elsewhere in the repository leaves the project's tree as it was; one inside
+        // the project changes it.
+        commit(&origin, "other/y.py", "still not the project");
+        let elsewhere = snapshot(&repo, None, &scratch("elsewhere")).unwrap();
+        assert_ne!(elsewhere.commit, taken.commit);
+        assert_eq!(elsewhere.tree, taken.tree);
+        commit(&origin, "examples/ticker/src/app.py", "three");
+        let inside = snapshot(&repo, None, &scratch("inside")).unwrap();
+        assert_ne!(inside.tree, taken.tree);
+        let gone = Repository {
+            path: "examples/nope".into(),
+            ..repo.clone()
+        };
+        assert!(snapshot(&gone, None, &scratch("gone")).is_err());
+
         let missing = Repository {
             branch: "nope".into(),
             ..repo
         };
         assert!(head(&missing, None).is_err());
-        let _ = std::fs::remove_dir_all(&origin);
-        let _ = std::fs::remove_dir_all(&work);
+        for dir in ["origin", "work", "elsewhere", "inside", "gone"] {
+            let _ = std::fs::remove_dir_all(
+                std::env::temp_dir().join(format!("kermodes-git-{}-{dir}", std::process::id())),
+            );
+        }
     }
 }

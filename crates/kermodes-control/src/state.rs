@@ -18,8 +18,22 @@ pub struct State {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Commit {
     pub commit: String,
+    /// The git tree of the project's directory: equal trees are the same code. Unknown for
+    /// commits synced before it was recorded.
+    pub tree: Option<String>,
     pub manifest: Option<String>,
     pub error: Option<String>,
+}
+
+const COMMIT_COLUMNS: &str = "commit, tree, manifest, error";
+
+fn commit_row(row: tokio_postgres::Row) -> Commit {
+    Commit {
+        commit: row.get(0),
+        tree: row.get(1),
+        manifest: row.get(2),
+        error: row.get(3),
+    }
 }
 
 impl State {
@@ -39,6 +53,7 @@ impl State {
                  error TEXT,
                  PRIMARY KEY (project, commit)
              );
+             ALTER TABLE kermodes_control_commits ADD COLUMN IF NOT EXISTS tree TEXT;
              CREATE TABLE IF NOT EXISTS kermodes_control_deployed (
                  project TEXT NOT NULL,
                  resource TEXT NOT NULL,
@@ -61,14 +76,15 @@ impl State {
         &mut self,
         project: &str,
         commit: &str,
+        tree: &str,
         snapshot: &[u8],
     ) -> Result<(), String> {
         self.client()
             .await?
             .execute(
-                "INSERT INTO kermodes_control_commits (project, commit, snapshot)
-                 VALUES ($1, $2, $3) ON CONFLICT (project, commit) DO NOTHING",
-                &[&project, &commit, &snapshot],
+                "INSERT INTO kermodes_control_commits (project, commit, tree, snapshot)
+                 VALUES ($1, $2, $3, $4) ON CONFLICT (project, commit) DO NOTHING",
+                &[&project, &commit, &tree, &snapshot],
             )
             .await
             .map_err(sql)?;
@@ -103,17 +119,15 @@ impl State {
             .client()
             .await?
             .query_opt(
-                "SELECT commit, manifest, error FROM kermodes_control_commits
-                 WHERE project = $1 AND commit = $2",
+                &format!(
+                    "SELECT {COMMIT_COLUMNS} FROM kermodes_control_commits
+                     WHERE project = $1 AND commit = $2"
+                ),
                 &[&project, &commit],
             )
             .await
             .map_err(sql)?
-            .map(|row| Commit {
-                commit: row.get(0),
-                manifest: row.get(1),
-                error: row.get(2),
-            }))
+            .map(commit_row))
     }
 
     /// The newest synced commit, discovered or not: the mainline as the controller last saw it.
@@ -122,17 +136,15 @@ impl State {
             .client()
             .await?
             .query_opt(
-                "SELECT commit, manifest, error FROM kermodes_control_commits
-                 WHERE project = $1 ORDER BY synced_at DESC LIMIT 1",
+                &format!(
+                    "SELECT {COMMIT_COLUMNS} FROM kermodes_control_commits
+                     WHERE project = $1 ORDER BY synced_at DESC LIMIT 1"
+                ),
                 &[&project],
             )
             .await
             .map_err(sql)?
-            .map(|row| Commit {
-                commit: row.get(0),
-                manifest: row.get(1),
-                error: row.get(2),
-            }))
+            .map(commit_row))
     }
 
     /// The newest synced commit whose discovery succeeded: what the project should run.
@@ -141,18 +153,16 @@ impl State {
             .client()
             .await?
             .query_opt(
-                "SELECT commit, manifest, error FROM kermodes_control_commits
-                 WHERE project = $1 AND manifest IS NOT NULL
-                 ORDER BY synced_at DESC LIMIT 1",
+                &format!(
+                    "SELECT {COMMIT_COLUMNS} FROM kermodes_control_commits
+                     WHERE project = $1 AND manifest IS NOT NULL
+                     ORDER BY synced_at DESC LIMIT 1"
+                ),
                 &[&project],
             )
             .await
             .map_err(sql)?
-            .map(|row| Commit {
-                commit: row.get(0),
-                manifest: row.get(1),
-                error: row.get(2),
-            }))
+            .map(commit_row))
     }
 
     pub async fn snapshot(
@@ -281,7 +291,10 @@ mod tests {
     async fn a_failed_commit_never_replaces_the_deployable_one() {
         let Some(url) = database().await else { return };
         let mut state = State::open(&url).await.unwrap();
-        state.add_commit("ticker", "a", b"tar a").await.unwrap();
+        state
+            .add_commit("ticker", "a", "tree a", b"tar a")
+            .await
+            .unwrap();
         // Known but not yet discovered: not deployable.
         assert_eq!(state.latest_discovered("ticker").await.unwrap(), None);
         state
@@ -289,7 +302,10 @@ mod tests {
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        state.add_commit("ticker", "b", b"tar b").await.unwrap();
+        state
+            .add_commit("ticker", "b", "tree b", b"tar b")
+            .await
+            .unwrap();
         state
             .discovered("ticker", "b", &Err("SyntaxError".into()))
             .await
@@ -299,8 +315,12 @@ mod tests {
         // The mainline is at the failed commit; it shows as failed, not as what runs.
         let head = state.latest("ticker").await.unwrap().unwrap();
         assert_eq!(
-            (head.commit.as_str(), head.error.as_deref()),
-            ("b", Some("SyntaxError"))
+            (
+                head.commit.as_str(),
+                head.tree.as_deref(),
+                head.error.as_deref()
+            ),
+            ("b", Some("tree b"), Some("SyntaxError"))
         );
         assert_eq!(
             state
