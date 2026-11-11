@@ -1,11 +1,12 @@
 # syntax=docker/dockerfile:1
 # The one Kermodes image (architecture.md §16.1): Python slim and the kermodes wheel, which runs
 # every role (`kermodes weir`, `kermodes ui`, ...). Built once per release and promoted as is.
+# Image names are fully qualified: CI builds with buildah, which does not guess registries.
 
 ARG RUST_VERSION=1.98.1
 
 # The web app and the notebook widget, which the wheel serves from kermodes/static.
-FROM oven/bun:1.4.2 AS web
+FROM docker.io/oven/bun:1.4.2 AS web
 WORKDIR /src/web
 COPY web/ ./
 RUN bun install --frozen-lockfile && bun run build
@@ -25,7 +26,7 @@ COPY . .
 COPY --from=web /src/python/kermodes/static python/kermodes/static
 RUN uv build --wheel --out-dir /dist
 
-FROM python:3.14-slim-trixie AS runtime
+FROM docker.io/library/python:3.14-slim-trixie AS runtime
 ARG IMAGE_CREATED
 ARG IMAGE_REVISION
 ARG IMAGE_SOURCE
