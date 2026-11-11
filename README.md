@@ -17,7 +17,7 @@ live = ticks.where("price > 0").update("notional = price * size")
 
 ticks.append(pa.table({"sym": ["a", "b"], "price": [1.5, -2.0], "size": [10, 20]}))
 s.step()
-pa.table(live)   # sym, price, size, notional for rows with price > 0
+pa.table(live)  # sym, price, size, notional for rows with price > 0
 ```
 
 ## Development
