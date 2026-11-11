@@ -4,7 +4,8 @@ Status: draft. This document is the design contract; nothing here is implemented
 
 Ursid is a cloud-native data platform where live and historical data share one table model.
 A real-time incremental engine, a columnar ingest log, a Parquet lake, a job scheduler, a model
-registry, a feature store, and an agent surface all sit on that model.
+registry, a feature store, and an agent surface all sit on that model. User code lives in git and
+reaches the cluster through a deployment pipeline.
 
 The name: the Ursids are a meteor shower radiating from Ursa Minor — a stream of events coming
 from a bear.
@@ -21,6 +22,14 @@ Everything else is a declarative object built on tables: feature views, models, 
 ingesters, deployments. The same expression that builds a training set from history runs
 incrementally on live data; replaying history through the engine is a backtest.
 
+**Arrow end to end.** Arrow in memory, Arrow Flight on the wire, Arrow IPC for intraday storage,
+Parquet for history. One engine evaluates both live and static queries. No embedded third-party
+query engine.
+
+**Git is the source of truth.** Tables, deployments, jobs, feature views, and models are declared
+in project repositories, developed and tested locally, and delivered to the cluster by a pipeline
+that builds once and promotes the same artifact through targets.
+
 ## 2. Goals and non-goals
 
 Goals
@@ -35,17 +44,21 @@ Goals
 - Multi-user from the start: OIDC login, namespace RBAC, per-user isolated worker pods.
 - Schema changes as first-class, planned operations across live data, history, and dependents.
 - Kubernetes-native: Helm install; the controller runs every worker as its own pod.
-- Clean local start: `pip install ursid` or one static binary. No JVM, Docker, or Kubernetes
-  required.
+- Clean local start: `pip install ursid` (one wheel). No JVM, Docker, or Kubernetes required.
+- Continuous integration and delivery for user projects: develop locally, push, and the cluster
+  tests, plans, and deploys the commit.
+- Small dependency surface: the arrow-rs family for data, plus infrastructure crates.
 
 Non-goals (for now)
 
 - Distributing one update graph across nodes. One deployment = one engine process; scale by
   sharding deployments.
 - General incremental SQL (DBSP/differential dataflow). The engine supports a fixed operator set.
+- A SQL engine. The query surface is the Ursid expression language and table API; a SQL frontend
+  compiling to Ursid plans may come later.
 - A custom historical file format. History is Parquet.
-- Web UI beyond catalog, table viewer, console, jobs, and models until notebooks and agents work
-  end to end.
+- Web UI beyond catalog, table viewer, console, pipelines, jobs, and models until notebooks and
+  agents work end to end.
 
 ## 3. Prior art mapping
 
@@ -56,8 +69,9 @@ Non-goals (for now)
 | RDB | Worker reading intraday | Engine worker, `db.live_table` |
 | RTE / CEP, chained TP | Persistent query | Engine deployment publishing derived live tables back to weir |
 | `.u.end` end-of-day writedown | Merge + validate | Daily merge job |
-| HDB (splayed, date-partitioned, mmap) | Historical (DH format / Parquet) | Parquet in DuckLake, `db.historical_table` |
+| HDB (splayed, date-partitioned, mmap) | Historical (DH format / Parquet) | Parquet + Ursid catalog, `db.historical_table` |
 | Gateway | Query routing | `db.table` + query router |
+| q scripts on disk | Git-integrated persistent query scripts | Project repositories + deployment pipeline (§11) |
 
 Lessons taken from kdb+: keep the ingest hop dumb (append, log, publish — no queries); historical
 speed comes from layout (sort by key within date, enumerated keys, parted attribute) more than
@@ -68,15 +82,17 @@ from file format.
 | Component | Name | Language | Role |
 |---|---|---|---|
 | Ingest server | weir | Rust | Accepts ingest protocol, writes Arrow IPC segments, serves snapshot + tail |
-| Engine | falls | Rust (library + server) | Incremental update graph, expressions, inference, Flight server |
-| Merge | — | Rust job | Daily intraday → sorted Parquet → DuckLake commit |
-| Control plane | — | Rust | Spec API, scheduler, Kubernetes controller, registry, audit |
+| Engine | falls | Rust (library + server) | Incremental and static operators, expressions, Parquet scans, inference, Flight server |
+| Merge | — | Rust job | Daily intraday → sorted Parquet → catalog commit |
+| Control plane | — | Rust | Catalog, spec API, scheduler, pipeline, Kubernetes controller, registry, audit |
 | Scheduler | run | Rust (in control plane) | Cron, DAGs, retries, leases |
+| Pipeline | — | Rust (in control plane) | Build, test, plan, deploy, promote project commits |
 | Model registry | den | Rust (in control plane) | Model versions, aliases, signatures |
 | Feature store | forage | Rust + Python SDK | Feature views, point-in-time training sets, online state |
-| Agent surface | ranger | Rust | MCP server over the spec API and query surface |
-| Gateway | — | Rust | Single authenticated entry point; proxies Flight/WebSocket to worker pods |
-| SDK | `ursid` | Python (+ PyO3 engine wheel) | Client, local engine, notebook widgets |
+| Agent surface | ranger | Rust | MCP server over the spec API, pipeline, and query surface |
+| Gateway | — | Rust | Single authenticated entry point; proxies Flight/WebSocket to worker pods; serves the UI |
+| SDK | `ursid` | Python (+ PyO3 engine module) | Client, local engine, notebook widgets, resource decorators |
+| CLI | `ursid` | Python (`argparse`) over the Rust core | Server roles, local platform, project workflow (`init`, `dev`, `test`, `plan`, `deploy`) |
 
 ```mermaid
 flowchart LR
@@ -92,20 +108,34 @@ flowchart LR
   EW -->|derived live tables| W
   EW -->|viewports| GWY[Gateway\nauth + routing] -->|Flight / WebSocket| C[Notebooks / agents / UI]
   W -->|sealed day| M[Merge job]
-  M -->|sorted Parquet + commit| LK[(DuckLake\nPostgres catalog + S3)]
-  LK -->|pushed-down SQL| DDB[Embedded DuckDB]
-  LK -->|Parquet + local cache| EW
-  DDB --> EW & C
-  CP[Control plane\nspecs, scheduler, registry, controller] -->|worker pods, Jobs| ING & EW & M
+  M -->|sorted Parquet| OS[(Object storage\nParquet)]
+  M -->|commit| CP
+  OS -->|pruned Parquet scans + local cache| EW
+  GIT[(Git repositories)] -->|webhook + fetch| CP[Control plane\ncatalog, pipeline, scheduler, controller]
+  CP -->|worker pods, Jobs| ING & EW & M
   CP --> PG[(Postgres)]
   AG[Agents] -->|MCP| CP
 ```
+
+### 4.1 Dependency policy
+
+Core data path: the arrow-rs family only — `arrow` (array, compute kernels, IPC), `arrow-flight`,
+`parquet`, and `object_store` for S3 and local files. One arrow-rs major version across the
+workspace.
+
+Infrastructure crates are allowed where writing our own would add risk without value: `tokio`,
+`tonic` (via arrow-flight), `sqlx` (Postgres, SQLite), `kube`, `ort` (ONNX Runtime), `pyo3` +
+`pyo3-arrow`, `openidconnect`, `jsonwebtoken`, `clap`, `serde`, `tracing`/OpenTelemetry.
+
+No embedded query engines (DataFusion, DuckDB, Polars). A new data-path dependency needs a written
+reason in this section.
 
 ## 5. Data model
 
 ### 5.1 Tables and schemas
 
-- A table is identified by `namespace.table`.
+- A table is identified by `namespace.table` and is owned by exactly one project (§11), which
+  declares it. Other projects read it.
 - Schemas are Arrow schemas with stable column IDs, versioned in the catalog. Live and historical
   share the schema history. Changes are planned operations (§5.4).
 - Column partition: `Date` (UTC, string `YYYY-MM-DD`), assigned from **ingest time**, not event
@@ -144,23 +174,31 @@ historical at a cycle boundary; the rows are identical, so downstream sees no ch
 
 ### 5.4 Schema evolution
 
-Schema changes are ordinary resource changes: validate → plan → apply (§10.2), from the SDK, CLI,
-or an agent.
+Table schemas are declared in the owning project. Changing one is a code change that goes through
+the pipeline: the plan classifies it, and applying the commit applies the change. Scratch
+namespaces also accept direct changes from the SDK, CLI, or an agent.
 
 ```python
-plan = (us.schema.alter("sports.odds")
-          .add("venue", us.string(), default=None)
-          .rename("px", "price")
-          .widen("size", us.int64()))
-plan.show()     # change classes, affected dependents, rewrite cost
-plan.apply()
+odds = us.table(
+    "sports.odds",
+    columns={
+        "game_id": us.string(),
+        "book": us.string(),
+        "price": us.float64(),       # renamed from "px": same column ID
+        "size": us.int64(),          # widened from int32
+        "venue": us.string(default=None),   # added
+    },
+    keys=["game_id", "book"],
+    ts="ts",
+)
 ```
 
 Column identity
 
-- Every column has a stable ID, carried as Arrow field metadata and Parquet `field_id`, and mapped
-  to DuckLake column IDs. Names are labels; data is matched by ID everywhere.
-- Renames are metadata-only. Old data never needs rewriting to change a name.
+- Every column has a stable ID, carried as Arrow field metadata and Parquet `field_id`, and stored
+  in the catalog. Names are labels; data is matched by ID everywhere.
+- Renames are metadata-only; the SDK records a rename explicitly (`us.renamed_from("px")`) so the
+  plan does not read it as drop + add.
 
 Change classes, determined by `plan`
 
@@ -168,17 +206,18 @@ Change classes, determined by `plan`
 |---|---|---|
 | Add column (nullable or with default) | compatible | Applies mid-day. Older segments and files read as null/default. |
 | Widen type (int32→int64, float32→float64, new enum value) | compatible | Cast on read. |
-| Rename column | compatible | Metadata only. Dependents referencing the old name are rewritten in the same apply. |
+| Rename column | compatible | Metadata only. Dependents referencing the old name are reported and must change in the same commit or a dependent project's next commit. |
 | Drop column | contract | Hidden from reads immediately; stored data kept until an explicit purge job. |
 | Incompatible type change, recomputed values | rewrite | Backfill DAG with one task per date: rewrite Parquet with a transform expression, commit each date atomically. Resumable. |
 | Sort keys / layout | rewrite (optional) | Applies to future merges; backfill optional. |
 
 Dependents
 
-- `plan` walks lineage and lists every affected ingester, deployment, feature view, and model
-  signature as unaffected, auto-migrated, or must-change.
-- Apply is atomic across the table and its dependent specs. A change that would break a feature
-  view or model signature is rejected unless the same plan updates it.
+- `plan` walks lineage across projects and lists every affected ingester, deployment, feature view,
+  and model signature as unaffected, auto-migrated, or must-change.
+- A change that would break a feature view or model signature in the same project is rejected
+  unless the same commit updates it. Breaking changes to tables other projects read require those
+  projects to be compatible first (expand → migrate consumers → contract).
 
 Live data
 
@@ -186,16 +225,16 @@ Live data
   segments.
 - weir accepts writes at any version compatible with the current one and projects them up by
   column ID (defaults, casts, dropped columns discarded). Producers and tables upgrade
-  independently: expand → migrate producers → contract.
+  independently.
 - Initial implementation restarts dependent deployments, which rebuild state from weir and
   history. Hot re-planning for compatible changes comes later.
 
 History
 
-- The schema change commits to DuckLake in the same transaction as the catalog version bump.
-  Existing Parquet files are not touched; reads map them by column ID.
-- Time travel to an older snapshot sees the older schema.
-- Merge projects every version present in a date onto the table's current version (§8.2).
+- The catalog records the new schema version in the same transaction as the table definition
+  change. Existing Parquet files are not touched; reads map them by column ID.
+- Catalog snapshots (§8.2) keep old schema versions; reading an old snapshot sees the old schema.
+- Merge projects every version present in a date onto the table's current version (§8.3).
 
 ## 6. Ingestion
 
@@ -220,14 +259,12 @@ coerced to the table schema by weir, same `seq` semantics.
 
 ### 6.2 Ingesters
 
-An ingester is a managed deployment that reads a source and speaks the ingest protocol.
+An ingester is a managed deployment that reads a source and speaks the ingest protocol. It is
+declared in a project like any other resource.
 
-```yaml
-kind: Ingester
-name: odds-nats
-source: {type: nats, subject: "odds.>", durable: ursid-odds}
-target: {namespace: sports, table: odds}
-transform: python:juicebear.ingest:parse_odds   # optional; or a declarative column map
+```python
+@us.ingester(target="sports.odds", source=us.nats(subject="odds.>", durable="ursid-odds"))
+def parse_odds(msgs: us.Batch) -> us.Batch: ...
 ```
 
 - Built-in Rust connectors: NATS JetStream, Kafka, WebSocket, HTTP poll, file drop.
@@ -243,9 +280,9 @@ transform: python:juicebear.ingest:parse_odds   # optional; or a declarative col
 ```
 /data/weir/{namespace}/{table}/{date}/{source_id}/
   seg-000042.arrow      sealed: Arrow IPC file (footer present), immutable
-  seg-000042.idx        batch offsets, seq range, ingest-time range, row range
+  seg-000042.idx        batch offsets, seq range, ingest-time range, row range, epoch
   seg-000043.arrows     open: Arrow IPC stream, append + fsync
-  state.json            last_seq, schema_version, sealed flag for the day
+  state.json            last_seq, epoch, schema_version, sealed flag for the day
 ```
 
 - Open segments are Arrow IPC streams. Appends are fsynced before ack.
@@ -276,47 +313,73 @@ writes to `D`. Writers have already rolled to `D+1` because `date` comes from in
 
 - Initial: single writer per internal partition on a Longhorn PVC (replicated block storage).
   weir is a StatefulSet.
-- Later: copy sealed segments to S3 (rustfs) so node loss costs at most the open segment (§16).
+- Later: copy sealed segments to S3 (rustfs) so node loss costs at most the open segment (§17).
 - Retention: intraday partitions are deleted N days after their merge validates.
 
 ## 8. Historical store
 
 ### 8.1 Layout
 
-Parquet files written by Ursid, cataloged in DuckLake (Postgres catalog on CNPG, data on rustfs).
+Parquet files written by Ursid to object storage (rustfs in the cluster, a local directory in
+local mode) through `object_store`.
 
 ```
-s3://lake/{namespace}/{table}/Date={date}/part-0000.parquet
+{lake}/{namespace}/{table}/Date={date}/part-{n}.parquet
 ```
 
 Per-table layout config, applied by the merge writer:
 
 - Sort by `(key columns..., ts_column)` within the date — the analogue of kdb+'s `p#`.
 - Dictionary-encode key columns — the analogue of kdb+'s `sym` enumeration.
-- Row groups sized to align with key ranges; write the page index so readers skip by key and time.
+- Row groups sized to align with key ranges; write column statistics and the page index so readers
+  skip by key and time.
+- Parquet `field_id` set from column IDs.
 - Compression: ZSTD.
 
-### 8.2 Merge job
+### 8.2 Catalog
+
+The catalog lives in the control-plane database (Postgres in the cluster, SQLite locally). It is
+the only record of what history exists.
+
+- Tables: namespace, name, owning project, current schema version, layout config.
+- Schema versions: columns by ID with name, type, default, and the version that introduced them.
+- Data files: path, `Date`, row count, byte size, schema version, per-column min/max for key and
+  `ts` columns, merge run ID.
+- Snapshots: every commit (merge, rewrite, purge) creates a snapshot ID; a read pins a snapshot
+  and sees a consistent file set. Snapshots older than the retention window are expired and their
+  unreferenced files deleted.
+- Commits are single database transactions; a merge or rewrite is atomic per date.
+
+### 8.3 Merge job
 
 Daily, scheduled through the Ursid scheduler.
 
 1. Wait until all internal partitions for `D` are sealed.
 2. Read sealed segments, project every schema version present in `D` onto the table's current
    version by column ID (§5.4), sort per layout config, write Parquet.
-3. Commit to DuckLake in one transaction, **replacing** partition `D` (idempotent re-runs).
-   Registering pre-written files uses DuckLake's add-data-files path; confirm semantics against the
-   deployed DuckLake version.
+3. Commit the files to the catalog in one transaction, **replacing** partition `D` (idempotent
+   re-runs).
 4. Validate: row counts per source match weir indexes.
-5. Mark `D` merged in the catalog (flips `db.table` routing) and schedule intraday deletion.
+5. Mark `D` merged (flips `db.table` routing) and schedule intraday deletion.
 
-### 8.3 Reading history
+### 8.4 Reading history
 
-- Static queries (no live input) on `db.historical_table` compile to SQL and run in embedded
-  DuckDB attached to DuckLake; results return as Arrow. Agent and human SQL over history goes
-  straight to DuckDB.
-- The engine reads Parquet itself (file list from the catalog, arrow-rs reader, local NVMe cache)
-  only when it must: as-of joins between live and historical, replay, and warming state at
-  startup.
+The engine reads history itself.
+
+- Partition pruning by `Date` from the catalog; file pruning by catalog min/max statistics.
+- Row-group and page pruning from Parquet statistics and the page index; projection to the
+  requested columns; filter predicates evaluated during decode where the `parquet` reader supports
+  it (row filters, row selections).
+- Static queries run on the engine's static operator path (§9.1), streaming record batches per
+  file; results return as Arrow over Flight.
+- Workers keep a local NVMe cache of fetched Parquet files and sealed weir segments.
+
+### 8.5 External access
+
+Files use a plain Hive-style layout with standard Parquet, so external tools (DuckDB, Polars,
+pyarrow, Spark) can read them directly with read access to the bucket. The catalog is the source
+of truth for which files are current; an export of catalog snapshots to an open table format
+(DuckLake or Iceberg metadata) is a later addition if external tools need snapshot consistency.
 
 ## 9. Engine
 
@@ -324,29 +387,42 @@ Daily, scheduled through the Ursid scheduler.
 
 - Deephaven-style update graph. Execution proceeds in cycles; each cycle propagates deltas
   (added / removed / modified row sets, plus shifts) through operators in topological order.
-- Data is held as Arrow chunks. Append-only sources produce only `added` deltas.
-- One worker pod per deployment, ingester, or session (§15.3). No worker process is shared
+- Data is held as Arrow arrays in chunks. Append-only sources produce only `added` deltas.
+- Two paths per operator:
+  - **static**: inputs never change; operators run once over streamed batches with no
+    incremental state (scans, filters, hash aggregation, hash join, sort);
+  - **incremental**: inputs tick; operators keep the state needed to apply deltas.
+  A static query is a graph whose sources are all static. Mixed graphs (live joined to history)
+  use the static path for static subtrees.
+- One worker pod per deployment, ingester, or session (§16.3). No worker process is shared
   between users.
-- The engine is a library first (Rust crate, PyO3 wheel for `us.local()`) and a server second
+- The engine is a library first (Rust crate, PyO3 module for `us.local()`) and a server second
   (same crate plus Flight).
 
 ### 9.2 Operators (initial set)
 
 `where`, `select` / `update` (expressions), `last_by`, `agg_by` (sum, count, mean, min, max,
-first, last, std), `natural_join`, `as_of_join`, `rolling` (row- and time-based), `sort`
-(snapshot-oriented), `merge` (union), `predict` (model inference).
+first, last, std), `natural_join`, `as_of_join`, `rolling` (row- and time-based), `sort`,
+`merge` (union), `head` / `tail`, `predict` (model inference).
 
-Anything outside this set runs as static queries or as Python jobs.
+Operators are built on arrow-rs compute kernels (filter, take, sort, cast, arithmetic,
+comparison, string) plus Ursid's own hash tables for joins and aggregations.
+
+Anything outside this set runs as Python jobs over Arrow batches.
 
 ### 9.3 Expressions
 
-The Ursid expression language is the contract. It compiles to:
+The Ursid expression language is the only query language in the engine.
 
-- DataFusion physical expressions for in-engine evaluation per chunk;
-- DuckDB SQL for pushed-down historical queries.
-
-A shared conformance corpus runs every expression through both and compares results. Raw SQL is a
-separate surface that only targets DuckDB.
+- Small grammar: literals, column references, arithmetic, comparison, boolean logic, `in`,
+  null handling, casts, conditionals, and a function library (math, string, time, date
+  arithmetic).
+- Hand-written parser producing a typed AST; type checking against the input schema at plan
+  time, with errors carrying position and fix hints.
+- Evaluation compiles the AST to a tree of arrow-rs kernel calls per chunk. Constant folding and
+  common-subexpression reuse are the only optimizations initially.
+- Predicates on scan inputs are translated into Parquet pruning (§8.4).
+- Rust-native function registry; Python UDFs run in the Python sidecar per batch (§9.5).
 
 ### 9.4 Clocks and replay
 
@@ -354,7 +430,8 @@ The engine is driven by an injectable clock.
 
 - Real-time clock: cycles on a fixed period (default 100 ms) or on input, whichever comes first.
 - Replay clock: feeds historical rows in `ts_column` order at a chosen speed (or as fast as
-  possible). The same graph run under replay is a backtest.
+  possible). The same graph run under replay is a backtest, and deterministic replay is the basis
+  of pipeline tests (§11.3).
 
 Late data policy is per operator: windows declare allowed lateness; as-of joins use the current
 state at cycle time.
@@ -378,25 +455,42 @@ state at cycle time.
 - Browser transport: WebSocket carrying the same frames. WebTransport (HTTP/3) can replace it later
   behind the same frame format once browser and proxy support allow.
 
+### 9.7 Memory
+
+- Each worker has an engine memory budget (§10.5) enforced by an accounting allocator over Arrow
+  buffers; an operator that would exceed it fails the query with an error instead of the pod
+  being OOM-killed.
+- Large static aggregations and joins process one `Date` partition at a time where the query
+  allows. Spilling to local disk is a later addition.
+
 ## 10. Control plane
 
-### 10.1 Resources
+### 10.1 Resources and sources of truth
 
 Every resource is a typed spec (Rust types, JSON Schema generated from them):
-`Table`, `Ingester`, `Deployment` (long-running engine graph), `Job`, `Dag`, `FeatureView`,
-`Model`, `ModelVersion`, `Alias`, `WorkerClass`, `Environment`, `Repository`, `Secret` reference.
+`Project`, `Table`, `Ingester`, `Deployment` (long-running engine graph), `Job`, `Dag`,
+`FeatureView`, `Model`, `ModelVersion`, `Alias`, `WorkerClass`, `Environment`, `Repository`,
+`Target`, `Secret` reference.
 
-Specs are stored in Postgres. GitOps export (into the Argo CD repo) is a later addition; Postgres is
-the source of truth.
+| Namespace kind | Source of truth | How changes arrive |
+|---|---|---|
+| Managed (`sports`, …) | A project repository at a commit | Only through the pipeline (§11) |
+| Scratch (`scratch.<user>`) | The control plane | Direct apply from SDK, CLI, or agents |
+| Preview (`<ns>@pr-<n>`) | The pull request's head commit | Pipeline preview target, expires with the PR |
+
+Postgres holds the catalog, what is deployed where and from which commit, run history, and audit.
+It never holds the only copy of a managed resource's definition.
 
 ### 10.2 validate → plan → apply
 
-- `validate`: type-check the spec; infer output schemas using the engine's planner.
-- `plan`: diff against current state; inferred schemas, sample rows (bounded), cost and
-  cardinality estimates, affected downstream resources.
-- `apply`: execute the plan; optional approval gate per caller role.
+- `validate`: type-check specs; infer output schemas using the engine's planner.
+- `plan`: diff desired state (a commit, or a scratch spec) against what is deployed on a target;
+  inferred schemas, schema change classes (§5.4), sample rows (bounded), cost and cardinality
+  estimates, environment status, affected downstream resources across projects.
+- `apply`: execute the plan. For managed namespaces only the pipeline applies, using a commit's
+  build artifact (§11.3).
 
-Humans (CLI, SDK) and agents use the same three calls.
+Humans (CLI, SDK, UI) and agents use the same calls.
 
 ### 10.3 Scheduler
 
@@ -404,6 +498,7 @@ Humans (CLI, SDK) and agents use the same three calls.
 - Retries with backoff, timeouts, concurrency limits, catch-up policy.
 - State in Postgres; workers claim tasks with leases (`SELECT ... FOR UPDATE SKIP LOCKED`).
 - Executors: Kubernetes Job per task (arbitrary image) or a warm Python worker pool (low latency).
+- Each run records the deployed artifact (commit SHA) it ran.
 - Run state is published to weir as live tables: `sys.job_runs`, `sys.task_runs`, `sys.task_logs`.
   Observability is `db.live_table("sys", "job_runs")`.
 
@@ -414,89 +509,208 @@ def retrain(ctx): ...
 
 ### 10.4 System tables
 
-`sys.job_runs`, `sys.task_runs`, `sys.task_logs`, `sys.deployments`, `sys.ingest_stats`,
-`sys.audit`, `sys.lineage`, `sys.model_events`. All are ordinary live tables and merge to the lake
-daily.
+`sys.job_runs`, `sys.task_runs`, `sys.task_logs`, `sys.deployments`, `sys.pipeline_runs`,
+`sys.ingest_stats`, `sys.audit`, `sys.lineage`, `sys.model_events`. All are ordinary live tables
+and merge to the lake daily.
 
 ### 10.5 Worker configuration
 
-Every deployment, ingester, job, and session declares the worker it runs on: code, Python
-environment, and resources.
+Every deployment, ingester, job, and session declares the worker it runs on.
 
-```yaml
-kind: Deployment
-name: odds-model
-namespace: sports
-code:
-  repo: rcolclough/juicebear
-  ref: main                 # resolved to a commit SHA at apply
-  path: apps/sportsflow
-  entrypoint: sportsflow.ursid:graph
-  track: true               # a push to main produces a new plan
-environment:
-  from: code                # apps/sportsflow/uv.lock at that commit
-  python: "3.13"
-worker:
-  class: medium             # admin-defined preset
-  memory: 16Gi              # pod total
-  engine_memory: 12Gi       # engine's own budget, kept below the container limit
-  python_memory: 4Gi        # python sidecar container
-  cpu: 4
-  gpu: 0
-  cache_disk: 50Gi
+```python
+@us.deployment(worker=us.worker(
+    worker_class="medium",   # admin-defined preset
+    memory="16Gi",           # pod total
+    engine_memory="12Gi",    # engine budget, kept below the container limit (§9.7)
+    python_memory="4Gi",     # python sidecar container
+    cpu=4,
+    gpu=0,
+    cache_disk="50Gi",
+))
+def edges(db): ...
 ```
 
 ```python
-s = us.connect().session(env="sportsflow@main", worker="medium", memory="8Gi")
+s = us.connect().session(env="sportsflow@main", worker_class="medium", memory="8Gi")
 ```
 
 - **Worker classes** are admin-defined presets (memory, CPU, GPU, node selector, priority, maximum
   overrides). Users pick a class and override within its limits and their quota.
-- The engine enforces `engine_memory` itself (Arrow memory pool budget) and reports usage to
-  `sys.deployments`, so it fails a query with an error instead of being OOM-killed.
-- `plan` shows the resolved commit, the environment status (cached or build required), and the
-  resources requested against quota.
+- `plan` shows the environment status (cached or build required) and resources requested against
+  quota.
 
 ### 10.6 Environments
 
 An environment is an immutable, prebuilt Python environment. Nothing is installed when a worker
 starts.
 
-- Sources: `from: code` (the `pyproject.toml` + `uv.lock` in the code path at the resolved
-  commit), or an inline dependency list, which the control plane resolves with uv into a lock
-  stored with the `Environment` version.
+- Source: the project's `pyproject.toml` + `uv.lock` at the commit. Scratch sessions may instead
+  use an inline dependency list, which the control plane resolves with uv into a lock stored with
+  the `Environment` version.
 - Identity: hash of `uv.lock`, `pyproject.toml`, Python version, Ursid version, and platform.
   Code changes that don't touch the lock reuse the existing environment.
-- Build, at apply time and only on a cache miss: an unprivileged Kubernetes Job starts from the
-  `ursid-python` base image, runs `uv sync --frozen --no-dev --no-install-project` into
-  `/opt/ursid/env`, and pushes that directory as one OCI layer on top of the base (no Docker daemon,
-  no privileged builder) to the Gitea OCI registry as `ursid-env:<hash>`.
+- Build, in the pipeline's build stage and only on a cache miss: an unprivileged Kubernetes Job
+  starts from the `ursid:<version>` image, runs `uv sync --frozen --no-dev --no-install-project`
+  into `/opt/ursid/env`, and pushes that directory as one OCI layer on top of the base (no Docker
+  daemon, no privileged builder) to the Gitea OCI registry as `ursid-env:<hash>`.
 - Workers reference the image by digest. The kubelet's image cache makes later starts on a node
   instant; an optional pre-pull DaemonSet warms environments marked hot.
-- A failed build fails `apply`; it never fails a running worker.
 - Sessions may `%pip install` into a scratch overlay for exploration. The session is then marked
-  dirty and cannot be promoted to a deployment until the dependency is in a lock.
-- Unreferenced environment images are garbage-collected, keeping the last N per environment.
+  dirty; the dependency has to land in the project's lock to be deployed.
+- Unreferenced environment images are garbage-collected, keeping the last N per project.
 
-### 10.7 Code from git
+## 11. Projects and delivery
+
+Ursid follows continuous integration and continuous delivery practice (Fowler; Humble & Farley):
+everything in version control, a self-testing build, every push to mainline triggers the
+pipeline, build once and promote the same artifact, test in a clone of production, everyone can
+see the pipeline, and deployment and rollback are automated and cheap.
+
+### 11.1 Project
+
+A project is a directory in a git repository (one repository may hold several).
+
+```
+sportsflow/
+  ursid.toml          project name, owned namespaces, targets, test config
+  pyproject.toml      Python dependencies (ursid + project deps)
+  uv.lock             → environment (§10.6)
+  src/sportsflow/
+    ursid_app.py      resource declarations: tables, ingesters, deployments, jobs, features, models
+    ...
+  tests/              pytest: unit tests on us.local(), replay tests on pinned history
+```
+
+```toml
+[project]
+name = "sportsflow"
+entry = "sportsflow.ursid_app"       # module whose decorators declare resources
+namespaces = ["sports"]              # namespaces this project owns
+
+[tests]
+replay = [{ tables = ["sports.odds", "sports.games"], dates = "2026-10-01..2026-10-07" }]
+
+[targets.preview]
+on = "pull_request"
+mode = "shadow"                      # read production inputs, write to sports@pr-<n>
+ttl = "3d"
+
+[targets.staging]
+on = "push:main"
+
+[targets.prod]
+promote_from = "staging"
+gate = { healthy_for = "30m", approval = "sports-admins" }
+```
+
+Resources are declared in Python with decorators (`us.table`, `@us.ingester`, `@us.deployment`,
+`@us.job`, `@us.feature_view`, `us.model`). Discovery imports `entry` in the project's environment
+and emits a **manifest**: the resolved specs as JSON. The manifest, not the Python source, is what
+`plan` and `apply` consume.
+
+`ursid init` scaffolds a project with an example deployment, a test, and `ursid.toml`.
+
+### 11.2 Local loop
+
+```mermaid
+flowchart LR
+  E[Edit code] --> D["ursid dev\nhot reload"]
+  D --> T[ursid test]
+  T --> P["ursid plan --target staging"]
+  P --> G[git push]
+  G --> PL[Pipeline]
+```
+
+- `ursid dev` runs the project on the local platform (§16.6) and restarts affected deployments on
+  file save; their state rebuilds from local weir and lake.
+- Local data, in increasing realism:
+  - synthetic sources declared in the project (`@us.source` generators) for tests and demos;
+  - `ursid data pull sports.odds --dates 2026-11-01..2026-11-07` copies Parquet partitions from the
+    cluster lake (subject to read grants);
+  - `ursid dev --live <cluster>` subscribes local deployments to the cluster's live tables
+    read-only through the gateway. Outputs stay local.
+- `ursid test` runs the same tests the pipeline runs: pytest on `us.local()`, plus replay tests over
+  the dates in `ursid.toml` with the replay clock (§9.4).
+- `ursid plan --target <t>` diffs the working tree against what is deployed on `t`.
+- `ursid deploy --target sandbox` deploys the working tree, including uncommitted changes, to the
+  user's personal sandbox (a scratch namespace in the cluster), marked dirty. Shared targets only
+  accept pipeline deployments of pushed commits.
+
+### 11.3 Pipeline
+
+Ursid runs the pipeline itself, in the cluster, because every stage needs the production
+environment images, data access, and worker resources. The git host stores code and displays
+results; generic CI (lint, formatting) can still run in Gitea Actions.
+
+```mermaid
+flowchart LR
+  W[Webhook: push / PR] --> R[Resolve\nSHA, discover manifest]
+  R --> B[Build\nenvironment image, code snapshot]
+  B --> T[Test\npytest + replay]
+  T --> PL[Plan\nper target]
+  PL --> PV[Preview\nshadow]
+  PL --> ST[Staging]
+  ST -->|gate| PR[Prod]
+```
+
+1. **Resolve**: fetch the commit, run discovery in the environment, store the manifest.
+2. **Build**: environment image (cached by hash, §10.6) and code snapshot (content-addressed by
+   SHA and path). Manifest + image digest + snapshot = the **artifact**, built once per commit.
+3. **Test**: pytest and replay tests as an Ursid job using the artifact's image and worker class,
+   against production history read-only. A failed test stops the pipeline for that commit.
+4. **Plan**: per target; schema change classes and cross-project impact.
+5. **Deploy**: per target policy (§11.4), always deploying the artifact, never rebuilding.
+
+- Triggers: Gitea push and pull-request webhooks, with polling as a fallback.
+- Results go back to the git host as commit statuses (`ursid/test`, `ursid/plan`) and a PR comment
+  with the plan and preview links.
+- Every stage is a row in `sys.pipeline_runs`; the UI shows commit → build → test → plan → deploy
+  per target, live.
+- Build stays fast by caching: environments by lock hash, snapshots by SHA, test data by catalog
+  snapshot on the worker cache.
+- A failing `main` blocks promotion until fixed; previous artifacts stay deployed.
+
+### 11.4 Targets and promotion
+
+- A target is a named deployment destination with a trigger and a gate: `preview` (pull
+  requests), `staging` (pushes to `main`), `prod` (promotion from staging), and per-user
+  `sandbox`.
+- Promotion deploys the same artifact to the next target once its gate passes: health for a
+  duration (deployments caught up, no errors), approval by a role, or both.
+- Staging and prod differ by namespace mapping and worker classes, not by code or environment.
+- Kargo continues to promote the Ursid platform itself (Helm chart); Ursid promotes user projects.
+
+### 11.5 Preview and shadow deployments
+
+- `mode = "shadow"` deploys the PR's artifact with production inputs read-only and outputs
+  redirected to `<ns>@pr-<n>`. Production consumers never see shadow outputs.
+- `ursid diff sports.edges --against sports@pr-123.edges --window 1h` compares preview outputs with
+  production on live or replayed data — the test in a clone of production.
+- Model changes can additionally run as a challenger alias in production (§12.1) to hide work in
+  progress behind a flag.
+- Previews expire with the PR or after `ttl`.
+
+### 11.6 Rollback
+
+Rollback deploys a previous artifact to the target. Environment images and snapshots are cached,
+so it is a restart, not a rebuild. Schema changes are the exception: rollback across a
+contract or rewrite change requires a forward fix, and `plan` says so.
+
+### 11.7 Repositories and credentials
 
 - A `Repository` registers a git remote (Gitea first), its credentials (secret reference), and a
   webhook secret. Credentials stay in the control plane; worker pods never hold them.
-- `code.ref` (branch, tag, or SHA) resolves to a commit SHA at apply time. The control plane
-  snapshots `code.path` at that SHA into object storage, content-addressed by SHA and path; the
-  worker fetches it at start with a short-lived token and mounts it read-only.
-- Every deployment, job run, and session records the SHA it ran (`sys.deployments`,
-  `sys.task_runs`, `sys.audit`). Rollback = apply a previous SHA.
-- `track: true`: a Gitea push webhook produces a new plan for the tracked ref, applied
-  automatically or after approval per the resource's policy.
-- Scheduled jobs resolve a tracked ref at trigger time and record the SHA per run.
-- The project's own package is placed on `PYTHONPATH` from the snapshot, so a code-only change is
-  a snapshot download, not an environment build.
-- Agents change code through pull requests; deployments follow merged commits.
+- Code snapshots reach workers through an init container with a short-lived token and are mounted
+  read-only. The project's package is placed on `PYTHONPATH`, so a code-only change is a snapshot
+  download, not an environment build.
+- Every deployment, job run, and session records the commit it ran (`sys.deployments`,
+  `sys.task_runs`, `sys.audit`).
+- The pipeline acts as the project's service identity with grants on the project's namespaces;
+  gate approvals require a role on the target.
 
-## 11. ML
+## 12. ML
 
-### 11.1 Model registry (den)
+### 12.1 Model registry (den)
 
 A model version is:
 
@@ -504,12 +718,14 @@ A model version is:
 - flavor: `onnx`, `sklearn`, `torch`, `python`;
 - input/output Arrow schemas (signature);
 - feature-view references and versions;
+- the commit and job run that trained it;
 - link to an MLflow run (MLflow stays as experiment tracking).
 
-Aliases (`champion`, `challenger`) are pointers to versions. Alias changes are events in
-`sys.model_events`.
+Models are registered by jobs (training runs from a project commit) or from notebooks into scratch
+namespaces. Aliases (`champion`, `challenger`) are pointers to versions; alias changes on managed
+namespaces go through the pipeline or an approval and are events in `sys.model_events`.
 
-### 11.2 Feature store (forage)
+### 12.2 Feature store (forage)
 
 A feature view is a keyed, timestamped table expression.
 
@@ -521,28 +737,30 @@ def form(games):
 ```
 
 - Offline: `us.training_set(labels, features=[...], ts=...)` evaluates the view over
-  `db.historical_table` and performs a point-in-time-correct as-of join. Large training sets push
-  down to DuckDB.
+  `db.historical_table` on the engine's static path and performs a point-in-time-correct as-of
+  join, one `Date` partition at a time.
 - Online: the same view runs incrementally on `db.live_table`; online state is
   `last_by(entity)` in engine memory. No separate online store.
 - Served-feature logging: deployments publish the exact features and predictions they served back
   to weir as live tables. These merge into history and become training data that matches serving.
 
-## 12. Agent surface (ranger)
+## 13. Agent surface (ranger)
 
-MCP server over the control plane and query surface.
+MCP server over the control plane, pipeline, and query surface.
 
 - Catalog: search namespaces/tables, describe schema, sample rows, lineage.
-- Query: bounded static queries (DuckDB) and bounded live snapshots.
-- Resources: validate / plan / apply for every resource kind; job logs; retry; model comparison.
-- Sandboxes: agent sessions run in their own engine processes with memory, CPU, and time quotas;
-  writes go to scratch namespaces unless the role allows otherwise.
-- Agents act with a delegated, optionally narrowed token from their user (§13); they never exceed
+- Query: bounded static queries and bounded live snapshots in the Ursid expression language.
+- Scratch: validate / plan / apply directly in the agent's scratch namespace.
+- Managed namespaces: agents work on a branch, run `test` and `plan`, push, and open a pull request;
+  the preview target shows their outputs in shadow; humans merge.
+- Pipeline: read runs, logs, test failures, plans; re-run stages.
+- Sandboxes: agent sessions run in their own engine processes with memory, CPU, and time quotas.
+- Agents act with a delegated, optionally narrowed token from their user (§14); they never exceed
   the user's grants.
 - Every agent action is recorded in `sys.audit`.
 - Errors are structured (code, location, fix hint) so agents can repair specs without guessing.
 
-## 13. Identity and access
+## 14. Identity and access
 
 Multi-user within one organization first; separate tenants later.
 
@@ -550,7 +768,7 @@ Identity
 
 - Any OIDC provider; Dex in the reference deployment.
 - Browser and hosted notebooks: authorization code + PKCE. CLI and SDK: device authorization flow
-  (`us.login()`), token cached in the OS keychain.
+  (`ursid login`), token cached in the OS keychain.
 - The control plane exchanges the OIDC ID token for a short-lived Ursid access token (JWT,
   refreshable) carrying subject, groups, and scopes. weir, the gateway, and workers verify it
   against the control plane's JWKS; nothing calls the OIDC provider on the request path.
@@ -559,19 +777,20 @@ Workload identity
 
 - Every worker and job pod runs under its own Kubernetes ServiceAccount. The pod's projected
   ServiceAccount token (audience `ursid`) is exchanged at the control plane for an Ursid token
-  scoped to the resource's owner and grants. No long-lived credentials in pods.
+  scoped to the resource's project and grants. No long-lived credentials in pods.
 
 Authorization
 
 - RBAC per namespace. Roles: `viewer` (read tables), `writer` (ingest, publish derived tables),
-  `editor` (create and modify resources), `admin` (schema changes, grants, purges).
+  `editor` (scratch resources, sandbox deploys, PR previews), `admin` (gate approvals, grants,
+  purges).
 - Bindings map users or OIDC groups to roles.
-- Resources have owners and run with the owner's grants, re-checked at every (re)start.
+- Managed resources run with their project's grants; scratch resources with their owner's.
 - `sys.*` rows are filtered to namespaces the caller can view.
 
-Enforcement points: control plane (spec operations), gateway (which workers a caller may reach),
-weir (per-table writes; reads by workers only), workers (table opens checked against the worker's
-token).
+Enforcement points: control plane (spec operations, pipeline), gateway (which workers a caller may
+reach), weir (per-table writes; reads by workers only), workers (table opens checked against the
+worker's token).
 
 Isolation and quotas
 
@@ -581,17 +800,22 @@ Isolation and quotas
 Later: row filters, column masking, multiple tenants (tenant-scoped namespaces and Kubernetes
 namespaces).
 
-## 14. Clients
+## 15. Clients
 
-### 14.1 Python SDK and notebooks
+### 15.1 Python SDK and notebooks
 
-- `us.connect()` — remote cluster; `us.local()` — in-process engine from the same Rust crate.
-- Tables convert to pyarrow, pandas, and polars without copying where possible.
+- `us.connect()` — remote cluster or a running `ursid dev`; `us.local()` — in-process engine from
+  the same Rust crate.
+- Tables convert to pyarrow, pandas, and polars without copying where possible (Arrow PyCapsule
+  interface).
 - Ticking tables render in Jupyter via an anywidget-based widget subscribed to a viewport.
-- Decorators: `@us.job`, `@us.feature_view`; registry: `us.models.register(...)`; ingest:
+- Resource decorators: `us.table`, `@us.ingester`, `@us.deployment`, `@us.job`,
+  `@us.feature_view`, `@us.source`; registry: `us.models.register(...)`; ingest:
   `us.ingest.writer(...)`.
+- Notebooks are for exploration; deployable code lives in project modules. Notebooks may live in
+  the project repository but are not part of the manifest.
 
-### 14.2 Web UI
+### 15.2 Web UI
 
 - React + TypeScript, Vite, Bun (package manager, scripts, tests), shadcn/ui on Tailwind CSS,
   lucide icons, React Router — juicebear's web baseline plus shadcn.
@@ -599,58 +823,64 @@ namespaces).
   IPC with `apache-arrow`. Used by the UI and any other TypeScript consumer.
 - Ticking tables: viewport subscription rendered with TanStack Virtual; updates applied once per
   animation frame; only visible rows are in the DOM. A canvas grid is an optimization to adopt only
-  if profiling demands it. Static lists (catalog, jobs, models) use TanStack Table with shadcn
-  table components.
+  if profiling demands it. Static lists (catalog, pipelines, jobs, models) use TanStack Table with
+  shadcn table components.
 - Auth: OIDC authorization code + PKCE (`oidc-client-ts`). Local mode skips login.
-- The production build is embedded in the `ursid` binary and served by the gateway, so local mode
+- The production build ships inside the `ursid` wheel and is served by the gateway, so local mode
   and the cluster serve the same UI with no separate web server.
 - v1 surfaces: catalog (schemas, versions, lineage), live and historical table viewer, console
-  (expression editor on CodeMirror 6), job runs and logs (live from `sys.*`), models and aliases,
-  agent chat backed by ranger.
+  (expression editor on CodeMirror 6), pipelines (commit → deploy per target), job runs and logs
+  (live from `sys.*`), models and aliases, agent chat backed by ranger.
 
-## 15. Runtime and deployment
+## 16. Runtime and deployment
 
-Every server role (control plane, gateway, weir, worker) is a subcommand of one Rust binary,
-`ursid`. Two runtimes host it: Kubernetes (§15.1–15.5) and local (§15.6).
+Ursid ships as one Python package: a Rust core (`ursid._native`) and a thin Python layer. The
+`ursid` command is a Python `argparse` CLI; every server role (control plane, gateway, weir,
+worker) and every developer command is a subcommand of it. Server roles call into `_native`, which
+detaches from the interpreter and runs the Tokio runtime until shutdown; Rust installs the
+SIGTERM/SIGINT handlers for graceful shutdown. Two runtimes host it: Kubernetes (§16.1–16.5) and
+local (§16.6).
 
-### 15.1 Packaging
+### 16.1 Packaging
 
 - Helm chart `ursid` in this repo (`deploy/helm/ursid`), published to the Gitea OCI registry,
-  as one `ursid` image (all server roles) plus `ursid-python` for Python sidecars and jobs.
+  plus one image, `ursid:<version>` (Python slim + the `ursid` wheel), which runs every role and is
+  the base for environment images.
 - The Argo CD repo consumes it like other upstream charts (values in
   `components/ursid/helm/values.yaml`); Kargo promotes chart versions.
 - The chart installs: CRDs, `ursid-control`, `ursid-gateway`, weir, ServiceAccounts and RBAC,
   config. It does not contain workers, ingesters, or jobs; the controller creates those at runtime.
 - External dependencies are values: Postgres (existing CNPG cluster or connection secret; the
-  chart can optionally render a CNPG `Cluster`), S3 endpoint and bucket (rustfs), DuckLake catalog,
-  OIDC issuer.
+  chart can optionally render a CNPG `Cluster`), S3 endpoint and bucket (rustfs), OCI registry for
+  environment images, git hosts, OIDC issuer.
 
-### 15.2 Controller
+### 16.2 Controller
 
-- `ursid control` runs API, scheduler, reconciler, and ranger. It runs with several
-  replicas; scheduler and reconciler loops use leader election via a Kubernetes `Lease`, and every
-  replica serves the API.
+- `ursid control` runs API, catalog, scheduler, pipeline, reconciler, and ranger. It runs with
+  several replicas; scheduler, pipeline, and reconciler loops use leader election via a Kubernetes
+  `Lease`, and every replica serves the API.
 - Two layers of state:
-  - **Intent** in Postgres: specs, versions, owners, run history, audit. Written by
-    validate → plan → apply.
+  - **Intent**: managed resources come from project commits (§11); scratch resources, catalog,
+    deployments, runs, and audit are in Postgres.
   - **Runtime** in Kubernetes: custom resources the controller writes from intent and reconciles
     into native objects. `kubectl get ursidworkers` shows what is running.
 - Status flows back: the controller watches Pods and Jobs and writes status to the custom
-  resource and to `sys.deployments` / `sys.task_runs`.
+  resource and to `sys.deployments` / `sys.task_runs` / `sys.pipeline_runs`.
 - Owner references garbage-collect everything a worker created.
 
 | Runtime object | Created for | Reconciled into |
 |---|---|---|
 | `UrsidWorker` (CRD) | deployment, ingester, session | StatefulSet (1 replica) or Pod, Service, ServiceAccount |
-| `batch/v1` Job | scheduled task attempt | created directly by the scheduler; history in Postgres |
+| `batch/v1` Job | scheduled task attempt, pipeline stage, environment build | created directly by the scheduler or pipeline; history in Postgres |
 
-### 15.3 Worker pods
+### 16.3 Worker pods
 
-- One worker = one pod. Containers: `engine` (image `ursid:<version>`, Flight server) and an
-  optional `python` sidecar (image `ursid-env:<hash>`, §10.6) for Python model flavors, UDFs, and
-  user code, connected by a Unix socket on a shared `emptyDir`. Each container gets its own memory
-  limit from the worker spec (§10.5).
-- An init container fetches the code snapshot (§10.7) into a read-only volume.
+- One worker = one pod, using the environment image (`ursid-env:<hash>`, §10.6), which already
+  contains the matching `ursid` version. Containers: `engine` (`ursid worker`, Flight server) and an
+  optional `python` sidecar (same image) for Python model flavors, UDFs, and user code, connected
+  by a Unix socket on a shared `emptyDir`. User code runs in the sidecar process, never in the
+  engine process. Each container gets its own memory limit from the worker spec (§10.5).
+- An init container fetches the code snapshot (§11.7) into a read-only volume.
 - Deployments and ingesters: StatefulSet with one replica. This guarantees at most one pod per
   identity (no rollout overlap double-publishing derived tables), stable DNS, and a PVC for the
   segment/Parquet cache. Restarts rebuild state from weir and history.
@@ -658,19 +888,18 @@ Every server role (control plane, gateway, weir, worker) is a subcommand of one 
   session request within the user's quota.
 - Jobs: one `batch/v1` Job per task attempt with `backoffLimit: 0`; the Ursid scheduler owns
   retries so every attempt is a row in `sys.task_runs`.
-- User Python always comes from a prebuilt environment image (§10.6); nothing is installed at pod
-  start.
+- User Python always comes from a prebuilt environment image; nothing is installed at pod start.
 - Scheduling: requests/limits from the spec; node selectors and tolerations pass through. Priority
-  classes: deployments > ingesters > jobs > sessions.
+  classes: deployments > ingesters > pipeline > jobs > sessions.
 
-### 15.4 Gateway
+### 16.4 Gateway
 
 - Clients never address worker pods directly. `ursid-gateway` terminates TLS, verifies tokens,
   checks the caller may reach the target worker, and proxies Flight (gRPC) and WebSocket to it,
   routed by `x-ursid-worker` metadata or URL path.
-- One Gateway API `HTTPRoute` exposes the whole platform.
+- One Gateway API `HTTPRoute` exposes the whole platform, including the UI and git webhooks.
 
-### 15.5 Reference deployment
+### 16.5 Reference deployment
 
 | Workload | Kind | Storage / dependency |
 |---|---|---|
@@ -678,37 +907,35 @@ Every server role (control plane, gateway, weir, worker) is a subcommand of one 
 | ursid-control | Deployment, 2+ replicas (chart) | Postgres (CNPG) |
 | ursid-gateway | Deployment (chart) | — |
 | Workers | `UrsidWorker` → StatefulSet / Pod (controller) | PVC cache for deployments |
-| Merge, jobs | `batch/v1` Job (scheduler) | rustfs, DuckLake catalog |
-| Lake | existing DuckLake component | CNPG catalog + rustfs |
+| Merge, jobs, pipeline stages, environment builds | `batch/v1` Job | rustfs, OCI registry |
+| Lake | Parquet in a rustfs bucket | catalog in Postgres |
 
 Telemetry: OpenTelemetry traces to Tempo, logs to Loki, metrics to Prometheus; platform state stays
 in `sys.*` tables.
 
-### 15.6 Local mode
+### 16.6 Local mode
 
 No JVM, Docker, or Kubernetes.
 
 | Entry point | What runs | Use |
 |---|---|---|
 | `us.local()` | Engine inside the Python process (PyO3) | Notebooks, tests, experiments |
-| `ursid dev` | One supervisor process: control plane, gateway + UI, weir, workers as child processes | Full platform on a laptop |
-| Kubernetes | Same binary, one role per pod | Cluster |
+| `ursid dev` | One supervisor process: control plane, gateway + UI, weir, workers as child processes; hot reload of the current project | Development |
+| Kubernetes | Same package, one role per pod | Cluster |
 
-- Install: `pip install ursid` installs the SDK and in-process engine, and pulls the `ursid-cli`
-  wheel that carries the native `ursid` binary (§18.1). A standalone binary is also published.
-- `ursid dev` keeps state in `./.ursid/` (or `--data-dir`): weir segments on local disk; the lake
-  is DuckLake with a SQLite catalog file (multi-process safe, unlike a DuckDB catalog file) and
-  local Parquet; control-plane state in SQLite; a single implicit user, OIDC optional.
+- Install: `pip install ursid` (or `uv tool install ursid`): one wheel with the SDK, the engine,
+  every server role, and the `ursid` command (§19.1).
+- `ursid dev` keeps state in `./.ursid/` (or `--data-dir`): weir segments on local disk; the lake as
+  local Parquet; catalog and control-plane state in SQLite; a single implicit user, OIDC optional.
 - Workers are `ursid worker` child processes; Python sidecars are child processes using the
   environment built by uv into `.ursid/envs/<hash>` (same hash as §10.6, built once, then reused).
-  Code comes from the local working tree or a git ref. Same protocols as pods, so behaviour
-  matches the cluster.
+  Same protocols as pods, so behaviour matches the cluster.
 - The controller has a runtime trait (`Local`: child processes; `Kubernetes`: `UrsidWorker`) and a
   storage trait (SQLite, Postgres) with one conformance suite run against both.
 - `us.connect()` with no arguments targets a running `ursid dev`, otherwise `URSID_URL`.
 - Startup targets: `us.local()` under 100 ms; `ursid dev` ready under 1 s.
 
-## 16. Scaling and high availability
+## 17. Scaling and high availability
 
 Not built initially: one weir, restart-based recovery. These invariants are built from M1 so that
 sharding and HA are additive later instead of a redesign.
@@ -736,115 +963,123 @@ failure; `plan` warns when a non-replayable source has no replicated ack.
 | Control plane, gateway | 2+ replicas | — |
 | Postgres, lake | CNPG replicas; rustfs | — |
 
-## 17. Technology choices
+## 18. Technology choices
 
 | Concern | Choice |
 |---|---|
-| Engine, weir, control plane | Rust |
-| Columnar memory | arrow-rs; one major version across the workspace, pinned to DataFusion's. Crates on another major (e.g. `duckdb`) exchange data through the Arrow C Data Interface |
-| Expressions / planning | DataFusion |
-| RPC | arrow-flight (tonic, HTTP/2) |
-| Lake catalog and batch SQL | DuckDB + DuckLake |
-| Parquet | `parquet` crate (writer and engine reads) |
+| Engine, weir, control plane, gateway | Rust, exposed as the `ursid._native` extension module |
+| CLI | Python `argparse` (standard library) |
+| Columnar memory and kernels | `arrow` (one major version across the workspace) |
+| RPC | `arrow-flight` (tonic, HTTP/2) |
+| Historical files | `parquet` |
+| Object storage | `object_store` (S3 / rustfs, local filesystem) |
+| Expressions | Own grammar, parser, and kernel compiler (§9.3) |
+| Catalog and control-plane DB | Postgres (cluster) / SQLite (local) via `sqlx` |
 | Inference | ONNX Runtime via `ort`; Python sidecar for other flavors |
-| Kubernetes | kube-rs |
-| Control-plane DB | Postgres via sqlx |
-| Python bindings | PyO3 (abi3), `pyo3-arrow` (Arrow PyCapsule interface), maturin, uv workspace |
+| Kubernetes | `kube` |
+| Python bindings | PyO3 (abi3), `pyo3-arrow` (Arrow PyCapsule interface), maturin, uv |
+| Python environments | uv lockfiles → OCI environment images |
 | Notebook widget | anywidget |
 | Auth | OIDC (`openidconnect`), JWT (`jsonwebtoken`) |
 | Packaging | Helm chart, OCI registry on Gitea |
+| Git hosting | Gitea first (webhooks, commit statuses, PR comments); other hosts behind the same trait |
 | Web UI | React, TypeScript, Vite, Bun, shadcn/ui, Tailwind CSS, React Router |
 | Browser data | `apache-arrow` (JS), TanStack Virtual, TanStack Table, CodeMirror 6 |
-| Local-mode storage | SQLite (control plane, DuckLake catalog) |
 
-## 18. Planned repository layout
+## 19. Repository layout
 
 ```
 Cargo.toml        Cargo workspace; shared versions in [workspace.dependencies]
-pyproject.toml    `ursid` Python package (maturin, builds crates/ursid-py) and uv workspace root
+pyproject.toml    `ursid` Python package (maturin, builds crates/ursid-py)
 uv.lock
 crates/
-  ursid-core      Arrow tables, row sets, update graph, clocks
-  ursid-ops       operators
-  ursid-expr      expression language → DataFusion / DuckDB SQL
+  ursid-core      Arrow tables, row sets, update graph, clocks, memory accounting
+  ursid-ops       static and incremental operators
+  ursid-expr      expression language: parser, type checker, kernel compiler
   ursid-flight    Flight server, delta protocol
   ursid-weir      ingest server and segment store
-  ursid-lake      DuckLake catalog, Parquet writer, merge
-  ursid-control   spec API, scheduler, registry, MCP
-  ursid-gateway   authenticated Flight/WebSocket proxy
-  ursid-cli       the `ursid` binary (dev, control, gateway, weir, worker); its pyproject.toml
-                  builds the `ursid-cli` wheel
-  ursid-py        PyO3 extension module `ursid._native`
-python/ursid      SDK, widgets, decorators (pure Python over `ursid._native`)
+  ursid-lake      Parquet reader/writer, pruning, catalog, merge
+  ursid-control   spec API, scheduler, pipeline, registry, controller, MCP
+  ursid-gateway   authenticated Flight/WebSocket proxy, UI serving
+  ursid-py        PyO3 extension module `ursid._native`: engine API and server entry points
+python/ursid      SDK, widgets, decorators, `cli.py` (pure Python over `ursid._native`)
 web/app           React UI (Bun workspace)
 web/client        @ursid/client TypeScript package
 deploy/helm/ursid Helm chart: CRDs, control plane, gateway, weir
+examples/         example projects (toy ticker, toy sportsbook)
 docs/
 ```
 
-### 18.1 Python packaging
+### 19.1 Python packaging
 
-Verified against maturin 1.16, PyO3 0.30, and uv workspaces.
+Verified against maturin 1.16, PyO3 0.30, and uv.
 
-- Two wheels from one repository: `ursid` (SDK + `ursid._native`) depends on `ursid-cli`
-  (`bindings = "bin"`). maturin does not package a `[[bin]]` target into a PyO3 wheel; the split
-  keeps the CLI a native process with no interpreter in worker processes, identical to the binary
-  in the container image.
+- One wheel, `ursid`: the Python package plus `ursid._native`, which links every Rust crate.
+  `[project.scripts] ursid = "ursid.cli:main"` provides the command, as maturin recommends over
+  shipping a library and a separate binary. Containers and local workers run the same wheel.
 - Root `pyproject.toml`: `[tool.maturin]` with `manifest-path = "crates/ursid-py/Cargo.toml"`,
-  `module-name = "ursid._native"`, `python-source = "python"`; `[tool.uv.workspace]` with
-  `members = ["crates/ursid-cli"]`; `ursid-cli = { workspace = true }` in `[tool.uv.sources]`.
-- Both pyproject files set `tool.uv.cache-keys` to cover the workspace `Cargo.toml`, `Cargo.lock`,
-  and every crate's `*.rs` and `Cargo.toml` (parent-relative globs from `crates/ursid-cli`), so
-  `uv sync` / `uv run` rebuild after any Rust change. Without this, uv only rebuilds when a
-  package's own `pyproject.toml` changes.
+  `module-name = "ursid._native"`, `python-source = "python"`.
+- `tool.uv.cache-keys` covers the workspace `Cargo.toml`, `Cargo.lock`, and every crate's `*.rs`
+  and `Cargo.toml`, so `uv sync` / `uv run` rebuild after any Rust change. Without this, uv only
+  rebuilds when `pyproject.toml` changes.
+- Rust integration tests start servers through the Rust APIs directly, not through the CLI.
 - PyO3 without the `extension-module` feature (maturin sets `PYO3_BUILD_EXTENSION_MODULE`), so
   `cargo test` links normally; `crate-type = ["cdylib", "rlib"]`; declarative
   `#[pymodule] mod _native`.
 - ABI: `abi3-py312`, one wheel per platform for GIL-enabled CPython. Free-threaded 3.14t needs a
   version-specific wheel; `abi3t` (PEP 803) covers both builds from CPython 3.15.
 - Arrow crosses the boundary through `pyo3-arrow` (Arrow PyCapsule interface): zero-copy to
-  pyarrow, polars, arro3, nanoarrow, with no hard pyarrow dependency.
+  pyarrow, polars, arro3, nanoarrow, with no hard pyarrow dependency. The workspace arrow major is
+  the newest one `pyo3-arrow` supports (currently arrow 60 with `pyo3-arrow` 0.21 / PyO3 0.30).
 - Editable builds use a `dev-py` Cargo profile (release optimisation, no LTO, incremental) through
   maturin's `editable-profile`; published wheels use `release`.
 - Type stubs for `_native` are hand-written until maturin's `--generate-stubs` (PyO3
   `experimental-inspect`) is stable.
 
-## 19. Roadmap
+## 20. Roadmap
 
 | Milestone | Deliverable | Toy example |
 |---|---|---|
-| M0 | Engine crate: chunks, update graph, initial operators, expressions; PyO3 wheel; notebook widget | Random-walk ticker → rolling mean/vol, live in Jupyter |
+| M0 | Engine crate: chunks, update graph, static + incremental operators, expression language; PyO3 module; notebook widget | Random-walk ticker → rolling mean/vol, live in Jupyter |
 | M1 | weir (DoPut, segments, seq dedup, epochs, snapshot + tail); `db.live_table`; WebSocket connector; `ursid dev`; Helm chart (weir + engine) | Synthetic ticker over WebSocket → weir → engine, on a laptop and in the cluster |
-| M2 | Merge job, DuckLake commit, `db.historical_table`, `db.table`, DuckDB pushdown, replay clock; column IDs and compatible schema changes | Ticker merged nightly, replayed as a backtest; add a column mid-day |
-| M3 | Control plane: specs, validate/plan/apply, scheduler, `sys.*` tables, ranger MCP; OIDC, RBAC, `UrsidWorker` controller, gateway; worker classes, prebuilt environments, git code sources; schema plans with dependents and rewrites; web UI v1 | Two users, each with their own sessions; a DAG deployed from a git ref with its own environment; retries visible live in the UI |
-| M4 | den: register sklearn LinearRegression → ONNX → `predict`; torch MLP; aliases, shadow mode | Live prediction; swap champion without restart |
-| M5 | forage: feature views, training sets, online `last_by`, served-feature logging | Toy sportsbook: simulated games + odds → form features → live win probability vs implied odds |
-| M6 | Port juicebear sportsflow features and models | Real data |
+| M2 | Parquet writer and pruned reader, catalog with snapshots, merge job, `db.historical_table`, `db.table`, replay clock; column IDs and compatible schema changes | Ticker merged nightly, replayed as a backtest; add a column mid-day |
+| M3 | Projects: `ursid init` / `dev` / `test` / `plan`, manifest discovery, environments, pipeline (build, test, plan, deploy), targets and promotion, preview/shadow; scheduler and `sys.*` tables | Toy ticker project: push to `main` deploys to staging, promotion to prod, PR shadow preview with `ursid diff` |
+| M4 | Multi-user: OIDC, RBAC, `UrsidWorker` controller, gateway, worker classes, sandboxes; ranger MCP; web UI v1 | Two users with their own sessions; an agent opens a PR that previews in shadow |
+| M5 | den: register sklearn LinearRegression → ONNX → `predict`; torch MLP; aliases, shadow mode | Live prediction; swap champion without restart |
+| M6 | forage: feature views, training sets, online `last_by`, served-feature logging | Toy sportsbook: simulated games + odds → form features → live win probability vs implied odds |
+| M7 | Port juicebear sportsflow as an Ursid project | Real data |
 
-## 20. Open questions
+## 21. Open questions
 
 1. Latency target per event (assumed 100 ms–1 s cycles).
 2. Peak rows/sec and live state size for juicebear — validates single-process deployments.
 3. Derived-state checkpointing: replay from start of day vs periodic engine snapshots.
-4. weir placement policy once sharded: hashing vs explicit assignment (deferred; §16 keeps it
+4. weir placement policy once sharded: hashing vs explicit assignment (deferred; §17 keeps it
    additive).
+5. SQL frontend: whether agents and users need SQL in addition to the expression language and
+   table API, compiled to Ursid plans if so.
 
-## 21. Risks
+## 22. Risks
 
-- **Engine scope.** A general Deephaven-class engine is years of work; hold the operator set fixed
-  until M5.
+- **Engine scope.** The engine now also covers static queries (scans, hash joins, aggregations,
+  sort) that an embedded query engine would have provided. Hold the operator set fixed until M6
+  and keep the static path simple: streaming per partition, no cost-based optimizer.
+- **No spilling.** Large static joins and aggregations are bounded by worker memory until spilling
+  exists; per-`Date` processing and the memory budget (§9.7) keep failures explicit.
+- **External readers see files, not snapshots.** Tools reading the lake directly can observe a
+  merge mid-flight or expired files; catalog export (§8.5) fixes this when needed.
 - **Event vs processing time.** Replay correctness depends on the injectable clock and explicit
   lateness rules from M0.
 - **Python in the hot path.** Batch-per-cycle is mandatory for Python inference and UDFs.
-- **Two SQL dialects.** Mitigated by the expression language and conformance corpus (§9.3).
-- **Arrow version skew.** DataFusion, `duckdb`, `arrow-flight`, and `pyo3-arrow` each pin an
-  arrow-rs major and release on different cadences. One workspace major (DataFusion's), a
-  duplicate-version ban in `cargo deny`, and C Data Interface bridging for any outlier.
+- **Arrow version lag.** `pyo3-arrow` trails arrow-rs releases; the workspace stays on the newest
+  major it supports.
 - **Single weir.** Node loss stalls ingest until the volume reattaches; non-replayable sources lose
-  that window. Accepted initially; §16 invariants keep sharding and replication additive.
+  that window. Accepted initially; §17 invariants keep sharding and replication additive.
 - **Two control-plane stores.** SQLite (local) and Postgres (cluster) can diverge; one conformance
   suite runs against both, and the storage trait stays narrow.
+- **Pipeline scope.** Ursid runs its own build/test/deploy pipeline rather than delegating to an
+  external CI; keep it to the five stages in §11.3 and leave generic CI to the git host.
 - **Rewrite cost.** Incompatible schema changes on long histories are expensive; `plan` must show
   partitions and bytes to rewrite, and the backfill must be resumable per date.
-- **Two state layers.** Postgres intent and Kubernetes runtime objects can drift; the reconciler
-  treats Postgres as truth and recreates or deletes runtime objects to match.
+- **Two state layers.** Desired state (commits, Postgres) and Kubernetes runtime objects can drift;
+  the reconciler treats desired state as truth and recreates or deletes runtime objects to match.
