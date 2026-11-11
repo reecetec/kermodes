@@ -880,6 +880,7 @@ strategy (how its run is replaced).
 @km.deployment(update="auto", rollout="rolling")  # the defaults
 def edges(db): ...
 
+
 @km.deployment(rollout="recreate")  # too large to run twice
 def book(db): ...
 ```
