@@ -11,7 +11,7 @@ Direction: [docs/architecture.md](docs/architecture.md). Engine: [docs/engine.md
 import pyarrow as pa
 import ursid as us
 
-s = us.local()
+s = us.local(manual=True)  # cycles run on step(); us.local() runs them on input
 ticks = s.input_table({"sym": us.string(), "price": us.float64(), "size": us.int64()})
 live = ticks.where("price > 0").update("notional = price * size")
 
@@ -20,8 +20,8 @@ s.step()
 pa.table(live)  # sym, price, size, notional for rows with price > 0
 ```
 
-In a notebook, `s.start()` runs cycles in the background and a displayed ticking table updates in
-place; [examples/live.ipynb](examples/live.ipynb) streams a random-walk ticker.
+By default `us.local()` runs a cycle as soon as writes arrive, and a ticking table displayed in a
+notebook updates in place; [examples/live.ipynb](examples/live.ipynb) streams a random-walk ticker.
 
 ## Development
 

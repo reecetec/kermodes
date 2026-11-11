@@ -164,9 +164,11 @@ reason in this section.
 | append | weir → lake | Default. Rows are never modified or removed. |
 | blink | no | Only the current cycle's rows are visible; for high-rate transient signals. |
 | derived | optional | Engine output. May be published back to weir as an append table. |
+| input | engine memory | As in Deephaven: append-only, or keyed (one row per key; upserts replace, deletes remove). Written from code or edited by hand in the UI. |
 
-Mutable data (upserts, CDC, order books) is stored as an append log of changes. Current state is a
-view: `live_table(...).last_by("key")`. Storage never mutates rows.
+Ingested mutable data (upserts, CDC, order books from a feed) is stored as an append log of changes.
+Current state is a view: `live_table(...).last_by("key")`. Storage never mutates ingested rows;
+keyed input tables are the mutable tables people and programs edit directly.
 
 ### 5.3 Access API
 

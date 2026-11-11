@@ -108,11 +108,13 @@ impl Session {
         py.detach(|| self.0.step())
     }
 
-    /// Runs cycles in the background, one every `period` (such as `"100ms"` or `"1s"`) while
-    /// writes are pending, until `stop`.
-    #[pyo3(signature = (period="100ms"))]
-    fn start(&self, period: &str) -> PyResult<()> {
-        self.0.start(parse_period(period)?).map_err(engine_error)
+    /// Runs cycles in the background: one as soon as writes arrive, folding writes that arrive
+    /// during a cycle into the next, until `stop`. `min_period` (such as `"100ms"` or `"1s"`)
+    /// spaces cycles at least that far apart.
+    #[pyo3(signature = (min_period=None))]
+    fn start(&self, min_period: Option<&str>) -> PyResult<()> {
+        let min_period = min_period.map(parse_period).transpose()?;
+        self.0.start(min_period).map_err(engine_error)
     }
 
     /// Stops the background cycles, after any cycle in progress.

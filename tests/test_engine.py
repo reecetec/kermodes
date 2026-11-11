@@ -16,7 +16,7 @@ def ticks(sym: list[str], price: list[float], size: list[int | None]) -> pa.Tabl
 
 
 def test_derived_tables_tick_with_their_input():
-    s = us.local()
+    s = us.local(manual=True)
     src = s.input_table(COLUMNS)
     live = src.where("price > 0").update("notional = price * size")
 
@@ -39,7 +39,7 @@ def test_derived_tables_tick_with_their_input():
 
 
 def test_static_tables_compute_without_cycles():
-    s = us.local()
+    s = us.local(manual=True)
     data = s.static_table(ticks(["a", "b"], [1.0, 2.0], [1, 2]))
     doubled = data.update("size = size * 2")
     assert not doubled.is_refreshing
@@ -47,16 +47,21 @@ def test_static_tables_compute_without_cycles():
 
 
 def test_expression_errors_point_at_the_problem():
-    src = us.local().input_table(COLUMNS)
+    src = us.local(manual=True).input_table(COLUMNS)
     with pytest.raises(us.UrsidError, match="did you mean `price`"):
         src.where("prise > 0")
 
 
-def test_the_clock_starts_once_and_stops_quietly():
-    s = us.local()
+def test_the_clock_runs_by_default_starts_once_and_stops_quietly():
+    auto = us.local()
+    assert auto.is_running
+    auto.stop()
+    assert not auto.is_running
+
+    s = us.local(manual=True)
+    assert not s.is_running
     with pytest.raises(ValueError, match="period"):
         s.start("fast")
-    assert not s.is_running
     s.start("10ms")
     try:
         assert s.is_running
@@ -69,7 +74,7 @@ def test_the_clock_starts_once_and_stops_quietly():
 
 
 def test_a_failed_table_raises_but_the_session_keeps_running():
-    s = us.local()
+    s = us.local(manual=True)
     src = s.input_table(COLUMNS)
     risky = src.update("big = size * 4611686018427387904")
     fine = src.where("size > 0")
@@ -81,14 +86,14 @@ def test_a_failed_table_raises_but_the_session_keeps_running():
 
 
 def test_appends_must_match_the_table():
-    src = us.local().input_table(COLUMNS)
+    src = us.local(manual=True).input_table(COLUMNS)
     wrong = pa.table({"sym": ["a"], "price": [1], "size": [1]})
     with pytest.raises(us.UrsidError, match="column `price` is int64"):
         src.append(wrong)
 
 
 def test_keyed_tables_follow_upserts_and_deletes():
-    s = us.local()
+    s = us.local(manual=True)
     book = s.input_table(COLUMNS, key="sym")
     rich = book.where("price > 10")
     book.upsert(ticks(["a", "b"], [5.0, 20.0], [1, 2]))
@@ -104,7 +109,7 @@ def test_keyed_tables_follow_upserts_and_deletes():
 
 
 def test_last_by_and_agg_by_match_a_plain_python_recomputation():
-    s = us.local()
+    s = us.local(manual=True)
     src = s.input_table(COLUMNS)
     latest = src.last_by("sym")
     stats = src.agg_by(

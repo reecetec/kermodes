@@ -17,9 +17,16 @@ __all__ = [
 ]
 
 
-def local() -> Session:
-    """Start an engine inside this Python process."""
-    return Session()
+def local(*, manual: bool = False) -> Session:
+    """Start an engine inside this Python process.
+
+    Cycles run on their own as soon as writes arrive. With `manual=True`, nothing runs until
+    `step()` (tests, replay); `start()` and `stop()` switch between the two.
+    """
+    session = Session()
+    if not manual:
+        session.start()
+    return session
 
 
 def boolean() -> str:

@@ -107,10 +107,12 @@ Delta { added: [(keys, rows)], removed: [(keys, last rows)], modified: [(keys, p
 - One `RwLock` guards graph state: a cycle holds the write lock; snapshot readers hold the read
   lock between cycles. Readers copy what they need and release it.
 - Clocks:
-  - manual: `step()` runs one cycle (tests, notebooks, replay);
-  - periodic: `start(period)` runs a cycle every period (default 100 ms) on a background thread
-    while writes are pending, until `stop()`. The thread holds the session weakly, so dropping
-    the session ends it.
+  - on input (the default for `us.local()`): a background thread runs a cycle as soon as writes
+    arrive; writes that arrive during a cycle fold into the next, so batches grow with load and
+    latency stays near zero when idle. `start(min_period)` optionally spaces cycles at least that
+    far apart; `stop()` ends it. The thread holds the session weakly, so dropping the session
+    ends it.
+  - manual (`us.local(manual=True)`): `step()` runs one cycle (tests, replay).
 - Each table records the cycle that last changed its rows (or failed it); viewers poll that to
   re-render only what changed.
 - Cycles run tables one after another. `agg_by` spreads a large delta (64k+ rows) over every core
@@ -174,7 +176,7 @@ Grouping keys:
 ```python
 import ursid as us
 
-s = us.local()  # in-process engine and update graph
+s = us.local()  # in-process engine; cycles run as soon as writes arrive
 
 ticks = s.input_table(
     {
@@ -195,10 +197,10 @@ latest = live.last_by("sym")
 stats = live.agg_by("sym", n="count(*)", notional="sum(notional)", size="sum(size)")
 vwap = stats.update("vwap = notional / size")
 
-s.step()  # one cycle
 pa.table(latest)  # snapshot through the Arrow PyCapsule interface
-s.start(period="100ms")  # background cycles; s.stop()
 latest  # in a notebook: a live view (§8)
+
+m = us.local(manual=True)  # only m.step() runs cycles; m.start() / m.stop()
 
 # Still to come in M0:
 enriched = live.natural_join(refs, on="sym")

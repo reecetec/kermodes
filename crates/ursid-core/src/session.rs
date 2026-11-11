@@ -1,8 +1,9 @@
 //! A session owns one update graph: input tables, the tables derived from them, and cycles.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arrow::compute::interleave_record_batch;
 use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
@@ -27,16 +28,21 @@ struct Inner {
     graph: RwLock<Graph>,
     /// Writes waiting for the next cycle, in arrival order.
     pending: Mutex<Vec<(usize, Write)>>,
+    /// Signalled when writes are queued or the clock is told to stop.
+    arrived: Condvar,
     /// The background clock started by `Session::start`, if running.
     clock: Mutex<Option<Clock>>,
 }
 
-/// A thread running cycles on a period. It holds the session weakly, so dropping the last
-/// `Session` handle also ends it.
+/// A thread running a cycle whenever writes are pending. It holds the session only while it
+/// waits a bounded time or runs a cycle, so dropping the last `Session` handle also ends it.
 struct Clock {
-    stop: Arc<(Mutex<bool>, Condvar)>,
+    stop: Arc<AtomicBool>,
     thread: JoinHandle<()>,
 }
+
+/// How long the clock waits for writes before checking whether its session is gone.
+const CLOCK_WAIT: Duration = Duration::from_secs(1);
 
 enum Write {
     Append(RecordBatch),
@@ -227,38 +233,52 @@ impl Session {
         cycle
     }
 
-    /// Starts running cycles in the background, one every `period` while writes are pending.
-    /// Fails if a clock is already running; `stop` ends it.
-    pub fn start(&self, period: Duration) -> Result<(), Error> {
+    /// Starts running cycles in the background: one as soon as writes arrive, folding writes that
+    /// arrive during a cycle into the next. With `min_period`, cycles start at least that far
+    /// apart. Fails if a clock is already running; `stop` ends it.
+    pub fn start(&self, min_period: Option<Duration>) -> Result<(), Error> {
         let mut clock = self.clock();
         if clock.is_some() {
             return Err(Error::Unsupported(
                 "the session's clock is already running".into(),
             ));
         }
-        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
         let session = Arc::downgrade(&self.inner);
-        let signal = stop.clone();
         let thread = thread::Builder::new()
             .name("ursid-clock".into())
             .spawn(move || {
-                let (stopped, wake) = &*signal;
+                let mut last: Option<Instant> = None;
                 loop {
-                    let guard = stopped.lock().expect("ursid clock flag poisoned");
-                    let (guard, _) = wake
-                        .wait_timeout_while(guard, period, |stopped| !*stopped)
-                        .expect("ursid clock flag poisoned");
-                    if *guard {
-                        return;
-                    }
-                    drop(guard);
                     let Some(inner) = session.upgrade() else {
                         return;
                     };
                     let session = Session { inner };
-                    if !session.pending().is_empty() {
-                        session.step();
+                    let ready = {
+                        let pending = session.pending();
+                        let (pending, _) = session
+                            .inner
+                            .arrived
+                            .wait_timeout_while(pending, CLOCK_WAIT, |pending| {
+                                pending.is_empty() && !stopped.load(Ordering::Acquire)
+                            })
+                            .expect("ursid write queue poisoned by an earlier panic");
+                        !pending.is_empty()
+                    };
+                    if stopped.load(Ordering::Acquire) {
+                        return;
                     }
+                    if !ready {
+                        continue;
+                    }
+                    if let (Some(min_period), Some(last)) = (min_period, last) {
+                        thread::sleep(
+                            (last + min_period).saturating_duration_since(Instant::now()),
+                        );
+                    }
+                    last = Some(Instant::now());
+                    session.step();
                 }
             })
             .map_err(|e| Error::Unsupported(format!("cannot start the clock thread: {e}")))?;
@@ -271,9 +291,10 @@ impl Session {
         let Some(clock) = self.clock().take() else {
             return;
         };
-        let (stopped, wake) = &*clock.stop;
-        *stopped.lock().expect("ursid clock flag poisoned") = true;
-        wake.notify_all();
+        clock.stop.store(true, Ordering::Release);
+        // Taking the queue lock orders the flag before a waiter's next check of it.
+        drop(self.pending());
+        self.inner.arrived.notify_all();
         clock.thread.join().expect("ursid clock thread panicked");
     }
 
@@ -681,6 +702,7 @@ impl Table {
 
     fn queue(&self, writes: impl Iterator<Item = Write>) {
         self.session.pending().extend(writes.map(|w| (self.id, w)));
+        self.session.inner.arrived.notify_all();
     }
 
     /// Builds a table from this one, computed from this table's current rows. Building on a
