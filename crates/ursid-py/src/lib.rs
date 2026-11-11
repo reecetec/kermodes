@@ -1,12 +1,14 @@
 //! `ursid._native`: the engine exposed to Python. Engine work runs with the interpreter released.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use arrow::array::{ArrayIterator, ArrayRef, StructArray};
-use arrow::datatypes::{Field, Schema};
+use arrow::array::{Array, ArrayIterator, ArrayRef, AsArray, RecordBatch, StructArray};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit, TimestampNanosecondType};
 use arrow::error::ArrowError;
+use arrow::util::display::{ArrayFormatter, FormatOptions};
 use pyo3::create_exception;
-use pyo3::exceptions::PyException;
+use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyCapsule, PyDict};
 use pyo3_arrow::error::PyArrowError;
@@ -104,6 +106,43 @@ impl Session {
     /// Runs one cycle and returns its number.
     fn step(&self, py: Python<'_>) -> u64 {
         py.detach(|| self.0.step())
+    }
+
+    /// Runs cycles in the background, one every `period` (such as `"100ms"` or `"1s"`) while
+    /// writes are pending, until `stop`.
+    #[pyo3(signature = (period="100ms"))]
+    fn start(&self, period: &str) -> PyResult<()> {
+        self.0.start(parse_period(period)?).map_err(engine_error)
+    }
+
+    /// Stops the background cycles, after any cycle in progress.
+    fn stop(&self, py: Python<'_>) {
+        py.detach(|| self.0.stop());
+    }
+
+    #[getter]
+    fn is_running(&self) -> bool {
+        self.0.is_running()
+    }
+}
+
+/// A period such as `"100ms"`, `"0.5s"`, or `"2s"`.
+fn parse_period(text: &str) -> PyResult<Duration> {
+    let text = text.trim();
+    let (number, scale) = if let Some(ms) = text.strip_suffix("ms") {
+        (ms, 1e-3)
+    } else if let Some(s) = text.strip_suffix('s') {
+        (s, 1.0)
+    } else {
+        (text, 0.0)
+    };
+    match number.trim().parse::<f64>() {
+        Ok(value) if scale > 0.0 && value.is_finite() && value > 0.0 => {
+            Ok(Duration::from_secs_f64(value * scale))
+        }
+        _ => Err(PyValueError::new_err(format!(
+            "period must look like \"100ms\" or \"1s\", not {text:?}"
+        ))),
     }
 }
 
@@ -221,6 +260,35 @@ impl Table {
         Ok(to_stream_pycapsule(py, reader, requested_schema)?)
     }
 
+    /// The cycle that last changed this table; live notebook views poll it.
+    #[getter]
+    fn _changed(&self) -> u64 {
+        self.0.changed()
+    }
+
+    /// The first `rows` rows as an HTML table, with the row count, or the table's error.
+    fn _preview_html(&self, py: Python<'_>, rows: usize) -> PyResult<String> {
+        let preview =
+            py.detach(|| Ok::<_, ursid_core::Error>((self.0.head(rows)?, self.0.num_rows()?)));
+        let status = if self.0.is_refreshing() {
+            format!("ticking · updated in cycle {}", self.0.changed())
+        } else {
+            "static".to_owned()
+        };
+        match preview {
+            Ok((head, total)) => preview_html(&head, total, &status).map_err(arrow_error),
+            Err(error) => Ok(failure_html(&error.to_string())),
+        }
+    }
+
+    /// Notebook display: a live view for ticking tables (see `ursid._live`).
+    fn _ipython_display_(slf: &Bound<'_, Self>) -> PyResult<()> {
+        slf.py()
+            .import("ursid._live")?
+            .call_method1("show", (slf,))?;
+        Ok(())
+    }
+
     fn __repr__(&self) -> String {
         let columns = self
             .columns()
@@ -251,4 +319,117 @@ mod _native {
     fn init(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module.add("UrsidError", module.py().get_type::<super::UrsidError>())
     }
+}
+
+const CAPTION: &str = "font:12px ui-monospace,monospace;opacity:0.65;margin:2px 0";
+const CELL: &str = "padding:2px 10px;white-space:nowrap";
+
+/// HTML for a table's first rows: column names and types, then the rows, then how many more.
+fn preview_html(head: &RecordBatch, total: usize, status: &str) -> Result<String, ArrowError> {
+    let options = FormatOptions::default()
+        .with_null("null")
+        .with_timestamp_tz_format(Some("%Y-%m-%d %H:%M:%S%.f"));
+    let columns: Vec<ArrayRef> = head.columns().iter().map(displayable).collect();
+    let formatters = columns
+        .iter()
+        .map(|c| ArrayFormatter::try_new(c.as_ref(), &options))
+        .collect::<Result<Vec<_>, _>>()?;
+    let schema = head.schema();
+    let mut html = format!(
+        "<div><div style=\"{CAPTION}\">{} · {} rows</div>",
+        escape(status),
+        thousands(total)
+    );
+    html.push_str("<table style=\"border-collapse:collapse;font:12px ui-monospace,monospace\">");
+    html.push_str("<thead><tr>");
+    for field in schema.fields() {
+        html.push_str(&format!(
+            "<th style=\"{CELL};text-align:{};border-bottom:1px solid #8886\">{} \
+             <span style=\"opacity:0.5;font-weight:normal\">{}</span></th>",
+            alignment(field.data_type()),
+            escape(field.name()),
+            escape(&ursid_core::type_name(field.data_type())),
+        ));
+    }
+    html.push_str("</tr></thead><tbody>");
+    for row in 0..head.num_rows() {
+        html.push_str("<tr>");
+        for ((formatter, column), field) in formatters.iter().zip(&columns).zip(schema.fields()) {
+            let value = escape(&formatter.value(row).try_to_string()?);
+            let value = if column.is_null(row) {
+                format!("<span style=\"opacity:0.4\">{value}</span>")
+            } else {
+                value
+            };
+            html.push_str(&format!(
+                "<td style=\"{CELL};text-align:{}\">{value}</td>",
+                alignment(field.data_type())
+            ));
+        }
+        html.push_str("</tr>");
+    }
+    html.push_str("</tbody></table>");
+    if total > head.num_rows() {
+        html.push_str(&format!(
+            "<div style=\"{CAPTION}\">… {} more rows</div>",
+            thousands(total - head.num_rows())
+        ));
+    }
+    html.push_str("</div>");
+    Ok(html)
+}
+
+fn failure_html(message: &str) -> String {
+    format!(
+        "<div style=\"font:12px ui-monospace,monospace;color:#d33\">{}</div>",
+        escape(message)
+    )
+}
+
+fn alignment(data_type: &DataType) -> &'static str {
+    match data_type {
+        DataType::Int32 | DataType::Int64 | DataType::Float64 => "right",
+        _ => "left",
+    }
+}
+
+/// UTC timestamps relabelled with the fixed offset `+00:00`: same instants, but they format
+/// without a time zone database.
+fn displayable(column: &ArrayRef) -> ArrayRef {
+    match column.data_type() {
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(tz)) if tz.as_ref() == "UTC" => Arc::new(
+            column
+                .as_primitive::<TimestampNanosecondType>()
+                .clone()
+                .with_timezone("+00:00"),
+        ),
+        _ => column.clone(),
+    }
+}
+
+fn escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// `1234567` as `1,234,567`.
+fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }

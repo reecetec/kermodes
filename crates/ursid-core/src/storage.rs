@@ -168,6 +168,24 @@ impl Storage {
         }
     }
 
+    /// The first `n` rows in key order. A sparse table selects its `n` smallest keys in linear
+    /// time rather than sorting all of them.
+    pub fn head(&self, n: usize) -> Result<RecordBatch, ArrowError> {
+        let keys = match &self.index {
+            Index::Dense { len, .. } => (0..(n as RowKey).min(*len)).collect(),
+            Index::Sparse { slot_of, .. } => {
+                let mut keys: Vec<RowKey> = slot_of.keys().copied().collect();
+                if keys.len() > n {
+                    keys.select_nth_unstable(n);
+                    keys.truncate(n);
+                }
+                keys.sort_unstable();
+                keys
+            }
+        };
+        self.gather(&keys)
+    }
+
     /// Current rows in key order.
     pub fn snapshot(&self) -> Result<Vec<RecordBatch>, ArrowError> {
         match &self.index {

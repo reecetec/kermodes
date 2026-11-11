@@ -52,6 +52,22 @@ def test_expression_errors_point_at_the_problem():
         src.where("prise > 0")
 
 
+def test_the_clock_starts_once_and_stops_quietly():
+    s = us.local()
+    with pytest.raises(ValueError, match="period"):
+        s.start("fast")
+    assert not s.is_running
+    s.start("10ms")
+    try:
+        assert s.is_running
+        with pytest.raises(us.UrsidError, match="already running"):
+            s.start()
+    finally:
+        s.stop()
+    assert not s.is_running
+    s.stop()
+
+
 def test_a_failed_table_raises_but_the_session_keeps_running():
     s = us.local()
     src = s.input_table(COLUMNS)

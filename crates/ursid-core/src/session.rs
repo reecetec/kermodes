@@ -1,6 +1,8 @@
 //! A session owns one update graph: input tables, the tables derived from them, and cycles.
 
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use arrow::compute::interleave_record_batch;
 use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
@@ -25,6 +27,15 @@ struct Inner {
     graph: RwLock<Graph>,
     /// Writes waiting for the next cycle, in arrival order.
     pending: Mutex<Vec<(usize, Write)>>,
+    /// The background clock started by `Session::start`, if running.
+    clock: Mutex<Option<Clock>>,
+}
+
+/// A thread running cycles on a period. It holds the session weakly, so dropping the last
+/// `Session` handle also ends it.
+struct Clock {
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    thread: JoinHandle<()>,
 }
 
 enum Write {
@@ -51,6 +62,8 @@ struct TableState {
     failure: Option<Error>,
     /// This cycle's changes, read by the tables built from this one.
     delta: Option<Delta>,
+    /// The cycle that last changed this table's rows or failed it; 0 if none has.
+    changed: u64,
     source: Source,
 }
 
@@ -170,6 +183,7 @@ impl Session {
     pub fn step(&self) -> u64 {
         let pending = std::mem::take(&mut *self.pending());
         let mut graph = self.write();
+        let cycle = graph.cycle + 1;
         let mut writes: Vec<Vec<Write>> = graph.tables.iter().map(|_| Vec::new()).collect();
         for (id, write) in pending {
             writes[id].push(write);
@@ -195,6 +209,7 @@ impl Session {
                             table: table.description.clone(),
                             cause: Arc::new(cause.clone()),
                         });
+                        table.changed = cycle;
                         continue;
                     }
                     let Some(delta) = &parent.delta else {
@@ -204,9 +219,73 @@ impl Session {
                 }
             };
             table.commit(result);
+            if table.delta.is_some() || table.failure.is_some() {
+                table.changed = cycle;
+            }
         }
-        graph.cycle += 1;
-        graph.cycle
+        graph.cycle = cycle;
+        cycle
+    }
+
+    /// Starts running cycles in the background, one every `period` while writes are pending.
+    /// Fails if a clock is already running; `stop` ends it.
+    pub fn start(&self, period: Duration) -> Result<(), Error> {
+        let mut clock = self.clock();
+        if clock.is_some() {
+            return Err(Error::Unsupported(
+                "the session's clock is already running".into(),
+            ));
+        }
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let session = Arc::downgrade(&self.inner);
+        let signal = stop.clone();
+        let thread = thread::Builder::new()
+            .name("ursid-clock".into())
+            .spawn(move || {
+                let (stopped, wake) = &*signal;
+                loop {
+                    let guard = stopped.lock().expect("ursid clock flag poisoned");
+                    let (guard, _) = wake
+                        .wait_timeout_while(guard, period, |stopped| !*stopped)
+                        .expect("ursid clock flag poisoned");
+                    if *guard {
+                        return;
+                    }
+                    drop(guard);
+                    let Some(inner) = session.upgrade() else {
+                        return;
+                    };
+                    let session = Session { inner };
+                    if !session.pending().is_empty() {
+                        session.step();
+                    }
+                }
+            })
+            .map_err(|e| Error::Unsupported(format!("cannot start the clock thread: {e}")))?;
+        *clock = Some(Clock { stop, thread });
+        Ok(())
+    }
+
+    /// Stops the background clock, after any cycle in progress. Does nothing if none runs.
+    pub fn stop(&self) {
+        let Some(clock) = self.clock().take() else {
+            return;
+        };
+        let (stopped, wake) = &*clock.stop;
+        *stopped.lock().expect("ursid clock flag poisoned") = true;
+        wake.notify_all();
+        clock.thread.join().expect("ursid clock thread panicked");
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.clock().is_some()
+    }
+
+    fn clock(&self) -> MutexGuard<'_, Option<Clock>> {
+        self.inner
+            .clock
+            .lock()
+            .expect("ursid clock poisoned by an earlier panic")
     }
 
     fn add(&self, state: TableState) -> Table {
@@ -263,6 +342,7 @@ impl TableState {
             add_only,
             failure: None,
             delta: None,
+            changed: 0,
             source,
         }
     }
@@ -554,6 +634,24 @@ impl Table {
             table: table.description.clone(),
             message: e.to_string(),
         })
+    }
+
+    /// The first `n` rows in key order, or the error that failed the table.
+    pub fn head(&self, n: usize) -> Result<RecordBatch, Error> {
+        let graph = self.session.read();
+        let table = &graph.tables[self.id];
+        if let Some(error) = &table.failure {
+            return Err(error.clone());
+        }
+        table.storage.head(n).map_err(|e| Error::Compute {
+            table: table.description.clone(),
+            message: e.to_string(),
+        })
+    }
+
+    /// The cycle that last changed this table's rows or failed it; 0 if none has.
+    pub fn changed(&self) -> u64 {
+        self.session.read().tables[self.id].changed
     }
 
     pub fn num_rows(&self) -> Result<usize, Error> {

@@ -20,6 +20,9 @@ s.step()
 pa.table(live)  # sym, price, size, notional for rows with price > 0
 ```
 
+In a notebook, `s.start()` runs cycles in the background and a displayed ticking table updates in
+place; [examples/live.ipynb](examples/live.ipynb) streams a random-walk ticker.
+
 ## Development
 
 Requires Rust and [uv](https://docs.astral.sh/uv/).

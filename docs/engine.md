@@ -108,8 +108,11 @@ Delta { added: [(keys, rows)], removed: [(keys, last rows)], modified: [(keys, p
   lock between cycles. Readers copy what they need and release it.
 - Clocks:
   - manual: `step()` runs one cycle (tests, notebooks, replay);
-  - periodic: a background thread runs a cycle every period (default 100 ms) when a source has
-    pending data.
+  - periodic: `start(period)` runs a cycle every period (default 100 ms) on a background thread
+    while writes are pending, until `stop()`. The thread holds the session weakly, so dropping
+    the session ends it.
+- Each table records the cycle that last changed its rows (or failed it); viewers poll that to
+  re-render only what changed.
 - Cycles run tables one after another. `agg_by` spreads a large delta (64k+ rows) over every core
   in two phases (§5); other operators are single-threaded until a profile shows the need.
 - Failure: if an operator errors, its table and everything downstream of it enter a failed state
@@ -194,12 +197,12 @@ vwap = stats.update("vwap = notional / size")
 
 s.step()  # one cycle
 pa.table(latest)  # snapshot through the Arrow PyCapsule interface
+s.start(period="100ms")  # background cycles; s.stop()
+latest  # in a notebook: a live view (§8)
 
 # Still to come in M0:
 enriched = live.natural_join(refs, on="sym")
 vol = ticks.rolling("sym", rows=100, std_price="std(price)")
-s.start(period="100ms")  # background cycles; s.stop()
-latest  # in Jupyter: ticking widget
 ```
 
 - Every engine call releases the interpreter while Rust works.
@@ -208,15 +211,17 @@ latest  # in Jupyter: ticking widget
 - Type stubs for `_native` are hand-written; the public API is the Python layer in
   `python/ursid`.
 
-## 8. Notebook widget
+## 8. Notebook view
 
-- An anywidget front end; the kernel side talks to the engine directly (no server in M0).
-- Front end → kernel: `subscribe {first_row, last_row, columns}` when the viewport scrolls or
-  resizes.
-- Kernel → front end, at most 10 times a second and only when the viewport's rows or the row count
-  changed: `{row_count, first_row, batch}` where `batch` is Arrow IPC bytes for the visible rows.
-- The front end decodes with `apache-arrow` and renders with TanStack Virtual. The same message
-  shapes are later carried over WebSocket by the gateway.
+- Displaying a table shows its first 20 rows in key order as HTML, with column types and the row
+  count, rendered in Rust (the wheel has no Python dependencies).
+- A ticking table's output is re-rendered in place through Jupyter's `update_display_data`: one
+  background thread checks every live output ten times a second and re-renders those whose
+  table changed since. This works in any frontend that honours display updates (Jupyter, VS
+  Code, Tern), with no front-end code; `examples/live.ipynb` shows it.
+- Scrolling past the first rows needs a widget (anywidget: the front end subscribes to a viewport
+  and receives Arrow IPC for the visible rows). That comes when a slice needs it, in frontends
+  that support widget comms.
 
 ## 9. Testing
 

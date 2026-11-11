@@ -47,6 +47,24 @@ fn derived_tables_update_only_when_a_cycle_runs() {
 }
 
 #[test]
+fn tables_record_the_cycle_that_last_changed_them() {
+    let session = Session::new();
+    let input = session.input_table(&schema()).unwrap();
+    let big = input.filter("size > 5").unwrap();
+    assert_eq!((input.changed(), big.changed()), (0, 0));
+
+    input.append(&[rows(&["a"], &[8])]).unwrap();
+    let first = session.step();
+    assert_eq!((input.changed(), big.changed()), (first, first));
+
+    // A row the filter drops changes the input only; an idle cycle changes nothing.
+    input.append(&[rows(&["b"], &[3])]).unwrap();
+    let second = session.step();
+    session.step();
+    assert_eq!((input.changed(), big.changed()), (second, first));
+}
+
+#[test]
 fn tables_built_later_start_from_current_rows() {
     let session = Session::new();
     let input = session.input_table(&schema()).unwrap();
