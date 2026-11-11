@@ -141,6 +141,33 @@ fn a_failed_table_fails_its_dependents_but_not_the_session() {
 }
 
 #[test]
+fn a_fed_table_that_loses_its_source_fails_with_its_dependents() {
+    let session = Session::new();
+    let (fed, feed) = session.fed_table(&schema(), "live md.ticks").unwrap();
+    let downstream = fed.filter("size > 0").unwrap();
+    feed.append(&[rows(&["a"], &[1])]).unwrap();
+    session.step();
+    assert_eq!(downstream.num_rows().unwrap(), 1);
+
+    assert!(feed.fail("the store closed the stream".into()));
+    session.step();
+    match fed.snapshot() {
+        Err(Error::Source { table, message }) => {
+            assert_eq!(
+                (table.as_str(), message.as_str()),
+                ("live md.ticks", "the store closed the stream")
+            );
+        }
+        other => panic!("expected a lost source, got {other:?}"),
+    }
+    assert!(matches!(downstream.snapshot(), Err(Error::Upstream { .. })));
+    // Rows after the failure change nothing.
+    feed.append(&[rows(&["b"], &[2])]).unwrap();
+    session.step();
+    assert!(matches!(fed.snapshot(), Err(Error::Source { .. })));
+}
+
+#[test]
 fn appends_must_match_the_table() {
     let session = Session::new();
     let input = session.input_table(&schema()).unwrap();

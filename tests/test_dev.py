@@ -7,6 +7,7 @@ import time
 
 import kermodes as km
 import pyarrow as pa
+import pytest
 
 _WRITE_UNTIL_THE_SERVER_GOES = """
 import sys
@@ -96,3 +97,27 @@ def test_processes_share_kermodes_dev_and_a_killed_server_loses_nothing(tmp_path
     finally:
         dev.kill()
         dev.wait()
+
+
+def test_a_live_table_fails_when_its_store_goes(tmp_path):
+    owner = km.local(tmp_path, manual=True)
+    owner.create_table("md.ticks", {"n": km.int64()})
+    server = owner.serve_store()
+    reader = km.connect(server.url, manual=True)
+    live = reader.live_table("md.ticks")
+    derived = live.where("n > 0")
+    reader.step()
+    assert len(live) == 0
+
+    server.stop()
+    deadline = time.monotonic() + 10
+    while True:
+        reader.step()
+        try:
+            len(live)
+        except km.KermodesError:
+            break
+        assert time.monotonic() < deadline, "the live table never noticed"
+        time.sleep(0.01)
+    with pytest.raises(km.KermodesError):
+        len(derived)

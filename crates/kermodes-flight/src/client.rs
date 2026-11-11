@@ -141,11 +141,14 @@ impl Client {
     }
 
     /// Feeds `subscriber` every committed batch of `name`, then each new one, from a background
-    /// task until it returns `false` or the server goes; returns the table's schema.
+    /// task until it returns `false`; returns the table's schema. If the stream ends first (the
+    /// server stopped, the connection broke), `lost` gets the reason: the subscriber would
+    /// otherwise wait forever on rows that cannot come.
     pub fn subscribe(
         &self,
         name: &TableName,
         mut subscriber: Subscriber,
+        lost: Box<dyn FnOnce(String) + Send>,
     ) -> Result<SchemaRef, Error> {
         let mut flight = self.flight.clone();
         let ticket = Ticket {
@@ -172,14 +175,22 @@ impl Client {
                 }
             }
         })?;
+        let name = name.to_string();
         self.runtime.spawn(async move {
-            while let Some(Ok(message)) = decoded.next().await {
-                if let DecodedPayload::RecordBatch(batch) = message.payload
-                    && !subscriber(&batch)
-                {
-                    return;
+            let reason = loop {
+                match decoded.next().await {
+                    Some(Ok(message)) => {
+                        if let DecodedPayload::RecordBatch(batch) = message.payload
+                            && !subscriber(&batch)
+                        {
+                            return;
+                        }
+                    }
+                    Some(Err(e)) => break format!("the stream of {name} broke: {e}"),
+                    None => break format!("the server ended the stream of {name}"),
                 }
-            }
+            };
+            lost(reason);
         });
         Ok(schema)
     }

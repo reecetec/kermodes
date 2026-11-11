@@ -124,14 +124,27 @@ impl Tables {
         }
     }
 
-    fn subscribe(
+    /// Feeds `feed` the table's rows; a remote table whose stream ends fails the fed table. (A
+    /// local store delivers in-process and cannot lose a subscription.)
+    fn feed(
         &self,
         name: &kermodes_weir::TableName,
-        subscriber: kermodes_weir::Subscriber,
+        feed: kermodes_core::Feed,
     ) -> Result<(), kermodes_weir::Error> {
+        let rows = feed.clone();
+        let subscriber: kermodes_weir::Subscriber =
+            Box::new(move |batch| matches!(rows.append(std::slice::from_ref(batch)), Ok(true)));
         match self {
             Tables::Local(store) => store.subscribe(name, subscriber).map(drop),
-            Tables::Remote(client) => client.subscribe(name, subscriber).map(drop),
+            Tables::Remote(client) => client
+                .subscribe(
+                    name,
+                    subscriber,
+                    Box::new(move |reason| {
+                        feed.fail(reason);
+                    }),
+                )
+                .map(drop),
         }
     }
 
@@ -308,14 +321,7 @@ impl Session {
                 .engine
                 .fed_table(&schema, &format!("live {name}"))
                 .map_err(engine_error)?;
-            tables
-                .subscribe(
-                    &name,
-                    Box::new(move |batch| {
-                        matches!(feed.append(std::slice::from_ref(batch)), Ok(true))
-                    }),
-                )
-                .map_err(store_error)?;
+            tables.feed(&name, feed).map_err(store_error)?;
             Ok::<_, PyErr>(table)
         })?;
         Ok(Table(table))

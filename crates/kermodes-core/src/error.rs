@@ -14,6 +14,8 @@ pub enum Error {
     Schema(String),
     /// Computing a table failed, while building it or during a cycle.
     Compute { table: String, message: String },
+    /// A fed table lost the source that fed it (`Feed::fail`).
+    Source { table: String, message: String },
     /// A table failed because a table it reads from failed.
     Upstream { table: String, cause: Arc<Error> },
     /// The operation does not apply to this kind of table.
@@ -37,6 +39,9 @@ impl fmt::Display for Error {
             }
             Error::Schema(message) | Error::Unsupported(message) => f.write_str(message),
             Error::Compute { table, message } => write!(f, "table `{table}` failed: {message}"),
+            Error::Source { table, message } => {
+                write!(f, "table `{table}` lost its source: {message}")
+            }
             Error::Upstream { table, cause } => {
                 write!(
                     f,

@@ -78,6 +78,8 @@ enum Write {
     Upsert(RecordBatch),
     /// Key columns only.
     Delete(RecordBatch),
+    /// The fed table's source is gone (`Feed::fail`).
+    Fail(String),
 }
 
 #[derive(Default)]
@@ -625,6 +627,7 @@ impl WeakTable {
 
 /// Delivers rows to a fed table (`Session::fed_table`). It holds the table weakly: once nothing
 /// else does, `append` reports the table gone and the store can stop feeding it.
+#[derive(Clone)]
 pub struct Feed {
     table: WeakTable,
 }
@@ -639,6 +642,17 @@ impl Feed {
         let batches = conform_all(&table.schema, batches)?;
         table.queue(batches.into_iter().map(Write::Append));
         Ok(true)
+    }
+
+    /// Fails the table at its next cycle because its source is gone (a store connection that
+    /// broke): rather than look current while it no longer updates, it fails, and so do the
+    /// tables built from it. `false` once the table is gone.
+    pub fn fail(&self, message: String) -> bool {
+        let Some(table) = self.table.upgrade() else {
+            return false;
+        };
+        table.queue(std::iter::once(Write::Fail(message)));
+        true
     }
 }
 
@@ -743,6 +757,18 @@ impl Session {
             let table = &mut rest[0];
             table.delta = None;
             if table.failure.is_some() {
+                continue;
+            }
+            let lost = writes.iter().find_map(|write| match write {
+                Write::Fail(message) => Some(message.clone()),
+                _ => None,
+            });
+            if let Some(message) = lost {
+                table.fail(Error::Source {
+                    table: table.description.clone(),
+                    message,
+                });
+                table.changed = cycle;
                 continue;
             }
             if table.source.parents().next().is_some() {
@@ -1070,7 +1096,7 @@ fn appended(storage: &Storage, writes: Vec<Write>) -> Delta {
         .into_iter()
         .filter_map(|write| match write {
             Write::Append(batch) => Some(batch),
-            Write::Upsert(_) | Write::Delete(_) => None,
+            Write::Upsert(_) | Write::Delete(_) | Write::Fail(_) => None,
         })
         .map(|batch| {
             let count = batch.num_rows() as RowKey;
@@ -1096,7 +1122,7 @@ impl Keyed {
             let (kind, batch, upserting) = match write {
                 Write::Upsert(batch) => (&self.rows, batch, true),
                 Write::Delete(batch) => (&self.deletes, batch, false),
-                Write::Append(_) => continue,
+                Write::Append(_) | Write::Fail(_) => continue,
             };
             let encoded = kind.encode(&batch)?;
             let keys = kind.keys(&batch, encoded.as_ref());

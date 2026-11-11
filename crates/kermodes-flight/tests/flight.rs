@@ -90,6 +90,8 @@ fn clients_share_a_served_store() {
     assert_eq!(names, ["md.ticks"]);
     let seen = Arc::new(Mutex::new(Vec::new()));
     let sink = seen.clone();
+    let lost = Arc::new(Mutex::new(None::<String>));
+    let reason = lost.clone();
     let schema = reader
         .subscribe(
             &ticks(),
@@ -98,6 +100,7 @@ fn clients_share_a_served_store() {
                 sink.lock().unwrap().extend(n.values().iter().copied());
                 true
             }),
+            Box::new(move |why| *reason.lock().unwrap() = Some(why)),
         )
         .unwrap();
     assert_eq!(schema.field(1).name(), "sym");
@@ -147,4 +150,14 @@ fn clients_share_a_served_store() {
         RecordBatch::try_from_iter([("n", Arc::new(Int64Array::from(vec![1])) as ArrayRef)])
             .unwrap();
     assert!(matches!(resumed.write(&wrong, None), Err(Error::Schema(_))));
+
+    // A subscriber learns when the server goes rather than waiting forever.
+    assert_eq!(*lost.lock().unwrap(), None);
+    let mut server = server;
+    server.stop();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while lost.lock().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the subscriber was never told");
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }

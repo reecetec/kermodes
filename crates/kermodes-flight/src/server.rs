@@ -17,6 +17,8 @@ use arrow_flight::{
 use futures::stream::{self, StreamExt, TryStreamExt};
 use kermodes_weir::{Error, SourceId, Store, TableName};
 use serde_json::{Value, json};
+use std::time::Duration;
+
 use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status, Streaming};
 
@@ -48,13 +50,19 @@ pub fn serve(store: Arc<Store>, addr: SocketAddr) -> std::io::Result<Server> {
                 let listener =
                     tokio::net::TcpListener::from_std(listener).expect("a bound listener converts");
                 let incoming = tonic::transport::server::TcpIncoming::from(listener);
-                let _ = tonic::transport::Server::builder()
+                let serving = tonic::transport::Server::builder()
                     .add_service(service)
-                    .serve_with_incoming_shutdown(incoming, async {
-                        let _ = stopped.await;
-                    })
-                    .await;
+                    .serve_with_incoming(incoming);
+                tokio::select! {
+                    _ = serving => {}
+                    _ = stopped => {}
+                }
             });
+            // Not a graceful shutdown: that waits for open streams, and tails and writers' streams
+            // stay open as long as their clients do. Dropping the connections tells readers the
+            // server went, and a write cut short is recovered as after a crash; acknowledged
+            // writes are already durable.
+            runtime.shutdown_timeout(Duration::from_secs(5));
         })?;
     Ok(Server {
         addr,
