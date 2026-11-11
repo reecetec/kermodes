@@ -1,5 +1,5 @@
-# A synthetic market-data feed, ingested into md.ticks. Locally: `kermodes demo ticker`, then
-# `kermodes run ticks --project examples/ticker` against `kermodes dev`.
+# A synthetic market-data feed, generated and ingested into md.ticks. Locally:
+# `kermodes dev --project examples/ticker`.
 [project]
 name = "ticker"
 entry = "ticker.app"

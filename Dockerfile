@@ -37,7 +37,11 @@ LABEL org.opencontainers.image.created="${IMAGE_CREATED}" \
       org.opencontainers.image.title="Kermodes" \
       org.opencontainers.image.version="${IMAGE_VERSION}"
 COPY --from=wheel /dist/ /tmp/dist/
-RUN pip install --no-cache-dir /tmp/dist/*.whl && \
+# git: `kermodes control` syncs projects with it.
+RUN apt-get update && \
+    apt-get install --yes --no-install-recommends git && \
+    rm -rf /var/lib/apt/lists/* && \
+    pip install --no-cache-dir /tmp/dist/*.whl && \
     rm -rf /tmp/dist && \
     useradd --create-home --uid 10001 kermodes
 USER 10001

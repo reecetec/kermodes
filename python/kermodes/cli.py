@@ -5,11 +5,14 @@ import itertools
 import json
 import os
 import signal
+import tarfile
 import time
+import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 
 import kermodes as km
+from kermodes import _native
 from kermodes import project as projects
 from kermodes.supervisor import Supervisor
 
@@ -115,6 +118,26 @@ def main(argv: list[str] | None = None) -> None:
     feed.add_argument("--rate", type=int, default=1_000, help="ticks a second")
     feed.add_argument("--symbols", type=int, default=100)
 
+    control = commands.add_parser(
+        "control",
+        help="run the controller: sync projects from git and run their resources",
+        description="Syncs each configured project's mainline from git, discovers what each "
+        "commit declares, and runs every resource as a Kubernetes Deployment rolled out by its "
+        "update policy (architecture.md §11.3-11.4, §16.2). Secrets come from the environment: "
+        "KERMODES_CATALOG (its Postgres), KERMODES_GIT_USERNAME and KERMODES_GIT_PASSWORD, "
+        "KERMODES_WEBHOOK_SECRET; POD_NAMESPACE is where it runs.",
+    )
+    control.add_argument(
+        "--config", type=Path, required=True, help="JSON: projects, image, weir, ..."
+    )
+
+    fetch = commands.add_parser(
+        "fetch-snapshot",
+        help="download a commit's code snapshot from the controller (run init containers)",
+    )
+    fetch.add_argument("url")
+    fetch.add_argument("dest", type=Path)
+
     manifest = commands.add_parser(
         "manifest",
         help="print a project's resources as JSON",
@@ -173,6 +196,38 @@ def main(argv: list[str] | None = None) -> None:
         run_resource(
             args.project, args.resource, args.server, args.data_dir, args.ready_file
         )
+    elif args.command == "control":
+        run_control(args.config)
+    elif args.command == "fetch-snapshot":
+        fetch_snapshot(args.url, args.dest)
+
+
+def run_control(config_path: Path) -> None:
+    config = json.loads(config_path.read_text())
+    for key, variable in [
+        ("database", "KERMODES_CATALOG"),
+        ("git_username", "KERMODES_GIT_USERNAME"),
+        ("git_password", "KERMODES_GIT_PASSWORD"),
+        ("webhook_secret", "KERMODES_WEBHOOK_SECRET"),
+        ("namespace", "POD_NAMESPACE"),
+    ]:
+        if os.environ.get(variable):
+            config[key] = os.environ[variable]
+    print(
+        f"kermodes control: {len(config.get('projects', []))} projects, "
+        f"listening on {config.get('listen')}",
+        flush=True,
+    )
+    _native.control(json.dumps(config))
+
+
+def fetch_snapshot(url: str, dest: Path) -> None:
+    """Extracts the tar at `url` into `dest`, refusing anything that would land outside it."""
+    with (
+        urllib.request.urlopen(url, timeout=60) as response,
+        tarfile.open(fileobj=response, mode="r|") as tar,
+    ):
+        tar.extractall(dest, filter="data")
 
 
 def run_resource(

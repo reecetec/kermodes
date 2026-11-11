@@ -1,0 +1,201 @@
+{{- if .Values.control.enabled }}
+{{- if not .Values.catalog.secretName }}
+{{- fail "control.enabled needs catalog.secretName: the controller keeps its state in the catalog's Postgres" }}
+{{- end }}
+{{- $name := printf "%s-control" (include "kermodes.fullname" .) -}}
+{{- $selector := dict "root" . "component" "control" -}}
+{{- $pullSecrets := list -}}
+{{- range .Values.imagePullSecrets }}{{ $pullSecrets = append $pullSecrets .name }}{{ end -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "kermodes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control
+---
+# What it runs projects with, in its own namespace only (architecture.md §16.2).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "kermodes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control
+rules:
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [get, list, create, delete]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "kermodes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "kermodes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control
+data:
+  control.json: |
+    {{- dict
+        "image" (include "kermodes.image" .)
+        "weir" (include "kermodes.weirUrl" .)
+        "snapshots" (printf "http://%s:8732/snapshots" $name)
+        "listen" "0.0.0.0:8732"
+        "pull_secrets" $pullSecrets
+        "poll_seconds" .Values.control.pollSeconds
+        "projects" .Values.control.projects
+      | toPrettyJson | nindent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "kermodes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control
+spec:
+  selector:
+    {{- include "kermodes.selectorLabels" $selector | nindent 4 }}
+  ports:
+    - name: http
+      port: 8732
+      targetPort: http
+---
+# One replica, replaced by stopping it first: until it elects a leader, two controllers must never
+# run at once.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "kermodes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "kermodes.selectorLabels" $selector | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kermodes.labels" . | nindent 8 }}
+        app.kubernetes.io/component: control
+      annotations:
+        # Roll the controller when its configuration changes.
+        checksum/config: {{ .Values.control | toJson | sha256sum }}
+    spec:
+      serviceAccountName: {{ $name }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "kermodes.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: control
+          image: {{ include "kermodes.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [control, --config, /etc/kermodes/control.json]
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # git writes its scratch and config under HOME.
+            - name: HOME
+              value: /tmp
+            - name: KERMODES_CATALOG
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.catalog.secretName }}
+                  key: {{ .Values.catalog.secretKey }}
+            {{- with .Values.control.git.secretName }}
+            - name: KERMODES_GIT_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: username
+            - name: KERMODES_GIT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: password
+            {{- end }}
+            {{- with .Values.control.webhook.secretName }}
+            - name: KERMODES_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: secret
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 8732
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.control.resources | nindent 12 }}
+          securityContext:
+            {{- include "kermodes.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kermodes
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $name }}
+        - name: tmp
+          emptyDir: {}
+---
+# Its API is unauthenticated until the gateway (architecture.md §16.4): only its namespace may
+# reach it, where runs fetch their snapshots.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "kermodes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "kermodes.selectorLabels" $selector | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8732
+{{- end }}

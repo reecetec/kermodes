@@ -878,9 +878,9 @@ flowchart LR
    deploying the artifact, never rebuilding. Pull requests stop at the plan, plus a preview if the
    project enables them (§11.5).
 
-- Triggers: a push webhook from any git host (GitHub, GitLab, and Gitea signatures are verified; a
-  generic endpoint takes a shared secret), with polling as the fallback, so a lost webhook only
-  delays a sync.
+- Triggers: polling (every 30 s by default), and a push webhook any git host can call:
+  `POST /hooks/sync` with a shared secret in `X-Kermodes-Secret`. A host adapter (§11.7) adds that
+  host's own webhook signature. A lost webhook only delays a sync.
 - With a host adapter (§11.7), results go back to the host as commit statuses (`kermodes/test`,
   `kermodes/plan`) and a PR comment with the plan.
 - Every stage is a row in `sys.pipeline_runs`. The UI shows commit → build → test → plan → roll out,
@@ -907,7 +907,7 @@ def book(db): ...
 |---|---|
 | `auto` (default) | As soon as its commit passes the pipeline |
 | `manual` | When someone rolls it out (UI, CLI, or API); until then the UI shows the update, with its plan |
-| `on_start` | At the resource's next scheduled start (`schedule=`), as Deephaven's persistent queries pick up changes on their daily restart |
+| `on_start` | At the resource's next scheduled start (`schedule=`), as Deephaven's persistent queries pick up changes on their daily restart. Refused at discovery until schedules exist. |
 
 | Strategy | Replacement |
 |---|---|
@@ -1165,9 +1165,10 @@ host it: Kubernetes (§16.1–16.5) and local (§16.6).
 - The Argo CD repo pins a chart version in an umbrella chart (`components/kermodes/helm/`, values in
   its `values.yaml`); Kargo promotes a release by updating that pin.
 - The chart installs weir (a StatefulSet on a PVC, reachable only from its namespace until Flight
-  has authentication) and `kermodes ui` (a Deployment, with an optional Gateway API route). It
-  grows to `kermodes-control`, `kermodes-gateway`, ServiceAccounts and RBAC, and config. It does
-  not contain workers, ingesters, or jobs; the controller creates those at runtime.
+  has authentication), `kermodes ui` (a Deployment, with an optional Gateway API route), and,
+  with `control.enabled`, `kermodes control` with its ServiceAccount and namespaced Role. It
+  grows to `kermodes-gateway` and config. It does not contain workers, ingesters, or jobs; the
+  controller creates those at runtime.
 - External dependencies are values: Postgres (a Secret with its connection URI; the reference
   deployment uses a CloudNativePG cluster's `<cluster>-app` Secret, the cluster defined beside
   Kermodes' values), S3 endpoint and bucket (rustfs), OCI registry for environment images, git
@@ -1177,7 +1178,12 @@ host it: Kubernetes (§16.1–16.5) and local (§16.6).
 
 - `kermodes control` runs API, catalog, scheduler, pipeline, reconciler, and ranger. It runs with
   several replicas; scheduler, pipeline, and reconciler loops use leader election via a Kubernetes
-  `Lease`, and every replica serves the API.
+  `Lease`, and every replica serves the API. Built so far: one replica (replaced with `Recreate`
+  until it elects a leader) that syncs the projects listed in the chart's values, keeps each
+  synced commit's snapshot and manifest in the catalog's Postgres, discovers each commit in a
+  Job, reconciles each resource's Deployment by its update policy, and serves snapshots, the sync
+  webhook, status (`GET /api/status`), and manual rollouts (`POST
+  /api/projects/{project}/resources/{resource}/rollout`) on port 8732.
 - Desired state is git (resource definitions, by commit) and Postgres (what is deployed where,
   runs, audit). Kubernetes holds only native objects the controller derives from it, labelled
   `kermodes.io/project`, `kermodes.io/resource`, and `kermodes.io/commit`; there is no custom
@@ -1188,7 +1194,7 @@ host it: Kubernetes (§16.1–16.5) and local (§16.6).
 
 | Kubernetes object | Created for | Notes |
 |---|---|---|
-| `apps/v1` Deployment | deployment, ingester | One replica, two for a hot standby. `RollingUpdate` (`maxSurge: 1`, `maxUnavailable: 0`) or `Recreate` (§11.4); the controller changes the template only to roll out an artifact. A PodDisruptionBudget per resource (§17.1). |
+| `apps/v1` Deployment | deployment, ingester | One replica, two for a hot standby. `RollingUpdate` (`maxSurge: 1`, `maxUnavailable: 0`) or `Recreate` (§11.4); the controller changes the template only to roll out an artifact. An init container fetches the commit's snapshot from the controller. A PodDisruptionBudget per resource, once the controller moves runs off cordoned nodes (§17.1): before that, one would block every drain. |
 | Pod | session | `restartPolicy: Never`, reaped after the idle timeout |
 | `batch/v1` Job | scheduled task attempt, pipeline stage, discovery, environment build | Created by the scheduler or pipeline; history in Postgres |
 

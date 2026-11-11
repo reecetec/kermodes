@@ -606,6 +606,14 @@ impl Ticker {
     }
 }
 
+/// Runs `kermodes control` (architecture.md §16.2) until SIGTERM or SIGINT, with the interpreter
+/// released: `config` is its JSON configuration (projects, database, image, ...).
+#[pyfunction]
+fn control(py: Python<'_>, config: &str) -> PyResult<()> {
+    let config = kermodes_control::Config::parse(config).map_err(PyValueError::new_err)?;
+    py.detach(|| kermodes_control::run_blocking(config).map_err(KermodesError::new_err))
+}
+
 /// Serves a synthetic feed on `host:port` (port 0 picks a free one): about `rate` ticks a second
 /// over `symbols` symbols, as JSON arrays of `{sym, price, size, ts}` every 10 ms.
 #[pyfunction]
@@ -1166,8 +1174,8 @@ impl Viewer {
 mod _native {
     #[pymodule_export]
     use super::{
-        Ingest, IngestStats, Server, Session, StoreServer, Table, Ticker, Viewer, Writer, merge,
-        ticker,
+        Ingest, IngestStats, Server, Session, StoreServer, Table, Ticker, Viewer, Writer, control,
+        merge, ticker,
     };
 
     use pyo3::prelude::*;

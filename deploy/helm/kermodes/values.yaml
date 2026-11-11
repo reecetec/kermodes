@@ -10,6 +10,27 @@ catalog:
   secretName: ""
   secretKey: uri
 
+# `kermodes control` (architecture.md §16.2): syncs projects from git and runs their resources.
+# Needs `catalog`: it keeps its state in the catalog's Postgres.
+control:
+  enabled: false
+  pollSeconds: 30
+  # Each: name (its kermodes.toml's), url (any git host, HTTPS), branch (its mainline), and path
+  # (its directory in the repository; empty for the root).
+  projects: []
+  # A Secret with `username` and `password` (a token) for the projects' repositories.
+  git:
+    secretName: ""
+  # A Secret with `secret`, required on POST /hooks/sync; without one, the webhook is off.
+  webhook:
+    secretName: ""
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
 imagePullSecrets: []
 
 weir:
