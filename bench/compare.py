@@ -1,14 +1,14 @@
-"""Static operators in Ursid, DuckDB, and Polars on the same data (bench/data.py): time and memory.
+"""Static operators in Kermodes, DuckDB, and Polars on the same data (bench/data.py): time and memory.
 
-    uv run --no-sync --with maturin maturin develop --release -m crates/ursid-py/Cargo.toml
+    uv run --no-sync --with maturin maturin develop --release -m crates/kermodes-py/Cargo.toml
     uv run --no-sync --with numpy --with duckdb --with polars --with psutil python bench/compare.py
     ... python bench/compare.py --threads 1 --rows 1000000
 
-Use a release build of Ursid: `uv sync` installs a faster-to-build profile.
+Use a release build of Kermodes: `uv sync` installs a faster-to-build profile.
 
 Each (engine, operation) runs in its own process, so memory figures do not mix engines:
 
-- inputs: RSS the engine adds when it loads the tables (Polars and Ursid share the generated
+- inputs: RSS the engine adds when it loads the tables (Polars and Kermodes share the generated
   Arrow buffers; DuckDB copies them into its own storage);
 - peak: the highest RSS seen during the operation's first run, above the RSS before it, sampled
   every 2 ms;
@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import data  # bench/ is not a package: found through sys.path above
 
 REPEATS = 3
-ENGINES = ["ursid", "duckdb", "polars"]
+ENGINES = ["kermodes", "duckdb", "polars"]
 OPERATIONS = [
     "where + update",
     "last_by",
@@ -67,10 +67,10 @@ MB = 1 << 20
 
 def operations(engine: str, ticks, quotes, refs):
     """The engine's tables and a function per operation returning its materialized result."""
-    if engine == "ursid":
-        import ursid as us
+    if engine == "kermodes":
+        import kermodes as km
 
-        s = us.local(manual=True)
+        s = km.local(manual=True)
         t, q, r = s.static_table(ticks), s.static_table(quotes), s.static_table(refs)
         return {
             "where + update": lambda: t.where("price > 100").update(
@@ -82,8 +82,8 @@ def operations(engine: str, ticks, quotes, refs):
             ),
             "natural_join": lambda: t.natural_join(r, "sym"),
             "as_of_join": lambda: t.as_of_join(q, "sym", "ts"),
-            "merge": lambda: us.merge(t, t),
-            "merge + agg_by": lambda: us.merge(t, t).agg_by(
+            "merge": lambda: km.merge(t, t),
+            "merge + agg_by": lambda: km.merge(t, t).agg_by(
                 "sym", n="count(*)", avg="mean(price)"
             ),
             "tail": lambda: t.tail(1000),
@@ -97,7 +97,7 @@ def operations(engine: str, ticks, quotes, refs):
         import duckdb
 
         con = duckdb.connect()
-        threads = os.environ.get("URSID_THREADS")
+        threads = os.environ.get("KERMODES_THREADS")
         if threads:
             con.execute(f"set threads={threads}")
         for name, table in [("ticks", ticks), ("quotes", quotes), ("refs", refs)]:
@@ -248,7 +248,7 @@ def main() -> None:
     operations_to_run = args.operation or OPERATIONS
     env = dict(os.environ)
     if args.threads:
-        env["POLARS_MAX_THREADS"] = env["URSID_THREADS"] = str(args.threads)
+        env["POLARS_MAX_THREADS"] = env["KERMODES_THREADS"] = str(args.threads)
     results = {}
     for op in operations_to_run:
         for engine in ENGINES:

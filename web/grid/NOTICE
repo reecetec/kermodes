@@ -1,5 +1,5 @@
-@ursid/grid
-Copyright Ursid contributors
+@kermodes/grid
+Copyright Kermodes contributors
 
 This package contains code adapted from @deephaven/grid and @deephaven/utils,
 part of the Deephaven web-client-ui project:

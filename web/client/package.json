@@ -1,5 +1,5 @@
 {
-  "name": "@ursid/client",
+  "name": "@kermodes/client",
   "version": "0.0.0",
   "private": true,
   "license": "Apache-2.0",
@@ -11,7 +11,7 @@
     "test": "bun test"
   },
   "dependencies": {
-    "@ursid/grid": "workspace:*"
+    "@kermodes/grid": "workspace:*"
   },
   "devDependencies": {
     "@types/bun": "^1.4.0",

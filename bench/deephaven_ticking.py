@@ -6,7 +6,7 @@
 Needs Java 17+ on the path. Each operation runs in a fresh JVM: an append-only input table
 `ticks` (and, for the as-of join, `quotes`) gains one batch per cycle through `InputTable.add`,
 timed until the update graph has finished the cycle, downstream tables included. The as-of
-join's two adds are two update cycles; Ursid appends both and runs one. Each batch is converted to
+join's two adds are two update cycles; Kermodes appends both and runs one. Each batch is converted to
 a Deephaven table before timing. Memory is the JVM heap in use after a full
 collection, after the last cycle minus before the first.
 """

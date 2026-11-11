@@ -81,7 +81,7 @@ export function FilterBar({
         return (
           <input
             key={column.name}
-            className="ursid-filter-input"
+            className="kermodes-filter-input"
             type="text"
             spellCheck={false}
             aria-label={`Filter ${column.name}`}
@@ -102,8 +102,8 @@ export function FilterBar({
                 border: `1px solid ${error == null ? theme.headerSeparatorColor : theme.errorColor}`,
                 boxShadow:
                   error == null ? undefined : `0 0 0 1px ${theme.errorColor}`,
-                '--ursid-placeholder': theme.headerSeparatorHoverColor,
-                '--ursid-accent': theme.selectionOutlineColor,
+                '--kermodes-placeholder': theme.headerSeparatorHoverColor,
+                '--kermodes-accent': theme.selectionOutlineColor,
               } as React.CSSProperties
             }
           />

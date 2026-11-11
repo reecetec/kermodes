@@ -1,11 +1,11 @@
 import subprocess
 import sys
 
+import kermodes as km
 import pyarrow as pa
 import pytest
-import ursid as us
 
-COLUMNS = {"sym": us.string(), "price": us.float64(), "size": us.int64()}
+COLUMNS = {"sym": km.string(), "price": km.float64(), "size": km.int64()}
 
 
 def ticks(sym: list[str], price: list[float], size: list[int | None]) -> pa.Table:
@@ -19,7 +19,7 @@ def ticks(sym: list[str], price: list[float], size: list[int | None]) -> pa.Tabl
 
 
 def test_derived_tables_tick_with_their_input():
-    s = us.local(manual=True)
+    s = km.local(manual=True)
     src = s.input_table(COLUMNS)
     live = src.where("price > 0").update("notional = price * size")
 
@@ -42,7 +42,7 @@ def test_derived_tables_tick_with_their_input():
 
 
 def test_static_tables_compute_without_cycles():
-    s = us.local(manual=True)
+    s = km.local(manual=True)
     data = s.static_table(ticks(["a", "b"], [1.0, 2.0], [1, 2]))
     doubled = data.update("size = size * 2")
     assert not doubled.is_refreshing
@@ -50,36 +50,36 @@ def test_static_tables_compute_without_cycles():
 
 
 def test_select_keeps_and_computes_columns_in_order():
-    s = us.local(manual=True)
+    s = km.local(manual=True)
     src = s.input_table(COLUMNS)
     picked = src.select("size", "notional = price * size", "sym")
     src.append(ticks(["a"], [2.0], [3]))
     s.step()
     assert pa.table(picked).to_pylist() == [{"size": 3, "notional": 6.0, "sym": "a"}]
-    with pytest.raises(us.UrsidError, match="twice"):
+    with pytest.raises(km.KermodesError, match="twice"):
         src.select("sym", "sym")
 
 
 def test_expression_errors_point_at_the_problem():
-    src = us.local(manual=True).input_table(COLUMNS)
-    with pytest.raises(us.UrsidError, match="did you mean `price`"):
+    src = km.local(manual=True).input_table(COLUMNS)
+    with pytest.raises(km.KermodesError, match="did you mean `price`"):
         src.where("prise > 0")
 
 
 def test_the_clock_runs_by_default_starts_once_and_stops_quietly():
-    auto = us.local()
+    auto = km.local()
     assert auto.is_running
     auto.stop()
     assert not auto.is_running
 
-    s = us.local(manual=True)
+    s = km.local(manual=True)
     assert not s.is_running
     with pytest.raises(ValueError, match="period"):
         s.start("fast")
     s.start("10ms")
     try:
         assert s.is_running
-        with pytest.raises(us.UrsidError, match="already running"):
+        with pytest.raises(km.KermodesError, match="already running"):
             s.start()
     finally:
         s.stop()
@@ -88,26 +88,26 @@ def test_the_clock_runs_by_default_starts_once_and_stops_quietly():
 
 
 def test_a_failed_table_raises_but_the_session_keeps_running():
-    s = us.local(manual=True)
+    s = km.local(manual=True)
     src = s.input_table(COLUMNS)
     risky = src.update("big = size * 4611686018427387904")
     fine = src.where("size > 0")
     src.append(ticks(["a"], [1.0], [4]))
     s.step()
-    with pytest.raises(us.UrsidError, match="Overflow"):
+    with pytest.raises(km.KermodesError, match="Overflow"):
         len(risky)
     assert len(fine) == 1
 
 
 def test_appends_must_match_the_table():
-    src = us.local(manual=True).input_table(COLUMNS)
+    src = km.local(manual=True).input_table(COLUMNS)
     wrong = pa.table({"sym": ["a"], "price": [1], "size": [1]})
-    with pytest.raises(us.UrsidError, match="column `price` is int64"):
+    with pytest.raises(km.KermodesError, match="column `price` is int64"):
         src.append(wrong)
 
 
 def test_keyed_tables_follow_upserts_and_deletes():
-    s = us.local(manual=True)
+    s = km.local(manual=True)
     book = s.input_table(COLUMNS, key="sym")
     rich = book.where("price > 10")
     book.upsert(ticks(["a", "b"], [5.0, 20.0], [1, 2]))
@@ -123,7 +123,7 @@ def test_keyed_tables_follow_upserts_and_deletes():
 
 
 def test_last_by_and_agg_by_match_a_plain_python_recomputation():
-    s = us.local(manual=True)
+    s = km.local(manual=True)
     src = s.input_table(COLUMNS)
     latest = src.last_by("sym")
     stats = src.agg_by(
@@ -156,11 +156,11 @@ def test_last_by_and_agg_by_match_a_plain_python_recomputation():
 
 
 def test_trades_pick_up_the_prevailing_quote_and_reference_data():
-    s = us.local(manual=True)
-    stamp = us.timestamp()
-    trades = s.input_table({"sym": us.string(), "ts": stamp, "qty": us.int64()})
-    quotes = s.input_table({"sym": us.string(), "ts": stamp, "bid": us.float64()})
-    refs = s.input_table({"sym": us.string(), "sector": us.string()}, key="sym")
+    s = km.local(manual=True)
+    stamp = km.timestamp()
+    trades = s.input_table({"sym": km.string(), "ts": stamp, "qty": km.int64()})
+    quotes = s.input_table({"sym": km.string(), "ts": stamp, "bid": km.float64()})
+    refs = s.input_table({"sym": km.string(), "sector": km.string()}, key="sym")
     enriched = trades.as_of_join(quotes, "sym", "ts").natural_join(refs, "sym")
 
     def at(*seconds: int) -> pa.Array:
@@ -204,9 +204,9 @@ def test_trades_pick_up_the_prevailing_quote_and_reference_data():
 
 
 def test_merge_follows_its_tables_in_order_and_needs_matching_columns():
-    s = us.local(manual=True)
+    s = km.local(manual=True)
     east, west = s.input_table(COLUMNS), s.input_table(COLUMNS)
-    both = us.merge(east, west)
+    both = km.merge(east, west)
     east.append(ticks(["a"], [1.0], [1]))
     west.append(ticks(["b", "c"], [2.0, 3.0], [2, 3]))
     s.step()
@@ -216,13 +216,13 @@ def test_merge_follows_its_tables_in_order_and_needs_matching_columns():
     assert pa.table(both)["sym"].to_pylist() == ["a", "d", "b", "c"]
     assert len(both) == 4 and both.is_refreshing
 
-    other = s.input_table({"sym": us.string(), "price": us.float64()})
-    with pytest.raises(us.UrsidError, match="same columns"):
-        us.merge(east, other)
+    other = s.input_table({"sym": km.string(), "price": km.float64()})
+    with pytest.raises(km.KermodesError, match="same columns"):
+        km.merge(east, other)
 
 
 def test_head_and_tail_follow_the_ends_of_a_ticking_table():
-    s = us.local(manual=True)
+    s = km.local(manual=True)
     src = s.input_table(COLUMNS)
     first, last = src.head(2), src.tail(2)
     src.append(ticks(["a", "b", "c"], [1.0, 2.0, 3.0], [1, 2, 3]))
@@ -234,7 +234,7 @@ def test_head_and_tail_follow_the_ends_of_a_ticking_table():
 
 
 def test_sort_orders_rows_with_nulls_last_and_ticking_sorts_order_reads():
-    s = us.local(manual=True)
+    s = km.local(manual=True)
     fixed = s.static_table(
         ticks(["b", "a", "b", "a"], [1.0, 2.0, 3.0, 4.0], [1, None, 2, 3])
     )
@@ -248,14 +248,14 @@ def test_sort_orders_rows_with_nulls_last_and_ticking_sorts_order_reads():
     src.append(ticks(["c"], [2.0], [3]))
     s.step()
     assert pa.table(live)["price"].to_pylist() == [3.0, 2.0, 1.0]
-    with pytest.raises(us.UrsidError, match="sort last"):
+    with pytest.raises(km.KermodesError, match="sort last"):
         live.where("price > 0")
 
 
 def test_rolling_follows_row_and_time_windows():
-    s = us.local(manual=True)
+    s = km.local(manual=True)
     src = s.input_table(
-        {"sym": us.string(), "price": us.float64(), "ts": us.timestamp()}
+        {"sym": km.string(), "price": km.float64(), "ts": km.timestamp()}
     )
     pairs = src.rolling("sym", rows=2, total="sum(price)")
     recent = src.rolling("sym", time="2s", at="ts", n="count(*)")
@@ -276,10 +276,10 @@ def test_rolling_follows_row_and_time_windows():
 _POLL_WHILE_TICKING = """
 import array, random, threading, time
 import pyarrow as pa
-import ursid as us
+import kermodes as km
 
-s = us.local()
-book = s.input_table({"id": us.int64(), "price": us.float64()}, key="id")
+s = km.local()
+book = s.input_table({"id": km.int64(), "price": km.float64()}, key="id")
 rng = random.Random(1)
 stop = time.monotonic() + 3
 

@@ -25,9 +25,9 @@ def main() -> None:
     parser.add_argument("--minutes", type=float, default=20)
     args = parser.parse_args()
 
+    import kermodes as km
     import numpy as np
     import pyarrow as pa
-    import ursid as us
     from memory import resident
 
     rng = np.random.default_rng(3)
@@ -43,13 +43,13 @@ def main() -> None:
             }
         )
 
-    s = us.local(manual=True)
+    s = km.local(manual=True)
     book = s.input_table(
         {
-            "id": us.int64(),
-            "sym": us.string(),
-            "price": us.float64(),
-            "size": us.int64(),
+            "id": km.int64(),
+            "sym": km.string(),
+            "price": km.float64(),
+            "size": km.int64(),
         },
         key="id",
     )

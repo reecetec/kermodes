@@ -1,5 +1,5 @@
 """The engine.md static agg_by target: 100M rows, 10k int64 groups, sum/mean/std of a float64,
-in Ursid and Polars (target: Ursid within 2x of Polars' group_by).
+in Kermodes and Polars (target: Kermodes within 2x of Polars' group_by).
 
     uv run --no-sync --with numpy --with polars --with psutil python bench/agg_target.py [--rows N]
 
@@ -27,10 +27,10 @@ def worker(engine: str, rows: int) -> dict:
     table = pa.table(
         {"key": rng.integers(0, 10_000, rows), "value": rng.standard_normal(rows)}
     )
-    if engine == "ursid":
-        import ursid as us
+    if engine == "kermodes":
+        import kermodes as km
 
-        source = us.local(manual=True).static_table(table)
+        source = km.local(manual=True).static_table(table)
 
         def run():
             return source.agg_by(
@@ -81,7 +81,7 @@ def main() -> None:
         print(json.dumps(worker(args.worker, args.rows)))
         return
     results = {}
-    for engine in ["ursid", "polars"]:
+    for engine in ["kermodes", "polars"]:
         out = subprocess.run(
             [sys.executable, __file__, "--worker", engine, "--rows", str(args.rows)],
             capture_output=True,
@@ -93,8 +93,8 @@ def main() -> None:
         print(
             f"{engine}: {r['ms']:.1f} ms, peak {r['peak_mb']:.0f} MB, {r['groups']:,} groups"
         )
-    ratio = results["ursid"]["ms"] / results["polars"]["ms"]
-    print(f"Ursid / Polars: {ratio:.2f}x (target: within 2x)")
+    ratio = results["kermodes"]["ms"] / results["polars"]["ms"]
+    print(f"Kermodes / Polars: {ratio:.2f}x (target: within 2x)")
 
 
 if __name__ == "__main__":

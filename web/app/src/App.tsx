@@ -12,9 +12,9 @@ import {
   type ConnectionStatus,
   type SocketView,
   type TableInfo,
-  type UrsidConnection,
-} from '@ursid/client';
-import { TableViewer, gridThemes, type GridThemeName } from '@ursid/grid';
+  type KermodesConnection,
+} from '@kermodes/client';
+import { TableViewer, gridThemes, type GridThemeName } from '@kermodes/grid';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -28,12 +28,12 @@ import {
 } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
 
-const THEME_KEY = 'ursid-theme';
+const THEME_KEY = 'kermodes-theme';
 
 type Tab = { key: string; view: SocketView };
 
 /** Re-render when the connection's status, tables, or last error change */
-function useConnection(connection: UrsidConnection): void {
+function useConnection(connection: KermodesConnection): void {
   const [, setVersion] = useState(0);
   useEffect(
     () => connection.onChange(() => setVersion(version => version + 1)),
@@ -92,7 +92,7 @@ function TopBar({
   themeName,
   onToggleTheme,
 }: {
-  connection: UrsidConnection;
+  connection: KermodesConnection;
   themeName: GridThemeName;
   onToggleTheme: () => void;
 }) {
@@ -101,7 +101,7 @@ function TopBar({
       <div className="flex size-7 items-center justify-center rounded-md bg-primary text-primary-foreground shadow-sm">
         <PawPrint className="size-4" />
       </div>
-      <span className="text-[15px] font-semibold tracking-tight">Ursid</span>
+      <span className="text-[15px] font-semibold tracking-tight">Kermodes</span>
       <span className="text-sm text-muted-foreground">Tables</span>
       <div className="ml-auto flex items-center gap-2">
         <ConnectionPill status={connection.status} error={connection.lastError} />
@@ -228,7 +228,7 @@ function EmptyState() {
   );
 }
 
-export default function App({ connection }: { connection: UrsidConnection }) {
+export default function App({ connection }: { connection: KermodesConnection }) {
   useConnection(connection);
   const [themeName, toggleTheme] = useThemeName();
   const [tabs, setTabs] = useState<Tab[]>([]);

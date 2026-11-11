@@ -1,17 +1,17 @@
 import array
 
+import kermodes as km
 import pyarrow as pa
-import ursid as us
 from IPython.core.interactiveshell import InteractiveShell
-from ursid._widget import TableView
+from kermodes._widget import TableView
 
 
 def test_rerunning_a_cell_replaces_the_table_it_built():
     shell = InteractiveShell.instance()
     shell.run_cell(
-        "import ursid as us\n"
-        "s = us.local(manual=True)\n"
-        "src = s.input_table({'sym': us.string(), 'size': us.int64()})"
+        "import kermodes as km\n"
+        "s = km.local(manual=True)\n"
+        "src = s.input_table({'sym': km.string(), 'size': km.int64()})"
     )
     for _ in range(3):
         # Displayed, so IPython's output history sees each table too.
@@ -30,7 +30,7 @@ class _Recorded(TableView):
 
     _esm = "export default { render() {} }"
 
-    def __init__(self, table: us.Table) -> None:
+    def __init__(self, table: km.Table) -> None:
         self.sent: list[tuple[dict, pa.Table, list[int]]] = []
         super().__init__(table)
 
@@ -48,8 +48,8 @@ class _Recorded(TableView):
 
 
 def test_the_widget_carries_frames_and_shows_the_viewers_state():
-    s = us.local(manual=True)
-    src = s.input_table({"sym": us.string(), "price": us.float64()}, key="sym")
+    s = km.local(manual=True)
+    src = s.input_table({"sym": km.string(), "price": km.float64()}, key="sym")
     src.upsert(
         pa.table({"sym": ["aa", "AB", "b", "ca"], "price": [3.0, 1.0, 4.0, 2.0]})
     )

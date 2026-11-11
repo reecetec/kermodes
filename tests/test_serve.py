@@ -1,12 +1,12 @@
 import urllib.error
 import urllib.request
 
-import ursid as us
+import kermodes as km
 
 
 def test_a_server_holds_published_tables_until_it_stops():
-    s = us.local(manual=True)
-    src = s.input_table({"sym": us.string(), "size": us.int64()})
+    s = km.local(manual=True)
+    src = s.input_table({"sym": km.string(), "size": km.int64()})
     server = s.serve()
     assert server.url.startswith("http://127.0.0.1:")
 

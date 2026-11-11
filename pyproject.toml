@@ -1,5 +1,5 @@
 [project]
-name = "ursid"
+name = "kermodes"
 version = "0.1.0"
 description = "Live and historical tables on Arrow"
 readme = "README.md"
@@ -7,7 +7,7 @@ requires-python = ">=3.12"
 dependencies = []
 
 [project.optional-dependencies]
-# The table viewer in notebooks (ursid._widget); without it tables show as HTML.
+# The table viewer in notebooks (kermodes._widget); without it tables show as HTML.
 notebook = ["anywidget>=0.9"]
 
 [dependency-groups]
@@ -25,8 +25,8 @@ requires = ["maturin>=1.16,<2"]
 build-backend = "maturin"
 
 [tool.maturin]
-manifest-path = "crates/ursid-py/Cargo.toml"
-module-name = "ursid._native"
+manifest-path = "crates/kermodes-py/Cargo.toml"
+module-name = "kermodes._native"
 python-source = "python"
 editable-profile = "dev-py"
 

@@ -3,9 +3,9 @@ import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import { defineConfig } from 'vite';
 
-// The gateway (`ursid` serve) serves the built app at `/` from the wheel's static
+// The gateway (`kermodes` serve) serves the built app at `/` from the wheel's static
 // directory and the protocol on `/ws`; in development Vite proxies `/ws` to it.
-const gatewayPort = process.env.URSID_PORT ?? '8765';
+const gatewayPort = process.env.KERMODES_PORT ?? '8765';
 
 export default defineConfig({
   base: './',
@@ -19,7 +19,7 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: path.resolve(import.meta.dirname, '../../python/ursid/static/app'),
+    outDir: path.resolve(import.meta.dirname, '../../python/kermodes/static/app'),
     emptyOutDir: true,
     // One page: React, the grid and apache-arrow load together, so no split helps
     chunkSizeWarningLimit: 800,

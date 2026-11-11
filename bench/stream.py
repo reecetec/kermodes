@@ -1,6 +1,6 @@
-"""The engine.md stream target in Ursid (compare bench/deephaven_stream.py).
+"""The engine.md stream target in Kermodes (compare bench/deephaven_stream.py).
 
-    uv run --no-sync --with maturin maturin develop --release -m crates/ursid-py/Cargo.toml
+    uv run --no-sync --with maturin maturin develop --release -m crates/kermodes-py/Cargo.toml
     uv run --no-sync --with numpy --with psutil python bench/stream.py [--seconds 60] [--rate N]
 
 A random walk over 10k symbols (bench/data.py) arrives in 100k-row batches, at `--rate` rows/s
@@ -34,9 +34,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    import kermodes as km
     import pyarrow as pa
     import pyarrow.compute as pc
-    import ursid as us
     from memory import resident
 
     batches = args.seconds * 1_000_000 // BATCH
@@ -44,13 +44,13 @@ def main() -> None:
     gc.collect()
     before = resident()
 
-    s = us.local(manual=True)
+    s = km.local(manual=True)
     ticks = s.input_table(
         {
-            "sym": us.string(),
-            "price": us.float64(),
-            "size": us.int64(),
-            "ts": us.timestamp(),
+            "sym": km.string(),
+            "price": km.float64(),
+            "size": km.int64(),
+            "ts": km.timestamp(),
         }
     )
     live = ticks.where("price > 100").update(

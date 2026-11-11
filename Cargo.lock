@@ -699,6 +699,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "kermodes-bench"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "kermodes-core",
+]
+
+[[package]]
+name = "kermodes-core"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "arrow",
+ "hashbrown",
+ "sqlparser",
+]
+
+[[package]]
+name = "kermodes-gateway"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "axum",
+ "futures-util",
+ "kermodes-core",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
+name = "kermodes-py"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "kermodes-core",
+ "kermodes-gateway",
+ "libmimalloc-sys",
+ "mimalloc",
+ "pyo3",
+ "pyo3-arrow",
+]
+
+[[package]]
 name = "lexical-core"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1426,50 +1470,6 @@ name = "unicode-width"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557"
-
-[[package]]
-name = "ursid-bench"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "ursid-core",
-]
-
-[[package]]
-name = "ursid-core"
-version = "0.1.0"
-dependencies = [
- "ahash",
- "arrow",
- "hashbrown",
- "sqlparser",
-]
-
-[[package]]
-name = "ursid-gateway"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "axum",
- "futures-util",
- "serde_json",
- "tokio",
- "tokio-tungstenite",
- "ursid-core",
-]
-
-[[package]]
-name = "ursid-py"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "libmimalloc-sys",
- "mimalloc",
- "pyo3",
- "pyo3-arrow",
- "ursid-core",
- "ursid-gateway",
-]
 
 [[package]]
 name = "version_check"

@@ -1,6 +1,6 @@
-# Ursid engine (M0)
+# Kermodes engine (M0)
 
-Direction for the first milestone: the engine as a library, driven from Python on `us.local()`,
+Direction for the first milestone: the engine as a library, driven from Python on `km.local()`,
 with ticking tables in Jupyter. Like `architecture.md`, this is the current best guess; the code
 corrects it.
 
@@ -119,16 +119,16 @@ Delta { added: [(keys, rows)], removed: [(keys, last rows)], modified: [(keys, p
 - One `RwLock` guards graph state: a cycle holds the write lock; snapshot readers hold the read
   lock between cycles. Readers copy what they need and release it.
 - Clocks:
-  - on input (the default for `us.local()`): a background thread runs a cycle as soon as writes
+  - on input (the default for `km.local()`): a background thread runs a cycle as soon as writes
     arrive; writes that arrive during a cycle fold into the next, so batches grow with load and
     latency stays near zero when idle. `start(min_period)` optionally spaces cycles at least that
     far apart; `stop()` ends it. The thread holds the session weakly, so dropping the session
     ends it.
-  - manual (`us.local(manual=True)`): `step()` runs one cycle (tests, replay).
+  - manual (`km.local(manual=True)`): `step()` runs one cycle (tests, replay).
 - Each table records the cycle that last changed its rows (or failed it); viewers poll that to
   re-render only what changed.
 - Cycles run tables one after another. Within a table, a large delta (64k+ rows) spreads over every
-  core (or `URSID_THREADS`) in fixed pieces, so results never depend on the core count: `agg_by`
+  core (or `KERMODES_THREADS`) in fixed pieces, so results never depend on the core count: `agg_by`
   in two phases (§5); `where`, `update`, and joins against a static right side in 64k-row pieces
   whose outputs keep piece order. A join whose right side ticks records left rows per key, which
   stays on one thread, as do removes and modifies.
@@ -148,7 +148,7 @@ Delta { added: [(keys, rows)], removed: [(keys, last rows)], modified: [(keys, p
 - Memory goes back to the OS when the engine goes idle: after a table is built or released, and
   when a running clock has had no writes for a second. The Python extension allocates through
   mimalloc and registers its collection (`mi_collect`) as the idle hook
-  (`ursid_core::set_idle_hook`); while cycles run back to back, freed memory is reused instead.
+  (`kermodes_core::set_idle_hook`); while cycles run back to back, freed memory is reused instead.
   A process's footprint then follows the tables it holds, not its high-water mark.
 
 ## 5. Operators
@@ -203,19 +203,19 @@ Grouping keys:
 ## 7. Python API (M0)
 
 ```python
-import ursid as us
+import kermodes as km
 
-s = us.local()  # in-process engine; cycles run as soon as writes arrive
+s = km.local()  # in-process engine; cycles run as soon as writes arrive
 
 ticks = s.input_table(
     {
-        "sym": us.string(),
-        "price": us.float64(),
-        "size": us.int64(),
-        "ts": us.timestamp(),
+        "sym": km.string(),
+        "price": km.float64(),
+        "size": km.int64(),
+        "ts": km.timestamp(),
     }
 )
-refs = s.input_table({"sym": us.string(), "sector": us.string()}, key="sym")
+refs = s.input_table({"sym": km.string(), "sector": km.string()}, key="sym")
 
 ticks.append(batch)  # anything with __arrow_c_stream__ or __arrow_c_array__
 refs.upsert(batch)
@@ -229,11 +229,11 @@ vwap = stats.update("vwap = notional / size")
 pa.table(latest)  # snapshot through the Arrow PyCapsule interface
 latest  # in a notebook: a live view (§8)
 
-m = us.local(manual=True)  # only m.step() runs cycles; m.start() / m.stop()
+m = km.local(manual=True)  # only m.step() runs cycles; m.start() / m.stop()
 
 enriched = live.natural_join(refs, on="sym")  # `joins=` picks and renames right columns
 priced = ticks.as_of_join(quotes, on="sym", at="ts")
-both = us.merge(east, west)  # rows of every table, uncopied
+both = km.merge(east, west)  # rows of every table, uncopied
 recent = ticks.tail(100)  # head(n) / tail(n), kept current
 ranked = ticks.sort("sym", "ts desc")  # ticking: read in this order
 
@@ -242,9 +242,9 @@ vol = ticks.rolling("sym", rows=100, std_price="std(price)")  # or time="5m", at
 
 - Every engine call releases the interpreter while Rust works.
 - Table methods build plan nodes and attach them to the graph immediately (eager, like
-  Deephaven); a plan-only form arrives with the Ursid plan in M2.
+  Deephaven); a plan-only form arrives with the Kermodes plan in M2.
 - Type stubs for `_native` are hand-written; the public API is the Python layer in
-  `python/ursid`.
+  `python/kermodes`.
 
 ## 8. Notebook view
 
@@ -258,7 +258,7 @@ vol = ticks.rolling("sym", rows=100, std_price="std(price)")  # or time="5m", at
   weakly, and after each cell the history (`Out`, `_`, `__`, `___`, `_N`) keeps weak proxies to
   tables in place of the tables. A re-run cell's old table goes once its name is rebound, and
   its output stays as last rendered.
-- The table viewer (`architecture.md` §15.3) replaces this view where `ursid[notebook]` is
+- The table viewer (`architecture.md` §15.3) replaces this view where `kermodes[notebook]` is
   installed: a canvas grid subscribed to a viewport, with scrolling over every row, sort,
   filters, and copying. The HTML view stays for frontends without widget support.
 
@@ -272,16 +272,16 @@ vol = ticks.rolling("sym", rows=100, std_price="std(price)")  # or time="5m", at
   compares exactly. A failure prints the seed and the cycle that diverged.
 - **Expressions:** decision tables per kernel family (null semantics, overflow, casts), and the
   same expressions checked against pandas in Python tests.
-- **Python:** pytest over the public API on `us.local(manual=True)`, stepping manually.
+- **Python:** pytest over the public API on `km.local(manual=True)`, stepping manually.
 - **Determinism:** no test depends on wall-clock time or thread scheduling.
 
 ## 10. Benchmarks
 
-A benchmark binary in the workspace (`ursid-bench`: profiling-friendly ticker and order-book
+A benchmark binary in the workspace (`kermodes-bench`: profiling-friendly ticker and order-book
 workloads) and comparison scripts under `bench/`, all reading the same seeded data
 (`bench/data.py`):
 
-- `compare.py`: every static operator in Ursid, DuckDB, and Polars, all cores or `--threads N`.
+- `compare.py`: every static operator in Kermodes, DuckDB, and Polars, all cores or `--threads N`.
   Each (engine, operator) runs in its own process, measuring time (best of three) and memory:
   RSS the engine adds when loading its inputs, the peak RSS during the operator (sampled every
   2 ms), and the RSS retained with its result alive. Row counts and checksums must agree across
@@ -291,16 +291,16 @@ workloads) and comparison scripts under `bench/`, all reading the same seeded da
 - `ticking.py` / `deephaven_ticking.py`: each operator ticking alone over 100 cycles of 100k
   appended rows; cycle time p50/p99 and memory growth. Deephaven cycles are timed until its update
   graph finishes them (its exclusive lock), not until `add` returns.
-- `deephaven_book.py`: the `ursid-bench book` workload in Deephaven.
+- `deephaven_book.py`: the `kermodes-bench book` workload in Deephaven.
 - The targets below: `stream.py` / `deephaven_stream.py` (the stream, paced or unthrottled;
-  throughput is rows per second of cycle time), `ursid-bench book` / `deephaven_book.py`,
+  throughput is rows per second of cycle time), `kermodes-bench book` / `deephaven_book.py`,
   `agg_target.py` (100M-row `agg_by` against Polars), and `import_time.py`.
 - `soak.py`: a keyed order book with constant live data (1M orders, 100k upserts and 10k deletes
   per cycle, plus a notebook-style static burst every 50 cycles) for `--minutes`, memory every
   30 s. Memory that keeps growing while data does not is allocator fragmentation; run it on
   Linux (glibc) as well as macOS.
 
-Python comparisons need a release build of Ursid (`maturin develop --release`); `uv sync` builds
+Python comparisons need a release build of Kermodes (`maturin develop --release`); `uv sync` builds
 a faster-to-compile profile. Numbers go in commit messages with the machine; nothing is checked in
 as a baseline file.
 
@@ -309,19 +309,19 @@ Targets (release build, on the development laptop):
 | Workload | Target |
 |---|---|
 | Random walk, 10k symbols, 1M rows/s appended in 100k-row batches every 100 ms, through `where` → `update` (2 expressions) → `last_by(sym)` and `agg_by(sym)` (`count`, `mean`, `std`), for 60 s | p99 cycle < 50 ms; memory grows with source data only, plus O(groups) state |
-| Same workload in Deephaven Community on the same machine | Ursid sustained throughput ≥ Deephaven's |
-| Keyed order book (`ursid-bench book`): 1M orders over 100 symbols, 100k upserts and deletes per cycle, through `agg_by(sym)` (`count`, `sum`, `mean`, `std`); the same in Deephaven (`bench/deephaven_book.py`) | Cycle time ≤ Deephaven's |
+| Same workload in Deephaven Community on the same machine | Kermodes sustained throughput ≥ Deephaven's |
+| Keyed order book (`kermodes-bench book`): 1M orders over 100 symbols, 100k upserts and deletes per cycle, through `agg_by(sym)` (`count`, `sum`, `mean`, `std`); the same in Deephaven (`bench/deephaven_book.py`) | Cycle time ≤ Deephaven's |
 | Static `agg_by` over 100M rows, 10k `int64` groups, `sum`/`mean`/`std` of a `float64` | Within 2× of Polars `group_by` on the same data |
-| `import ursid; us.local()` | < 100 ms |
+| `import kermodes; km.local()` | < 100 ms |
 
 ## 11. Code layout for M0
 
-- `crates/ursid-core`: types, row sets, column sources, deltas, update graph, operators,
+- `crates/kermodes-core`: types, row sets, column sources, deltas, update graph, operators,
   expressions. One crate until a boundary or compile times justify splitting it.
-- `crates/ursid-py`: the PyO3 module `ursid._native`.
-- `crates/ursid-bench`: the benchmark binary.
-- `python/ursid`: the Python API and widget. `cli.py` arrives with the first real command
-  (`ursid dev`, M1).
+- `crates/kermodes-py`: the PyO3 module `kermodes._native`.
+- `crates/kermodes-bench`: the benchmark binary.
+- `python/kermodes`: the Python API and widget. `cli.py` arrives with the first real command
+  (`kermodes dev`, M1).
 
 ## 12. What M0 will tell us
 

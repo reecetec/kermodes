@@ -1,5 +1,5 @@
 {
-  "name": "ursid-web",
+  "name": "kermodes-web",
   "private": true,
   "type": "module",
   "workspaces": [
@@ -9,7 +9,7 @@
     "app"
   ],
   "scripts": {
-    "build": "bun run --cwd widget build && mkdir -p ../python/ursid/static && cp widget/dist/widget.js ../python/ursid/static/widget.js && bun run --cwd app build",
+    "build": "bun run --cwd widget build && mkdir -p ../python/kermodes/static && cp widget/dist/widget.js ../python/kermodes/static/widget.js && bun run --cwd app build",
     "dev": "bun run --cwd widget dev",
     "typecheck": "bun run --cwd grid typecheck && bun run --cwd client typecheck && bun run --cwd widget typecheck && bun run --cwd app typecheck",
     "test": "bun test",

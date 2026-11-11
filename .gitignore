@@ -1,6 +1,6 @@
 /target/
 /.venv/
-/.ursid/
+/.kermodes/
 __pycache__/
 *.so
 *.pyd
@@ -10,4 +10,4 @@ node_modules/
 /web/**/dist/
 
 # The table viewer bundle, built from web/ (bun run build) and shipped in the wheel.
-python/ursid/static/
+python/kermodes/static/

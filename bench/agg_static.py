@@ -1,4 +1,4 @@
-"""Static `agg_by` in DuckDB and Polars, for comparison with `ursid-bench ticks`.
+"""Static `agg_by` in DuckDB and Polars, for comparison with `kermodes-bench ticks`.
 
     uv run --no-project --with numpy --with polars --with duckdb python bench/agg_static.py
     POLARS_MAX_THREADS=1 uv run ...   # Polars on one thread

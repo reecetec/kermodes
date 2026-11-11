@@ -2,7 +2,7 @@
 // Injected by the component so every host (Vite app, anywidget bundle) gets it
 // without a CSS pipeline.
 
-const STYLE_ID = 'ursid-grid-styles';
+const STYLE_ID = 'kermodes-grid-styles';
 
 const GRID_CSS = `
 .grid-wrapper {
@@ -24,9 +24,9 @@ const GRID_CSS = `
 .grid-cursor-pointer { cursor: pointer; }
 .grid-cursor-move { cursor: grabbing; }
 .grid-block-events { pointer-events: none; }
-.ursid-filter-input { box-sizing: border-box; padding: 0 5px; margin: 0; border-radius: 2px; outline: none; }
-.ursid-filter-input::placeholder { color: var(--ursid-placeholder); opacity: 1; }
-.ursid-filter-input:focus { border-color: var(--ursid-accent) !important; }
+.kermodes-filter-input { box-sizing: border-box; padding: 0 5px; margin: 0; border-radius: 2px; outline: none; }
+.kermodes-filter-input::placeholder { color: var(--kermodes-placeholder); opacity: 1; }
+.kermodes-filter-input:focus { border-color: var(--kermodes-accent) !important; }
 `;
 
 export function injectGridStyles(doc: Document = document): void {

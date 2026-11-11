@@ -1,5 +1,5 @@
 // Dev page: the notebook widget over a fake anywidget model that plays the
-// Python side (python/ursid/_widget.py): a ticking in-memory table with row
+// Python side (python/kermodes/_widget.py): a ticking in-memory table with row
 // keys, viewport windows, sort, quick filters with their errors, and fetch.
 // ?theme=light picks the light theme, ?rows=N the table size.
 import {
@@ -14,7 +14,7 @@ import {
   tableToIPC,
   vectorFromArray,
 } from 'apache-arrow';
-import type { SortKey, ViewerRequest, ViewerState } from '@ursid/grid';
+import type { SortKey, ViewerRequest, ViewerState } from '@kermodes/grid';
 import widget, { type WidgetModel } from '../src/index';
 
 const params = new URLSearchParams(location.search);
@@ -62,7 +62,7 @@ const byName = new Map(data.map(column => [column.name, column]));
 const NUMBER = /^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/;
 type Predicate = (value: unknown) => boolean;
 
-/** The quick filter rules of python/ursid/_widget.py's quick_filter, as a predicate */
+/** The quick filter rules of python/kermodes/_widget.py's quick_filter, as a predicate */
 function quickFilter(type: string, entry: string): Predicate {
   const text = entry.trim();
   if (text.toLowerCase() === 'null') return v => v == null;

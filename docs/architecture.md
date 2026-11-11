@@ -1,4 +1,4 @@
-# Ursid architecture
+# Kermodes architecture
 
 Status: direction. These are ideals, not hard rules; nothing here is implemented yet, and the code
 corrects this document as it teaches us. "Writing a novel is like driving a car at night. You can
@@ -6,13 +6,13 @@ see only as far as your headlights, but you can make the whole trip that way." (
 
 The engine's first milestone is designed in more detail in [engine.md](engine.md).
 
-Ursid is a cloud-native data platform where live and historical data share one table model.
+Kermodes is a cloud-native data platform where live and historical data share one table model.
 A real-time incremental engine, a columnar ingest log, a Parquet lake, a job scheduler, a model
 registry, a feature store, and an agent surface all sit on that model. User code lives in git and
 reaches the cluster through a deployment pipeline.
 
-The name: the Ursids are a meteor shower radiating from Ursa Minor — a stream of events coming
-from a bear.
+The name: the Kermode bear, or spirit bear, is a rare white black bear found only in British
+Columbia's Great Bear Rainforest. pandas, then Polars, then Kermodes: `import kermodes as km`.
 
 ## 1. Thesis
 
@@ -48,7 +48,7 @@ Goals
 - Multi-user from the start: OIDC login, namespace RBAC, per-user isolated worker pods.
 - Schema changes as first-class, planned operations across live data, history, and dependents.
 - Kubernetes-native: Helm install; the controller runs every worker as its own pod.
-- Clean local start: `pip install ursid` (one wheel). No JVM, Docker, or Kubernetes required.
+- Clean local start: `pip install kermodes` (one wheel). No JVM, Docker, or Kubernetes required.
 - Continuous integration and delivery for user projects: develop locally, push, and the cluster
   tests, plans, and deploys the commit.
 - Small dependency surface: the arrow-rs family for data, plus infrastructure crates.
@@ -58,7 +58,7 @@ Non-goals (for now)
 - Distributing one update graph across nodes. One deployment = one engine process; scale by
   sharding deployments.
 - General incremental SQL (DBSP/differential dataflow). The engine supports a fixed operator set.
-- A third-party SQL engine. SQL is a frontend that compiles to the same Ursid plan as the table
+- A third-party SQL engine. SQL is a frontend that compiles to the same Kermodes plan as the table
   API (§9.8).
 - A custom historical file format. History is Parquet.
 - Web UI beyond catalog, table viewer, console, pipelines, jobs, and models until notebooks and
@@ -66,14 +66,14 @@ Non-goals (for now)
 
 ## 3. Prior art mapping
 
-| kdb+ tick | Deephaven Enterprise | Ursid |
+| kdb+ tick | Deephaven Enterprise | Kermodes |
 |---|---|---|
 | Feedhandler | Logger / Kafka ingester | Ingester (connector) |
 | Tickerplant + tplog | Data Import Server (DIS) | **weir** |
 | RDB | Worker reading intraday | Engine worker, `db.live_table` |
 | RTE / CEP, chained TP | Persistent query | Engine deployment publishing derived live tables back to weir |
 | `.u.end` end-of-day writedown | Merge + validate | Daily merge job |
-| HDB (splayed, date-partitioned, mmap) | Historical (DH format / Parquet) | Parquet + Ursid catalog, `db.historical_table` |
+| HDB (splayed, date-partitioned, mmap) | Historical (DH format / Parquet) | Parquet + Kermodes catalog, `db.historical_table` |
 | Gateway | Query routing | `db.table` + query router |
 | q scripts on disk | Git-integrated persistent query scripts | Project repositories + deployment pipeline (§11) |
 
@@ -95,8 +95,8 @@ from file format.
 | Feature store | forage | Rust + Python SDK | Feature views, point-in-time training sets, online state |
 | Agent surface | ranger | Rust | MCP server over the spec API, pipeline, and query surface |
 | Gateway | — | Rust | Single authenticated entry point; proxies Flight/WebSocket to worker pods; serves the UI |
-| SDK | `ursid` | Python (+ PyO3 engine module) | Client, local engine, notebook widgets, resource decorators |
-| CLI | `ursid` | Python (`argparse`) over the Rust core | Server roles, local platform, project workflow (`init`, `dev`, `test`, `plan`, `deploy`) |
+| SDK | `kermodes` | Python (+ PyO3 engine module) | Client, local engine, notebook widgets, resource decorators |
+| CLI | `kermodes` | Python (`argparse`) over the Rust core | Server roles, local platform, project workflow (`init`, `dev`, `test`, `plan`, `deploy`) |
 
 ```mermaid
 flowchart LR
@@ -185,7 +185,7 @@ keyed input tables are the mutable tables people and programs edit directly.
 ### 5.3 Access API
 
 ```python
-db = us.connect().db
+db = km.connect().db
 
 odds = db.live_table("sports", "odds")  # unmerged intraday partitions, ticking
 hist = db.historical_table("sports", "odds")  # merged dates, static
@@ -204,14 +204,14 @@ the pipeline: the plan classifies it, and applying the commit applies the change
 namespaces also accept direct changes from the SDK, CLI, or an agent.
 
 ```python
-odds = us.table(
+odds = km.table(
     "sports.odds",
     columns={
-        "game_id": us.string(),
-        "book": us.string(),
-        "price": us.float64(),  # renamed from "px": same column ID
-        "size": us.int64(),  # widened from int32
-        "venue": us.string(default=None),  # added
+        "game_id": km.string(),
+        "book": km.string(),
+        "price": km.float64(),  # renamed from "px": same column ID
+        "size": km.int64(),  # widened from int32
+        "venue": km.string(default=None),  # added
     },
     keys=["game_id", "book"],
     ts="ts",
@@ -222,7 +222,7 @@ Column identity
 
 - Every column has a stable ID, carried as Arrow field metadata and Parquet `field_id`, and stored
   in the catalog. Names are labels; data is matched by ID everywhere.
-- Renames are metadata-only; the SDK records a rename explicitly (`us.renamed_from("px")`) so the
+- Renames are metadata-only; the SDK records a rename explicitly (`km.renamed_from("px")`) so the
   plan does not read it as drop + add.
 
 Change classes, determined by `plan`
@@ -288,14 +288,14 @@ An ingester is a managed deployment that reads a source and speaks the ingest pr
 declared in a project like any other resource.
 
 ```python
-@us.ingester(
-    target="sports.odds", source=us.nats(subject="odds.>", durable="ursid-odds")
+@km.ingester(
+    target="sports.odds", source=km.nats(subject="odds.>", durable="kermodes-odds")
 )
-def parse_odds(msgs: us.Batch) -> us.Batch: ...
+def parse_odds(msgs: km.Batch) -> km.Batch: ...
 ```
 
 - Built-in Rust connectors: NATS JetStream, Kafka, WebSocket, HTTP poll, file drop.
-- Python connectors use `us.ingest.writer(ns, table, source=...)`, the SDK equivalent of a
+- Python connectors use `km.ingest.writer(ns, table, source=...)`, the SDK equivalent of a
   Deephaven logger.
 - Batch imports (CSV, API backfills) are ordinary jobs that write either through weir (live) or
   directly into the lake (historical, via the merge writer).
@@ -347,7 +347,7 @@ writes to `D`. Writers have already rolled to `D+1` because `date` comes from in
 
 ### 8.1 Layout
 
-Parquet files written by Ursid to object storage (rustfs in the cluster, a local directory in
+Parquet files written by Kermodes to object storage (rustfs in the cluster, a local directory in
 local mode) through `object_store`.
 
 ```
@@ -379,7 +379,7 @@ the only record of what history exists.
 
 ### 8.3 Merge job
 
-Daily, scheduled through the Ursid scheduler.
+Daily, scheduled through the Kermodes scheduler.
 
 1. Wait until all internal partitions for `D` are sealed.
 2. Read sealed segments, project every schema version present in `D` onto the table's current
@@ -423,7 +423,7 @@ of truth for which files are current; an export of catalog snapshots to an open 
   use the static path for static subtrees.
 - One worker pod per deployment, ingester, or session (§16.3). No worker process is shared
   between users.
-- The engine is a library first (Rust crate, PyO3 module for `us.local()`) and a server second
+- The engine is a library first (Rust crate, PyO3 module for `km.local()`) and a server second
   (same crate plus Flight).
 
 ### 9.2 Operators (initial set)
@@ -433,13 +433,13 @@ first, last, std), `natural_join`, `as_of_join`, `rolling` (row- and time-based)
 `merge` (union), `head` / `tail`, `predict` (model inference).
 
 Operators are built on arrow-rs compute kernels (filter, take, sort, cast, arithmetic,
-comparison, string) plus Ursid's own hash tables for joins and aggregations.
+comparison, string) plus Kermodes's own hash tables for joins and aggregations.
 
 Anything outside this set runs as Python jobs over Arrow batches.
 
 ### 9.3 Plans and expressions
 
-- Every query is an **Ursid plan**: a serializable logical plan of operators (§9.2) over named
+- Every query is an **Kermodes plan**: a serializable logical plan of operators (§9.2) over named
   tables. The Python table API builds plans client-side; SQL compiles to the same plans (§9.8).
   Plans are what workers execute, what `plan`/`EXPLAIN` show, and what clients send over Flight.
 - Scalar expressions use SQL expression syntax everywhere, including table API strings:
@@ -495,7 +495,7 @@ state at cycle time.
 
 ### 9.8 SQL
 
-SQL is a frontend onto the Ursid plan, the way Deephaven's SQL compiles to its table operations.
+SQL is a frontend onto the Kermodes plan, the way Deephaven's SQL compiles to its table operations.
 A query ticks when any input it reads ticks, and is static otherwise; the same SQL works over live
 data, history, or both.
 
@@ -528,7 +528,7 @@ Table resolution
 
 Supported subset, mapped to operators
 
-| SQL | Ursid operator |
+| SQL | Kermodes operator |
 |---|---|
 | `WHERE` | `where` |
 | `SELECT` expressions, aliases | `select` / `update` |
@@ -545,7 +545,7 @@ Supported subset, mapped to operators
   rejected at bind time with an error naming the construct and the closest supported form.
 - `ORDER BY` / `LIMIT` on ticking inputs are maintained incrementally, as in Deephaven; on static
   inputs they run once.
-- `EXPLAIN` prints the Ursid plan with pruning decisions (dates, files, row groups) and whether
+- `EXPLAIN` prints the Kermodes plan with pruning decisions (dates, files, row groups) and whether
   each subtree runs on the static or incremental path.
 - SQL works everywhere a plan does: sessions (`db.sql`), deployments (a deployment may be one SQL
   file in the project), feature views, the web console, and ranger.
@@ -590,7 +590,7 @@ Humans (CLI, SDK, UI) and agents use the same calls.
   Observability is `db.live_table("sys", "job_runs")`.
 
 ```python
-@us.job(schedule="0 6 * * *", retries=3, backoff="exp", timeout="30m")
+@km.job(schedule="0 6 * * *", retries=3, backoff="exp", timeout="30m")
 def retrain(ctx): ...
 ```
 
@@ -605,8 +605,8 @@ and merge to the lake daily.
 Every deployment, ingester, job, and session declares the worker it runs on.
 
 ```python
-@us.deployment(
-    worker=us.worker(
+@km.deployment(
+    worker=km.worker(
         worker_class="medium",  # admin-defined preset
         memory="16Gi",  # pod total
         engine_memory="12Gi",  # engine budget, kept below the container limit (§9.7)
@@ -620,7 +620,7 @@ def edges(db): ...
 ```
 
 ```python
-s = us.connect().session(env="sportsflow@main", worker_class="medium", memory="8Gi")
+s = km.connect().session(env="sportsflow@main", worker_class="medium", memory="8Gi")
 ```
 
 - **Worker classes** are admin-defined presets (memory, CPU, GPU, node selector, priority, maximum
@@ -636,12 +636,12 @@ starts.
 - Source: the project's `pyproject.toml` + `uv.lock` at the commit. Scratch sessions may instead
   use an inline dependency list, which the control plane resolves with uv into a lock stored with
   the `Environment` version.
-- Identity: hash of `uv.lock`, `pyproject.toml`, Python version, Ursid version, and platform.
+- Identity: hash of `uv.lock`, `pyproject.toml`, Python version, Kermodes version, and platform.
   Code changes that don't touch the lock reuse the existing environment.
 - Build, in the pipeline's build stage and only on a cache miss: an unprivileged Kubernetes Job
-  starts from the `ursid:<version>` image, runs `uv sync --frozen --no-dev --no-install-project`
-  into `/opt/ursid/env`, and pushes that directory as one OCI layer on top of the base (no Docker
-  daemon, no privileged builder) to the Gitea OCI registry as `ursid-env:<hash>`.
+  starts from the `kermodes:<version>` image, runs `uv sync --frozen --no-dev --no-install-project`
+  into `/opt/kermodes/env`, and pushes that directory as one OCI layer on top of the base (no Docker
+  daemon, no privileged builder) to the Gitea OCI registry as `kermodes-env:<hash>`.
 - Workers reference the image by digest. The kubelet's image cache makes later starts on a node
   instant; an optional pre-pull DaemonSet warms environments marked hot.
 - Sessions may `%pip install` into a scratch overlay for exploration. The session is then marked
@@ -650,7 +650,7 @@ starts.
 
 ## 11. Projects and delivery
 
-Ursid follows continuous integration and continuous delivery practice (Fowler; Humble & Farley):
+Kermodes follows continuous integration and continuous delivery practice (Fowler; Humble & Farley):
 everything in version control, a self-testing build, every push to mainline triggers the
 pipeline, build once and promote the same artifact, test in a clone of production, everyone can
 see the pipeline, and deployment and rollback are automated and cheap.
@@ -661,19 +661,19 @@ A project is a directory in a git repository (one repository may hold several).
 
 ```
 sportsflow/
-  ursid.toml          project name, owned namespaces, targets, test config
-  pyproject.toml      Python dependencies (ursid + project deps)
+  kermodes.toml          project name, owned namespaces, targets, test config
+  pyproject.toml      Python dependencies (kermodes + project deps)
   uv.lock             → environment (§10.6)
   src/sportsflow/
-    ursid_app.py      resource declarations: tables, ingesters, deployments, jobs, features, models
+    kermodes_app.py      resource declarations: tables, ingesters, deployments, jobs, features, models
     ...
-  tests/              pytest: unit tests on us.local(), replay tests on pinned history
+  tests/              pytest: unit tests on km.local(), replay tests on pinned history
 ```
 
 ```toml
 [project]
 name = "sportsflow"
-entry = "sportsflow.ursid_app"       # module whose decorators declare resources
+entry = "sportsflow.kermodes_app"       # module whose decorators declare resources
 namespaces = ["sports"]              # namespaces this project owns
 
 [tests]
@@ -692,42 +692,42 @@ promote_from = "staging"
 gate = { healthy_for = "30m", approval = "sports-admins" }
 ```
 
-Resources are declared in Python with decorators (`us.table`, `@us.ingester`, `@us.deployment`,
-`@us.job`, `@us.feature_view`, `us.model`). Discovery imports `entry` in the project's environment
+Resources are declared in Python with decorators (`km.table`, `@km.ingester`, `@km.deployment`,
+`@km.job`, `@km.feature_view`, `km.model`). Discovery imports `entry` in the project's environment
 and emits a **manifest**: the resolved specs as JSON. The manifest, not the Python source, is what
 `plan` and `apply` consume.
 
-`ursid init` scaffolds a project with an example deployment, a test, and `ursid.toml`.
+`kermodes init` scaffolds a project with an example deployment, a test, and `kermodes.toml`.
 
 ### 11.2 Local loop
 
 ```mermaid
 flowchart LR
-  E[Edit code] --> D["ursid dev\nhot reload"]
-  D --> T[ursid test]
-  T --> P["ursid plan --target staging"]
+  E[Edit code] --> D["kermodes dev\nhot reload"]
+  D --> T[kermodes test]
+  T --> P["kermodes plan --target staging"]
   P --> G[git push]
   G --> PL[Pipeline]
 ```
 
-- `ursid dev` runs the project on the local platform (§16.6) and restarts affected deployments on
+- `kermodes dev` runs the project on the local platform (§16.6) and restarts affected deployments on
   file save; their state rebuilds from local weir and lake.
 - Local data, in increasing realism:
-  - synthetic sources declared in the project (`@us.source` generators) for tests and demos;
-  - `ursid data pull sports.odds --dates 2026-11-01..2026-11-07` copies Parquet partitions from the
+  - synthetic sources declared in the project (`@km.source` generators) for tests and demos;
+  - `kermodes data pull sports.odds --dates 2026-11-01..2026-11-07` copies Parquet partitions from the
     cluster lake (subject to read grants);
-  - `ursid dev --live <cluster>` subscribes local deployments to the cluster's live tables
+  - `kermodes dev --live <cluster>` subscribes local deployments to the cluster's live tables
     read-only through the gateway. Outputs stay local.
-- `ursid test` runs the same tests the pipeline runs: pytest on `us.local()`, plus replay tests over
-  the dates in `ursid.toml` with the replay clock (§9.4).
-- `ursid plan --target <t>` diffs the working tree against what is deployed on `t`.
-- `ursid deploy --target sandbox` deploys the working tree, including uncommitted changes, to the
+- `kermodes test` runs the same tests the pipeline runs: pytest on `km.local()`, plus replay tests over
+  the dates in `kermodes.toml` with the replay clock (§9.4).
+- `kermodes plan --target <t>` diffs the working tree against what is deployed on `t`.
+- `kermodes deploy --target sandbox` deploys the working tree, including uncommitted changes, to the
   user's personal sandbox (a scratch namespace in the cluster), marked dirty. Shared targets only
   accept pipeline deployments of pushed commits.
 
 ### 11.3 Pipeline
 
-Ursid runs the pipeline itself, in the cluster, because every stage needs the production
+Kermodes runs the pipeline itself, in the cluster, because every stage needs the production
 environment images, data access, and worker resources. The git host stores code and displays
 results; generic CI (lint, formatting) can still run in Gitea Actions.
 
@@ -745,13 +745,13 @@ flowchart LR
 1. **Resolve**: fetch the commit, run discovery in the environment, store the manifest.
 2. **Build**: environment image (cached by hash, §10.6) and code snapshot (content-addressed by
    SHA and path). Manifest + image digest + snapshot = the **artifact**, built once per commit.
-3. **Test**: pytest and replay tests as an Ursid job using the artifact's image and worker class,
+3. **Test**: pytest and replay tests as an Kermodes job using the artifact's image and worker class,
    against production history read-only. A failed test stops the pipeline for that commit.
 4. **Plan**: per target; schema change classes and cross-project impact.
 5. **Deploy**: per target policy (§11.4), always deploying the artifact, never rebuilding.
 
 - Triggers: Gitea push and pull-request webhooks, with polling as a fallback.
-- Results go back to the git host as commit statuses (`ursid/test`, `ursid/plan`) and a PR comment
+- Results go back to the git host as commit statuses (`kermodes/test`, `kermodes/plan`) and a PR comment
   with the plan and preview links.
 - Every stage is a row in `sys.pipeline_runs`; the UI shows commit → build → test → plan → deploy
   per target, live.
@@ -767,13 +767,13 @@ flowchart LR
 - Promotion deploys the same artifact to the next target once its gate passes: health for a
   duration (deployments caught up, no errors), approval by a role, or both.
 - Staging and prod differ by namespace mapping and worker classes, not by code or environment.
-- Kargo continues to promote the Ursid platform itself (Helm chart); Ursid promotes user projects.
+- Kargo continues to promote the Kermodes platform itself (Helm chart); Kermodes promotes user projects.
 
 ### 11.5 Preview and shadow deployments
 
 - `mode = "shadow"` deploys the PR's artifact with production inputs read-only and outputs
   redirected to `<ns>@pr-<n>`. Production consumers never see shadow outputs.
-- `ursid diff sports.edges --against sports@pr-123.edges --window 1h` compares preview outputs with
+- `kermodes diff sports.edges --against sports@pr-123.edges --window 1h` compares preview outputs with
   production on live or replayed data — the test in a clone of production.
 - Model changes can additionally run as a challenger alias in production (§12.1) to hide work in
   progress behind a flag.
@@ -819,14 +819,14 @@ namespaces go through the pipeline or an approval and are events in `sys.model_e
 A feature view is a keyed, timestamped table expression.
 
 ```python
-@us.feature_view(entity="player_id", ts="ts")
+@km.feature_view(entity="player_id", ts="ts")
 def form(games):
     return games.rolling(by="player_id", rows=10).agg(
-        pts_avg=us.mean("pts"), mins_avg=us.mean("mins")
+        pts_avg=km.mean("pts"), mins_avg=km.mean("mins")
     )
 ```
 
-- Offline: `us.training_set(labels, features=[...], ts=...)` evaluates the view over
+- Offline: `km.training_set(labels, features=[...], ts=...)` evaluates the view over
   `db.historical_table` on the engine's static path and performs a point-in-time-correct as-of
   join, one `Date` partition at a time.
 - Online: the same view runs incrementally on `db.live_table`; online state is
@@ -858,15 +858,15 @@ Identity
 
 - Any OIDC provider; Dex in the reference deployment.
 - Browser and hosted notebooks: authorization code + PKCE. CLI and SDK: device authorization flow
-  (`ursid login`), token cached in the OS keychain.
-- The control plane exchanges the OIDC ID token for a short-lived Ursid access token (JWT,
+  (`kermodes login`), token cached in the OS keychain.
+- The control plane exchanges the OIDC ID token for a short-lived Kermodes access token (JWT,
   refreshable) carrying subject, groups, and scopes. weir, the gateway, and workers verify it
   against the control plane's JWKS; nothing calls the OIDC provider on the request path.
 
 Workload identity
 
 - Every worker and job pod runs under its own Kubernetes ServiceAccount. The pod's projected
-  ServiceAccount token (audience `ursid`) is exchanged at the control plane for an Ursid token
+  ServiceAccount token (audience `kermodes`) is exchanged at the control plane for an Kermodes token
   scoped to the resource's project and grants. No long-lived credentials in pods.
 
 Authorization
@@ -894,15 +894,15 @@ namespaces).
 
 ### 15.1 Python SDK and notebooks
 
-- `us.connect()` — remote cluster or a running `ursid dev`; `us.local()` — in-process engine from
+- `km.connect()` — remote cluster or a running `kermodes dev`; `km.local()` — in-process engine from
   the same Rust crate. `db.sql(...)` and the table API build the same plans (§9.3, §9.8).
 - Tables convert to pyarrow, pandas, and polars without copying where possible (Arrow PyCapsule
   interface).
 - Tables render in Jupyter through the table viewer (§15.3), an anywidget subscribed to a
   viewport.
-- Resource decorators: `us.table`, `@us.ingester`, `@us.deployment`, `@us.job`,
-  `@us.feature_view`, `@us.source`; registry: `us.models.register(...)`; ingest:
-  `us.ingest.writer(...)`.
+- Resource decorators: `km.table`, `@km.ingester`, `@km.deployment`, `@km.job`,
+  `@km.feature_view`, `@km.source`; registry: `km.models.register(...)`; ingest:
+  `km.ingest.writer(...)`.
 - Notebooks are for exploration; deployable code lives in project modules. Notebooks may live in
   the project repository but are not part of the manifest.
 
@@ -910,24 +910,24 @@ namespaces).
 
 - React + TypeScript, Vite, Bun (package manager, scripts, tests), shadcn/ui on Tailwind CSS,
   lucide icons, React Router — juicebear's web baseline plus shadcn.
-- `@ursid/client`: TypeScript package speaking the delta protocol over WebSocket and decoding Arrow
+- `@kermodes/client`: TypeScript package speaking the delta protocol over WebSocket and decoding Arrow
   IPC with `apache-arrow`. Used by the UI and any other TypeScript consumer.
 - Ticking and large tables: the table viewer (§15.3). Static lists (catalog, pipelines, jobs,
   models) use TanStack Table with shadcn table components.
 - Auth: OIDC authorization code + PKCE (`oidc-client-ts`). Local mode skips login.
-- The production build ships inside the `ursid` wheel and is served by the gateway, so local mode
+- The production build ships inside the `kermodes` wheel and is served by the gateway, so local mode
   and the cluster serve the same UI with no separate web server.
 - First slice, before the cluster gateway: `server = session.serve()` serves the app for one
   local session, and `server.publish(name, table)` lists a table there (held until unpublished
   or the server stops). It listens on 127.0.0.1 and has no authentication; the WebSocket
-  protocol is in `ursid-gateway`'s module doc. `ursid dev` will start the same server.
+  protocol is in `kermodes-gateway`'s module doc. `kermodes dev` will start the same server.
 - v1 surfaces: catalog (schemas, versions, lineage), live and historical table viewer, console
   (SQL and table-API editor on CodeMirror 6, `EXPLAIN` view), pipelines (commit → deploy per
   target), job runs and logs (live from `sys.*`), models and aliases, agent chat backed by ranger.
 
 ### 15.3 Table viewer
 
-One canvas-rendered grid, `@ursid/grid` (`web/grid` in the Bun workspace), shows every table in
+One canvas-rendered grid, `@kermodes/grid` (`web/grid` in the Bun workspace), shows every table in
 notebooks and the web UI, in the spirit of Deephaven's. It is our own component, adapted from
 `@deephaven/grid` (Apache-2.0; the attribution is kept in `NOTICE` and in each adapted file):
 its virtualised metrics, canvas renderer, and mouse and keyboard handling are the hard,
@@ -940,14 +940,14 @@ proven parts.
 - Transport: in notebooks, the widget's comm (a small JSON header plus Arrow IPC buffers); in
   the web UI, the same frames over WebSocket, later Barrage-style deltas over Flight (§9.6).
   What answers the grid (windows, quick filters, sorting, fetches) is the engine's
-  (`ursid_core::viewer`); each transport only carries its messages.
+  (`kermodes_core::viewer`); each transport only carries its messages.
 - Hosts: Jupyter, JupyterLab, and VS Code through anywidget, installed with the
-  `ursid[notebook]` extra (`anywidget`, `ipywidgets`, `jupyterlab-widgets`,
+  `kermodes[notebook]` extra (`anywidget`, `ipywidgets`, `jupyterlab-widgets`,
   `widgetsnbextension`, `psygnal`; IPython and the kernel are already there). Without the extra,
   or in kernels without IPython's widget comms (Tern's), tables keep the live HTML preview. The
   web UI hosts the same component in React.
 - The bundle (`web/widget`, one ES module with React, the grid, and `apache-arrow`, 141 KB
-  gzipped) is built by `bun run build` into `python/ursid/static/`, which the wheel ships; it
+  gzipped) is built by `bun run build` into `python/kermodes/static/`, which the wheel ships; it
   is not checked in.
 - From day one: virtual scrolling over rows and columns; column resize and reorder; sort by
   clicking a header (shift-click adds a key); per-column quick filters; row and range
@@ -962,8 +962,8 @@ proven parts.
 
 ## 16. Runtime and deployment
 
-Ursid ships as one Python package: a Rust core (`ursid._native`) and a thin Python layer. The
-`ursid` command is a Python `argparse` CLI; every server role (control plane, gateway, weir,
+Kermodes ships as one Python package: a Rust core (`kermodes._native`) and a thin Python layer. The
+`kermodes` command is a Python `argparse` CLI; every server role (control plane, gateway, weir,
 worker) and every developer command is a subcommand of it. Server roles call into `_native`, which
 detaches from the interpreter and runs the Tokio runtime until shutdown; Rust installs the
 SIGTERM/SIGINT handlers for graceful shutdown. Two runtimes host it: Kubernetes (§16.1–16.5) and
@@ -971,12 +971,12 @@ local (§16.6).
 
 ### 16.1 Packaging
 
-- Helm chart `ursid` in this repo (`deploy/helm/ursid`), published to the Gitea OCI registry,
-  plus one image, `ursid:<version>` (Python slim + the `ursid` wheel), which runs every role and is
+- Helm chart `kermodes` in this repo (`deploy/helm/kermodes`), published to the Gitea OCI registry,
+  plus one image, `kermodes:<version>` (Python slim + the `kermodes` wheel), which runs every role and is
   the base for environment images.
 - The Argo CD repo consumes it like other upstream charts (values in
-  `components/ursid/helm/values.yaml`); Kargo promotes chart versions.
-- The chart installs: CRDs, `ursid-control`, `ursid-gateway`, weir, ServiceAccounts and RBAC,
+  `components/kermodes/helm/values.yaml`); Kargo promotes chart versions.
+- The chart installs: CRDs, `kermodes-control`, `kermodes-gateway`, weir, ServiceAccounts and RBAC,
   config. It does not contain workers, ingesters, or jobs; the controller creates those at runtime.
 - External dependencies are values: Postgres (existing CNPG cluster or connection secret; the
   chart can optionally render a CNPG `Cluster`), S3 endpoint and bucket (rustfs), OCI registry for
@@ -984,27 +984,27 @@ local (§16.6).
 
 ### 16.2 Controller
 
-- `ursid control` runs API, catalog, scheduler, pipeline, reconciler, and ranger. It runs with
+- `kermodes control` runs API, catalog, scheduler, pipeline, reconciler, and ranger. It runs with
   several replicas; scheduler, pipeline, and reconciler loops use leader election via a Kubernetes
   `Lease`, and every replica serves the API.
 - Two layers of state:
   - **Intent**: managed resources come from project commits (§11); scratch resources, catalog,
     deployments, runs, and audit are in Postgres.
   - **Runtime** in Kubernetes: custom resources the controller writes from intent and reconciles
-    into native objects. `kubectl get ursidworkers` shows what is running.
+    into native objects. `kubectl get kermodesworkers` shows what is running.
 - Status flows back: the controller watches Pods and Jobs and writes status to the custom
   resource and to `sys.deployments` / `sys.task_runs` / `sys.pipeline_runs`.
 - Owner references garbage-collect everything a worker created.
 
 | Runtime object | Created for | Reconciled into |
 |---|---|---|
-| `UrsidWorker` (CRD) | deployment, ingester, session | StatefulSet (1 replica) or Pod, Service, ServiceAccount |
+| `KermodesWorker` (CRD) | deployment, ingester, session | StatefulSet (1 replica) or Pod, Service, ServiceAccount |
 | `batch/v1` Job | scheduled task attempt, pipeline stage, environment build | created directly by the scheduler or pipeline; history in Postgres |
 
 ### 16.3 Worker pods
 
-- One worker = one pod, using the environment image (`ursid-env:<hash>`, §10.6), which already
-  contains the matching `ursid` version. Containers: `engine` (`ursid worker`, Flight server) and an
+- One worker = one pod, using the environment image (`kermodes-env:<hash>`, §10.6), which already
+  contains the matching `kermodes` version. Containers: `engine` (`kermodes worker`, Flight server) and an
   optional `python` sidecar (same image) for Python model flavors, UDFs, and user code, connected
   by a Unix socket on a shared `emptyDir`. User code runs in the sidecar process, never in the
   engine process. Each container gets its own memory limit from the worker spec (§10.5).
@@ -1014,7 +1014,7 @@ local (§16.6).
   segment/Parquet cache. Restarts rebuild state from weir and history.
 - Sessions: bare Pod, `restartPolicy: Never`, reaped after the idle timeout; resources from the
   session request within the user's quota.
-- Jobs: one `batch/v1` Job per task attempt with `backoffLimit: 0`; the Ursid scheduler owns
+- Jobs: one `batch/v1` Job per task attempt with `backoffLimit: 0`; the Kermodes scheduler owns
   retries so every attempt is a row in `sys.task_runs`.
 - User Python always comes from a prebuilt environment image; nothing is installed at pod start.
 - Scheduling: requests/limits from the spec; node selectors and tolerations pass through. Priority
@@ -1022,9 +1022,9 @@ local (§16.6).
 
 ### 16.4 Gateway
 
-- Clients never address worker pods directly. `ursid-gateway` terminates TLS, verifies tokens,
+- Clients never address worker pods directly. `kermodes-gateway` terminates TLS, verifies tokens,
   checks the caller may reach the target worker, and proxies Flight (gRPC) and WebSocket to it,
-  routed by `x-ursid-worker` metadata or URL path.
+  routed by `x-kermodes-worker` metadata or URL path.
 - One Gateway API `HTTPRoute` exposes the whole platform, including the UI and git webhooks.
 
 ### 16.5 Reference deployment
@@ -1032,9 +1032,9 @@ local (§16.6).
 | Workload | Kind | Storage / dependency |
 |---|---|---|
 | weir | StatefulSet (chart) | Longhorn PVC |
-| ursid-control | Deployment, 2+ replicas (chart) | Postgres (CNPG) |
-| ursid-gateway | Deployment (chart) | — |
-| Workers | `UrsidWorker` → StatefulSet / Pod (controller) | PVC cache for deployments |
+| kermodes-control | Deployment, 2+ replicas (chart) | Postgres (CNPG) |
+| kermodes-gateway | Deployment (chart) | — |
+| Workers | `KermodesWorker` → StatefulSet / Pod (controller) | PVC cache for deployments |
 | Merge, jobs, pipeline stages, environment builds | `batch/v1` Job | rustfs, OCI registry |
 | Lake | Parquet in a rustfs bucket | catalog in Postgres |
 
@@ -1047,21 +1047,21 @@ No JVM, Docker, or Kubernetes.
 
 | Entry point | What runs | Use |
 |---|---|---|
-| `us.local()` | Engine inside the Python process (PyO3) | Notebooks, tests, experiments |
-| `ursid dev` | One supervisor process: control plane, gateway + UI, weir, workers as child processes; hot reload of the current project | Development |
+| `km.local()` | Engine inside the Python process (PyO3) | Notebooks, tests, experiments |
+| `kermodes dev` | One supervisor process: control plane, gateway + UI, weir, workers as child processes; hot reload of the current project | Development |
 | Kubernetes | Same package, one role per pod | Cluster |
 
-- Install: `pip install ursid` (or `uv tool install ursid`): one wheel with the SDK, the engine,
-  every server role, and the `ursid` command (§19.1).
-- `ursid dev` keeps state in `./.ursid/` (or `--data-dir`): weir segments on local disk; the lake as
+- Install: `pip install kermodes` (or `uv tool install kermodes`): one wheel with the SDK, the engine,
+  every server role, and the `kermodes` command (§19.1).
+- `kermodes dev` keeps state in `./.kermodes/` (or `--data-dir`): weir segments on local disk; the lake as
   local Parquet; catalog and control-plane state in SQLite; a single implicit user, OIDC optional.
-- Workers are `ursid worker` child processes; Python sidecars are child processes using the
-  environment built by uv into `.ursid/envs/<hash>` (same hash as §10.6, built once, then reused).
+- Workers are `kermodes worker` child processes; Python sidecars are child processes using the
+  environment built by uv into `.kermodes/envs/<hash>` (same hash as §10.6, built once, then reused).
   Same protocols as pods, so behaviour matches the cluster.
-- The controller has a runtime trait (`Local`: child processes; `Kubernetes`: `UrsidWorker`) and a
+- The controller has a runtime trait (`Local`: child processes; `Kubernetes`: `KermodesWorker`) and a
   storage trait (SQLite, Postgres) with one conformance suite run against both.
-- `us.connect()` with no arguments targets a running `ursid dev`, otherwise `URSID_URL`.
-- Startup targets: `us.local()` under 100 ms; `ursid dev` ready under 1 s.
+- `km.connect()` with no arguments targets a running `kermodes dev`, otherwise `KERMODES_URL`.
+- Startup targets: `km.local()` under 100 ms; `kermodes dev` ready under 1 s.
 
 ## 17. Scaling and high availability
 
@@ -1095,13 +1095,13 @@ failure; `plan` warns when a non-replayable source has no replicated ack.
 
 | Concern | Choice |
 |---|---|
-| Engine, weir, control plane, gateway | Rust, exposed as the `ursid._native` extension module |
+| Engine, weir, control plane, gateway | Rust, exposed as the `kermodes._native` extension module |
 | CLI | Python `argparse` (standard library) |
 | Columnar memory and kernels | `arrow` (one major version across the workspace) |
 | RPC | `arrow-flight` (tonic, HTTP/2) |
 | Historical files | `parquet` |
 | Object storage | `object_store` (S3 / rustfs, local filesystem) |
-| Query frontends | Python table API and SQL (`sqlparser` for parsing), both compiled to the Ursid plan (§9.3, §9.8) |
+| Query frontends | Python table API and SQL (`sqlparser` for parsing), both compiled to the Kermodes plan (§9.3, §9.8) |
 | Catalog and control-plane DB | Postgres (cluster) / SQLite (local) via `sqlx` |
 | Inference | ONNX Runtime via `ort`; Python sidecar for other flavors |
 | Kubernetes | `kube` |
@@ -1118,22 +1118,22 @@ failure; `plan` warns when a non-replayable source has no replicated ack.
 
 ```
 Cargo.toml        Cargo workspace; shared versions in [workspace.dependencies]
-pyproject.toml    `ursid` Python package (maturin, builds crates/ursid-py)
+pyproject.toml    `kermodes` Python package (maturin, builds crates/kermodes-py)
 uv.lock
 crates/           target split; crates start merged and split when they earn it
-  ursid-core      Arrow tables, row sets, update graph, clocks, memory accounting
-  ursid-ops       static and incremental operators
-  ursid-plan      Ursid plan, SQL and expression binder (via sqlparser), type checker, kernel compiler
-  ursid-flight    Flight server, delta protocol
-  ursid-weir      ingest server and segment store
-  ursid-lake      Parquet reader/writer, pruning, catalog, merge
-  ursid-control   spec API, scheduler, pipeline, registry, controller, MCP
-  ursid-gateway   authenticated Flight/WebSocket proxy, UI serving
-  ursid-py        PyO3 extension module `ursid._native`: engine API and server entry points
-python/ursid      SDK, widgets, decorators, `cli.py` (pure Python over `ursid._native`)
+  kermodes-core      Arrow tables, row sets, update graph, clocks, memory accounting
+  kermodes-ops       static and incremental operators
+  kermodes-plan      Kermodes plan, SQL and expression binder (via sqlparser), type checker, kernel compiler
+  kermodes-flight    Flight server, delta protocol
+  kermodes-weir      ingest server and segment store
+  kermodes-lake      Parquet reader/writer, pruning, catalog, merge
+  kermodes-control   spec API, scheduler, pipeline, registry, controller, MCP
+  kermodes-gateway   authenticated Flight/WebSocket proxy, UI serving
+  kermodes-py        PyO3 extension module `kermodes._native`: engine API and server entry points
+python/kermodes      SDK, widgets, decorators, `cli.py` (pure Python over `kermodes._native`)
 web/app           React UI (Bun workspace)
-web/client        @ursid/client TypeScript package
-deploy/helm/ursid Helm chart: CRDs, control plane, gateway, weir
+web/client        @kermodes/client TypeScript package
+deploy/helm/kermodes Helm chart: CRDs, control plane, gateway, weir
 examples/         example projects (toy ticker, toy sportsbook)
 docs/
 ```
@@ -1142,11 +1142,11 @@ docs/
 
 Verified against maturin 1.16, PyO3 0.30, and uv.
 
-- One wheel, `ursid`: the Python package plus `ursid._native`, which links every Rust crate.
-  `[project.scripts] ursid = "ursid.cli:main"` provides the command, as maturin recommends over
+- One wheel, `kermodes`: the Python package plus `kermodes._native`, which links every Rust crate.
+  `[project.scripts] kermodes = "kermodes.cli:main"` provides the command, as maturin recommends over
   shipping a library and a separate binary. Containers and local workers run the same wheel.
-- Root `pyproject.toml`: `[tool.maturin]` with `manifest-path = "crates/ursid-py/Cargo.toml"`,
-  `module-name = "ursid._native"`, `python-source = "python"`.
+- Root `pyproject.toml`: `[tool.maturin]` with `manifest-path = "crates/kermodes-py/Cargo.toml"`,
+  `module-name = "kermodes._native"`, `python-source = "python"`.
 - `tool.uv.cache-keys` covers the workspace `Cargo.toml`, `Cargo.lock`, and every crate's `*.rs`
   and `Cargo.toml`, so `uv sync` / `uv run` rebuild after any Rust change. Without this, uv only
   rebuilds when `pyproject.toml` changes.
@@ -1169,13 +1169,13 @@ Verified against maturin 1.16, PyO3 0.30, and uv.
 | Milestone | Deliverable | Toy example |
 |---|---|---|
 | M0 | Engine library: row sets, update graph, static + incremental operators, expressions; PyO3 module; notebook widget; oracle tests; benchmarks ([engine.md](engine.md)) | Random-walk ticker → rolling mean/vol, live in Jupyter |
-| M1 | weir (DoPut, segments, seq dedup, epochs, snapshot + tail); `db.live_table`; WebSocket connector; `ursid dev`; Helm chart (weir + engine) | Synthetic ticker over WebSocket → weir → engine, on a laptop and in the cluster |
+| M1 | weir (DoPut, segments, seq dedup, epochs, snapshot + tail); `db.live_table`; WebSocket connector; `kermodes dev`; Helm chart (weir + engine) | Synthetic ticker over WebSocket → weir → engine, on a laptop and in the cluster |
 | M2 | Parquet writer and pruned reader, catalog with snapshots, merge job, `db.historical_table`, `db.table`, replay clock; SQL frontend with `EXPLAIN`; column IDs and compatible schema changes | Same SQL query over last month (static) and today (ticking); ticker merged nightly, replayed as a backtest |
-| M3 | Projects: `ursid init` / `dev` / `test` / `plan`, manifest discovery, environments, pipeline (build, test, plan, deploy), targets and promotion, preview/shadow; scheduler and `sys.*` tables | Toy ticker project: push to `main` deploys to staging, promotion to prod, PR shadow preview with `ursid diff` |
-| M4 | Multi-user: OIDC, RBAC, `UrsidWorker` controller, gateway, worker classes, sandboxes; ranger MCP; web UI v1 | Two users with their own sessions; an agent opens a PR that previews in shadow |
+| M3 | Projects: `kermodes init` / `dev` / `test` / `plan`, manifest discovery, environments, pipeline (build, test, plan, deploy), targets and promotion, preview/shadow; scheduler and `sys.*` tables | Toy ticker project: push to `main` deploys to staging, promotion to prod, PR shadow preview with `kermodes diff` |
+| M4 | Multi-user: OIDC, RBAC, `KermodesWorker` controller, gateway, worker classes, sandboxes; ranger MCP; web UI v1 | Two users with their own sessions; an agent opens a PR that previews in shadow |
 | M5 | den: register sklearn LinearRegression → ONNX → `predict`; torch MLP; aliases, shadow mode | Live prediction; swap champion without restart |
 | M6 | forage: feature views, training sets, online `last_by`, served-feature logging | Toy sportsbook: simulated games + odds → form features → live win probability vs implied odds |
-| M7 | Port juicebear sportsflow as an Ursid project | Real data |
+| M7 | Port juicebear sportsflow as an Kermodes project | Real data |
 
 ## 21. Open questions
 
@@ -1206,7 +1206,7 @@ Verified against maturin 1.16, PyO3 0.30, and uv.
 - **SQL expectations.** Users will try SQL the engine doesn't support. The subset is documented,
   rejected constructs fail at bind time with the nearest supported form, and the subset grows only
   when an incremental implementation exists.
-- **Pipeline scope.** Ursid runs its own build/test/deploy pipeline rather than delegating to an
+- **Pipeline scope.** Kermodes runs its own build/test/deploy pipeline rather than delegating to an
   external CI; keep it to the five stages in §11.3 and leave generic CI to the git host.
 - **Rewrite cost.** Incompatible schema changes on long histories are expensive; `plan` must show
   partitions and bytes to rewrite, and the backfill must be resumable per date.

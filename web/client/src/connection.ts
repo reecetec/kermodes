@@ -5,7 +5,7 @@ import {
   type ViewerRequest,
   type ViewerState,
   type ViewportColumn,
-} from '@ursid/grid';
+} from '@kermodes/grid';
 import { parseFrame } from './frame';
 
 /** A table the session publishes */
@@ -71,7 +71,7 @@ export class SocketView implements ViewerChannel {
   private stateHandlers = new Set<() => void>();
 
   constructor(
-    private readonly connection: UrsidConnection,
+    private readonly connection: KermodesConnection,
     id: number,
     table: string,
     columns: ViewportColumn[]
@@ -149,7 +149,7 @@ export class SocketView implements ViewerChannel {
  * tables, routes each view's messages by its id, and reconnects with backoff,
  * reopening the views as they were (viewport, sort, filters).
  */
-export class UrsidConnection {
+export class KermodesConnection {
   status: ConnectionStatus = 'connecting';
 
   tables: readonly TableInfo[] = [];

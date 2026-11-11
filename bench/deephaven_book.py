@@ -1,4 +1,4 @@
-"""The `ursid-bench book` workload in Deephaven Community, for comparison.
+"""The `kermodes-bench book` workload in Deephaven Community, for comparison.
 
     uv run --no-project --python 3.12 --with deephaven-server --with numpy \
         python bench/deephaven_book.py

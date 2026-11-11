@@ -1,8 +1,8 @@
-# Ursid agent instructions
+# Kermodes agent instructions
 
 ## Mission
 
-Build the smallest complete Ursid that someone can actually use: ticking tables in a notebook first, then each layer the architecture describes, one working slice at a time.
+Build the smallest complete Kermodes that someone can actually use: ticking tables in a notebook first, then each layer the architecture describes, one working slice at a time.
 
 `docs/architecture.md` is the direction and `docs/engine.md` the engine design. Both are ideals, not contracts: like driving at night, we see as far as the headlights and still make the trip. When the code teaches us something they got wrong, fix or delete that part of the doc in the same change. There are no decision logs or status documents; commit messages carry the why.
 
@@ -10,9 +10,9 @@ Prefer code that is easy to change or delete over code designed for imagined reu
 
 ## Stack
 
-Facts about what Ursid runs on. Changing one is a normal change, not an architecture change.
+Facts about what Kermodes runs on. Changing one is a normal change, not an architecture change.
 
-- One Cargo workspace (the Rust core) and one Python package, `ursid`, built with maturin; Rust is exposed as `ursid._native` through PyO3. The `ursid` command is `argparse` over it. One wheel and one image with process roles; roles are not microservices.
+- One Cargo workspace (the Rust core) and one Python package, `kermodes`, built with maturin; Rust is exposed as `kermodes._native` through PyO3. The `kermodes` command is `argparse` over it. One wheel and one image with process roles; roles are not microservices.
 - Data path: the arrow-rs family (`arrow`, `arrow-flight`, `parquet`, `object_store`) and `sqlparser` for parsing. No embedded query engines. A new data-path dependency needs its reason in `docs/architecture.md` §4.1.
 - Python tooling is uv. The web UI is React, Vite, Bun, and shadcn/ui.
 
@@ -67,7 +67,7 @@ Delivery:
 
 ## Worktrees
 
-Each change happens in its own git worktree on a branch from `origin/main`. Local platform state lives in the worktree's `./.ursid/`, so worktrees never share weir segments, a lake, or a catalog.
+Each change happens in its own git worktree on a branch from `origin/main`. Local platform state lives in the worktree's `./.kermodes/`, so worktrees never share weir segments, a lake, or a catalog.
 
 ## Verify for real
 
@@ -75,11 +75,11 @@ Tests passing is not evidence the change works. Run the changed path the way its
 
 | Change | Verify by |
 | --- | --- |
-| An operator or expression | Build it from Python on `us.local()`, tick it, and compare the result with a pandas recomputation of the same input. |
-| Ingest or weir | Run `ursid dev`, push data, kill the process with `-9`, restart, and check the table has no gaps or duplicates. |
+| An operator or expression | Build it from Python on `km.local()`, tick it, and compare the result with a pandas recomputation of the same input. |
+| Ingest or weir | Run `kermodes dev`, push data, kill the process with `-9`, restart, and check the table has no gaps or duplicates. |
 | History, merge, or the catalog | Merge a day, read it back as `db.historical_table`, and check row counts and pruning in `EXPLAIN`. |
 | SQL | Run the query once over merged dates (static) and once over today (ticking). |
-| The UI | Open it in a browser against `ursid dev` and use the changed screen. |
+| The UI | Open it in a browser against `kermodes dev` and use the changed screen. |
 | The Helm chart or controller | Deploy to the cluster through the Argo CD repo and watch the workers reach ready. |
 
 The pull request says under **Tested for real** what you ran and what you saw. A path you could not run goes under **Not tested for real** with the reason; never imply the rest.

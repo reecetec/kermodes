@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, jest } from 'bun:test';
-import { type ViewerBuffer, type ViewerReply } from '@ursid/grid';
+import { type ViewerBuffer, type ViewerReply } from '@kermodes/grid';
 import { parseFrame } from './frame';
-import { UrsidConnection, type SocketLike } from './connection';
+import { KermodesConnection, type SocketLike } from './connection';
 
 /** A binary frame as the gateway builds it */
 function frame(header: object, rows: Uint8Array, keys: bigint[]): ArrayBuffer {
@@ -56,9 +56,9 @@ class FakeSocket implements SocketLike {
   }
 }
 
-function connect(): { connection: UrsidConnection; sockets: FakeSocket[] } {
+function connect(): { connection: KermodesConnection; sockets: FakeSocket[] } {
   const sockets: FakeSocket[] = [];
-  const connection = new UrsidConnection('ws://test/ws', {
+  const connection = new KermodesConnection('ws://test/ws', {
     createSocket: () => {
       const socket = new FakeSocket();
       sockets.push(socket);
@@ -120,7 +120,7 @@ describe('parseFrame', () => {
   });
 });
 
-describe('UrsidConnection', () => {
+describe('KermodesConnection', () => {
   it('lists tables and opens views with their columns', () => {
     const { connection, sockets } = connect();
     sockets[0].open();

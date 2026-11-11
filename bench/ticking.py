@@ -1,6 +1,6 @@
-"""Ticking operators in Ursid (compare bench/deephaven_ticking.py): cycle time and memory.
+"""Ticking operators in Kermodes (compare bench/deephaven_ticking.py): cycle time and memory.
 
-    uv run --no-sync --with maturin maturin develop --release -m crates/ursid-py/Cargo.toml
+    uv run --no-sync --with maturin maturin develop --release -m crates/kermodes-py/Cargo.toml
     uv run --no-sync --with numpy --with psutil python bench/ticking.py \
         [--cycles 100] [--batch 100000]
 
@@ -8,7 +8,7 @@ Each operation runs alone in its own process: an append-only `ticks` table (and,
 join, `quotes`) gains one batch per cycle from bench/data.py, and each cycle is timed from
 `step()` to its return. `refs` is a keyed table loaded before the first cycle. Each batch is
 copied before it is appended and the copy dropped, so the engine's retained memory shows as RSS
-growth (Ursid otherwise keeps the producer's Arrow buffers without copying).
+growth (Kermodes otherwise keeps the producer's Arrow buffers without copying).
 """
 
 import argparse
@@ -40,9 +40,9 @@ MB = 1 << 20
 
 
 def worker(op: str, cycles: int, batch: int) -> dict:
+    import kermodes as km
     import pyarrow as pa
     import pyarrow.compute as pc
-    import ursid as us
     from memory import resident
 
     rows = cycles * batch
@@ -50,13 +50,13 @@ def worker(op: str, cycles: int, batch: int) -> dict:
     gc.collect()
     before = resident()
 
-    s = us.local(manual=True)
-    stamp = us.timestamp()
+    s = km.local(manual=True)
+    stamp = km.timestamp()
     ticks = s.input_table(
-        {"sym": us.string(), "price": us.float64(), "size": us.int64(), "ts": stamp}
+        {"sym": km.string(), "price": km.float64(), "size": km.int64(), "ts": stamp}
     )
-    quotes = s.input_table({"sym": us.string(), "bid": us.float64(), "ts": stamp})
-    refs = s.input_table({"sym": us.string(), "sector": us.string()}, key="sym")
+    quotes = s.input_table({"sym": km.string(), "bid": km.float64(), "ts": stamp})
+    refs = s.input_table({"sym": km.string(), "sector": km.string()}, key="sym")
     refs.upsert(data.refs())
     s.step()
     output = {
@@ -70,7 +70,7 @@ def worker(op: str, cycles: int, batch: int) -> dict:
         ),
         "natural_join": lambda: ticks.natural_join(refs, "sym"),
         "as_of_join": lambda: ticks.as_of_join(quotes, "sym", "ts"),
-        "merge + agg_by": lambda: us.merge(ticks, ticks.where("price > 100")).agg_by(
+        "merge + agg_by": lambda: km.merge(ticks, ticks.where("price > 100")).agg_by(
             "sym", n="count(*)", avg="mean(price)"
         ),
         "tail": lambda: ticks.tail(1000),
@@ -128,7 +128,7 @@ def main() -> None:
         out = subprocess.run(command, capture_output=True, text=True, check=True)
         r = json.loads(out.stdout.strip().splitlines()[-1])
         print(
-            f"| {op} | ursid | {r['p50']:.1f} | {r['p99']:.1f} | {r['rows_per_s']:,.0f} "
+            f"| {op} | kermodes | {r['p50']:.1f} | {r['p99']:.1f} | {r['rows_per_s']:,.0f} "
             f"| {r['memory_mb']:.0f} | {r['rows']:,} |"
         )
 

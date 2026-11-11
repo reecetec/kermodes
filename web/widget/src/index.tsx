@@ -8,7 +8,7 @@ import {
   type ViewerReply,
   type ViewerRequest,
   type ViewerState,
-} from '@ursid/grid';
+} from '@kermodes/grid';
 
 /** The slice of anywidget's model the viewer uses */
 export interface WidgetModel {
