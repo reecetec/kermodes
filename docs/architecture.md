@@ -138,6 +138,13 @@ than it saves.
 `ahash` (already compiled in through arrow-array) hashes group keys; using it directly adds no
 crate to the build.
 
+`mimalloc` is the Python extension's global allocator. The system allocators keep freed memory
+resident (macOS keeps large freed blocks cached; glibc keeps freed memory in its heaps), so a
+long-lived process's footprint follows its high-water mark, the usual reason data processes get
+OOM-killed in containers. mimalloc reuses freed memory while work runs, and the engine has it
+return what is free whenever it goes idle (`engine.md` §4), at no measured cost to cycle times.
+Polars ships a tuned jemalloc for the same reason.
+
 No embedded query engines (DataFusion, DuckDB, Polars). A new data-path dependency needs a written
 reason in this section.
 

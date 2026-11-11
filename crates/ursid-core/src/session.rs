@@ -1,7 +1,9 @@
 //! A session owns one update graph: input tables, the tables derived from them, and cycles.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{
+    Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -20,6 +22,22 @@ use crate::sort::sorted;
 use crate::storage::{Delta, End, Modified, RowKey, Rows, Storage};
 use crate::types::check_types;
 use crate::{Error, Expression, type_name};
+
+static IDLE_HOOK: OnceLock<fn()> = OnceLock::new();
+
+/// Registers `hook` to run whenever the engine goes idle: after a table is built or released,
+/// and when a running clock has had no writes for a second (`CLOCK_WAIT`). The Python extension
+/// registers its allocator's collection, so memory that work just freed goes back to the OS,
+/// while a steady stream of cycles keeps reusing it. The first registration wins.
+pub fn set_idle_hook(hook: fn()) {
+    let _ = IDLE_HOOK.set(hook);
+}
+
+fn idle() {
+    if let Some(hook) = IDLE_HOOK.get() {
+        hook();
+    }
+}
 
 /// An engine instance: one update graph and the tables in it. Clones share the graph.
 #[derive(Clone, Default)]
@@ -123,6 +141,7 @@ impl Drop for Handle {
         if let Ok(mut graph) = inner.graph.try_write() {
             graph.release(&inner.unheld);
         }
+        idle();
     }
 }
 
@@ -692,6 +711,8 @@ impl Session {
                         return;
                     }
                     if !ready {
+                        // No writes for a whole wait: the engine is idle.
+                        idle();
                         continue;
                     }
                     if let (Some(min_period), Some(last)) = (min_period, last) {
@@ -734,6 +755,7 @@ impl Session {
     fn add(&self, state: TableState) -> Table {
         let schema = state.schema.clone();
         let id = self.write().push(state);
+        idle();
         Table::new(self, id, schema)
     }
 
@@ -1150,6 +1172,8 @@ impl Table {
         let state =
             TableState::fixed(description.clone(), self.schema.clone(), sorted).map_err(compute)?;
         let id = graph.push(state);
+        drop(graph);
+        idle();
         Ok(Table::new(&self.session, id, self.schema.clone()))
     }
 
@@ -1599,6 +1623,8 @@ impl Table {
         }
         state.settle();
         let id = graph.push(state);
+        drop(graph);
+        idle();
         Ok(Table::new(&self.session, id, schema))
     }
 
@@ -1690,6 +1716,8 @@ impl Table {
             Source::Merge { inputs },
         );
         let id = graph.push(state);
+        drop(graph);
+        idle();
         Ok(Table::new(&first.session, id, schema))
     }
 
@@ -1803,6 +1831,8 @@ impl Table {
         }
         state.settle();
         let id = graph.push(state);
+        drop(graph);
+        idle();
         Ok(Table::new(&self.session, id, schema))
     }
 }

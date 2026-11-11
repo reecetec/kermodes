@@ -10,6 +10,7 @@ publish = false
 
 [workspace.dependencies]
 arrow = { version = "60.1", default-features = false }
+mimalloc = { version = "0.1.52", default-features = false }
 pyo3 = { version = "0.30.1", features = ["abi3-py312"] }
 pyo3-arrow = "0.21"
 sqlparser = { version = "0.64", default-features = false, features = ["std"] }

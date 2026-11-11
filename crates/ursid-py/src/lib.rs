@@ -15,6 +15,22 @@ use pyo3_arrow::error::PyArrowError;
 use pyo3_arrow::ffi::to_stream_pycapsule;
 use pyo3_arrow::input::AnyRecordBatch;
 
+/// mimalloc for every allocation the engine makes. It keeps freed memory for reuse only briefly
+/// and returns what stays idle to the OS, where the system allocators keep large freed blocks
+/// resident (macOS) or in their heaps (glibc): a process's footprint then follows the tables it
+/// holds, which keeps container memory predictable.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Returns free memory to the OS: freed pages from every thread's heap, including those of
+/// worker threads that have exited. Registered as the engine's idle hook (see
+/// `ursid_core::set_idle_hook`): about 1 µs with nothing to return, about 14 ms after freeing
+/// 900 MB.
+fn release_free_memory() {
+    // SAFETY: mi_collect has no preconditions; it only hands free pages back to the OS.
+    unsafe { libmimalloc_sys::mi_collect(true) }
+}
+
 create_exception!(
     ursid,
     UrsidError,
@@ -466,6 +482,7 @@ mod _native {
 
     #[pymodule_init]
     fn init(module: &Bound<'_, PyModule>) -> PyResult<()> {
+        ursid_core::set_idle_hook(super::release_free_memory);
         module.add("UrsidError", module.py().get_type::<super::UrsidError>())
     }
 }

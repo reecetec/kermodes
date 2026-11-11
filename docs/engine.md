@@ -145,6 +145,11 @@ Delta { added: [(keys, rows)], removed: [(keys, last rows)], modified: [(keys, p
   tables stay as empty placeholders so ids never move. A handle dropped while a cycle runs (or a
   reader holds the graph) releases its table the next time the graph changes: the next cycle,
   or the next table built.
+- Memory goes back to the OS when the engine goes idle: after a table is built or released, and
+  when a running clock has had no writes for a second. The Python extension allocates through
+  mimalloc and registers its collection (`mi_collect`) as the idle hook
+  (`ursid_core::set_idle_hook`); while cycles run back to back, freed memory is reused instead.
+  A process's footprint then follows the tables it holds, not its high-water mark.
 
 ## 5. Operators
 
