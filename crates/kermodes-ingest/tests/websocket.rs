@@ -146,7 +146,7 @@ fn a_ticker_feed_lands_in_a_store() {
     let name = TableName::parse("md.ticks").unwrap();
     store.create_table(&name, &schema()).unwrap();
     let writer = store
-        .writer(&name, &SourceId::parse("ticker").unwrap())
+        .writer(&name, &SourceId::parse("ticker").unwrap(), false)
         .unwrap();
 
     let feed = ticker("127.0.0.1:0".parse().unwrap(), 5_000, 50).unwrap();

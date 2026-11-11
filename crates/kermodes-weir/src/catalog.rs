@@ -10,7 +10,7 @@ use kermodes_core::{parse_type, type_name};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
-use crate::{Error, TableName};
+use crate::{Error, SourceId, TableName};
 
 /// The catalog's format; a newer one is a migration, not a silent reinterpretation.
 const FORMAT: i64 = 1;
@@ -45,6 +45,14 @@ impl Catalog {
                  location TEXT NOT NULL,
                  columns TEXT NOT NULL,
                  UNIQUE (branch, namespace, name)
+             );
+             -- Each source's lease epoch (§7.4). Added after format 1 shipped: a table of its
+             -- own, so catalogs without it still open, and older versions ignore it.
+             CREATE TABLE IF NOT EXISTS sources (
+                 table_id INTEGER NOT NULL REFERENCES tables (id),
+                 source TEXT NOT NULL,
+                 epoch INTEGER NOT NULL,
+                 PRIMARY KEY (table_id, source)
              );",
         )
         .map_err(|e| Error::catalog(path, e))?;
@@ -180,6 +188,33 @@ impl Catalog {
             });
         }
         Ok(tables)
+    }
+
+    /// Takes the next lease on a table's source: its epoch, one above the last ever taken.
+    pub(crate) fn next_epoch(&mut self, table_id: i64, source: &SourceId) -> Result<u64, Error> {
+        self.conn
+            .query_row(
+                "INSERT INTO sources (table_id, source, epoch) VALUES (?1, ?2, 1)
+                 ON CONFLICT (table_id, source) DO UPDATE SET epoch = epoch + 1
+                 RETURNING epoch",
+                params![table_id, source.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|epoch| epoch as u64)
+            .map_err(Error::sql)
+    }
+
+    /// The epoch of a table source's latest lease; `None` before its first writer.
+    pub(crate) fn epoch(&self, table_id: i64, source: &SourceId) -> Result<Option<u64>, Error> {
+        self.conn
+            .query_row(
+                "SELECT epoch FROM sources WHERE table_id = ?1 AND source = ?2",
+                params![table_id, source.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|epoch| epoch.map(|e| e as u64))
+            .map_err(Error::sql)
     }
 }
 

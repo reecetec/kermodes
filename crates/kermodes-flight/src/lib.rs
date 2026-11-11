@@ -1,14 +1,17 @@
 //! A store served over Arrow Flight (architecture.md §6.1, §7.2), so many processes share one
 //! weir: `Server` wraps a `kermodes_weir::Store`; `Client` gives a process the same operations.
 //!
-//! Protocol:
-//! - `DoPut` writes: the first message's descriptor is a command `{"table", "source"}`; each
-//!   record batch's `app_metadata` is its sequence number (u64, little-endian). Each batch is
+//! Protocol (additions since 0.1.1 are optional fields, so either side may be older):
+//! - `DoPut` writes: the first message's descriptor is a command `{"table", "source", "wait"}`.
+//!   The server answers once it holds the source's lease (§7.4): at once, or, with `"wait":
+//!   true`, when the current writer goes; without, a taken source fails with `Busy`. Each record
+//!   batch's `app_metadata` is its sequence number (u64, little-endian). Each batch is
 //!   acknowledged once durable (or dropped as a resend) with a `PutResult` whose `app_metadata` is
 //!   the source's last sequence number (u64) and whether the batch was written (one byte).
 //! - `DoGet` reads: the ticket `{"table"}` streams every committed batch, then each new one.
 //! - Actions, JSON in and out: `create_table` `{"table", "columns": [[name, type]]}`; `tables`;
-//!   `last_seq` `{"table", "source"}`.
+//!   `last_seq` `{"table", "source"}` → `{"last_seq", "epoch"}`. A writer asks for it once its
+//!   `DoPut` holds the lease, so nothing can write between the answer and its first batch.
 
 #![forbid(unsafe_code)]
 

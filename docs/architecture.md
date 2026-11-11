@@ -295,8 +295,9 @@ Arrow Flight `DoPut`.
 - weir acknowledges each batch on the `PutResult` stream once it is durable (fsynced) or dropped:
   the source's last `seq` and whether this batch was written. A writer's call returns only then.
 - weir drops batches with `seq <= last_seq`. Resent batches are harmless.
-- One writer per source at a time, server-wide: a second is refused until the first disconnects.
-- On (re)connect the writer reads the action `last_seq` and resumes the source from
+- One writer per source at a time, server-wide, holding the source's lease (§7.4): a second is
+  refused, or with `wait` waits, until the first lets go or its connection drops.
+- Once it holds the lease, the writer reads the action `last_seq` and resumes the source from
   there. For log-structured sources (NATS JetStream, Kafka) the source offset is the `seq`, so
   connectors keep no state of their own.
 - The descriptor's `schema_version` may be any version compatible with the table's current one;
@@ -400,15 +401,18 @@ One writer per source is enforced by weir, not by whatever runs the writers: rol
 drains run old and new runs side by side (§11.4, §17.1), and a run on a partitioned node can
 outlive what Kubernetes believes.
 
-- A writer holds a lease on `(table, source)`. A second writer waits for it, or fails at once if
-  it asks to.
-- Taking a lease increments the source's epoch. Each batch is recorded with its writer's epoch,
-  and writes from an older epoch are rejected, so a fenced run's late writes never land.
-- A lease is released when its writer closes or its connection drops, and expires if its holder
-  stops renewing it.
-- The new holder resumes from `last_seq`. A program whose output seqs derive from its inputs'
-  positions (§17) recomputes the same batches with the same seqs, so a handover writes each batch
-  exactly once.
+- A writer holds a lease on `(table, source)`: `session.writer(table, source, wait=True)` waits
+  for the current holder to go; without `wait`, a taken source fails at once.
+- Taking a lease increments the source's epoch, kept in the catalog, so epochs rise across
+  restarts. weir accepts writes only on the holder's stream, and each batch's index record carries
+  its epoch, so a replicated weir (§17) can reject a fenced holder's writes as well.
+- A lease is released when its writer closes or its connection drops. A holder that vanishes
+  without closing (a crashed or partitioned node) is found by HTTP/2 keepalive pings within about
+  30 s.
+- The new holder reads `last_seq` once it holds the lease, so it resumes after the old holder's
+  final batch, including one committed but not yet acknowledged when the old holder died. A
+  program whose output seqs derive from its inputs' positions (§17) recomputes the same batches
+  with the same seqs, so a handover writes each batch exactly once.
 
 ### 7.5 Durability
 
@@ -1057,8 +1061,8 @@ namespaces).
 - Tables render in Jupyter through the table viewer (§15.3), an anywidget subscribed to a
   viewport.
 - Resource decorators: `km.table`, `@km.ingester`, `@km.deployment`, `@km.job`,
-  `@km.feature_view`, `@km.source`; registry: `km.models.register(...)`; ingest:
-  `km.ingest.writer(...)`.
+  `@km.feature_view`, `@km.source`; registry: `km.models.register(...)`; ingest: a session's
+  `writer(table, source=..., wait=...)`.
 - Notebooks are for exploration; deployable code lives in project modules. Notebooks may live in
   the project repository but are not part of the manifest.
 

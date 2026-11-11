@@ -110,7 +110,7 @@ fn rows_survive_reopening_and_resends_are_dropped() {
     {
         let store = Store::open(&dir.0).unwrap();
         store.create_table(&ticks(), &schema()).unwrap();
-        let writer = store.writer(&ticks(), &source("feed")).unwrap();
+        let writer = store.writer(&ticks(), &source("feed"), false).unwrap();
         assert_eq!(writer.last_seq(), None);
         assert!(writer.write(&batch(0..3), None).unwrap());
         assert!(writer.write(&batch(3..5), None).unwrap());
@@ -122,7 +122,7 @@ fn rows_survive_reopening_and_resends_are_dropped() {
     }
     let store = Store::open(&dir.0).unwrap();
     assert_eq!(values(&store), (0..6).collect::<Vec<_>>());
-    let writer = store.writer(&ticks(), &source("feed")).unwrap();
+    let writer = store.writer(&ticks(), &source("feed"), false).unwrap();
     assert_eq!(writer.last_seq(), Some(10));
     assert!(writer.write(&batch(6..7), None).unwrap());
     assert_eq!(writer.last_seq(), Some(11));
@@ -135,7 +135,7 @@ fn recovery_keeps_committed_batches_and_drops_what_a_crash_cut_short() {
     {
         let store = Store::open(&dir.0).unwrap();
         store.create_table(&ticks(), &schema()).unwrap();
-        let writer = store.writer(&ticks(), &source("feed")).unwrap();
+        let writer = store.writer(&ticks(), &source("feed"), false).unwrap();
         for seq in 0..3 {
             writer.write(&batch(seq * 10..seq * 10 + 10), None).unwrap();
         }
@@ -147,7 +147,7 @@ fn recovery_keeps_committed_batches_and_drops_what_a_crash_cut_short() {
     {
         let store = Store::open(&dir.0).unwrap();
         assert_eq!(values(&store), (0..30).collect::<Vec<_>>());
-        let writer = store.writer(&ticks(), &source("feed")).unwrap();
+        let writer = store.writer(&ticks(), &source("feed"), false).unwrap();
         assert_eq!(writer.last_seq(), Some(3));
         writer.write(&batch(30..40), None).unwrap();
     }
@@ -160,7 +160,7 @@ fn recovery_keeps_committed_batches_and_drops_what_a_crash_cut_short() {
     fs::write(&index, bytes).unwrap();
     let store = Store::open(&dir.0).unwrap();
     assert_eq!(values(&store), (0..30).collect::<Vec<_>>());
-    let writer = store.writer(&ticks(), &source("feed")).unwrap();
+    let writer = store.writer(&ticks(), &source("feed"), false).unwrap();
     assert_eq!(writer.last_seq(), Some(3));
     assert!(writer.write(&batch(30..40), Some(4)).unwrap());
     assert_eq!(values(&store), (0..40).collect::<Vec<_>>());
@@ -180,7 +180,7 @@ fn recovery_keeps_committed_batches_and_drops_what_a_crash_cut_short() {
     fs::write(name(&stream, next), [0xab; 64]).unwrap();
     let store = Store::open(&dir.0).unwrap();
     assert_eq!(values(&store), (0..40).collect::<Vec<_>>());
-    let writer = store.writer(&ticks(), &source("feed")).unwrap();
+    let writer = store.writer(&ticks(), &source("feed"), false).unwrap();
     assert!(writer.write(&batch(40..50), None).unwrap());
     assert_eq!(values(&store), (0..50).collect::<Vec<_>>());
 }
@@ -190,8 +190,8 @@ fn subscribers_get_every_committed_batch_once_then_each_new_one() {
     let dir = TempDir::new();
     let store = Store::open(&dir.0).unwrap();
     store.create_table(&ticks(), &schema()).unwrap();
-    let east = store.writer(&ticks(), &source("east")).unwrap();
-    let west = store.writer(&ticks(), &source("west")).unwrap();
+    let east = store.writer(&ticks(), &source("east"), false).unwrap();
+    let west = store.writer(&ticks(), &source("west"), false).unwrap();
     east.write(&batch(0..2), None).unwrap();
     west.write(&batch(2..4), None).unwrap();
 
@@ -234,17 +234,63 @@ fn one_process_owns_a_store_and_one_writer_owns_a_source() {
     let store = Store::open(&dir.0).unwrap();
     assert!(matches!(Store::open(&dir.0), Err(Error::Busy(_))));
     store.create_table(&ticks(), &schema()).unwrap();
-    let writer = store.writer(&ticks(), &source("feed")).unwrap();
+    let writer = store.writer(&ticks(), &source("feed"), false).unwrap();
     assert!(matches!(
-        store.writer(&ticks(), &source("feed")),
+        store.writer(&ticks(), &source("feed"), false),
         Err(Error::Busy(_))
     ));
-    let other = store.writer(&ticks(), &source("other")).unwrap();
+    let other = store.writer(&ticks(), &source("other"), false).unwrap();
     drop(writer);
-    store.writer(&ticks(), &source("feed")).unwrap();
+    store.writer(&ticks(), &source("feed"), false).unwrap();
     drop(other);
     drop(store);
     Store::open(&dir.0).unwrap();
+}
+
+#[test]
+fn a_waiting_writer_takes_the_lease_with_a_new_epoch() {
+    let dir = TempDir::new();
+    {
+        let store = Arc::new(Store::open(&dir.0).unwrap());
+        store.create_table(&ticks(), &schema()).unwrap();
+        let first = store.writer(&ticks(), &source("feed"), false).unwrap();
+        assert_eq!(first.epoch(), 1);
+        first.write(&batch(0..2), None).unwrap();
+
+        // A second writer waits for the first to go, then resumes after its last batch.
+        let waiting = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                let next = store.writer(&ticks(), &source("feed"), true).unwrap();
+                (next.epoch(), next.last_seq())
+            })
+        };
+        // Long enough that the second writer is usually waiting already; it is right either way.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        first.write(&batch(2..4), None).unwrap();
+        drop(first);
+        assert_eq!(waiting.join().unwrap(), (2, Some(2)));
+    }
+
+    // Epochs outlive the store's process: the next lease is above every earlier one.
+    let store = Store::open(&dir.0).unwrap();
+    let writer = store.writer(&ticks(), &source("feed"), false).unwrap();
+    assert_eq!(writer.epoch(), 3);
+    writer.write(&batch(4..5), None).unwrap();
+
+    // Each index record carries the epoch of the lease its batch was written under.
+    let epochs: Vec<u64> = segments(&dir.0)
+        .iter()
+        .flat_map(|(index, _)| {
+            let bytes = fs::read(index).unwrap();
+            let (records, _) = bytes[8..].as_chunks::<48>();
+            records
+                .iter()
+                .map(|record| u64::from_le_bytes(record[32..40].try_into().unwrap()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(epochs, [1, 1, 3]);
 }
 
 #[test]
@@ -291,11 +337,15 @@ fn names_definitions_and_columns_are_checked() {
         Err(Error::Schema(_))
     ));
     assert!(matches!(
-        store.writer(&TableName::parse("md.nope").unwrap(), &source("feed")),
+        store.writer(
+            &TableName::parse("md.nope").unwrap(),
+            &source("feed"),
+            false
+        ),
         Err(Error::NotFound(_))
     ));
 
-    let writer = store.writer(&ticks(), &source("feed")).unwrap();
+    let writer = store.writer(&ticks(), &source("feed"), false).unwrap();
     // Columns match by name, in any order; anything else is refused before it is written.
     let reordered = RecordBatch::try_from_iter([
         ("sym", Arc::new(StringArray::from(vec!["x"])) as ArrayRef),
@@ -366,7 +416,7 @@ fn full_segments_roll_over() {
     {
         let store = Store::open(&dir.0).unwrap();
         store.create_table(&name, &schema).unwrap();
-        let writer = store.writer(&name, &source("feed")).unwrap();
+        let writer = store.writer(&name, &source("feed"), false).unwrap();
         for k in 0..10 {
             writer.write(&big(k), None).unwrap();
         }

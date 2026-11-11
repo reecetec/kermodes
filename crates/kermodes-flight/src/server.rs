@@ -50,7 +50,11 @@ pub fn serve(store: Arc<Store>, addr: SocketAddr) -> std::io::Result<Server> {
                 let listener =
                     tokio::net::TcpListener::from_std(listener).expect("a bound listener converts");
                 let incoming = tonic::transport::server::TcpIncoming::from(listener);
+                // HTTP/2 pings find a vanished client (a crashed or partitioned node) within
+                // about half a minute, and closing its connection releases its writer's lease.
                 let serving = tonic::transport::Server::builder()
+                    .http2_keepalive_interval(Some(Duration::from_secs(10)))
+                    .http2_keepalive_timeout(Some(Duration::from_secs(20)))
                     .add_service(service)
                     .serve_with_incoming(incoming);
                 tokio::select! {
@@ -161,8 +165,11 @@ impl FlightService for Service {
             .ok_or_else(|| Status::invalid_argument("the first message needs a descriptor"))?;
         let target = command(&descriptor.cmd)?;
         let (name, source) = (table_name(&target)?, source_id(&target)?);
+        // Absent in 0.1.1 clients' descriptors: they fail at once if the source is taken.
+        let wait = target["wait"].as_bool().unwrap_or(false);
         let store = self.store.clone();
-        let writer = Arc::new(blocking(move || store.writer(&name, &source)).await?);
+        // The response (and so the client's `do_put`) waits until the lease is held.
+        let writer = Arc::new(blocking(move || store.writer(&name, &source, wait)).await?);
         let messages = stream::once(async { Ok(first) })
             .chain(incoming.map_err(FlightError::from))
             .boxed();
@@ -256,8 +263,8 @@ impl FlightService for Service {
             "last_seq" => {
                 let command = command(&action.body)?;
                 let (name, source) = (table_name(&command)?, source_id(&command)?);
-                let last = blocking(move || store.last_seq(&name, &source)).await?;
-                json!({ "last_seq": last })
+                let (last, epoch) = blocking(move || store.source_state(&name, &source)).await?;
+                json!({ "last_seq": last, "epoch": epoch })
             }
             other => return Err(Status::invalid_argument(format!("no action `{other}`"))),
         };
@@ -279,7 +286,7 @@ impl FlightService for Service {
             ("tables", "every table with its columns"),
             (
                 "last_seq",
-                "{table, source}: the source's last sequence number",
+                "{table, source}: the source's last sequence number and latest lease epoch",
             ),
         ];
         let actions = actions.map(|(kind, description)| {

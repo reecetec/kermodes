@@ -106,18 +106,20 @@ impl Client {
             .ok_or_else(|| Error::NotFound(format!("no table {name}; create it first")))
     }
 
-    /// A writer for `source`'s rows of `name`: one per source, server-wide.
-    pub fn writer(&self, name: &TableName, source: &SourceId) -> Result<RemoteWriter, Error> {
+    /// A writer for `source`'s rows of `name`, holding the source's lease server-wide until it
+    /// is dropped: with `wait`, once the current writer goes; without, failing with `Busy` if
+    /// there is one.
+    pub fn writer(
+        &self,
+        name: &TableName,
+        source: &SourceId,
+        wait: bool,
+    ) -> Result<RemoteWriter, Error> {
         let schema = self.table(name)?;
-        let last = self.action(
-            "last_seq",
-            json!({"table": name.to_string(), "source": source.as_str()}),
-        )?["last_seq"]
-            .as_u64();
         let mut first: FlightData = batches_to_flight_data(&schema, [])
             .map_err(|e| Error::Arrow(e.to_string()))?
             .remove(0);
-        let target = json!({"table": name.to_string(), "source": source.as_str()});
+        let target = json!({"table": name.to_string(), "source": source.as_str(), "wait": wait});
         first.flight_descriptor = Some(FlightDescriptor::new_cmd(target.to_string()));
         let (sender, outgoing) = mpsc::unbounded_channel::<FlightData>();
         sender
@@ -127,16 +129,26 @@ impl Client {
             outgoing.recv().await.map(|data| (data, outgoing))
         });
         let mut flight = self.flight.clone();
+        // Returns once the server holds the lease for us.
         let acks = self
             .runtime
             .block_on(async move { flight.do_put(outgoing).await })
             .map_err(|s| error_from_status(&s))?
             .into_inner();
+        // Only now: a writer before us may have written until it let go.
+        let state = self.action(
+            "last_seq",
+            json!({"table": name.to_string(), "source": source.as_str()}),
+        )?;
         Ok(RemoteWriter {
             runtime: self.runtime.clone(),
             schema,
             sender,
-            state: Mutex::new(WriterState { acks, last }),
+            epoch: state["epoch"].as_u64(),
+            state: Mutex::new(WriterState {
+                acks,
+                last: state["last_seq"].as_u64(),
+            }),
         })
     }
 
@@ -201,6 +213,7 @@ pub struct RemoteWriter {
     runtime: Arc<Runtime>,
     schema: SchemaRef,
     sender: mpsc::UnboundedSender<FlightData>,
+    epoch: Option<u64>,
     state: Mutex<WriterState>,
 }
 
@@ -215,6 +228,11 @@ impl RemoteWriter {
             .lock()
             .expect("kermodes writer poisoned by an earlier panic")
             .last
+    }
+
+    /// This writer's lease epoch (§7.4); `None` from a server older than leases (0.1.1).
+    pub fn epoch(&self) -> Option<u64> {
+        self.epoch
     }
 
     /// As `kermodes_weir::Writer::write`: returns once the server has the batch durably, or

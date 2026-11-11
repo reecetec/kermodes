@@ -30,8 +30,8 @@ const ROWS: u32 = 0;
 const SEGMENT_BYTES: u64 = 64 << 20;
 
 /// One committed batch. Its index record (little-endian) is: seq u64, rows u64, ingest time ns
-/// i64, end offset u64, epoch u64 (the writer's fencing token, §17; 0 while a partition has one
-/// owner for good), change kind u32, CRC-32 of the preceding 44 bytes.
+/// i64, end offset u64, epoch u64 (the lease its writer held, §7.4), change kind u32, CRC-32 of
+/// the preceding 44 bytes.
 #[derive(Clone, Copy, Debug)]
 struct Entry {
     seq: u64,
@@ -132,13 +132,14 @@ impl Partition {
         self.last_seq
     }
 
-    /// Appends `batch` as `seq`, durably, before returning; `false` (and nothing written) when
-    /// `seq` is not above the last sequence number.
+    /// Appends `batch` as `seq`, written under lease `epoch`, durably, before returning; `false`
+    /// (and nothing written) when `seq` is not above the last sequence number.
     pub(crate) fn append(
         &mut self,
         batch: &RecordBatch,
         seq: u64,
         ingest_ns: i64,
+        epoch: u64,
     ) -> Result<bool, Error> {
         if self.last_seq.is_some_and(|last| seq <= last) {
             return Ok(false);
@@ -162,7 +163,7 @@ impl Partition {
         };
         let index = index_path(&self.dir, open.segment.number);
         open.index
-            .write_all(&entry.encode(ingest_ns, 0))
+            .write_all(&entry.encode(ingest_ns, epoch))
             .and_then(|()| open.index.sync_data())
             .map_err(|e| Error::io(&index, e))?;
         open.segment.entries.push(entry);

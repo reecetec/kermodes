@@ -152,10 +152,13 @@ impl Tables {
         &self,
         name: &kermodes_weir::TableName,
         source: &kermodes_weir::SourceId,
+        wait: bool,
     ) -> Result<SourceWriter, kermodes_weir::Error> {
         Ok(match self {
-            Tables::Local(store) => SourceWriter::Local(store.writer(name, source)?),
-            Tables::Remote(client) => SourceWriter::Remote(Box::new(client.writer(name, source)?)),
+            Tables::Local(store) => SourceWriter::Local(store.writer(name, source, wait)?),
+            Tables::Remote(client) => {
+                SourceWriter::Remote(Box::new(client.writer(name, source, wait)?))
+            }
         })
     }
 }
@@ -298,14 +301,16 @@ impl Session {
         py.detach(|| tables.names()).map_err(store_error)
     }
 
-    /// Writes rows of `name` for one source (one writer per source at a time).
-    #[pyo3(signature = (name, source="default"))]
-    fn writer(&self, py: Python<'_>, name: &str, source: &str) -> PyResult<Writer> {
+    /// Writes rows of `name` for one source, holding the source's lease until the writer goes:
+    /// one writer per source at a time. With `wait`, this waits for the current writer to go (a
+    /// handover); without, a taken source raises.
+    #[pyo3(signature = (name, source="default", wait=false))]
+    fn writer(&self, py: Python<'_>, name: &str, source: &str, wait: bool) -> PyResult<Writer> {
         let tables = self.stored()?;
         let name = kermodes_weir::TableName::parse(name).map_err(store_error)?;
         let source = kermodes_weir::SourceId::parse(source).map_err(store_error)?;
         let writer = py
-            .detach(|| tables.writer(&name, &source))
+            .detach(|| tables.writer(&name, &source, wait))
             .map_err(store_error)?;
         Ok(Writer(writer))
     }
@@ -350,7 +355,7 @@ impl Session {
         };
         let ingest = py.detach(|| {
             let schema = tables.schema(&name).map_err(store_error)?;
-            let writer = tables.writer(&name, &source).map_err(store_error)?;
+            let writer = tables.writer(&name, &source, false).map_err(store_error)?;
             kermodes_ingest::websocket(
                 url,
                 schema,
@@ -449,6 +454,16 @@ impl Writer {
             SourceWriter::Local(writer) => writer.last_seq(),
             SourceWriter::Remote(writer) => writer.last_seq(),
         })
+    }
+
+    /// This writer's lease epoch: above every earlier writer's of the source. `None` from a
+    /// server older than leases.
+    #[getter]
+    fn epoch(&self) -> Option<u64> {
+        match &self.0 {
+            SourceWriter::Local(writer) => Some(writer.epoch()),
+            SourceWriter::Remote(writer) => writer.epoch(),
+        }
     }
 }
 

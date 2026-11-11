@@ -74,7 +74,7 @@ fn clients_share_a_served_store() {
     let producer = Client::connect(&url).unwrap();
     producer.create_table(&ticks(), &schema()).unwrap();
     let writer = producer
-        .writer(&ticks(), &SourceId::parse("feed").unwrap())
+        .writer(&ticks(), &SourceId::parse("feed").unwrap(), false)
         .unwrap();
     assert_eq!(writer.last_seq(), None);
     assert!(writer.write(&batch(0..3), None).unwrap());
@@ -120,13 +120,13 @@ fn clients_share_a_served_store() {
     // One writer per source across clients; the source is free again once its writer goes.
     let feed = SourceId::parse("feed").unwrap();
     assert!(matches!(
-        reader.writer(&ticks(), &feed),
+        reader.writer(&ticks(), &feed, false),
         Err(Error::Busy(_))
     ));
     drop(writer);
     let deadline = Instant::now() + Duration::from_secs(10);
     let resumed = loop {
-        match reader.writer(&ticks(), &feed) {
+        match reader.writer(&ticks(), &feed, false) {
             Ok(writer) => break writer,
             Err(Error::Busy(_)) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(10))
@@ -160,4 +160,36 @@ fn clients_share_a_served_store() {
         assert!(Instant::now() < deadline, "the subscriber was never told");
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// A rolling handover between processes: the new writer waits for the source's lease, and resumes
+/// after every batch the old one wrote, including those written while it waited.
+#[test]
+fn a_waiting_writer_resumes_after_the_last_writers_final_batch() {
+    let dir = TempDir::new();
+    let store = Arc::new(Store::open(&dir.0).unwrap());
+    let server = serve(store, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let url = format!("grpc://{}", server.addr());
+    let feed = SourceId::parse("feed").unwrap();
+
+    let old = Client::connect(&url).unwrap();
+    old.create_table(&ticks(), &schema()).unwrap();
+    let writer = old.writer(&ticks(), &feed, false).unwrap();
+    assert_eq!(writer.epoch(), Some(1));
+    assert!(writer.write(&batch(0..3), None).unwrap());
+
+    let waiting = {
+        let (url, feed) = (url.clone(), feed.clone());
+        std::thread::spawn(move || {
+            let new = Client::connect(&url).unwrap();
+            let writer = new.writer(&ticks(), &feed, true).unwrap();
+            (writer.epoch(), writer.last_seq())
+        })
+    };
+    // Long enough that the new writer is usually waiting already; it is right either way.
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(writer.write(&batch(3..4), None).unwrap());
+    assert!(writer.write(&batch(4..5), None).unwrap());
+    drop(writer);
+    assert_eq!(waiting.join().unwrap(), (Some(2), Some(3)));
 }

@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::{Schema, SchemaRef};
@@ -32,7 +32,13 @@ pub struct Store {
     /// Held for the store's life: the OS releases the lock when the process ends, however.
     _lock: File,
     catalog: Mutex<Catalog>,
-    logs: Mutex<HashMap<i64, Arc<Mutex<TableLog>>>>,
+    logs: Mutex<HashMap<i64, Arc<Log>>>,
+}
+
+/// A table's log, and the signal that one of its source leases was released.
+struct Log {
+    state: Mutex<TableLog>,
+    released: Condvar,
 }
 
 /// One table's partitions and subscribers. Its lock orders every write against every
@@ -43,7 +49,7 @@ struct TableLog {
     /// By date, then source: the order a subscriber receives existing batches in.
     partitions: BTreeMap<(String, SourceId), Partition>,
     subscribers: Vec<Subscriber>,
-    /// Sources with a live `Writer` in this process: one writer per source.
+    /// Sources whose lease a `Writer` holds: one writer per source (§7.4).
     writing: HashSet<SourceId>,
 }
 
@@ -95,29 +101,56 @@ impl Store {
             .ok_or_else(|| Error::NotFound(format!("no table {name}; create it first")))
     }
 
-    /// A writer for `source`'s rows of `name`. One writer per source at a time.
-    pub fn writer(&self, name: &TableName, source: &SourceId) -> Result<Writer, Error> {
+    /// A writer for `source`'s rows of `name`, holding the source's lease (§7.4) until it is
+    /// dropped. One writer per source at a time: with `wait`, this waits for the current writer
+    /// to go; without, it fails at once. Each lease has a new epoch, recorded with every batch.
+    pub fn writer(&self, name: &TableName, source: &SourceId, wait: bool) -> Result<Writer, Error> {
         let log = self.log(name)?;
-        let mut guard = lock(&log);
-        if !guard.writing.insert(source.clone()) {
-            return Err(Error::Busy(format!(
-                "{name} already has a writer for source `{source}`"
-            )));
+        let mut state = lock(&log.state);
+        while state.writing.contains(source) {
+            if !wait {
+                return Err(Error::Busy(format!(
+                    "{name} already has a writer for source `{source}`"
+                )));
+            }
+            state = log
+                .released
+                .wait(state)
+                .expect("kermodes store poisoned by an earlier panic");
         }
-        let schema = guard.entry.schema.clone();
-        drop(guard);
-        Ok(Writer {
+        state.writing.insert(source.clone());
+        let (table_id, schema) = (state.entry.id, state.entry.schema.clone());
+        drop(state);
+        // The source is ours from here: the epoch is taken outside the log's lock, so the
+        // catalog's lock is never held inside it.
+        // If taking the epoch fails, dropping this writer releases the source again.
+        let mut writer = Writer {
             log,
             source: source.clone(),
             schema,
-        })
+            epoch: 0,
+        };
+        writer.epoch = lock(&self.catalog).next_epoch(table_id, source)?;
+        Ok(writer)
     }
 
-    /// `source`'s last sequence number for `name`, as its writer would resume from.
-    pub fn last_seq(&self, name: &TableName, source: &SourceId) -> Result<Option<u64>, Error> {
+    /// `source`'s last sequence number for `name`, as its writer would resume from, and the
+    /// epoch of its latest lease (`None` before its first writer).
+    pub fn source_state(
+        &self,
+        name: &TableName,
+        source: &SourceId,
+    ) -> Result<(Option<u64>, Option<u64>), Error> {
         let log = self.log(name)?;
-        let log = lock(&log);
-        Ok(newest(&log, source).and_then(Partition::last_seq))
+        let (table_id, last_seq) = {
+            let state = lock(&log.state);
+            (
+                state.entry.id,
+                newest(&state, source).and_then(Partition::last_seq),
+            )
+        };
+        let epoch = lock(&self.catalog).epoch(table_id, source)?;
+        Ok((last_seq, epoch))
     }
 
     /// Feeds `subscriber` every committed batch of `name`, then each new one as it commits;
@@ -128,7 +161,7 @@ impl Store {
         mut subscriber: Subscriber,
     ) -> Result<SchemaRef, Error> {
         let log = self.log(name)?;
-        let mut log = lock(&log);
+        let mut log = lock(&log.state);
         for partition in log.partitions.values() {
             for batch in partition.batches()? {
                 if !subscriber(&batch) {
@@ -141,7 +174,7 @@ impl Store {
     }
 
     /// The table's log, opened (and its partitions recovered) on first use.
-    fn log(&self, name: &TableName) -> Result<Arc<Mutex<TableLog>>, Error> {
+    fn log(&self, name: &TableName) -> Result<Arc<Log>, Error> {
         let entry = self.table(name)?;
         let mut logs = lock(&self.logs);
         if let Some(log) = logs.get(&entry.id) {
@@ -156,32 +189,43 @@ impl Store {
                 Partition::open(&path, entry.schema.clone())?,
             );
         }
-        let log = Arc::new(Mutex::new(TableLog {
-            entry: entry.clone(),
-            dir,
-            partitions,
-            subscribers: Vec::new(),
-            writing: HashSet::new(),
-        }));
+        let log = Arc::new(Log {
+            state: Mutex::new(TableLog {
+                entry: entry.clone(),
+                dir,
+                partitions,
+                subscribers: Vec::new(),
+                writing: HashSet::new(),
+            }),
+            released: Condvar::new(),
+        });
         logs.insert(entry.id, log.clone());
         Ok(log)
     }
 }
 
-/// Writes one source's rows of a table. Each batch lands in the partition for the UTC date it
-/// arrives (its ingest time) and is durable before `write` returns.
+/// Writes one source's rows of a table, holding the source's lease (§7.4) until dropped. Each
+/// batch lands in the partition for the UTC date it arrives (its ingest time) and is durable
+/// before `write` returns.
 pub struct Writer {
-    log: Arc<Mutex<TableLog>>,
+    log: Arc<Log>,
     source: SourceId,
     schema: SchemaRef,
+    epoch: u64,
 }
 
 impl Writer {
     /// The source's last sequence number: of its newest partition, since sequence numbers rise
     /// within a partition and a writer resumes from where its source left off.
     pub fn last_seq(&self) -> Option<u64> {
-        let log = lock(&self.log);
-        newest(&log, &self.source).and_then(Partition::last_seq)
+        let state = lock(&self.log.state);
+        newest(&state, &self.source).and_then(Partition::last_seq)
+    }
+
+    /// This writer's lease: above every earlier writer's of the source, and recorded with each
+    /// batch it writes.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// Appends `batch` (columns matched by name to the table's) as `seq`, or the next number after
@@ -192,7 +236,7 @@ impl Writer {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos() as i64);
         let date = utc_date(ingest_ns);
-        let mut guard = lock(&self.log);
+        let mut guard = lock(&self.log.state);
         let log = &mut *guard;
         let seq = match seq {
             Some(seq) => seq,
@@ -207,7 +251,7 @@ impl Writer {
             log.partitions.insert(key.clone(), partition);
         }
         let partition = log.partitions.get_mut(&key).expect("inserted above");
-        if !partition.append(&batch, seq, ingest_ns)? {
+        if !partition.append(&batch, seq, ingest_ns, self.epoch)? {
             return Ok(false);
         }
         log.subscribers.retain_mut(|subscriber| subscriber(&batch));
@@ -217,7 +261,8 @@ impl Writer {
 
 impl Drop for Writer {
     fn drop(&mut self) {
-        lock(&self.log).writing.remove(&self.source);
+        lock(&self.log.state).writing.remove(&self.source);
+        self.log.released.notify_all();
     }
 }
 
