@@ -91,7 +91,12 @@ impl Session {
     /// through `append`; with `key`, the table holds one row per key value, written through
     /// `upsert` and `delete`.
     #[pyo3(signature = (columns, key=None))]
-    fn input_table(&self, columns: &Bound<'_, PyDict>, key: Option<Key>) -> PyResult<Table> {
+    fn input_table(
+        &self,
+        py: Python<'_>,
+        columns: &Bound<'_, PyDict>,
+        key: Option<Key>,
+    ) -> PyResult<Table> {
         let mut fields = Vec::with_capacity(columns.len());
         for (name, type_name) in columns.iter() {
             let name: String = name.extract()?;
@@ -100,14 +105,14 @@ impl Session {
             fields.push(Field::new(name, data_type, true));
         }
         let schema = Schema::new(fields);
-        let table = match key {
+        let names = key.map(Key::names);
+        let table = py.detach(|| match &names {
             None => self.0.input_table(&schema),
-            Some(key) => {
-                let names = key.names();
+            Some(names) => {
                 let names: Vec<&str> = names.iter().map(String::as_str).collect();
                 self.0.keyed_input_table(&schema, &names)
             }
-        };
+        });
         Ok(Table(table.map_err(engine_error)?))
     }
 
@@ -129,9 +134,9 @@ impl Session {
     /// during a cycle into the next, until `stop`. `min_period` (such as `"100ms"` or `"1s"`)
     /// spaces cycles at least that far apart.
     #[pyo3(signature = (min_period=None))]
-    fn start(&self, min_period: Option<&str>) -> PyResult<()> {
+    fn start(&self, py: Python<'_>, min_period: Option<&str>) -> PyResult<()> {
         let min_period = min_period.map(parse_period).transpose()?;
-        self.0.start(min_period).map_err(engine_error)
+        py.detach(|| self.0.start(min_period)).map_err(engine_error)
     }
 
     /// Stops the background cycles, after any cycle in progress.
@@ -140,15 +145,15 @@ impl Session {
     }
 
     #[getter]
-    fn is_running(&self) -> bool {
-        self.0.is_running()
+    fn is_running(&self, py: Python<'_>) -> bool {
+        py.detach(|| self.0.is_running())
     }
 
     /// How many tables the session holds: those Python refers to, and those they are computed
     /// from. A table goes as soon as neither is true.
     #[getter]
-    fn table_count(&self) -> usize {
-        self.0.table_count()
+    fn table_count(&self, py: Python<'_>) -> usize {
+        py.detach(|| self.0.table_count())
     }
 }
 
@@ -186,6 +191,11 @@ enum Span {
 
 /// A table: static, or ticking with the session's cycles. It lives while Python refers to it or
 /// a live table is computed from it; weak references (the notebook view's) don't count.
+///
+/// Every method that reaches the session releases the interpreter first. A cycle can free rows
+/// that Python owns (inputs are imported without copying), which takes the interpreter while
+/// the cycle holds the session; waiting for the session while holding the interpreter would
+/// deadlock.
 #[pyclass(module = "ursid", name = "Table", frozen, weakref)]
 pub struct Table(ursid_core::Table);
 
@@ -203,26 +213,26 @@ impl Table {
     }
 
     #[getter]
-    fn is_refreshing(&self) -> bool {
-        self.0.is_refreshing()
+    fn is_refreshing(&self, py: Python<'_>) -> bool {
+        py.detach(|| self.0.is_refreshing())
     }
 
     /// Queues rows for the next cycle, from any Arrow table or record batch.
-    fn append(&self, data: AnyRecordBatch) -> PyResult<()> {
+    fn append(&self, py: Python<'_>, data: AnyRecordBatch) -> PyResult<()> {
         let (_, batches) = read_batches(data)?;
-        self.0.append(&batches).map_err(engine_error)
+        py.detach(|| self.0.append(&batches)).map_err(engine_error)
     }
 
     /// Queues rows that replace the row with the same key, or add one. Keyed tables only.
-    fn upsert(&self, data: AnyRecordBatch) -> PyResult<()> {
+    fn upsert(&self, py: Python<'_>, data: AnyRecordBatch) -> PyResult<()> {
         let (_, batches) = read_batches(data)?;
-        self.0.upsert(&batches).map_err(engine_error)
+        py.detach(|| self.0.upsert(&batches)).map_err(engine_error)
     }
 
     /// Queues removal of the rows with these keys; `data` holds only the key columns.
-    fn delete(&self, data: AnyRecordBatch) -> PyResult<()> {
+    fn delete(&self, py: Python<'_>, data: AnyRecordBatch) -> PyResult<()> {
         let (_, batches) = read_batches(data)?;
-        self.0.delete(&batches).map_err(engine_error)
+        py.detach(|| self.0.delete(&batches)).map_err(engine_error)
     }
 
     /// Rows for which `predicate` is true; NULL counts as false.
@@ -403,8 +413,8 @@ impl Table {
         Ok(Table(table))
     }
 
-    fn __len__(&self) -> PyResult<usize> {
-        self.0.num_rows().map_err(engine_error)
+    fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
+        py.detach(|| self.0.num_rows()).map_err(engine_error)
     }
 
     /// Exports a snapshot of the current rows through the Arrow PyCapsule interface.
@@ -414,7 +424,7 @@ impl Table {
         py: Python<'py>,
         requested_schema: Option<Bound<'py, PyCapsule>>,
     ) -> PyResult<Bound<'py, PyCapsule>> {
-        let batches = self.0.snapshot().map_err(engine_error)?;
+        let batches = py.detach(|| self.0.snapshot()).map_err(engine_error)?;
         let schema = self.0.schema();
         let field = Field::new_struct("", schema.fields().clone(), false)
             .with_metadata(schema.metadata().clone());
@@ -427,18 +437,20 @@ impl Table {
 
     /// The cycle that last changed this table; live notebook views poll it.
     #[getter]
-    fn _changed(&self) -> u64 {
-        self.0.changed()
+    fn _changed(&self, py: Python<'_>) -> u64 {
+        py.detach(|| self.0.changed())
     }
 
     /// The first `rows` rows as an HTML table, with the row count, or the table's error.
     fn _preview_html(&self, py: Python<'_>, rows: usize) -> PyResult<String> {
-        let preview = py.detach(|| self.0.rows_at(0, rows));
-        let status = if self.0.is_refreshing() {
-            format!("ticking · updated in cycle {}", self.0.changed())
-        } else {
-            "static".to_owned()
-        };
+        let (preview, status) = py.detach(|| {
+            let status = if self.0.is_refreshing() {
+                format!("ticking · updated in cycle {}", self.0.changed())
+            } else {
+                "static".to_owned()
+            };
+            (self.0.rows_at(0, rows), status)
+        });
         match preview {
             Ok((head, total)) => preview_html(&head, total, &status).map_err(arrow_error),
             Err(error) => Ok(failure_html(&error.to_string())),
@@ -474,22 +486,17 @@ impl Table {
         Ok(())
     }
 
-    fn __repr__(&self) -> String {
+    fn __repr__(&self, py: Python<'_>) -> String {
         let columns = self
             .columns()
             .iter()
             .map(|(name, type_name)| format!("{name}: {type_name}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let kind = if self.0.is_refreshing() {
-            "ticking"
-        } else {
-            "static"
-        };
-        format!(
-            "<ursid.Table {} [{kind}] {{{columns}}}>",
-            self.0.description()
-        )
+        let (refreshing, description) =
+            py.detach(|| (self.0.is_refreshing(), self.0.description()));
+        let kind = if refreshing { "ticking" } else { "static" };
+        format!("<ursid.Table {description} [{kind}] {{{columns}}}>")
     }
 }
 

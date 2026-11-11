@@ -1,3 +1,6 @@
+import subprocess
+import sys
+
 import pyarrow as pa
 import pytest
 import ursid as us
@@ -279,3 +282,54 @@ def test_viewport_sends_rows_by_position_as_arrow_ipc():
     rows = pa.ipc.open_stream(data).read_all()
     assert total == 3
     assert rows["sym"].to_pylist() == ["b", "c"]
+
+
+_POLL_WHILE_TICKING = """
+import array, random, threading, time
+import pyarrow as pa
+import ursid as us
+
+s = us.local()
+book = s.input_table({"id": us.int64(), "price": us.float64()}, key="id")
+rng = random.Random(1)
+stop = time.monotonic() + 3
+
+def column(values, typecode, type):
+    # Backed by a Python object, as numpy columns are: freeing it takes the interpreter.
+    data = array.array(typecode, values)
+    return pa.Array.from_buffers(type, len(data), [None, pa.py_buffer(data)])
+
+def feed():
+    while time.monotonic() < stop:
+        ids = [rng.randrange(50_000) for _ in range(5_000)]
+        book.upsert(pa.table({
+            "id": column(ids, "q", pa.int64()),
+            "price": column([i / 7 for i in ids], "d", pa.float64()),
+        }))
+        time.sleep(0.002)
+
+def poll():
+    while time.monotonic() < stop:
+        book._changed, len(book), book.is_refreshing, repr(book), s.is_running
+
+threads = [threading.Thread(target=feed), threading.Thread(target=poll)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+s.stop()
+print("done")
+"""
+
+
+def test_reading_tables_while_cycles_free_python_rows_does_not_deadlock():
+    # Cycles drop upserted rows that Python objects own, so freeing them takes the interpreter
+    # while the cycle holds the session; reads holding the interpreter must not wait on it.
+    done = subprocess.run(
+        [sys.executable, "-c", _POLL_WHILE_TICKING],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert done.stdout.strip() == "done", done.stderr
