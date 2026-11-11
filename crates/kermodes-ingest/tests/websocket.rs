@@ -103,9 +103,9 @@ fn feeds_are_read_tolerantly_and_reconnected() {
             stats.messages,
             stats.skipped,
             stats.reconnects,
-            stats.failed_writes
+            stats.failed
         ),
-        (5, 2, 1, 0),
+        (5, 2, 1, false),
         "{stats:?}"
     );
 
@@ -162,10 +162,10 @@ fn a_ticker_feed_lands_in_a_store() {
     let Stats {
         rows,
         skipped,
-        failed_writes,
+        failed,
         ..
     } = ingest.stats();
-    assert_eq!((skipped, failed_writes), (0, 0));
+    assert_eq!((skipped, failed), (0, false));
 
     let stored = Arc::new(AtomicU64::new(0));
     let nulls = Arc::new(AtomicU64::new(0));
@@ -187,4 +187,37 @@ fn a_ticker_feed_lands_in_a_store() {
         0,
         "every ticker field is read"
     );
+}
+
+#[test]
+fn a_failed_write_stops_the_connector() {
+    let feed = ticker("127.0.0.1:0".parse().unwrap(), 5_000, 10).unwrap();
+    let calls = Arc::new(AtomicU64::new(0));
+    let written = Arc::new(AtomicU64::new(0));
+    let (count, rows) = (calls.clone(), written.clone());
+    let options = Options {
+        flush: Duration::from_millis(10),
+        max_rows: 1_000,
+    };
+    let mut ingest = websocket(
+        &format!("ws://{}/", feed.addr()),
+        schema(),
+        options,
+        // The store goes on the second batch and is back for the third: rows after a failure
+        // must not be written as if nothing happened.
+        Box::new(move |batch| {
+            if count.fetch_add(1, Ordering::Relaxed) == 1 {
+                return Err(kermodes_weir::Error::Io("the store went".into()));
+            }
+            rows.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+            Ok(true)
+        }),
+    )
+    .unwrap();
+    wait_for("the failure", || ingest.stats().failed);
+    ingest.stop();
+    let stats = ingest.stats();
+    assert_eq!(calls.load(Ordering::Relaxed), 2, "{stats:?}");
+    assert_eq!(stats.rows, written.load(Ordering::Relaxed));
+    assert_eq!(stats.batches, 1);
 }

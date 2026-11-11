@@ -1,6 +1,7 @@
 """The `kermodes` command."""
 
 import argparse
+import itertools
 import signal
 import time
 from collections.abc import Callable
@@ -183,15 +184,19 @@ def run_websocket(
     ingest = session.ingest_websocket(url, table, source=source, flush=flush)
     print(f"reading {url} into {table} (source {source}); Ctrl-C to stop", flush=True)
     try:
-        while True:
-            time.sleep(5)
+        for second in itertools.count(1):
+            time.sleep(1)
             stats = ingest.stats
-            print(
-                f"{stats.rows:,} rows from {stats.messages:,} messages; "
-                f"{stats.skipped:,} skipped, {stats.reconnects} reconnects"
-                + (f"; last error: {stats.last_error}" if stats.last_error else ""),
-                flush=True,
-            )
+            if stats.failed:
+                # Its store went: exit, so a supervisor restarts it against the store.
+                raise SystemExit(f"kermodes ingest: stopped: {stats.last_error}")
+            if second % 5 == 0:
+                print(
+                    f"{stats.rows:,} rows from {stats.messages:,} messages; "
+                    f"{stats.skipped:,} skipped, {stats.reconnects} reconnects"
+                    + (f"; last error: {stats.last_error}" if stats.last_error else ""),
+                    flush=True,
+                )
     except KeyboardInterrupt:
         ingest.stop()
 

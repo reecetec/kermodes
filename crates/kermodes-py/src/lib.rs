@@ -478,7 +478,7 @@ impl Ingest {
             skipped: stats.skipped,
             batches: stats.batches,
             reconnects: stats.reconnects,
-            failed_writes: stats.failed_writes,
+            failed: stats.failed,
             last_error: stats.last_error,
         }
     }
@@ -509,8 +509,8 @@ pub struct IngestStats {
     batches: u64,
     /// Times the feed was reconnected after it dropped.
     reconnects: u64,
-    /// Writes that failed; their rows are lost, as the feed cannot be replayed.
-    failed_writes: u64,
+    /// A write failed and the connector stopped: its store went.
+    failed: bool,
     last_error: Option<String>,
 }
 
@@ -518,8 +518,16 @@ pub struct IngestStats {
 impl IngestStats {
     fn __repr__(&self) -> String {
         format!(
-            "<IngestStats {} rows from {} messages, {} skipped, {} reconnects, {} failed writes>",
-            self.rows, self.messages, self.skipped, self.reconnects, self.failed_writes
+            "<IngestStats {} rows from {} messages, {} skipped, {} reconnects{}>",
+            self.rows,
+            self.messages,
+            self.skipped,
+            self.reconnects,
+            if self.failed {
+                ", stopped: a write failed"
+            } else {
+                ""
+            }
         )
     }
 }

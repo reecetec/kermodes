@@ -25,7 +25,7 @@ def test_a_websocket_feed_ticks_into_a_stored_table(tmp_path):
     ingest.stop()
     feed.stop()
     stats = ingest.stats
-    assert (stats.skipped, stats.failed_writes) == (0, 0), stats
+    assert (stats.skipped, stats.failed) == (0, False), stats
 
     s.step()
     rows = pa.table(live)

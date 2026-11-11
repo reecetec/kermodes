@@ -58,8 +58,9 @@ pub struct Stats {
     pub batches: u64,
     /// Times the feed was reconnected after it dropped.
     pub reconnects: u64,
-    /// Writes that failed (their rows are lost: the feed cannot be replayed).
-    pub failed_writes: u64,
+    /// A write failed and the connector stopped: its store went. Rows it had not written are
+    /// lost (the feed cannot be replayed); whoever runs it restarts it against the store.
+    pub failed: bool,
     pub last_error: Option<String>,
 }
 
@@ -70,7 +71,7 @@ struct Counters {
     skipped: AtomicU64,
     batches: AtomicU64,
     reconnects: AtomicU64,
-    failed_writes: AtomicU64,
+    failed: AtomicBool,
     last_error: Mutex<Option<String>>,
 }
 
@@ -99,7 +100,7 @@ impl Ingest {
             skipped: c.skipped.load(Ordering::Relaxed),
             batches: c.batches.load(Ordering::Relaxed),
             reconnects: c.reconnects.load(Ordering::Relaxed),
-            failed_writes: c.failed_writes.load(Ordering::Relaxed),
+            failed: c.failed.load(Ordering::Relaxed),
             last_error: c
                 .last_error
                 .lock()
@@ -137,7 +138,7 @@ pub fn websocket(
     // queue: a slow writer slows the reader down rather than growing memory.
     let (batches, mut queue) = mpsc::channel::<RecordBatch>(16);
     let writer = {
-        let counters = counters.clone();
+        let (counters, stop) = (counters.clone(), stop.clone());
         thread::Builder::new()
             .name("kermodes-ingest-write".into())
             .spawn(move || {
@@ -150,8 +151,12 @@ pub fn websocket(
                                 .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
                         }
                         Err(e) => {
-                            counters.failed_writes.fetch_add(1, Ordering::Relaxed);
+                            // A writer whose store went stays broken; reading on would only drop
+                            // rows. Stopping lets a supervisor restart the connector.
                             counters.error(format!("write failed: {e}"));
+                            counters.failed.store(true, Ordering::Release);
+                            stop.store(true, Ordering::Release);
+                            return;
                         }
                     }
                 }

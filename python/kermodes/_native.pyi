@@ -46,7 +46,7 @@ class IngestStats:
     skipped: int
     batches: int
     reconnects: int
-    failed_writes: int
+    failed: bool
     last_error: str | None
 
 class Ticker:
