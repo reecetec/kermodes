@@ -44,6 +44,7 @@ OPERATIONS = [
     "merge",
     "merge + agg_by",
     "tail",
+    "sort",
 ]
 # Each result's row count plus a checksum: the sum (or non-null count) of one column.
 CHECKS = {
@@ -55,6 +56,7 @@ CHECKS = {
     "merge": ("price", "sum"),
     "merge + agg_by": ("n", "sum"),
     "tail": ("price", "sum"),
+    "sort": ("price", "sum"),
 }
 MB = 1 << 20
 
@@ -81,6 +83,7 @@ def operations(engine: str, ticks, quotes, refs):
                 "sym", n="count(*)", avg="mean(price)"
             ),
             "tail": lambda: t.tail(1000),
+            "sort": lambda: t.sort("sym", "ts desc"),
         }
     if engine == "duckdb":
         import duckdb
@@ -106,6 +109,7 @@ def operations(engine: str, ticks, quotes, refs):
             "merge + agg_by": "select sym, count(*) as n, avg(price) as avg from "
             "(select * from ticks union all select * from ticks) group by sym",
             "tail": "select * from ticks where rowid >= (select max(rowid) - 999 from ticks)",
+            "sort": "select * from ticks order by sym, ts desc",
         }
 
         def query(text: str):
@@ -139,6 +143,7 @@ def operations(engine: str, ticks, quotes, refs):
             .agg(n=pl.len(), avg=pl.col("price").mean())
         ),
         "tail": lambda: t.tail(1000),
+        "sort": lambda: t.sort(["sym", "ts"], descending=[False, True]),
     }
 
 

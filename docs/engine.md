@@ -152,7 +152,7 @@ keep no state) and an incremental path below. Static paths use the same kernels 
 | `rolling(by, window, aggs)` | Per group: a ring buffer (row windows) or deque (time windows) with running accumulators | Added rows in key order: push, evict out-of-window, emit the aggregate as columns on the added row. Earlier rows never change. | Input must be `append_only`; windows look backward only. |
 | `merge(tables)` | None; rows are read from the inputs (§2.4) | Re-key each input's delta with its input index; union. The batches are shared, not copied. A merge among the inputs contributes its own inputs, so merges never nest. | Same column names and types, in the same order; at most 256 inputs. |
 | `head(n)` / `tail(n)` | The input's `n` keys nearest that end, as an ordered set; every other input key lies beyond the boundary (the kept key farthest from the end). The kept rows are stored. | Kept rows the input removes leave; the set then refills with the input's next keys beyond the boundary (arithmetic for append-only inputs, a linear selection over slot tables, input by input for merges). Additions nearer than the boundary displace the farthest kept key; only a cycle's `n` nearest additions are considered, so a large append costs one linear selection. Kept rows the input modifies are modified. | Order is key order: arrival order for appended rows. |
-| `sort(by)` | — | Static only in M0. | Ticking sort is M2 (SQL `ORDER BY`). |
+| `sort(by)` | — (static: the output is a new static table) | Each sort column becomes an order-preserving unsigned integer per row (sign-flipped integers, IEEE total order for floats, ranks among distinct values for strings), as many bits as its range needs plus one for NULL, the largest value; descending columns are inverted. Columns pack into as few 64- or 128-bit words as fit. Rows sort by their words with their position as the last tie-break (ties keep input order): one pass partitions by the key's top bits, then the partitions sort on every core, and the output is gathered in parallel pieces. | Static only in M0; ticking sort is M2 (SQL `ORDER BY`). Entries are `name` or `name desc`. |
 
 Grouping keys:
 
@@ -219,6 +219,7 @@ enriched = live.natural_join(refs, on="sym")  # `joins=` picks and renames right
 priced = ticks.as_of_join(quotes, on="sym", at="ts")
 both = us.merge(east, west)  # rows of every table, uncopied
 recent = ticks.tail(100)  # head(n) / tail(n), kept current
+ranked = fixed.sort("sym", "ts desc")  # static tables only
 
 # Still to come in M0:
 vol = ticks.rolling("sym", rows=100, std_price="std(price)")

@@ -15,6 +15,7 @@ use crate::agg::{Accumulator, AggBy, agg_schema};
 use crate::groups::{KeyKind, Membership, resolve};
 use crate::join::{AsOfJoin, Join, JoinShape, NaturalJoin, Tracking};
 use crate::ops::{Assignment, Edge, LastBy, Operator, Update, Where};
+use crate::sort::sorted;
 use crate::storage::{Delta, End, Modified, RowKey, Rows, Storage};
 use crate::types::check_types;
 use crate::{Error, Expression, type_name};
@@ -487,28 +488,7 @@ impl Session {
     ) -> Result<Table, Error> {
         check_types(&schema)?;
         let batches = conform_all(&schema, &batches)?;
-        let mut state = TableState::new("static".into(), schema, false, true, Source::Static);
-        let mut next = 0;
-        let added = batches
-            .into_iter()
-            .map(|batch| {
-                let count = batch.num_rows() as RowKey;
-                next += count;
-                Rows {
-                    keys: (next - count..next).collect(),
-                    batch,
-                }
-            })
-            .collect();
-        state
-            .storage
-            .as_mut()
-            .expect(STORED)
-            .apply(&Delta {
-                added,
-                ..Delta::default()
-            })
-            .map_err(schema_error)?;
+        let state = TableState::fixed("static".into(), schema, batches).map_err(schema_error)?;
         Ok(self.add(state))
     }
 
@@ -700,6 +680,32 @@ impl Session {
 }
 
 impl TableState {
+    /// A static table holding `batches`, keyed by position.
+    fn fixed(
+        description: String,
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Self, ArrowError> {
+        let mut state = TableState::new(description, schema, false, true, Source::Static);
+        let mut next = 0;
+        let added = batches
+            .into_iter()
+            .map(|batch| {
+                let count = batch.num_rows() as RowKey;
+                next += count;
+                Rows {
+                    keys: (next - count..next).collect(),
+                    batch,
+                }
+            })
+            .collect();
+        state.storage.as_mut().expect(STORED).apply(&Delta {
+            added,
+            ..Delta::default()
+        })?;
+        Ok(state)
+    }
+
     fn new(
         description: String,
         schema: SchemaRef,
@@ -966,6 +972,63 @@ impl Table {
             self.add_only(),
             Operator::Update(update),
         )
+    }
+
+    /// Rows ordered by `by`, each entry `"name"` or `"name desc"` (`"name asc"` is the default),
+    /// earlier entries first. NULL sorts as the largest value; ties keep the input's order. The
+    /// table must be static: ticking sort arrives with SQL `ORDER BY`.
+    pub fn sort(&self, by: &[&str]) -> Result<Table, Error> {
+        if by.is_empty() {
+            return Err(Error::Unsupported("sort needs at least one column".into()));
+        }
+        let keys = by
+            .iter()
+            .map(|entry| {
+                let words: Vec<&str> = entry.split_whitespace().collect();
+                let (name, descending) = match words[..] {
+                    [name] => (name, false),
+                    [name, order] if order.eq_ignore_ascii_case("asc") => (name, false),
+                    [name, order] if order.eq_ignore_ascii_case("desc") => (name, true),
+                    _ => {
+                        return Err(Error::Schema(format!(
+                            "sort takes \"name\" or \"name desc\", not \"{entry}\""
+                        )));
+                    }
+                };
+                Ok((resolve(&self.schema, &[name])?[0], descending))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let description = format!("sort({})", by.join(", "));
+        let mut graph = self.session.write();
+        let table = &graph.tables[self.id];
+        if let Some(cause) = &table.failure {
+            return Err(Error::Upstream {
+                table: description,
+                cause: Arc::new(cause.clone()),
+            });
+        }
+        if table.refreshing {
+            return Err(Error::Unsupported(format!(
+                "sort needs a static table, and `{}` ticks; ticking sort arrives with SQL ORDER BY",
+                table.description
+            )));
+        }
+        let compute = |e: ArrowError| Error::Compute {
+            table: description.clone(),
+            message: e.to_string(),
+        };
+        let rows = Reader::new(&graph.tables, self.id)
+            .snapshot()
+            .map_err(compute)?;
+        let sorted = sorted(&self.schema, &rows, &keys).map_err(compute)?;
+        let state =
+            TableState::fixed(description.clone(), self.schema.clone(), sorted).map_err(compute)?;
+        graph.tables.push(state);
+        Ok(Table {
+            session: self.session.clone(),
+            id: graph.tables.len() - 1,
+            schema: self.schema.clone(),
+        })
     }
 
     /// The first `n` rows in key order (arrival order for appended rows), kept current as rows

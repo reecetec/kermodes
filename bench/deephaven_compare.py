@@ -40,7 +40,7 @@ def main() -> None:
 
     # Deephaven's modules import only once the server runs.
     import jpy
-    from deephaven import agg, merge
+    from deephaven import SortDirection, agg, merge
     from deephaven.arrow import to_arrow, to_table
 
     runtime = jpy.get_type("java.lang.Runtime").getRuntime()
@@ -81,6 +81,12 @@ def main() -> None:
             ("n", "sum"),
         ),
         "tail": (lambda: ticks.tail(1000), ("price", "sum")),
+        "sort": (
+            lambda: ticks.sort(
+                ["sym", "ts"], [SortDirection.ASCENDING, SortDirection.DESCENDING]
+            ),
+            ("price", "sum"),
+        ),
     }
 
     print(

@@ -229,6 +229,15 @@ impl Table {
         Ok(Table(table))
     }
 
+    /// Rows ordered by `by`, each `"name"` or `"name desc"`, earlier entries first. NULL sorts as
+    /// the largest value; ties keep the input's order. Static tables only.
+    #[pyo3(signature = (*by))]
+    fn sort(&self, py: Python<'_>, by: Vec<String>) -> PyResult<Table> {
+        let by: Vec<&str> = by.iter().map(String::as_str).collect();
+        let table = py.detach(|| self.0.sort(&by)).map_err(engine_error)?;
+        Ok(Table(table))
+    }
+
     /// Each row with columns from the `right` row whose `on` columns hold the same values, or
     /// NULLs; a key with more than one right row fails the table. `on` and `joins` entries are
     /// `"name"` or `"left=right"` (`"new=old"` for `joins`); `joins` defaults to every right

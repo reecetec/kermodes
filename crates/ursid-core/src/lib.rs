@@ -11,6 +11,7 @@ mod ops;
 mod parallel;
 mod session;
 mod slots;
+mod sort;
 mod storage;
 mod types;
 

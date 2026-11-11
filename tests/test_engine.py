@@ -217,3 +217,14 @@ def test_head_and_tail_follow_the_ends_of_a_ticking_table():
     s.step()
     assert pa.table(first)["sym"].to_pylist() == ["a", "b"]
     assert pa.table(last)["sym"].to_pylist() == ["c", "d"]
+
+
+def test_sort_orders_static_tables_with_nulls_last():
+    s = us.local(manual=True)
+    fixed = s.static_table(
+        ticks(["b", "a", "b", "a"], [1.0, 2.0, 3.0, 4.0], [1, None, 2, 3])
+    )
+    ordered = fixed.sort("sym", "size desc")
+    assert pa.table(ordered)["size"].to_pylist() == [None, 3, 2, 1]
+    with pytest.raises(us.UrsidError, match="ORDER BY"):
+        s.input_table(COLUMNS).sort("sym")
