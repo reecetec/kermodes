@@ -6,6 +6,7 @@ use std::sync::LazyLock;
 
 use ahash::RandomState;
 use arrow::array::{Array, ArrayRef, AsArray, StringArray, UInt32Array};
+use arrow::buffer::NullBuffer;
 use arrow::compute::take_record_batch;
 use arrow::datatypes::{
     DataType, Date32Type, Int32Type, Int64Type, Schema, TimeUnit, TimestampNanosecondType,
@@ -33,19 +34,15 @@ pub(crate) fn shard_of(hash: u64, shards: usize) -> usize {
     (((hash >> 32) * shards as u64) >> 32) as usize
 }
 
-/// Encodes key columns as comparable bytes, one key per row. Used by keyed input tables.
+/// Encodes key columns as comparable bytes, one key per row: keys that are not a single integer
+/// or string column.
 pub(crate) struct Grouper {
     columns: Vec<usize>,
     converter: RowConverter,
 }
 
 impl Grouper {
-    pub fn new(schema: &Schema, names: &[&str]) -> Result<Self, Error> {
-        let columns = resolve(schema, names)?;
-        Self::by_position(schema, columns).map_err(|e| Error::Schema(e.to_string()))
-    }
-
-    pub fn by_position(schema: &Schema, columns: Vec<usize>) -> Result<Self, ArrowError> {
+    fn by_position(schema: &Schema, columns: Vec<usize>) -> Result<Self, ArrowError> {
         let fields = columns
             .iter()
             .map(|i| SortField::new(schema.field(*i).data_type().clone()))
@@ -54,10 +51,6 @@ impl Grouper {
             columns,
             converter: RowConverter::new(fields)?,
         })
-    }
-
-    pub fn columns(&self) -> &[usize] {
-        &self.columns
     }
 
     pub fn encode(&self, batch: &RecordBatch) -> Result<Rows, ArrowError> {
@@ -129,7 +122,19 @@ impl KeyKind {
     pub fn keys<'a>(&self, batch: &'a RecordBatch, encoded: Option<&'a Rows>) -> Keys<'a> {
         match self {
             KeyKind::None => Keys::None,
-            KeyKind::Int(column) => Keys::Int(batch.column(*column).as_ref()),
+            KeyKind::Int(column) => {
+                let array = batch.column(*column);
+                let values = match array.data_type() {
+                    DataType::Int32 => IntValues::I32(array.as_primitive::<Int32Type>().values()),
+                    DataType::Date32 => IntValues::I32(array.as_primitive::<Date32Type>().values()),
+                    DataType::Int64 => IntValues::I64(array.as_primitive::<Int64Type>().values()),
+                    _ => IntValues::I64(array.as_primitive::<TimestampNanosecondType>().values()),
+                };
+                Keys::Int(Ints {
+                    values,
+                    nulls: array.nulls(),
+                })
+            }
             KeyKind::Str(column) => Keys::Str(batch.column(*column).as_string::<i32>()),
             KeyKind::Rows(_) => Keys::Rows(encoded.expect("row-encoded keys are encoded first")),
         }
@@ -139,9 +144,34 @@ impl KeyKind {
 /// The keys of one batch.
 pub(crate) enum Keys<'a> {
     None,
-    Int(&'a dyn Array),
+    Int(Ints<'a>),
     Str(&'a StringArray),
     Rows(&'a Rows),
+}
+
+/// An integer, date, or timestamp key column, resolved to its values once per batch and read as
+/// `i64`.
+pub(crate) struct Ints<'a> {
+    values: IntValues<'a>,
+    nulls: Option<&'a NullBuffer>,
+}
+
+enum IntValues<'a> {
+    I32(&'a [i32]),
+    I64(&'a [i64]),
+}
+
+impl Ints<'_> {
+    fn is_null(&self, row: usize) -> bool {
+        self.nulls.is_some_and(|nulls| nulls.is_null(row))
+    }
+
+    fn get(&self, row: usize) -> i64 {
+        match self.values {
+            IntValues::I32(values) => i64::from(values[row]),
+            IntValues::I64(values) => values[row],
+        }
+    }
 }
 
 /// A group's key, kept by the table that owns the group.
@@ -154,23 +184,14 @@ pub(crate) enum OwnedKey {
 }
 
 impl Keys<'_> {
-    fn int(array: &dyn Array, row: usize) -> i64 {
-        match array.data_type() {
-            DataType::Int32 => i64::from(array.as_primitive::<Int32Type>().value(row)),
-            DataType::Int64 => array.as_primitive::<Int64Type>().value(row),
-            DataType::Date32 => i64::from(array.as_primitive::<Date32Type>().value(row)),
-            _ => array.as_primitive::<TimestampNanosecondType>().value(row),
-        }
-    }
-
     /// The key of `row`, packed. See [`Packed`].
     #[inline(always)]
     pub fn pack(&self, row: usize) -> Packed {
         match self {
             Keys::None => Packed::default(),
-            Keys::Int(array) if array.is_null(row) => Packed::NULL,
-            Keys::Int(array) => Packed {
-                lo: Self::int(*array, row) as u64,
+            Keys::Int(ints) if ints.is_null(row) => Packed::NULL,
+            Keys::Int(ints) => Packed {
+                lo: ints.get(row) as u64,
                 ..Packed::default()
             },
             Keys::Str(array) if array.is_null(row) => Packed::NULL,
@@ -209,10 +230,10 @@ impl Keys<'_> {
     pub fn matches(&self, row: usize, key: &OwnedKey) -> bool {
         match (self, key) {
             (Keys::None, OwnedKey::All) => true,
-            (Keys::Int(array), OwnedKey::Null) => array.is_null(row),
+            (Keys::Int(ints), OwnedKey::Null) => ints.is_null(row),
             (Keys::Str(array), OwnedKey::Null) => array.is_null(row),
-            (Keys::Int(array), OwnedKey::Int(value)) => {
-                array.is_valid(row) && Self::int(*array, row) == *value
+            (Keys::Int(ints), OwnedKey::Int(value)) => {
+                !ints.is_null(row) && ints.get(row) == *value
             }
             (Keys::Str(array), OwnedKey::Str(text)) => {
                 array.is_valid(row) && array.value(row) == text.as_ref()
@@ -225,8 +246,8 @@ impl Keys<'_> {
     pub fn owned(&self, row: usize) -> OwnedKey {
         match self {
             Keys::None => OwnedKey::All,
-            Keys::Int(array) if array.is_null(row) => OwnedKey::Null,
-            Keys::Int(array) => OwnedKey::Int(Self::int(*array, row)),
+            Keys::Int(ints) if ints.is_null(row) => OwnedKey::Null,
+            Keys::Int(ints) => OwnedKey::Int(ints.get(row)),
             Keys::Str(array) if array.is_null(row) => OwnedKey::Null,
             Keys::Str(array) => OwnedKey::Str(array.value(row).into()),
             Keys::Rows(rows) => OwnedKey::Bytes(rows.row(row).data().into()),

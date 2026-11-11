@@ -45,11 +45,13 @@ needs an attribute its input lacks is rejected at plan time with an error saying
 - Every row has a `RowKey(u64)`. A key identifies one row for the lifetime of the table and is never
   reused. Keys are identities, not positions: there are no shifts.
 - Append-only sources use the global row position as the key.
-- State tables (`last_by`, `agg_by` outputs) use a slot number per group, assigned on first sight.
+- State tables (`last_by`, `agg_by` outputs) use a slot number per group, assigned on first sight;
+  keyed inputs use one per key value, mapped through the same grouping table (§5).
 - `merge` packs `(input index, input key)` into the key: input index in the top 8 bits.
 - Tables index their keys densely when append-only (key = position, located by binary search
-  over chunk starts) and in a `BTreeMap` otherwise. Deltas carry key vectors aligned with their
-  row batches. A range-based row set arrives with viewports if a measurement calls for it.
+  over chunk starts) and in a hash map otherwise; only snapshots need key order, and they sort.
+  Deltas carry key vectors aligned with their row batches. A range-based row set arrives with
+  viewports if a measurement calls for it.
 - Display order is separate from keys: a viewport asks for positions, which are ranks in the row
   set (or in a sort order, later).
 

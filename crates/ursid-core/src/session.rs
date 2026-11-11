@@ -1,6 +1,5 @@
 //! A session owns one update graph: input tables, the tables derived from them, and cycles.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use arrow::compute::interleave_record_batch;
@@ -9,7 +8,7 @@ use arrow::error::ArrowError;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
 use crate::agg::{Accumulator, AggBy, agg_schema};
-use crate::groups::{Grouper, Membership, resolve};
+use crate::groups::{KeyKind, Membership, resolve};
 use crate::ops::{Assignment, LastBy, Operator, Update, Where};
 use crate::storage::{Delta, Modified, RowKey, Rows, Storage};
 use crate::{Error, Expression, type_name};
@@ -56,7 +55,7 @@ struct TableState {
 
 enum Source {
     Append,
-    Keyed(Keyed),
+    Keyed(Box<Keyed>),
     Static,
     Derived {
         parent: usize,
@@ -66,13 +65,18 @@ enum Source {
 
 /// An input table with one row per key value: upserts replace, deletes remove.
 struct Keyed {
-    /// Key columns within full rows.
-    rows: Grouper,
-    /// Key columns within delete batches, which carry only the key.
-    deletes: Grouper,
+    /// The key within upsert batches, which hold full rows.
+    rows: KeyKind,
+    /// The key within delete batches, which hold only the key columns.
+    deletes: KeyKind,
     key_schema: SchemaRef,
-    slots: HashMap<Vec<u8>, RowKey>,
-    next_slot: RowKey,
+    /// Live keys: an id per key, and per id the row key of its row.
+    live: Membership,
+    /// Per id, the cycle's last write to its key: an upserted `(batch, row)`, or `None` for a
+    /// delete. Cleared as the cycle's delta is built.
+    latest: Vec<Option<(usize, usize)>>,
+    /// Per id, whether its key first appeared this cycle. Cleared likewise.
+    new: Vec<bool>,
 }
 
 /// A table in a session. Cheap to clone; clones refer to the same table.
@@ -109,16 +113,15 @@ impl Session {
             ));
         }
         let schema = nullable(schema)?;
-        let rows = Grouper::new(&schema, key)?;
-        let key_schema = Arc::new(schema.project(rows.columns()).map_err(schema_error)?);
-        let deletes =
-            Grouper::by_position(&key_schema, (0..key.len()).collect()).map_err(schema_error)?;
+        let columns = resolve(&schema, key)?;
+        let key_schema = Arc::new(schema.project(&columns).map_err(schema_error)?);
         let keyed = Keyed {
-            rows,
-            deletes,
+            rows: KeyKind::new(&schema, columns.clone()).map_err(schema_error)?,
+            deletes: KeyKind::new(&key_schema, (0..key.len()).collect()).map_err(schema_error)?,
             key_schema,
-            slots: HashMap::new(),
-            next_slot: 0,
+            live: Membership::new(&schema, columns, true, 0, 1).map_err(schema_error)?,
+            latest: Vec::new(),
+            new: Vec::new(),
         };
         let description = format!("input keyed by {}", key.join(", "));
         Ok(self.add(TableState::new(
@@ -126,7 +129,7 @@ impl Session {
             schema,
             true,
             false,
-            Source::Keyed(keyed),
+            Source::Keyed(Box::new(keyed)),
         )))
     }
 
@@ -315,47 +318,58 @@ impl Keyed {
     /// written and deleted within the cycle never appears.
     fn resolve(&mut self, storage: &Storage, writes: Vec<Write>) -> Result<Delta, ArrowError> {
         let mut upserts: Vec<RecordBatch> = Vec::new();
-        let mut latest: HashMap<Vec<u8>, Option<(usize, usize)>> = HashMap::new();
-        let mut order: Vec<Vec<u8>> = Vec::new();
         for write in writes {
-            let (keys, batch) = match write {
-                Write::Upsert(batch) => (self.rows.encode(&batch)?, Some(batch)),
-                Write::Delete(batch) => (self.deletes.encode(&batch)?, None),
+            let (kind, batch, upserting) = match write {
+                Write::Upsert(batch) => (&self.rows, batch, true),
+                Write::Delete(batch) => (&self.deletes, batch, false),
                 Write::Append(_) => continue,
             };
+            let encoded = kind.encode(&batch)?;
+            let keys = kind.keys(&batch, encoded.as_ref());
             let index = upserts.len();
-            let upserting = batch.is_some();
-            upserts.extend(batch);
-            for row in 0..keys.num_rows() {
-                let target = upserting.then_some((index, row));
-                let key = keys.row(row).data();
-                if latest.insert(key.to_vec(), target).is_none() {
-                    order.push(key.to_vec());
+            for row in 0..batch.num_rows() {
+                let id = self.live.group(
+                    keys.hash(row),
+                    |key| keys.matches(row, key),
+                    || keys.owned(row),
+                ) as usize;
+                if id >= self.latest.len() {
+                    self.latest.resize(id + 1, None);
+                    self.new.resize(id + 1, false);
                 }
+                self.latest[id] = upserting.then_some((index, row));
             }
+            if upserting {
+                upserts.push(batch);
+            }
+        }
+        for id in self.live.take_created() {
+            self.new[id as usize] = true;
         }
 
         let (mut added_keys, mut added_at) = (Vec::new(), Vec::new());
         let (mut modified_keys, mut modified_at) = (Vec::new(), Vec::new());
         let mut removed = Vec::new();
-        for key in order {
-            match (self.slots.get(&key).copied(), latest[&key]) {
-                (Some(slot), Some(at)) => {
+        for id in self.live.take_touched() {
+            let index = id as usize;
+            let slot = self.live.slot[index];
+            match (
+                std::mem::take(&mut self.new[index]),
+                self.latest[index].take(),
+            ) {
+                (false, Some(at)) => {
                     modified_keys.push(slot);
                     modified_at.push(at);
                 }
-                (Some(slot), None) => {
+                (false, None) => {
                     removed.push(slot);
-                    self.slots.remove(&key);
+                    self.live.release(id);
                 }
-                (None, Some(at)) => {
-                    let slot = self.next_slot;
-                    self.next_slot += 1;
-                    self.slots.insert(key, slot);
+                (true, Some(at)) => {
                     added_keys.push(slot);
                     added_at.push(at);
                 }
-                (None, None) => {}
+                (true, None) => self.live.release(id),
             }
         }
 

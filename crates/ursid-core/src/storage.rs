@@ -4,29 +4,28 @@
 //! and row holding its current version. A modified row gets a new version and its key is
 //! re-pointed; the old version stays readable, so a cycle's previous values cost nothing extra.
 
-use std::collections::BTreeMap;
-
+use ahash::RandomState;
 use arrow::compute::interleave_record_batch;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
+use hashbrown::HashMap;
 
 /// A row's identity within one table. Keys are never reused.
 pub(crate) type RowKey = u64;
 
 #[derive(Debug, Clone, Copy)]
 struct Location {
-    chunk: usize,
-    row: usize,
+    chunk: u32,
+    row: u32,
 }
 
 enum Index {
     /// Keys `0..len`, in chunk order: append-only tables.
-    Dense {
-        starts: Vec<RowKey>,
-        len: RowKey,
-    },
-    Sparse(BTreeMap<RowKey, Location>),
+    Dense { starts: Vec<RowKey>, len: RowKey },
+    /// Any keys. A hash map: lookups are the hot path (gathering previous values, applying
+    /// versions); key order is needed only for snapshots, which sort.
+    Sparse(HashMap<RowKey, Location, RandomState>),
 }
 
 pub(crate) struct Storage {
@@ -82,7 +81,7 @@ impl Storage {
         Self {
             schema,
             chunks: Vec::new(),
-            index: Index::Sparse(BTreeMap::new()),
+            index: Index::Sparse(HashMap::with_hasher(RandomState::new())),
         }
     }
 
@@ -107,8 +106,8 @@ impl Storage {
             Index::Dense { starts, len } => (key < *len).then(|| {
                 let chunk = starts.partition_point(|start| *start <= key) - 1;
                 Location {
-                    chunk,
-                    row: (key - starts[chunk]) as usize,
+                    chunk: chunk as u32,
+                    row: (key - starts[chunk]) as u32,
                 }
             }),
             Index::Sparse(map) => map.get(&key).copied(),
@@ -124,7 +123,7 @@ impl Storage {
             .iter()
             .map(|key| {
                 self.location(*key)
-                    .map(|l| (l.chunk, l.row))
+                    .map(|l| (l.chunk as usize, l.row as usize))
                     .ok_or_else(|| ArrowError::InvalidArgumentError(format!("no row {key}")))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -136,7 +135,11 @@ impl Storage {
     pub fn keys(&self) -> Vec<RowKey> {
         match &self.index {
             Index::Dense { len, .. } => (0..*len).collect(),
-            Index::Sparse(map) => map.keys().copied().collect(),
+            Index::Sparse(map) => {
+                let mut keys: Vec<RowKey> = map.keys().copied().collect();
+                keys.sort_unstable();
+                keys
+            }
         }
     }
 
@@ -210,10 +213,20 @@ impl Storage {
                     if keys.is_empty() {
                         continue;
                     }
-                    let chunk = self.chunks.len();
+                    let too_many =
+                        || ArrowError::InvalidArgumentError("over 2^32 chunks or rows".into());
+                    let chunk = u32::try_from(self.chunks.len()).map_err(|_| too_many())?;
+                    u32::try_from(keys.len()).map_err(|_| too_many())?;
                     self.chunks.push(batch.clone());
+                    map.reserve(keys.len());
                     for (row, key) in keys.iter().enumerate() {
-                        map.insert(*key, Location { chunk, row });
+                        map.insert(
+                            *key,
+                            Location {
+                                chunk,
+                                row: row as u32,
+                            },
+                        );
                     }
                 }
             }

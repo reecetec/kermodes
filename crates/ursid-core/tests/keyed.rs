@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
+use arrow::array::{ArrayRef, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -262,4 +262,48 @@ fn distinct_keys_stay_distinct_groups() {
         .map(|sym| format!("sym={}, n=2", sym.unwrap_or("null")))
         .collect();
     assert_eq!(sorted(rows(&counts)), sorted(expected));
+}
+
+#[test]
+fn integer_keys_stay_distinct_groups() {
+    let session = Session::new();
+    let int32 = [
+        None,
+        Some(0),
+        Some(1),
+        Some(-1),
+        Some(i32::MIN),
+        Some(i32::MAX),
+    ];
+    let int64 = [
+        None,
+        Some(0),
+        Some(1),
+        Some(-1),
+        Some(i64::MIN),
+        Some(i64::MAX),
+    ];
+    let render = |key: Option<String>| format!("k={}, n=2", key.as_deref().unwrap_or("null"));
+    let cases: [(ArrayRef, Vec<String>); 2] = [
+        (
+            Arc::new(Int32Array::from_iter(int32.iter().chain(&int32).copied())),
+            int32
+                .iter()
+                .map(|k| render(k.map(|v| v.to_string())))
+                .collect(),
+        ),
+        (
+            Arc::new(Int64Array::from_iter(int64.iter().chain(&int64).copied())),
+            int64
+                .iter()
+                .map(|k| render(k.map(|v| v.to_string())))
+                .collect(),
+        ),
+    ];
+    for (column, expected) in cases {
+        let batch = RecordBatch::try_from_iter([("k", column)]).unwrap();
+        let table = session.static_table(batch.schema(), vec![batch]).unwrap();
+        let counts = table.agg_by(&["k"], &[("n", "count(*)")]).unwrap();
+        assert_eq!(sorted(rows(&counts)), sorted(expected));
+    }
 }
