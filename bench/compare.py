@@ -175,23 +175,22 @@ def as_arrow(engine: str, result):
 
 
 def worker(engine: str, op: str, rows: int) -> dict:
-    import psutil
     import pyarrow.compute as pc
+    from memory import resident
 
-    process = psutil.Process()
     ticks, quotes, refs = data.ticks(rows), data.quotes(rows), data.refs()
     gc.collect()
-    generated = process.memory_info().rss
+    generated = resident()
     run = operations(engine, ticks, quotes, refs)[op]
     gc.collect()
-    before = process.memory_info().rss
+    before = resident()
 
     peak, done = before, threading.Event()
 
     def sample() -> None:
         nonlocal peak
         while not done.is_set():
-            peak = max(peak, process.memory_info().rss)
+            peak = max(peak, resident())
             time.sleep(0.002)
 
     sampler = threading.Thread(target=sample)
@@ -201,9 +200,9 @@ def worker(engine: str, op: str, rows: int) -> dict:
     times = [time.perf_counter() - start]
     done.set()
     sampler.join()
-    peak = max(peak, process.memory_info().rss)
+    peak = max(peak, resident())
     gc.collect()
-    retained = process.memory_info().rss - before
+    retained = resident() - before
 
     column, how = CHECKS[op]
     values = as_arrow(engine, result)

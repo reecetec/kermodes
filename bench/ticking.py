@@ -39,16 +39,15 @@ MB = 1 << 20
 
 
 def worker(op: str, cycles: int, batch: int) -> dict:
-    import psutil
     import pyarrow as pa
     import pyarrow.compute as pc
     import ursid as us
+    from memory import resident
 
     rows = cycles * batch
     ticks_data, quotes_data = data.ticks(rows), data.quotes(rows)
     gc.collect()
-    process = psutil.Process()
-    before = process.memory_info().rss
+    before = resident()
 
     s = us.local(manual=True)
     stamp = us.timestamp()
@@ -96,7 +95,7 @@ def worker(op: str, cycles: int, batch: int) -> dict:
         "p50": statistics.median(times),
         "p99": times[min(len(times) - 1, round(0.99 * (len(times) - 1)))],
         "rows_per_s": cycles * batch / (sum(times) / 1000),
-        "memory_mb": (process.memory_info().rss - before) / MB,
+        "memory_mb": (resident() - before) / MB,
         "rows": len(output),
     }
 

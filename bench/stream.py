@@ -34,16 +34,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    import psutil
     import pyarrow as pa
     import pyarrow.compute as pc
     import ursid as us
+    from memory import resident
 
     batches = args.seconds * 1_000_000 // BATCH
     stream = data.ticks(batches * BATCH)
     gc.collect()
-    process = psutil.Process()
-    before = process.memory_info().rss
+    before = resident()
 
     s = us.local(manual=True)
     ticks = s.input_table(
@@ -80,7 +79,7 @@ def main() -> None:
         cycles.append((time.perf_counter() - begin) * 1000)
     elapsed = time.perf_counter() - start
     gc.collect()
-    growth = (process.memory_info().rss - before) / MB
+    growth = (resident() - before) / MB
 
     cycles.sort()
     print(

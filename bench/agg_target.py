@@ -20,8 +20,8 @@ MB = 1 << 20
 
 def worker(engine: str, rows: int) -> dict:
     import numpy as np
-    import psutil
     import pyarrow as pa
+    from memory import resident
 
     rng = np.random.default_rng(7)
     table = pa.table(
@@ -48,14 +48,13 @@ def worker(engine: str, rows: int) -> dict:
                 vol=pl.col("value").std(),
             )
 
-    process = psutil.Process()
-    before = process.memory_info().rss
+    before = resident()
     peak, done = before, threading.Event()
 
     def sample() -> None:
         nonlocal peak
         while not done.is_set():
-            peak = max(peak, process.memory_info().rss)
+            peak = max(peak, resident())
             time.sleep(0.002)
 
     sampler = threading.Thread(target=sample)
