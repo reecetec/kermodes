@@ -384,7 +384,7 @@ state at cycle time.
 
 Every resource is a typed spec (Rust types, JSON Schema generated from them):
 `Table`, `Ingester`, `Deployment` (long-running engine graph), `Job`, `Dag`, `FeatureView`,
-`Model`, `ModelVersion`, `Alias`, `Secret` reference.
+`Model`, `ModelVersion`, `Alias`, `WorkerClass`, `Environment`, `Repository`, `Secret` reference.
 
 Specs are stored in Postgres. GitOps export (into the Argo CD repo) is a later addition; Postgres is
 the source of truth.
@@ -417,6 +417,82 @@ def retrain(ctx): ...
 `sys.job_runs`, `sys.task_runs`, `sys.task_logs`, `sys.deployments`, `sys.ingest_stats`,
 `sys.audit`, `sys.lineage`, `sys.model_events`. All are ordinary live tables and merge to the lake
 daily.
+
+### 10.5 Worker configuration
+
+Every deployment, ingester, job, and session declares the worker it runs on: code, Python
+environment, and resources.
+
+```yaml
+kind: Deployment
+name: odds-model
+namespace: sports
+code:
+  repo: rcolclough/juicebear
+  ref: main                 # resolved to a commit SHA at apply
+  path: apps/sportsflow
+  entrypoint: sportsflow.ursid:graph
+  track: true               # a push to main produces a new plan
+environment:
+  from: code                # apps/sportsflow/uv.lock at that commit
+  python: "3.13"
+worker:
+  class: medium             # admin-defined preset
+  memory: 16Gi              # pod total
+  engine_memory: 12Gi       # engine's own budget, kept below the container limit
+  python_memory: 4Gi        # python sidecar container
+  cpu: 4
+  gpu: 0
+  cache_disk: 50Gi
+```
+
+```python
+s = us.connect().session(env="sportsflow@main", worker="medium", memory="8Gi")
+```
+
+- **Worker classes** are admin-defined presets (memory, CPU, GPU, node selector, priority, maximum
+  overrides). Users pick a class and override within its limits and their quota.
+- The engine enforces `engine_memory` itself (Arrow memory pool budget) and reports usage to
+  `sys.deployments`, so it fails a query with an error instead of being OOM-killed.
+- `plan` shows the resolved commit, the environment status (cached or build required), and the
+  resources requested against quota.
+
+### 10.6 Environments
+
+An environment is an immutable, prebuilt Python environment. Nothing is installed when a worker
+starts.
+
+- Sources: `from: code` (the `pyproject.toml` + `uv.lock` in the code path at the resolved
+  commit), or an inline dependency list, which the control plane resolves with uv into a lock
+  stored with the `Environment` version.
+- Identity: hash of `uv.lock`, `pyproject.toml`, Python version, Ursid version, and platform.
+  Code changes that don't touch the lock reuse the existing environment.
+- Build, at apply time and only on a cache miss: an unprivileged Kubernetes Job starts from the
+  `ursid-python` base image, runs `uv sync --frozen --no-dev --no-install-project` into
+  `/opt/ursid/env`, and pushes that directory as one OCI layer on top of the base (no Docker daemon,
+  no privileged builder) to the Gitea OCI registry as `ursid-env:<hash>`.
+- Workers reference the image by digest. The kubelet's image cache makes later starts on a node
+  instant; an optional pre-pull DaemonSet warms environments marked hot.
+- A failed build fails `apply`; it never fails a running worker.
+- Sessions may `%pip install` into a scratch overlay for exploration. The session is then marked
+  dirty and cannot be promoted to a deployment until the dependency is in a lock.
+- Unreferenced environment images are garbage-collected, keeping the last N per environment.
+
+### 10.7 Code from git
+
+- A `Repository` registers a git remote (Gitea first), its credentials (secret reference), and a
+  webhook secret. Credentials stay in the control plane; worker pods never hold them.
+- `code.ref` (branch, tag, or SHA) resolves to a commit SHA at apply time. The control plane
+  snapshots `code.path` at that SHA into object storage, content-addressed by SHA and path; the
+  worker fetches it at start with a short-lived token and mounts it read-only.
+- Every deployment, job run, and session records the SHA it ran (`sys.deployments`,
+  `sys.task_runs`, `sys.audit`). Rollback = apply a previous SHA.
+- `track: true`: a Gitea push webhook produces a new plan for the tracked ref, applied
+  automatically or after approval per the resource's policy.
+- Scheduled jobs resolve a tracked ref at trigger time and record the SHA per run.
+- The project's own package is placed on `PYTHONPATH` from the snapshot, so a code-only change is
+  a snapshot download, not an environment build.
+- Agents change code through pull requests; deployments follow merged commits.
 
 ## 11. ML
 
@@ -570,9 +646,11 @@ Every server role (control plane, gateway, weir, worker) is a subcommand of one 
 
 ### 15.3 Worker pods
 
-- One worker = one pod. Containers: `engine` (Rust, Flight server) and an optional `python`
-  sidecar (Python model flavors, UDFs, user code), connected by a Unix socket on a shared
-  `emptyDir`.
+- One worker = one pod. Containers: `engine` (image `ursid:<version>`, Flight server) and an
+  optional `python` sidecar (image `ursid-env:<hash>`, §10.6) for Python model flavors, UDFs, and
+  user code, connected by a Unix socket on a shared `emptyDir`. Each container gets its own memory
+  limit from the worker spec (§10.5).
+- An init container fetches the code snapshot (§10.7) into a read-only volume.
 - Deployments and ingesters: StatefulSet with one replica. This guarantees at most one pod per
   identity (no rollout overlap double-publishing derived tables), stable DNS, and a PVC for the
   segment/Parquet cache. Restarts rebuild state from weir and history.
@@ -580,8 +658,8 @@ Every server role (control plane, gateway, weir, worker) is a subcommand of one 
   session request within the user's quota.
 - Jobs: one `batch/v1` Job per task attempt with `backoffLimit: 0`; the Ursid scheduler owns
   retries so every attempt is a row in `sys.task_runs`.
-- User Python: the `ursid-python` base image plus per-resource requirements installed with uv into a
-  cached volume at start, or a user image built `FROM` the base.
+- User Python always comes from a prebuilt environment image (§10.6); nothing is installed at pod
+  start.
 - Scheduling: requests/limits from the spec; node selectors and tolerations pass through. Priority
   classes: deployments > ingesters > jobs > sessions.
 
@@ -616,13 +694,15 @@ No JVM, Docker, or Kubernetes.
 | `ursid dev` | One supervisor process: control plane, gateway + UI, weir, workers as child processes | Full platform on a laptop |
 | Kubernetes | Same binary, one role per pod | Cluster |
 
-- Install: `pip install ursid` ships the SDK, the in-process engine, and the `ursid` binary in one
-  wheel (the ruff/uv pattern). A standalone binary is also published.
+- Install: `pip install ursid` installs the SDK and in-process engine, and pulls the `ursid-cli`
+  wheel that carries the native `ursid` binary (§18.1). A standalone binary is also published.
 - `ursid dev` keeps state in `./.ursid/` (or `--data-dir`): weir segments on local disk; the lake
   is DuckLake with a SQLite catalog file (multi-process safe, unlike a DuckDB catalog file) and
   local Parquet; control-plane state in SQLite; a single implicit user, OIDC optional.
-- Workers are `ursid worker` child processes; Python sidecars are child processes in a uv-managed
-  environment. They speak the same protocols as pods, so behaviour matches the cluster.
+- Workers are `ursid worker` child processes; Python sidecars are child processes using the
+  environment built by uv into `.ursid/envs/<hash>` (same hash as §10.6, built once, then reused).
+  Code comes from the local working tree or a git ref. Same protocols as pods, so behaviour
+  matches the cluster.
 - The controller has a runtime trait (`Local`: child processes; `Kubernetes`: `UrsidWorker`) and a
   storage trait (SQLite, Postgres) with one conformance suite run against both.
 - `us.connect()` with no arguments targets a running `ursid dev`, otherwise `URSID_URL`.
@@ -661,7 +741,7 @@ failure; `plan` warns when a non-replayable source has no replicated ack.
 | Concern | Choice |
 |---|---|
 | Engine, weir, control plane | Rust |
-| Columnar memory | arrow-rs |
+| Columnar memory | arrow-rs; one major version across the workspace, pinned to DataFusion's. Crates on another major (e.g. `duckdb`) exchange data through the Arrow C Data Interface |
 | Expressions / planning | DataFusion |
 | RPC | arrow-flight (tonic, HTTP/2) |
 | Lake catalog and batch SQL | DuckDB + DuckLake |
@@ -669,7 +749,7 @@ failure; `plan` warns when a non-replayable source has no replicated ack.
 | Inference | ONNX Runtime via `ort`; Python sidecar for other flavors |
 | Kubernetes | kube-rs |
 | Control-plane DB | Postgres via sqlx |
-| Python bindings | PyO3 + maturin |
+| Python bindings | PyO3 (abi3), `pyo3-arrow` (Arrow PyCapsule interface), maturin, uv workspace |
 | Notebook widget | anywidget |
 | Auth | OIDC (`openidconnect`), JWT (`jsonwebtoken`) |
 | Packaging | Helm chart, OCI registry on Gitea |
@@ -680,6 +760,9 @@ failure; `plan` warns when a non-replayable source has no replicated ack.
 ## 18. Planned repository layout
 
 ```
+Cargo.toml        Cargo workspace; shared versions in [workspace.dependencies]
+pyproject.toml    `ursid` Python package (maturin, builds crates/ursid-py) and uv workspace root
+uv.lock
 crates/
   ursid-core      Arrow tables, row sets, update graph, clocks
   ursid-ops       operators
@@ -689,14 +772,42 @@ crates/
   ursid-lake      DuckLake catalog, Parquet writer, merge
   ursid-control   spec API, scheduler, registry, MCP
   ursid-gateway   authenticated Flight/WebSocket proxy
-  ursid-cli       the `ursid` binary: dev, control, gateway, weir, worker subcommands
-  ursid-py        PyO3 bindings
-python/ursid      SDK, widgets, decorators
+  ursid-cli       the `ursid` binary (dev, control, gateway, weir, worker); its pyproject.toml
+                  builds the `ursid-cli` wheel
+  ursid-py        PyO3 extension module `ursid._native`
+python/ursid      SDK, widgets, decorators (pure Python over `ursid._native`)
 web/app           React UI (Bun workspace)
 web/client        @ursid/client TypeScript package
 deploy/helm/ursid Helm chart: CRDs, control plane, gateway, weir
 docs/
 ```
+
+### 18.1 Python packaging
+
+Verified against maturin 1.16, PyO3 0.30, and uv workspaces.
+
+- Two wheels from one repository: `ursid` (SDK + `ursid._native`) depends on `ursid-cli`
+  (`bindings = "bin"`). maturin does not package a `[[bin]]` target into a PyO3 wheel; the split
+  keeps the CLI a native process with no interpreter in worker processes, identical to the binary
+  in the container image.
+- Root `pyproject.toml`: `[tool.maturin]` with `manifest-path = "crates/ursid-py/Cargo.toml"`,
+  `module-name = "ursid._native"`, `python-source = "python"`; `[tool.uv.workspace]` with
+  `members = ["crates/ursid-cli"]`; `ursid-cli = { workspace = true }` in `[tool.uv.sources]`.
+- Both pyproject files set `tool.uv.cache-keys` to cover the workspace `Cargo.toml`, `Cargo.lock`,
+  and every crate's `*.rs` and `Cargo.toml` (parent-relative globs from `crates/ursid-cli`), so
+  `uv sync` / `uv run` rebuild after any Rust change. Without this, uv only rebuilds when a
+  package's own `pyproject.toml` changes.
+- PyO3 without the `extension-module` feature (maturin sets `PYO3_BUILD_EXTENSION_MODULE`), so
+  `cargo test` links normally; `crate-type = ["cdylib", "rlib"]`; declarative
+  `#[pymodule] mod _native`.
+- ABI: `abi3-py312`, one wheel per platform for GIL-enabled CPython. Free-threaded 3.14t needs a
+  version-specific wheel; `abi3t` (PEP 803) covers both builds from CPython 3.15.
+- Arrow crosses the boundary through `pyo3-arrow` (Arrow PyCapsule interface): zero-copy to
+  pyarrow, polars, arro3, nanoarrow, with no hard pyarrow dependency.
+- Editable builds use a `dev-py` Cargo profile (release optimisation, no LTO, incremental) through
+  maturin's `editable-profile`; published wheels use `release`.
+- Type stubs for `_native` are hand-written until maturin's `--generate-stubs` (PyO3
+  `experimental-inspect`) is stable.
 
 ## 19. Roadmap
 
@@ -705,7 +816,7 @@ docs/
 | M0 | Engine crate: chunks, update graph, initial operators, expressions; PyO3 wheel; notebook widget | Random-walk ticker → rolling mean/vol, live in Jupyter |
 | M1 | weir (DoPut, segments, seq dedup, epochs, snapshot + tail); `db.live_table`; WebSocket connector; `ursid dev`; Helm chart (weir + engine) | Synthetic ticker over WebSocket → weir → engine, on a laptop and in the cluster |
 | M2 | Merge job, DuckLake commit, `db.historical_table`, `db.table`, DuckDB pushdown, replay clock; column IDs and compatible schema changes | Ticker merged nightly, replayed as a backtest; add a column mid-day |
-| M3 | Control plane: specs, validate/plan/apply, scheduler, `sys.*` tables, ranger MCP; OIDC, RBAC, `UrsidWorker` controller, gateway; schema plans with dependents and rewrites; web UI v1 | Two users, each with their own sessions; agent creates a DAG; retries visible live in the UI |
+| M3 | Control plane: specs, validate/plan/apply, scheduler, `sys.*` tables, ranger MCP; OIDC, RBAC, `UrsidWorker` controller, gateway; worker classes, prebuilt environments, git code sources; schema plans with dependents and rewrites; web UI v1 | Two users, each with their own sessions; a DAG deployed from a git ref with its own environment; retries visible live in the UI |
 | M4 | den: register sklearn LinearRegression → ONNX → `predict`; torch MLP; aliases, shadow mode | Live prediction; swap champion without restart |
 | M5 | forage: feature views, training sets, online `last_by`, served-feature logging | Toy sportsbook: simulated games + odds → form features → live win probability vs implied odds |
 | M6 | Port juicebear sportsflow features and models | Real data |
@@ -715,8 +826,7 @@ docs/
 1. Latency target per event (assumed 100 ms–1 s cycles).
 2. Peak rows/sec and live state size for juicebear — validates single-process deployments.
 3. Derived-state checkpointing: replay from start of day vs periodic engine snapshots.
-4. User Python packaging: uv install at start vs built images as the default.
-5. weir placement policy once sharded: hashing vs explicit assignment (deferred; §16 keeps it
+4. weir placement policy once sharded: hashing vs explicit assignment (deferred; §16 keeps it
    additive).
 
 ## 21. Risks
@@ -727,6 +837,9 @@ docs/
   lateness rules from M0.
 - **Python in the hot path.** Batch-per-cycle is mandatory for Python inference and UDFs.
 - **Two SQL dialects.** Mitigated by the expression language and conformance corpus (§9.3).
+- **Arrow version skew.** DataFusion, `duckdb`, `arrow-flight`, and `pyo3-arrow` each pin an
+  arrow-rs major and release on different cadences. One workspace major (DataFusion's), a
+  duplicate-version ban in `cargo deny`, and C Data Interface bridging for any outlier.
 - **Single weir.** Node loss stalls ingest until the volume reattaches; non-replayable sources lose
   that window. Accepted initially; §16 invariants keep sharding and replication additive.
 - **Two control-plane stores.** SQLite (local) and Postgres (cluster) can diverge; one conformance
