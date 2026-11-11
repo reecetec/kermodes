@@ -294,6 +294,10 @@ workloads) and comparison scripts under `bench/`, all reading the same seeded da
 - The targets below: `stream.py` / `deephaven_stream.py` (the stream, paced or unthrottled;
   throughput is rows per second of cycle time), `ursid-bench book` / `deephaven_book.py`,
   `agg_target.py` (100M-row `agg_by` against Polars), and `import_time.py`.
+- `soak.py`: a keyed order book with constant live data (1M orders, 100k upserts and 10k deletes
+  per cycle, plus a notebook-style static burst every 50 cycles) for `--minutes`, memory every
+  30 s. Memory that keeps growing while data does not is allocator fragmentation; run it on
+  Linux (glibc) as well as macOS.
 
 Python comparisons need a release build of Ursid (`maturin develop --release`); `uv sync` builds
 a faster-to-compile profile. Numbers go in commit messages with the machine; nothing is checked in
