@@ -100,8 +100,9 @@ Delta { added: [(keys, rows)], removed: [(keys, last rows)], modified: [(keys, p
   - manual: `step()` runs one cycle (tests, notebooks, replay);
   - periodic: a background thread runs a cycle every period (default 100 ms) when a source has
     pending data.
-- Single-threaded cycles in M0. Parallelism inside operators (over chunks) comes when a benchmark
-  shows the need.
+- Cycles run tables one after another. `agg_by` spreads a large delta (64k+ rows) over every core
+  by sharding its groups (§5); other operators are single-threaded until a profile shows the
+  need.
 - Failure: if an operator errors, its table and everything downstream of it enter a failed state
   holding the error; the rest of the graph keeps running. Snapshots of a failed table raise the
   error in Python.
@@ -118,7 +119,7 @@ keep no state) and an incremental path below. Static paths use the same kernels 
 | `where(expr)` | Over an `add_only` input: none, and the output numbers its own rows. Otherwise the output keeps the input's keys. | Added: evaluate, keep matches. Modified: re-evaluate; true→true is modified, false→true added, true→false removed. Removed: drop if present. | — |
 | `update(exprs)` / `select(exprs)` | None; same keys as the input | Added and modified: evaluate on the new values. Removed: removed. | — |
 | `last_by(keys)` | Group arena; per group, its newest row key (`add_only` input) or the set of its row keys | Groups touched in the cycle compare their current last key with the one published; new group → added, emptied group → removed, different last or a modified last row → modified (the row is copied from the input). | Order is by row key (arrival); `last_by` over a `ts` order comes with ticking sort. |
-| `agg_by(keys, aggs)` | Group arena; per group, accumulators and (unless the input is `add_only`) its row keys | Rows added in key order fold into the accumulators. A removed or modified row, or an addition older than the group's newest row, marks the group stale; stale groups are recomputed from their rows in key order. Folding always in key order makes incremental results bit-identical to the static path. `min`/`max`/`first`/`last` keep the winning row key and copy its value. Empty groups are removed. | Invertible updates (subtracting removed rows) come if recomputation shows up in a benchmark. |
+| `agg_by(keys, aggs)` | Groups sharded by key hash, one shard per core; per shard, per-group accumulators stored column-wise and (unless the input is `add_only`) each group's row keys | Each batch becomes a vector of group ids, then each aggregation folds the batch in one typed loop. Rows added in key order fold in; a removed or modified row, or an addition older than the group's newest row, marks the group stale, and stale groups are recomputed from their rows in key order. Folding always in key order keeps incremental results bit-identical to the static path, on any number of cores. `min`/`max`/`first`/`last` keep the winning row key and copy its value. Empty groups are removed. Output row order is unspecified, as in SQL `GROUP BY`. | Invertible updates (subtracting removed rows) come if recomputation shows up in a profile. |
 | `natural_join(right, on)` | Right: key → row key. Left: key → left row set. | Left added/modified-on-key: look up; output redirection to the right row. Right added/modified/removed for a key: every left row with that key is modified. A key matching more than one right row fails the table. | — |
 | `as_of_join(right, on, ts)` | Right: per key, sorted `(ts, row key)`. Left: per key, sorted `(ts, row key)`. | Left added: binary search the greatest right `ts ≤ left ts`. Right added at `ts = t`: left rows with that key, `ts ≥ t`, and current match `< t` rematch (modified). | Right must be `add_only`. |
 | `rolling(by, window, aggs)` | Per group: a ring buffer (row windows) or deque (time windows) with running accumulators | Added rows in key order: push, evict out-of-window, emit the aggregate as columns on the added row. Earlier rows never change. | Input must be `append_only`; windows look backward only. |
@@ -128,12 +129,13 @@ keep no state) and an incremental path below. Static paths use the same kernels 
 
 Grouping keys:
 
-- `arrow::row::RowConverter` encodes the key columns of each batch to comparable bytes; groups
-  are found by those bytes, borrowed from the encoded batch, in an `ahash` map (already in the
-  dependency tree through arrow-array). One hash lookup per row; groups are then addressed by
-  arena index, and emptied groups free their index.
-- Single-column fast paths (an `i64` map for integer and temporal keys) come if a benchmark
-  shows encoding dominates.
+- A single integer, date, or timestamp key is hashed as an `i64`; a single string key as its
+  bytes; anything else through `arrow::row::RowConverter`'s comparable encoding. Maps use
+  `ahash` (already in the dependency tree through arrow-array). Groups are then addressed by
+  dense ids, and emptied groups free their id.
+- Shards: a delta's rows are hashed to shards in parallel 64k-row pieces; each shard then reads
+  its rows in place through index lists. A sampling profile (`samply`) of a 10M-row static
+  `agg_by` shows the shards' scattered reads of keys and values as the dominant cost.
 
 ## 6. Expressions
 
