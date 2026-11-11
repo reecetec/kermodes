@@ -58,6 +58,9 @@ struct Inner {
     /// Tables whose last handle was dropped while the graph was busy; released the next time
     /// the graph is written.
     unheld: Mutex<Vec<usize>>,
+    /// The last finished cycle, signalled through `cycled` (see `Session::wait_cycle`).
+    finished: Mutex<u64>,
+    cycled: Condvar,
 }
 
 /// A thread running a cycle whenever writes are pending. It holds the session only while it
@@ -596,6 +599,28 @@ pub struct RowsAt {
     pub total: usize,
 }
 
+/// A table reference that does not keep it alive: views hold tables this way, so a table goes
+/// when the code that made it lets go.
+#[derive(Clone)]
+pub struct WeakTable {
+    id: usize,
+    schema: SchemaRef,
+    alive: std::sync::Weak<Handle>,
+}
+
+impl WeakTable {
+    /// The table, if anything still holds it.
+    pub fn upgrade(&self) -> Option<Table> {
+        let alive = self.alive.upgrade()?;
+        Some(Table {
+            session: alive.session.clone(),
+            id: self.id,
+            schema: self.schema.clone(),
+            _alive: alive,
+        })
+    }
+}
+
 /// A table in a session. Cheap to clone; clones refer to the same table. The table lives while
 /// any clone does, or while a live table is computed from it.
 #[derive(Clone)]
@@ -744,7 +769,28 @@ impl Session {
             }
         }
         graph.cycle = cycle;
+        drop(graph);
+        *self.finished() = cycle;
+        self.inner.cycled.notify_all();
         cycle
+    }
+
+    /// Waits until a cycle after `after` has finished, or `timeout` passes; returns the last
+    /// finished cycle. Servers push changed rows after cycles without polling.
+    pub fn wait_cycle(&self, after: u64, timeout: Duration) -> u64 {
+        let (finished, _) = self
+            .inner
+            .cycled
+            .wait_timeout_while(self.finished(), timeout, |cycle| *cycle <= after)
+            .expect("ursid cycle counter poisoned by an earlier panic");
+        *finished
+    }
+
+    fn finished(&self) -> MutexGuard<'_, u64> {
+        self.inner
+            .finished
+            .lock()
+            .expect("ursid cycle counter poisoned by an earlier panic")
     }
 
     /// Starts running cycles in the background: one as soon as writes arrive, folding writes that
@@ -1095,6 +1141,15 @@ impl Table {
                 session: session.clone(),
                 id,
             }),
+        }
+    }
+
+    /// A reference that does not keep the table alive (see `WeakTable`).
+    pub fn downgrade(&self) -> WeakTable {
+        WeakTable {
+            id: self.id,
+            schema: self.schema.clone(),
+            alive: Arc::downgrade(&self._alive),
         }
     }
 

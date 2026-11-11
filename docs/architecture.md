@@ -930,6 +930,8 @@ proven parts.
   hundred-row one does, and the payload per update is the visible cells.
 - Transport: in notebooks, the widget's comm (a small JSON header plus Arrow IPC buffers); in
   the web UI, the same frames over WebSocket, later Barrage-style deltas over Flight (§9.6).
+  What answers the grid (windows, quick filters, sorting, fetches) is the engine's
+  (`ursid_core::viewer`); each transport only carries its messages.
 - Hosts: Jupyter, JupyterLab, and VS Code through anywidget, installed with the
   `ursid[notebook]` extra (`anywidget`, `ipywidgets`, `jupyterlab-widgets`,
   `widgetsnbextension`, `psygnal`; IPython and the kernel are already there). Without the extra,

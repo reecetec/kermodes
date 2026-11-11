@@ -1,12 +1,11 @@
 //! `ursid._native`: the engine exposed to Python. Engine work runs with the interpreter released.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arrow::array::{Array, ArrayIterator, ArrayRef, AsArray, RecordBatch, StructArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit, TimestampNanosecondType};
 use arrow::error::ArrowError;
-use arrow::ipc::writer::StreamWriter;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyValueError};
@@ -457,29 +456,6 @@ impl Table {
         }
     }
 
-    /// The rows at positions `start..start + count` in reading order as one Arrow IPC stream,
-    /// their row keys (little-endian u64), and the table's row count: what the table viewer
-    /// fetches for its viewport. Keys say which row is which across pushes, as positions shift.
-    fn _viewport<'py>(
-        &self,
-        py: Python<'py>,
-        start: usize,
-        count: usize,
-    ) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>, usize)> {
-        let (bytes, keys, total) = py.detach(|| {
-            let window = self.0.rows_at(start, count).map_err(engine_error)?;
-            let mut bytes = Vec::new();
-            let mut writer =
-                StreamWriter::try_new(&mut bytes, &window.rows.schema()).map_err(arrow_error)?;
-            writer.write(&window.rows).map_err(arrow_error)?;
-            writer.finish().map_err(arrow_error)?;
-            drop(writer);
-            let keys: Vec<u8> = window.keys.iter().flat_map(|k| k.to_le_bytes()).collect();
-            Ok::<_, PyErr>((bytes, keys, window.total))
-        })?;
-        Ok((PyBytes::new(py, &bytes), PyBytes::new(py, &keys), total))
-    }
-
     /// Notebook display: a live view for ticking tables (see `ursid._live`).
     fn _ipython_display_(slf: &Bound<'_, Self>) -> PyResult<()> {
         slf.py()
@@ -515,10 +491,153 @@ fn merge(py: Python<'_>, tables: Vec<PyRef<'_, Table>>) -> PyResult<Table> {
     Ok(Table(table))
 }
 
+/// One open grid's server side (`ursid_core::viewer`): `ursid._widget` carries its messages over
+/// the notebook comm. Frames are `(header, rows, keys)`: a dict, an Arrow IPC stream, and the
+/// rows' keys as little-endian u64. Holds its table weakly.
+#[pyclass(module = "ursid", name = "Viewer", frozen)]
+pub struct Viewer(Mutex<ursid_core::viewer::Viewer>);
+
+type PyFrame<'py> = (Bound<'py, PyDict>, Bound<'py, PyBytes>, Bound<'py, PyBytes>);
+
+impl Viewer {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ursid_core::viewer::Viewer> {
+        self.0
+            .lock()
+            .expect("ursid viewer poisoned by an earlier panic")
+    }
+}
+
+fn py_frame(py: Python<'_>, frame: ursid_core::viewer::Frame) -> PyResult<PyFrame<'_>> {
+    let header = PyDict::new(py);
+    match frame.fetched {
+        Some(id) => {
+            header.set_item("type", "fetched")?;
+            header.set_item("id", id)?;
+        }
+        None => header.set_item("type", "rows")?,
+    }
+    header.set_item("start", frame.start)?;
+    header.set_item("total", frame.total)?;
+    header.set_item("cycle", frame.cycle)?;
+    Ok((
+        header,
+        PyBytes::new(py, &frame.rows),
+        PyBytes::new(py, &frame.keys),
+    ))
+}
+
+/// A grid message: {"type": "viewport", "top", "bottom"}, {"type": "sort", "by": [{"column",
+/// "descending"}]}, {"type": "filter", "filters": {column: text}}, or {"type": "fetch", "id",
+/// "start", "count"}. `None` for other types.
+fn request(message: &Bound<'_, PyDict>) -> PyResult<Option<ursid_core::viewer::Request>> {
+    use ursid_core::viewer::{Request, SortKey};
+    let item = |name: &str| -> PyResult<Bound<'_, PyAny>> {
+        message
+            .get_item(name)?
+            .ok_or_else(|| PyValueError::new_err(format!("viewer message without `{name}`")))
+    };
+    let kind: String = item("type")?.extract()?;
+    Ok(Some(match kind.as_str() {
+        "viewport" => Request::Viewport {
+            top: item("top")?.extract()?,
+            bottom: item("bottom")?.extract()?,
+        },
+        "sort" => Request::Sort(
+            item("by")?
+                .try_iter()?
+                .map(|key| {
+                    let key = key?;
+                    Ok(SortKey {
+                        column: key.get_item("column")?.extract()?,
+                        descending: key.get_item("descending")?.extract()?,
+                    })
+                })
+                .collect::<PyResult<_>>()?,
+        ),
+        "filter" => Request::Filter(item("filters")?.extract()?),
+        "fetch" => Request::Fetch {
+            id: item("id")?.extract()?,
+            start: item("start")?.extract()?,
+            count: item("count")?.extract()?,
+        },
+        _ => return Ok(None),
+    }))
+}
+
+#[pymethods]
+impl Viewer {
+    #[new]
+    fn new(py: Python<'_>, table: PyRef<'_, Table>) -> Self {
+        let table = &table.0;
+        Self(Mutex::new(
+            py.detach(|| ursid_core::viewer::Viewer::new(table)),
+        ))
+    }
+
+    /// Handles a grid message; returns the frame to send back, if any.
+    fn receive<'py>(
+        &self,
+        py: Python<'py>,
+        message: &Bound<'py, PyDict>,
+    ) -> PyResult<Option<PyFrame<'py>>> {
+        let Some(request) = request(message)? else {
+            return Ok(None);
+        };
+        let frame = py
+            .detach(|| self.lock().receive(request))
+            .map_err(engine_error)?;
+        frame.map(|f| py_frame(py, f)).transpose()
+    }
+
+    /// The window the grid shows, as it is now; `None` once the table is gone.
+    fn rows<'py>(&self, py: Python<'py>) -> PyResult<Option<PyFrame<'py>>> {
+        let frame = py.detach(|| self.lock().rows()).map_err(engine_error)?;
+        frame.map(|f| py_frame(py, f)).transpose()
+    }
+
+    /// The viewed table's last changing cycle; `None` once it is gone.
+    #[getter]
+    fn changed(&self, py: Python<'_>) -> Option<u64> {
+        py.detach(|| self.lock().changed())
+    }
+
+    /// Drops the sorted or filtered table, so the engine can free it with the viewed table.
+    fn release(&self, py: Python<'_>) {
+        py.detach(|| self.lock().release());
+    }
+
+    /// Sort keys as (column, descending), most significant first.
+    #[getter]
+    fn sort(&self) -> Vec<(String, bool)> {
+        let viewer = self.lock();
+        viewer
+            .sort()
+            .iter()
+            .map(|key| (key.column.clone(), key.descending))
+            .collect()
+    }
+
+    #[getter]
+    fn filters(&self) -> std::collections::BTreeMap<String, String> {
+        self.lock().filters().clone()
+    }
+
+    /// Why filter entries were not applied, by column.
+    #[getter]
+    fn filter_errors(&self) -> std::collections::BTreeMap<String, String> {
+        self.lock().filter_errors().clone()
+    }
+
+    /// "static", or "ticking · updated in cycle N".
+    fn status(&self, cycle: u64) -> String {
+        self.lock().status(cycle)
+    }
+}
+
 #[pymodule]
 mod _native {
     #[pymodule_export]
-    use super::{Session, Table, merge};
+    use super::{Session, Table, Viewer, merge};
 
     use pyo3::prelude::*;
 

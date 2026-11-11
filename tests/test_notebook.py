@@ -3,7 +3,7 @@ import array
 import pyarrow as pa
 import ursid as us
 from IPython.core.interactiveshell import InteractiveShell
-from ursid._widget import FETCH_LIMIT, MARGIN, TableView
+from ursid._widget import TableView
 
 
 def test_rerunning_a_cell_replaces_the_table_it_built():
@@ -26,7 +26,7 @@ def test_rerunning_a_cell_replaces_the_table_it_built():
 
 
 class _Recorded(TableView):
-    """The viewer with an inline module instead of the built bundle, keeping what it sends."""
+    """The widget with an inline module instead of the built bundle, keeping what it sends."""
 
     _esm = "export default { render() {} }"
 
@@ -42,41 +42,12 @@ class _Recorded(TableView):
         self.sent.append((content, rows, keys))
 
     def ask(self, **content: object) -> tuple[dict, pa.Table, list[int]]:
-        """Sends a message as the grid would and returns the viewer's answer."""
+        """Sends a message as the grid would and returns the widget's answer."""
         self._receive(self, content, [])
         return self.sent[-1]
 
 
-def test_the_viewer_sends_the_rows_in_view_and_follows_the_table():
-    s = us.local(manual=True)
-    src = s.input_table({"n": us.int64()})
-    src.append(pa.table({"n": pa.array(range(1000), pa.int64())}))
-    s.step()
-
-    view = _Recorded(src)
-    header, rows, _ = view.sent[-1]
-    assert (header["start"], header["total"], view.row_count) == (0, 1000, 1000)
-    assert rows["n"].to_pylist() == list(range(2 * MARGIN))
-
-    # Scrolled to rows 600-619: those, with a margin either side.
-    header, rows, _ = view.ask(type="viewport", top=600, bottom=619)
-    assert header["start"] == 600 - MARGIN
-    assert rows["n"].to_pylist() == list(range(600 - MARGIN, 620 + MARGIN))
-
-    # A cycle that changes the table sends the same window again, with the new total.
-    src.append(pa.table({"n": pa.array([-1], pa.int64())}))
-    s.step()
-    view.push(src)
-    header, rows, _ = view.sent[-1]
-    assert (header["total"], header["cycle"], view.row_count) == (
-        1001,
-        src._changed,
-        1001,
-    )
-    assert view.status == f"ticking · updated in cycle {src._changed}"
-
-
-def test_the_viewer_sorts_and_filters_in_the_engine_and_keeps_row_keys():
+def test_the_widget_carries_frames_and_shows_the_viewers_state():
     s = us.local(manual=True)
     src = s.input_table({"sym": us.string(), "price": us.float64()}, key="sym")
     src.upsert(
@@ -84,43 +55,31 @@ def test_the_viewer_sorts_and_filters_in_the_engine_and_keeps_row_keys():
     )
     s.step()
     view = _Recorded(src)
-    _, _, keys = view.sent[-1]
-    key_of = dict(zip(pa.table(src)["sym"].to_pylist(), keys, strict=True))
+    header, rows, _ = view.sent[-1]
+    assert (header["type"], header["start"], header["total"]) == ("rows", 0, 4)
+    assert view.row_count == 4
+    assert view.status == f"ticking · updated in cycle {src._changed}"
 
-    # Contains, any case, then highest price first; keys still name the same rows.
-    view.ask(type="filter", filters={"sym": "a", "price": ""})
-    _, rows, keys = view.ask(type="sort", by=[{"column": "price", "descending": True}])
+    # Sort and filter in the engine; the traits show what applies and what did not.
+    view.ask(type="sort", by=[{"column": "price", "descending": True}])
+    _, rows, _ = view.ask(type="filter", filters={"sym": "a", "price": "> lots"})
     assert rows["sym"].to_pylist() == ["aa", "ca", "AB"]
-    assert keys == [key_of[sym] for sym in ["aa", "ca", "AB"]]
-    assert (view.row_count, view.filters, view.filter_errors) == (3, {"sym": "a"}, {})
+    assert view.sort == [{"column": "price", "descending": True}]
+    assert view.filters == {"sym": "a", "price": "> lots"}
+    assert view.filter_errors == {"price": "`lots` is not a number"}
+    assert view.row_count == 3
 
-    # The view follows the table: a new price moves a row and keeps its key.
+    # A cycle's push carries the new rows; a fetch answers its id and leaves the window alone.
     src.upsert(pa.table({"sym": ["AB"], "price": [9.0]}))
     s.step()
-    view.push(src)
-    _, rows, keys = view.sent[-1]
+    view.push()
+    header, rows, _ = view.sent[-1]
+    assert header["cycle"] == src._changed
     assert rows["sym"].to_pylist() == ["AB", "aa", "ca"]
-    assert keys[0] == key_of["AB"]
-
-    # An entry that is not a filter is reported and skipped; the others still apply.
-    _, rows, _ = view.ask(type="filter", filters={"sym": "=b", "price": "> lots"})
-    assert rows["sym"].to_pylist() == ["b"]
-    assert view.filter_errors == {"price": "`lots` is not a number"}
-
-    # Numbers compare; no filters and no sort show the table as it is.
-    _, rows, _ = view.ask(type="filter", filters={"price": ">= 4"})
-    assert rows["sym"].to_pylist() == ["AB", "b"]
-    view.ask(type="filter", filters={})
-    _, rows, _ = view.ask(type="sort", by=[])
-    assert rows["sym"].to_pylist() == pa.table(src)["sym"].to_pylist()
-
-
-def test_the_viewer_fetches_exact_rows_for_copying_up_to_a_limit():
-    s = us.local(manual=True)
-    fixed = s.static_table(pa.table({"n": pa.array(range(300_000), pa.int64())}))
-    view = _Recorded(fixed)
-    header, rows, _ = view.ask(type="fetch", id=7, start=250, count=5)
-    assert (header["type"], header["id"], header["start"]) == ("fetched", 7, 250)
-    assert rows["n"].to_pylist() == [250, 251, 252, 253, 254]
-    _, rows, _ = view.ask(type="fetch", id=8, start=0, count=10**9)
-    assert rows.num_rows == FETCH_LIMIT
+    header, rows, _ = view.ask(type="fetch", id=3, start=1, count=1)
+    assert (header["type"], header["id"], rows["sym"].to_pylist()) == (
+        "fetched",
+        3,
+        ["aa"],
+    )
+    assert view.row_count == 3

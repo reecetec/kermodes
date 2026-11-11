@@ -13,7 +13,7 @@ test = false
 doctest = false
 
 [dependencies]
-arrow = { workspace = true, features = ["ipc"] }
+arrow.workspace = true
 mimalloc.workspace = true
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 pyo3.workspace = true

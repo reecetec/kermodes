@@ -63,9 +63,9 @@ def _viewer() -> "type | None":
         or importlib.util.find_spec("anywidget") is None
     ):
         return None
-    from ursid._widget import Viewer
+    from ursid._widget import Widget
 
-    return Viewer
+    return Widget
 
 
 def show(table: Table) -> None:

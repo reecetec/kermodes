@@ -7,6 +7,8 @@ publish.workspace = true
 
 [dependencies]
 ahash = { version = "0.8", default-features = false }
-arrow.workspace = true
+# ipc: the viewer's frames. chrono-tz: reading timestamp literals against the "UTC" zone of
+# timestamp columns; without it that cast works only where another crate enables it (pyo3 does).
+arrow = { workspace = true, features = ["ipc", "chrono-tz"] }
 hashbrown = { version = "0.17", default-features = false }
 sqlparser.workspace = true
