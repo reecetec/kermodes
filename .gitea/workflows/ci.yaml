@@ -19,23 +19,25 @@ jobs:
     runs-on: arc
     container:
       image: ghcr.io/astral-sh/uv:0.13.7-python3.14-trixie-slim
-    # The Postgres catalog's tests (crates/kermodes-weir/tests/catalog.rs) run against it.
-    services:
-      postgres:
-        image: docker.io/library/postgres:17-alpine
-        env:
-          POSTGRES_PASSWORD: kermodes
     env:
       CARGO_HOME: /usr/local/cargo
       RUSTUP_HOME: /usr/local/rustup
       UV_LINK_MODE: copy
-      KERMODES_TEST_POSTGRES: postgres://postgres:kermodes@postgres:5432/postgres
+      # The Postgres catalog's tests (crates/kermodes-weir/tests/catalog.rs) run against it.
+      KERMODES_TEST_POSTGRES: postgres://postgres:kermodes@127.0.0.1:5432/postgres
 
     steps:
       - name: Install system packages
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends build-essential ca-certificates curl git nodejs unzip
+          apt-get install -y --no-install-recommends build-essential ca-certificates curl git nodejs postgresql unzip
+
+      # In the job's own container: the runner puts jobs on Docker's default bridge network, where
+      # a service container's name does not resolve.
+      - name: Start Postgres
+        run: |
+          pg_ctlcluster 17 main start
+          su postgres -c "psql -qc \"ALTER USER postgres PASSWORD 'kermodes'\""
 
       - name: Checkout repository
         uses: actions/checkout@v6
