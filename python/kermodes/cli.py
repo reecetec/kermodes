@@ -1,7 +1,9 @@
 """The `kermodes` command."""
 
 import argparse
+import signal
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import kermodes as km
@@ -29,6 +31,33 @@ def main(argv: list[str] | None = None) -> None:
     dev.add_argument(
         "--flight-port", type=int, help="Flight port (default: --port + 1)"
     )
+
+    weir = commands.add_parser(
+        "weir",
+        help="serve a store over Arrow Flight",
+        description=(
+            "Opens the store in --data-dir and serves it: writers and engines connect with "
+            "km.connect(). The store's half of `kermodes dev`, for a cluster."
+        ),
+    )
+    weir.add_argument("--data-dir", type=Path, required=True)
+    weir.add_argument("--host", default="127.0.0.1")
+    weir.add_argument("--port", type=int, default=DEV_PORT + 1)
+
+    ui = commands.add_parser(
+        "ui",
+        help="serve every table of a store in the web UI",
+        description=(
+            "Connects to a store server (kermodes weir or dev), follows every table as it "
+            "appears, and serves them in the web UI. Exits when it loses the store, so that "
+            "its supervisor restarts it. The engine's half of `kermodes dev`, for a cluster."
+        ),
+    )
+    ui.add_argument(
+        "--server", help="the store server (default: $KERMODES_URL, else kermodes dev)"
+    )
+    ui.add_argument("--host", default="127.0.0.1")
+    ui.add_argument("--port", type=int, default=DEV_PORT)
 
     ingest = commands.add_parser("ingest", help="run a built-in connector into a table")
     connectors = ingest.add_subparsers(dest="connector", required=True)
@@ -70,8 +99,14 @@ def main(argv: list[str] | None = None) -> None:
     feed.add_argument("--symbols", type=int, default=100)
 
     args = parser.parse_args(argv)
+    # A supervisor stops a process with SIGTERM: shut down as on Ctrl-C.
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     if args.command == "dev":
         run_dev(args.data_dir, args.host, args.port, args.flight_port or args.port + 1)
+    elif args.command == "weir":
+        run_weir(args.data_dir, args.host, args.port)
+    elif args.command == "ui":
+        run_ui(args.server, args.host, args.port)
     elif args.command == "ingest":
         run_websocket(
             args.url, args.table, args.source, args.columns, args.server, args.flush
@@ -90,17 +125,48 @@ def run_dev(data_dir: Path, host: str, port: int, flight_port: int) -> None:
         f"  connect  km.connect({flight.url!r})",
         flush=True,
     )
-    # Every stored table is in the web UI, including those other processes create later.
-    live: dict[str, km.Table] = {}
     try:
-        while True:
-            for name in session.tables:
-                if name not in live:
-                    live[name] = session.live_table(name)
-                    ui.publish(name, live[name])
-            time.sleep(1)
+        follow(session, ui.publish)
     except KeyboardInterrupt:
         pass
+
+
+def run_weir(data_dir: Path, host: str, port: int) -> None:
+    session = km.local(data_dir)
+    flight = session.serve_store(port=port, host=host)
+    print(f"kermodes weir: {data_dir.resolve()}\n  serving  {flight.url}", flush=True)
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        pass
+
+
+def run_ui(server: str | None, host: str, port: int) -> None:
+    session = km.connect(server)
+    ui = session.serve(port=port, host=host)
+    print(f"kermodes ui: {ui.url}", flush=True)
+    try:
+        follow(session, ui.publish)
+    except KeyboardInterrupt:
+        pass
+
+
+def follow(session: km.Session, publish: Callable[[str, km.Table], None]) -> None:
+    """Publishes every stored table, including those created later, until one fails.
+
+    A live table fails when it loses the store it follows; the KermodesError that `len` raises
+    then ends the process.
+    """
+    live: dict[str, km.Table] = {}
+    while True:
+        for name in session.tables:
+            if name not in live:
+                live[name] = session.live_table(name)
+                publish(name, live[name])
+        for table in live.values():
+            len(table)
+        time.sleep(1)
 
 
 def run_websocket(

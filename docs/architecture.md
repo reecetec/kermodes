@@ -1071,9 +1071,10 @@ proven parts.
 Kermodes ships as one Python package: a Rust core (`kermodes._native`) and a thin Python layer. The
 `kermodes` command is a Python `argparse` CLI; every server role (control plane, gateway, weir,
 worker) and every developer command is a subcommand of it. Server roles call into `_native`, which
-detaches from the interpreter and runs the Tokio runtime until shutdown; Rust installs the
-SIGTERM/SIGINT handlers for graceful shutdown. Two runtimes host it: Kubernetes (§16.1–16.5) and
-local (§16.6).
+detaches from the interpreter and runs the Tokio runtime until shutdown; the CLI turns SIGTERM into
+the same shutdown as Ctrl-C. A role that loses something it depends on (an engine its store)
+exits with an error rather than serving stale data, and its supervisor restarts it. Two runtimes
+host it: Kubernetes (§16.1–16.5) and local (§16.6).
 
 ### 16.1 Packaging
 
@@ -1174,7 +1175,9 @@ No JVM, Docker, or Kubernetes.
 - `kermodes dev` serves the web UI on port 8730 and the store over Flight on 8731 (`--port`,
   `--flight-port`), and shows every stored table in the UI as it appears. `km.connect()` uses
   `$KERMODES_URL`, else that local server; `Session.serve_store()` serves a store the same way
-  from any process that opened it.
+  from any process that opened it. `kermodes dev` is the two cluster roles in one process:
+  `kermodes weir` (the store over Flight) and `kermodes ui` (an engine that follows every table of
+  a store and serves the web UI).
 - Startup targets: `km.local()` under 100 ms; `kermodes dev` ready under 1 s.
 
 ### 16.7 Monitoring
