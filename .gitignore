@@ -6,3 +6,8 @@ __pycache__/
 *.pyd
 .pytest_cache/
 .ruff_cache/
+node_modules/
+/web/**/dist/
+
+# The table viewer bundle, built from web/ (bun run build) and shipped in the wheel.
+python/ursid/static/

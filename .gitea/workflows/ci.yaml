@@ -24,7 +24,7 @@ jobs:
       - name: Install system packages
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends build-essential ca-certificates curl git nodejs
+          apt-get install -y --no-install-recommends build-essential ca-certificates curl git nodejs unzip
 
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -55,6 +55,19 @@ jobs:
 
       - name: Build the Python package
         run: uv sync --locked
+
+      - name: Install Bun
+        run: |
+          curl -fsSL https://bun.sh/install | bash -s "bun-v1.4.2"
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+
+      - name: Check the table viewer (web/)
+        working-directory: web
+        run: |
+          bun install --frozen-lockfile
+          bun run typecheck
+          bun test
+          bun run build
 
       - name: Run Ruff
         run: |

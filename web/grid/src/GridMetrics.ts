@@ -1,0 +1,199 @@
+// Adapted from @deephaven/grid (Apache-2.0), web-client-ui 0bab596
+import type { BoundedAxisRange } from './GridAxisRange';
+
+/** A grid coordinate value */
+export type Coordinate = number;
+
+/** Coordinates of a box */
+export type BoxCoordinates = {
+  x1: Coordinate;
+  y1: Coordinate;
+  x2: Coordinate;
+  y2: Coordinate;
+};
+
+/** The visible index of the item, eg. after moves are applied */
+export type VisibleIndex = number;
+
+/** The model index of the item, eg. moves are not applied */
+export type ModelIndex = number;
+
+/** Map from an item index to it's coordinate */
+export type CoordinateMap = Map<VisibleIndex, Coordinate>;
+
+/** Map from an item index to it's size */
+export type SizeMap = Map<VisibleIndex, number>;
+
+/** Map from a ModelIndex to it's size */
+export type ModelSizeMap = Map<ModelIndex, number>;
+
+/** Map from visible Index to ModelIndex */
+export type VisibleToModelMap = Map<VisibleIndex, ModelIndex>;
+
+/** Represents a move operation from one index to another */
+export type MoveOperation = {
+  from: VisibleIndex | BoundedAxisRange;
+  to: VisibleIndex;
+};
+
+export type GridMetrics = {
+  // Row/Column metrics from model
+  rowHeight: number;
+  rowHeaderWidth: number;
+  rowFooterWidth: number;
+  rowCount: number;
+  columnWidth: number;
+  columnCount: number;
+  columnHeaderHeight: number;
+
+  // Floating row and column counts
+  floatingTopRowCount: number;
+  floatingBottomRowCount: number;
+  floatingLeftColumnCount: number;
+  floatingRightColumnCount: number;
+
+  // The grid offset from the top left
+  gridX: Coordinate;
+  gridY: Coordinate;
+
+  // Index of non-hidden row/columns
+  firstRow: VisibleIndex;
+  firstColumn: VisibleIndex;
+
+  // What viewport is currently visible, limited by data size
+  /**
+   * The visible index of the left-most column that is at least partially visible.
+   */
+  left: VisibleIndex;
+  /**
+   * The visible index of the top row that is at least partially visible.
+   */
+  top: VisibleIndex;
+  /**
+   * The visible index of the bottom row that is at least partially visible.
+   */
+  bottom: VisibleIndex;
+  /**
+   * The visible index of the right-most column that is at least partially visible.
+   */
+  right: VisibleIndex;
+  topOffset: Coordinate;
+  leftOffset: Coordinate;
+
+  // Bottom and right that are fully visible, not overlapped by scroll bars or anything
+  topVisible: VisibleIndex;
+  leftVisible: VisibleIndex;
+  bottomVisible: VisibleIndex;
+  rightVisible: VisibleIndex;
+
+  // Bottom and right of the viewport, not limited by data size
+  bottomViewport: VisibleIndex;
+  rightViewport: VisibleIndex;
+
+  // Canvas width/height
+  width: number;
+  height: number;
+
+  // Canvas on-screen to layout size ratio. Divide screen-space values (clientX, movementX) by this to get layout pixels,
+  // multiply layout-space values by this to get screen pixels
+  scaleX: number;
+  scaleY: number;
+
+  // Max x/y coordinate of the grid (does not include headers)
+  maxX: Coordinate;
+  maxY: Coordinate;
+
+  // Last valid column/row that can be the left/top of the grid
+  lastLeft: VisibleIndex;
+  lastTop: VisibleIndex;
+
+  // Scroll bar metrics
+  barHeight: number;
+  barTop: number; // Relative to canvas dimensions
+  barWidth: number;
+  barLeft: number; // Relative to canvas dimensions
+  handleHeight: number;
+  handleWidth: number;
+  hasHorizontalBar: boolean;
+  hasVerticalBar: boolean;
+  verticalBarWidth: number;
+  horizontalBarHeight: number;
+
+  // The vertical x/y scroll amount
+  scrollX: number;
+  scrollY: number;
+
+  // The size of all known content in the scrollable area
+  scrollableContentWidth: number;
+  scrollableContentHeight: number;
+
+  // The visible space for scrollable content to display
+  scrollableViewportWidth: number;
+  scrollableViewportHeight: number;
+
+  // Array of visible (i.e., in the viewport) rows/columns, by VisibleIndex
+  visibleRows: readonly VisibleIndex[];
+  visibleColumns: readonly VisibleIndex[];
+
+  // Renderer performance optimization - array of visible, non-hidden columns, by VisibleIndex
+  // Use visibleColumns if hidden columns should be included (e.g. rendering column headers)
+  columnsForRender: readonly VisibleIndex[];
+
+  // Map of the height/width of visible rows/columns
+  visibleRowHeights: SizeMap;
+  visibleColumnWidths: SizeMap;
+
+  // Array of floating rows/columns, by grid index
+  floatingRows: readonly VisibleIndex[];
+  floatingColumns: readonly VisibleIndex[];
+
+  // Array of all rows/columns, visible and floating, by grid index
+  allRows: readonly VisibleIndex[];
+  allColumns: readonly VisibleIndex[];
+
+  // Map of the height/width of all rows/columns, visible and floating
+  allRowHeights: SizeMap;
+  allColumnWidths: SizeMap;
+
+  // Floating metrics
+  floatingTopHeight: number;
+  floatingBottomHeight: number;
+  floatingLeftWidth: number;
+  floatingRightWidth: number;
+
+  // Map of the X/Y coordinates of the visible rows/columns, from the top left of the grid
+  visibleRowYs: CoordinateMap;
+  visibleColumnXs: CoordinateMap;
+
+  // Map of the X/Y coordinates of all rows/columns, visible and floating, from the top left of the grid
+  allRowYs: CoordinateMap;
+  allColumnXs: CoordinateMap;
+
+  // Mapping from visible row indexes to the model row/columns they pull from
+  modelRows: VisibleToModelMap;
+  modelColumns: VisibleToModelMap;
+
+  movedRows: readonly MoveOperation[];
+  movedColumns: readonly MoveOperation[];
+
+  // Map of the width of the fonts
+  fontWidthsLower: Map<string, number>;
+  fontWidthsUpper: Map<string, number>;
+
+  // Map of user set column/row width/height
+  userColumnWidths: ModelSizeMap;
+  userRowHeights: ModelSizeMap;
+
+  // Map of calculated row/column height/width
+  calculatedRowHeights: ModelSizeMap;
+  calculatedColumnWidths: ModelSizeMap;
+
+  // Map of calculated row/column height/width without caching largest value
+  contentColumnWidths: ModelSizeMap;
+  contentRowHeights: ModelSizeMap;
+
+  // Max depth of column headers. Depth of 1 for a table without column groups
+  columnHeaderMaxDepth: number;
+};
+
+export default GridMetrics;

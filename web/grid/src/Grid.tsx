@@ -1,0 +1,1902 @@
+// Adapted from @deephaven/grid (Apache-2.0), web-client-ui 0bab596
+/* eslint react/no-did-update-set-state: "off" */
+import React, { PureComponent, type ReactNode, type RefObject } from 'react';
+import classNames from 'classnames';
+import memoize from 'memoize-one';
+import { assertNotNull, clamp, EMPTY_ARRAY, getChangedKeys } from './utils';
+import GridMetricCalculator, {
+  type GridMetricState,
+} from './GridMetricCalculator';
+import type GridModel from './GridModel';
+import {
+  type GridMouseEvent,
+  type GridMouseHandlerFunctionName,
+} from './GridMouseHandler';
+import type GridMouseHandler from './GridMouseHandler';
+import GridTheme, { type GridTheme as GridThemeType } from './GridTheme';
+import GridRange, {
+  type GridRangeIndex,
+  SELECTION_DIRECTION,
+} from './GridRange';
+import GridRenderer from './GridRenderer';
+import GridUtils, { type GridPoint } from './GridUtils';
+import {
+  GridSelectionMouseHandler,
+  GridColumnSeparatorMouseHandler,
+  GridHorizontalScrollBarMouseHandler,
+  GridScrollBarCornerMouseHandler,
+  GridVerticalScrollBarMouseHandler,
+  type GridSeparator,
+} from './mouse-handlers';
+import injectGridStyles from './GridStyles';
+import {
+  type GridKeyHandlerFunctionName,
+  type GridKeyboardEvent,
+} from './KeyHandler';
+import type KeyHandler from './KeyHandler';
+import { SelectionKeyHandler } from './key-handlers';
+import {
+  type Coordinate,
+  type ModelIndex,
+  type MoveOperation,
+  type VisibleIndex,
+} from './GridMetrics';
+import type GridMetrics from './GridMetrics';
+import { type EventHandlerResultOptions } from './EventHandlerResult';
+import { assertIsDefined } from './errors';
+import ThemeContext from './ThemeContext';
+import {
+  type GestureExtendOptions,
+  type GestureMode,
+  type GetModel,
+  type Selection,
+} from './Selection';
+import { RangedSelection, isRangedSelection } from './RangedSelection';
+import { type GridRenderState } from './GridRendererTypes';
+
+type LegacyCanvasRenderingContext2D = CanvasRenderingContext2D & {
+  webkitBackingStorePixelRatio?: number;
+  mozBackingStorePixelRatio?: number;
+  msBackingStorePixelRatio?: number;
+  oBackingStorePixelRatio?: number;
+  backingStorePixelRatio?: number;
+};
+
+export type GridProps = typeof Grid.defaultProps & {
+  // Children to render in the grid
+  children?: ReactNode;
+
+  // Options to set on the canvas
+  canvasOptions?: CanvasRenderingContext2DSettings;
+
+  // Whether the grid should stick to the bottom or the right once scrolled to the end
+  // Only matters with ticking grids
+  isStickyBottom?: boolean;
+  isStickyRight?: boolean;
+
+  // Whether the grid is currently stuck to the bottom or the right
+  isStuckToBottom?: boolean;
+  isStuckToRight?: boolean;
+
+  // Calculate all the metrics required for drawing the grid
+  metricCalculator?: GridMetricCalculator;
+
+  // The model to pull data from
+  model: GridModel;
+
+  // Optional key and mouse handlers
+  keyHandlers?: readonly KeyHandler[];
+  mouseHandlers?: readonly GridMouseHandler[];
+
+  // Factory that creates an empty Selection; defaults to an empty RangedSelection.
+  // Uses a `GetModel` closure (not a direct `model` reference) so Selections
+  // always read the current `props.model` even after prop updates.
+  createEmptySelection?: (getModel: GetModel) => Selection;
+
+  // Initial state of moved columns or rows
+  movedColumns?: readonly MoveOperation[];
+  movedRows?: readonly MoveOperation[];
+
+  // Callback for if an error occurs
+  onError?: (e: Error) => void;
+
+  // Callback when the selection within the grid changes
+  onSelectionChange?: (selection: Selection) => void;
+
+  // Callback when the viewport has scrolled or changed
+  onViewChanged?: (metrics: GridMetrics) => void;
+
+  // Renderer for the grid canvas
+  renderer?: GridRenderer;
+
+  // Optional state override to pass in to the metric and render state
+  // Can be used to add custom properties as well
+  stateOverride?: Record<string, unknown>;
+
+  theme?: Partial<GridThemeType>;
+};
+
+export type GridState = {
+  // Top/left visible cell in the grid. Note that it's visible row/column index, not the model index (ie. if columns are re-ordered)
+  top: VisibleIndex;
+  left: VisibleIndex;
+
+  // The scroll offset of the top/left cell. 0,0 means the cell is at the top left
+  topOffset: number; // Should be less than the height of the row
+  leftOffset: number; // Should be less than the width of the column
+
+  // When drawing header separators for resizing
+  // Keeps hover style when mouse is in buffer before resize starts
+  draggingColumnSeparator: GridSeparator | null;
+
+  // Dragging a scroll bar status
+  isDraggingHorizontalScrollBar: boolean;
+  isDraggingVerticalScrollBar: boolean;
+
+  // Anything is performing a drag, for blocking hover rendering
+  isDragging: boolean;
+
+  // The coordinates of the mouse. May be outside of the canvas
+  mouseX: number | null;
+  mouseY: number | null;
+
+  // Move operations the user has performed on this grids columns/rows
+  movedColumns: readonly MoveOperation[];
+  movedRows: readonly MoveOperation[];
+
+  // The current selection. Owns the cursor the shift/drag endpoint
+  selection: Selection;
+  // Previous selection; used for deselect-on-reclick detection in `applyGestureAt`.
+  lastSelection: Selection;
+
+  // Modifier-derived mode of the in-flight mouse gesture (set on mouse-down,
+  // read on drag frames, cleared on mouse-up). `null` when no gesture is
+  // active. Lets drag frames distinguish additive gestures (`add`, `maximize`)
+  // from replacing ones (`replace`, `extend`) so ctrl+click+drag preserves the
+  // prior selection.
+  gestureMode: GestureMode | null;
+
+  // The mouse cursor style to use when hovering over the grid element
+  cursor: string | null;
+
+  // Whether we're stuck to the bottom or the right
+  isStuckToBottom: boolean;
+  isStuckToRight: boolean;
+
+  /**
+   * Errors thrown during a render animation frame.
+   * These are not caught by the grid panel,
+   * so we need to throw them in componentDidUpdate
+   */
+  renderError?: unknown;
+
+  /** What revision the grid is drawing. Automatically increments when a forceUpdate is called. */
+  updateRevision: number;
+};
+
+/** Selection-related slice of `GridState`. Returned by gesture entry points. */
+export type GridSelectionState = Pick<
+  GridState,
+  'selection' | 'lastSelection'
+>;
+
+/**
+ * High performance, extendible, themeable grid component.
+ * Architectured to be fast and handle billions of rows/columns by default.
+ * The base model does not provide support for sorting, filtering, etc.
+ * To get that functionality, extend GridModel/GridRenderer, and add onClick/onContextMenu handlers to implement your own sort.
+ *
+ * Extend GridModel with your own data model to provide the data for the grid.
+ * Extend GridTheme to change the appearance if the grid. See GridTheme for all the settable values.
+ * Extend GridMetricCalculator to provide different metrics for the grid, such as column sizing, header sizing, etc.
+ * Extend GridRenderer to have complete control over the rendering process. Can override just one method such as drawColumnHeader, or override the whole drawCanvas process.
+ *
+ * Add an onViewChanged callback to page in/out data as user moves around the grid
+ * Can also add onClick and onContextMenu handlers to add custom functionality and menus.
+ */
+class Grid extends PureComponent<GridProps, GridState> {
+  static contextType = ThemeContext;
+
+  // eslint-disable-next-line react/static-property-placement, react/sort-comp
+  declare context: React.ContextType<typeof ThemeContext>;
+
+  static defaultProps = {
+    canvasOptions: { alpha: false } as CanvasRenderingContext2DSettings,
+    isStickyBottom: false,
+    isStickyRight: false,
+    isStuckToBottom: false,
+    isStuckToRight: false,
+    keyHandlers: EMPTY_ARRAY as readonly KeyHandler[],
+    mouseHandlers: EMPTY_ARRAY as readonly GridMouseHandler[],
+    movedColumns: EMPTY_ARRAY as readonly MoveOperation[],
+    movedRows: EMPTY_ARRAY as readonly MoveOperation[],
+    onError: (): void => undefined,
+    onSelectionChange: (_selection: Selection): void => undefined,
+    onViewChanged: (metrics: GridMetrics): void => undefined,
+    stateOverride: {} as Record<string, unknown>,
+    theme: {
+      autoSelectColumn: false,
+      autoSelectRow: false,
+    } as Partial<GridThemeType>,
+    createEmptySelection: RangedSelection.empty as (
+      getModel: GetModel
+    ) => Selection,
+  };
+
+  // use same constant as chrome source for windows
+  // https://github.com/chromium/chromium/blob/973af9d461b6b5dc60208c8d3d66adc27e53da78/ui/events/blink/web_input_event_builders_win.cc#L285
+  static pixelsPerLine = 100 / 3;
+
+  static dragTimeout = 1000;
+
+  static getTheme = memoize(
+    (
+      contextTheme: Partial<GridThemeType>,
+      userTheme: Partial<GridThemeType>
+    ) => ({
+      ...GridTheme,
+      ...contextTheme,
+      ...userTheme,
+    })
+  );
+
+  /**
+   * On some devices there may be different scaling required for high DPI. Get the scale required for the canvas.
+   * @param context The canvas context
+   * @returns The scale to use
+   */
+  static getScale(context: CanvasRenderingContext2D): number {
+    const devicePixelRatio = window.devicePixelRatio || 1;
+
+    // backingStorePixelRatio is deprecated, but check it just in case
+    const legacyContext = context as LegacyCanvasRenderingContext2D;
+
+    const backingStorePixelRatio =
+      // Not worth converting to a massive if structure
+      // Converting would reduce readability and maintainability
+      // eslint-disable-next-line @typescript-eslint/strict-boolean-expressions
+      legacyContext.webkitBackingStorePixelRatio ??
+      legacyContext.mozBackingStorePixelRatio ??
+      legacyContext.msBackingStorePixelRatio ??
+      legacyContext.oBackingStorePixelRatio ??
+      legacyContext.backingStorePixelRatio ??
+      1;
+    return devicePixelRatio / backingStorePixelRatio;
+  }
+
+  /**
+   * Get the floored layout size of an element, unaffected by CSS transforms.
+   * clientWidth/clientHeight round fractional sizes, which can make the canvas
+   * overflow its wrapper by a pixel, so read the fractional size from the
+   * computed style when available.
+   * @param element The element to get the size of
+   * @returns The floored layout width and height of the element
+   */
+  static getFlooredLayoutSize(element: HTMLElement): {
+    width: number;
+    height: number;
+  } {
+    const style = window.getComputedStyle(element);
+    const width = parseFloat(style.width);
+    const height = parseFloat(style.height);
+    return {
+      width: Math.floor(Number.isFinite(width) ? width : element.clientWidth),
+      height: Math.floor(
+        Number.isFinite(height) ? height : element.clientHeight
+      ),
+    };
+  }
+
+  /**
+   * Get the class name from the cursor provided
+   * @param cursor The grid cursor to use
+   * @returns Class name with the grid-cursor prefix or null if no cursor provided
+   */
+  static getCursorClassName(cursor: string | null): string | null {
+    return cursor != null && cursor !== '' ? `grid-cursor-${cursor}` : null;
+  }
+
+  // Need to disable react/sort-comp so I can put the fields here
+  /* eslint-disable react/sort-comp */
+  renderer: GridRenderer;
+
+  metricCalculator: GridMetricCalculator;
+
+  canvas: HTMLCanvasElement | null;
+
+  canvasContext: CanvasRenderingContext2D | null;
+
+  // The wrapper element for the canvas, used for sizing
+  canvasWrapper: RefObject<HTMLDivElement | null>;
+
+  // Listen for resizing of the element and update the canvas appropriately
+  resizeObserver: ResizeObserver;
+
+  // We draw the canvas on the next animation frame, keep track of the next one
+  animationFrame: number | null;
+
+  // Keep track of previous metrics and new metrics for comparison
+  prevMetrics: GridMetrics | null;
+
+  metrics: GridMetrics | null;
+
+  private renderState: GridRenderState | null;
+
+  // Track the cursor that is currently added to the document
+  // Add to document so that when dragging the cursor stays, even if mouse leaves the canvas
+  // Note: on document, not body so that cursor styling can be combined with
+  // blocked pointer events that would otherwise prevent cursor styling from showing
+  documentCursor: string | null;
+
+  // Track if this Grid instance added the grid-block-events class
+  // Used to ensure only the Grid that added the class removes it
+  hasAddedBlockEvents: boolean;
+
+  dragTimer: ReturnType<typeof setTimeout> | null;
+
+  keyHandlers: readonly KeyHandler[];
+
+  mouseHandlers: readonly GridMouseHandler[];
+
+  /* eslint-enable react/sort-comp */
+
+  constructor(props: GridProps) {
+    super(props);
+
+    this.handleClick = this.handleClick.bind(this);
+    this.handleContextMenu = this.handleContextMenu.bind(this);
+    this.handleDoubleClick = this.handleDoubleClick.bind(this);
+    this.notifyKeyboardHandlers = this.notifyKeyboardHandlers.bind(this);
+    this.handleKeyDown = this.handleKeyDown.bind(this);
+    this.handleKeyUp = this.handleKeyUp.bind(this);
+    this.handleMouseDown = this.handleMouseDown.bind(this);
+    this.handleMouseDrag = this.handleMouseDrag.bind(this);
+    this.handleMouseMove = this.handleMouseMove.bind(this);
+    this.handleMouseLeave = this.handleMouseLeave.bind(this);
+    this.handleMouseUp = this.handleMouseUp.bind(this);
+    this.handleResize = this.handleResize.bind(this);
+    this.handleWheel = this.handleWheel.bind(this);
+    this.getModel = this.getModel.bind(this);
+
+    const {
+      isStuckToBottom,
+      isStuckToRight,
+      metricCalculator,
+      movedColumns,
+      movedRows,
+      renderer,
+    } = props;
+
+    this.renderer = renderer || new GridRenderer();
+    this.metricCalculator = metricCalculator || new GridMetricCalculator();
+
+    this.canvas = null;
+    this.canvasContext = null;
+    this.canvasWrapper = React.createRef<HTMLDivElement>();
+    this.resizeObserver = new window.ResizeObserver(this.handleResize);
+    this.animationFrame = null;
+
+    this.prevMetrics = null;
+    this.metrics = null;
+
+    this.renderState = null;
+
+    // Track the cursor that is currently added to the document
+    // Add to document so that when dragging the cursor stays, even if mouse leaves the canvas
+    // Note: on document, not body so that cursor styling can be combined with
+    // blocked pointer events that would otherwise prevent cursor styling from showing
+    this.documentCursor = null;
+    this.hasAddedBlockEvents = false;
+
+    this.dragTimer = null;
+
+    // specify handler ordering, such that any extensions can insert handlers in between
+    this.keyHandlers = [new SelectionKeyHandler(500)];
+    this.mouseHandlers = [
+      new GridColumnSeparatorMouseHandler(200),
+      new GridVerticalScrollBarMouseHandler(500),
+      new GridHorizontalScrollBarMouseHandler(600),
+      new GridScrollBarCornerMouseHandler(700),
+      new GridSelectionMouseHandler(900),
+    ];
+
+    // Selections are immutable, so a single instance can back both selection
+    // and lastSelection until the first commit produces a fresh committed value.
+    const emptySelection = props.createEmptySelection(this.getModel);
+
+    this.state = {
+      // Top/left visible cell in the grid. Note that it's visible row/column index, not the model index (ie. if columns are re-ordered)
+      top: 0,
+      left: 0,
+
+      // The scroll offset of the top/left cell. 0,0 means the cell is at the top left
+      // Should be less than the width of the column
+      topOffset: 0,
+      leftOffset: 0,
+
+      // When drawing header separators for resizing
+      draggingColumnSeparator: null,
+
+      isDraggingHorizontalScrollBar: false,
+      isDraggingVerticalScrollBar: false,
+
+      // Anything is performing a drag, for blocking hover rendering
+      isDragging: false,
+
+      // The coordinates of the mouse. May be outside of the canvas
+      mouseX: null,
+      mouseY: null,
+
+      // Move operations the user has performed on this grids columns/rows
+      movedColumns,
+      movedRows,
+
+      // Currently selected ranges and previously selected ranges
+      // Store the previously selected ranges to determine if the new selection should
+      // deselect again (if it's the same range)
+      selection: emptySelection,
+      lastSelection: emptySelection,
+      gestureMode: null,
+
+      // The mouse cursor style to use when hovering over the grid element
+      cursor: null,
+
+      isStuckToBottom,
+      isStuckToRight,
+
+      /** What revision the grid is drawing. Automatically increments when a forceUpdate is called. */
+      updateRevision: 0,
+    };
+  }
+
+  componentDidMount(): void {
+    injectGridStyles();
+    this.initContext();
+
+    // Need to explicitly add wheel event to canvas so we can preventDefault/avoid passive listener issue
+    // Otherwise React attaches listener at doc level and you can't prevent default
+    // https://github.com/facebook/react/issues/14856
+    this.canvas?.addEventListener('wheel', this.handleWheel, {
+      passive: false,
+    });
+    if (this.canvasWrapper.current != null) {
+      this.resizeObserver.observe(this.canvasWrapper.current);
+    }
+
+    this.updateCanvas();
+
+    // apply on mount, so that it works with a static model
+    // https://github.com/deephaven/web-client-ui/issues/581
+    const { isStuckToBottom, isStuckToRight } = this.props;
+    const { top, left } = this.getStickyScrollPosition(
+      isStuckToBottom,
+      isStuckToRight
+    );
+    this.setState({ top, left });
+  }
+
+  componentDidUpdate(prevProps: GridProps, prevState: GridState): void {
+    const { renderError } = this.state;
+
+    // Render errors mean we can't recover
+    if (renderError != null) {
+      throw renderError;
+    }
+
+    const changedProps = getChangedKeys(prevProps, this.props);
+    const changedState = getChangedKeys(prevState, this.state);
+    // We don't need to bother re-checking any of the metrics if no props have changed or only the children have changed
+    if (
+      (changedProps.length === 0 ||
+        (changedProps.length === 1 && changedProps[0] === 'children')) &&
+      changedState.length === 0
+    ) {
+      return;
+    }
+
+    const {
+      isStickyBottom,
+      isStickyRight,
+      movedColumns,
+      movedRows,
+      renderer,
+      metricCalculator,
+      createEmptySelection,
+    } = this.props;
+
+    const {
+      isStickyBottom: prevIsStickyBottom,
+      isStickyRight: prevIsStickyRight,
+      movedColumns: prevPropMovedColumns,
+      movedRows: prevPropMovedRows,
+    } = prevProps;
+
+    const stateUpdates: Partial<GridState> = {};
+
+    if (prevPropMovedColumns !== movedColumns) {
+      stateUpdates.movedColumns = movedColumns;
+    }
+
+    if (prevPropMovedRows !== movedRows) {
+      stateUpdates.movedRows = movedRows;
+    }
+
+    if (isStickyBottom !== prevIsStickyBottom) {
+      stateUpdates.isStuckToBottom = false;
+    }
+
+    if (isStickyRight !== prevIsStickyRight) {
+      stateUpdates.isStuckToRight = false;
+    }
+
+    // Sync renderer/metricCalculator props to instance fields so callers can
+    // swap them at runtime (e.g. pivot model swap supplies a pivot renderer
+    // and metric calculator).
+    if (renderer !== prevProps.renderer) {
+      this.renderer = renderer ?? new GridRenderer();
+    }
+    if (metricCalculator !== prevProps.metricCalculator) {
+      this.metricCalculator = metricCalculator ?? new GridMetricCalculator();
+    }
+
+    if (prevProps.createEmptySelection !== createEmptySelection) {
+      const empty = createEmptySelection(this.getModel);
+      stateUpdates.selection = empty;
+      stateUpdates.lastSelection = empty;
+    }
+
+    const updatedState = { ...this.state, ...stateUpdates };
+
+    this.updateMetrics(updatedState);
+
+    this.requestUpdateCanvas();
+
+    if (this.needToUpdateScroll()) {
+      const { top, left } = this.getStickyScrollPosition(
+        isStickyBottom,
+        isStickyRight
+      );
+      updatedState.top = top;
+      updatedState.left = left;
+    }
+
+    if (this.validateSelection()) {
+      this.checkSelectionChange(prevState);
+    }
+
+    this.setState(updatedState);
+  }
+
+  componentWillUnmount(): void {
+    if (this.animationFrame != null) {
+      cancelAnimationFrame(this.animationFrame);
+    }
+
+    this.canvas?.removeEventListener('wheel', this.handleWheel);
+
+    window.removeEventListener(
+      'mousemove',
+      this.handleMouseDrag as unknown as EventListenerOrEventListenerObject,
+      true
+    );
+    window.removeEventListener(
+      'mouseup',
+      this.handleMouseUp as unknown as EventListenerOrEventListenerObject,
+      true
+    );
+    this.resizeObserver.disconnect();
+
+    this.stopDragTimer();
+
+    this.removeDocumentCursor();
+  }
+
+  getTheme(): GridThemeType {
+    const { theme } = this.props;
+    return Grid.getTheme(this.context, theme);
+  }
+
+  getGridPointFromEvent(event: GridMouseEvent): GridPoint {
+    assertIsDefined(this.canvas);
+
+    if (!this.metrics) throw new Error('metrics must be set');
+
+    const rect = this.canvas.getBoundingClientRect();
+    const { scaleX, scaleY } = this.metrics;
+    const x = (event.clientX - rect.left) / scaleX;
+    const y = (event.clientY - rect.top) / scaleY;
+    return this.getGridPointFromXY(x, y);
+  }
+
+  getGridPointFromXY(x: Coordinate, y: Coordinate): GridPoint {
+    if (!this.metrics) throw new Error('metrics must be set');
+
+    return GridUtils.getGridPointFromXY(x, y, this.metrics);
+  }
+
+  getMetricState(state = this.state): GridMetricState {
+    const theme = this.getTheme();
+    const { model, stateOverride } = this.props;
+    if (!this.canvasContext || !this.canvas) {
+      throw new Error('Canvas and context must be defined to get metrics');
+    }
+    const context = this.canvasContext;
+    const width = this.canvas.clientWidth;
+    const height = this.canvas.clientHeight;
+    const rect = this.canvas.getBoundingClientRect();
+    const scaleX = width > 0 ? rect.width / width : 1;
+    const scaleY = height > 0 ? rect.height / height : 1;
+    const {
+      left,
+      top,
+      leftOffset,
+      topOffset,
+      movedColumns,
+      movedRows,
+      isDraggingHorizontalScrollBar,
+      isDraggingVerticalScrollBar,
+    } = state;
+
+    return {
+      left,
+      top,
+      leftOffset,
+      topOffset,
+      width,
+      height,
+      scaleX,
+      scaleY,
+      context,
+      theme,
+      model,
+      movedColumns,
+      movedRows,
+      isDraggingHorizontalScrollBar,
+      isDraggingVerticalScrollBar,
+      ...stateOverride,
+    };
+  }
+
+  getCachedKeyHandlers = memoize((keyHandlers: readonly KeyHandler[]) =>
+    [...keyHandlers, ...this.keyHandlers].sort((a, b) => a.order - b.order)
+  );
+
+  getKeyHandlers(): readonly KeyHandler[] {
+    const { keyHandlers } = this.props;
+    return this.getCachedKeyHandlers(keyHandlers);
+  }
+
+  getCachedMouseHandlers = memoize(
+    (mouseHandlers: readonly GridMouseHandler[]): readonly GridMouseHandler[] =>
+      [...mouseHandlers, ...this.mouseHandlers].sort(
+        (a, b) => a.order - b.order
+      )
+  );
+
+  getMouseHandlers(): readonly GridMouseHandler[] {
+    const { mouseHandlers } = this.props;
+    return this.getCachedMouseHandlers(mouseHandlers);
+  }
+
+  /**
+   * Translate from the provided visible index to the model index
+   * @param columnIndex The column index to get the model for
+   * @returns The model index
+   */
+  getModelColumn(columnIndex: VisibleIndex): ModelIndex {
+    const modelIndex = this.metrics?.modelColumns?.get(columnIndex);
+    if (modelIndex === undefined) {
+      throw new Error(`Unable to get ModelIndex for column ${columnIndex}`);
+    }
+    return modelIndex;
+  }
+
+  /**
+   * Translate from the provided visible index to the model index
+   * @param rowIndex The row index to get the model for
+   * @returns The model index
+   */
+  getModelRow(rowIndex: VisibleIndex): ModelIndex {
+    const modelIndex = this.metrics?.modelRows?.get(rowIndex);
+    if (modelIndex === undefined) {
+      throw new Error(`Unable to get ModelIndex for row ${rowIndex}`);
+    }
+    return modelIndex;
+  }
+
+  getStickyScrollPosition(
+    isStickyBottom: boolean,
+    isStickyRight: boolean
+  ): { top: VisibleIndex; left: VisibleIndex } {
+    // eslint-disable-next-line react/destructuring-assignment
+    if (!this.metrics) return { left: this.state.left, top: this.state.top };
+
+    const {
+      bottomVisible,
+      rowCount,
+      top,
+      lastTop,
+      rightVisible,
+      columnCount,
+      left,
+      lastLeft,
+    } = this.metrics;
+
+    let newTop = top;
+    let newLeft = left;
+
+    if (
+      isStickyBottom &&
+      ((bottomVisible < rowCount - 1 && bottomVisible > 0) || top > lastTop)
+    ) {
+      newTop = lastTop;
+    }
+    if (
+      isStickyRight &&
+      ((rightVisible < columnCount - 1 && rightVisible > 0) || left > lastLeft)
+    ) {
+      newLeft = lastLeft;
+    }
+
+    return { top: newTop, left: newLeft };
+  }
+
+  /**
+   * Allows the selected ranges to be set programatically
+   * Will update the cursor and selection start/end based on the new ranges
+   * @param gridRanges The new selected ranges to set
+   */
+  setSelectedRanges(gridRanges: readonly GridRange[]): void {
+    const { model } = this.props;
+    const { columnCount, rowCount } = model;
+    this.setState(state => {
+      let { cursorRow, cursorColumn } = state.selection;
+      let selectionEndRow: GridRangeIndex = null;
+      let selectionEndColumn: GridRangeIndex = null;
+      let anchorRow: GridRangeIndex = null;
+      let anchorColumn: GridRangeIndex = null;
+      if (gridRanges.length > 0) {
+        const range = GridRange.boundedRange(
+          gridRanges[0],
+          columnCount,
+          rowCount
+        );
+        if (!range.containsCell(cursorColumn, cursorRow)) {
+          ({ row: cursorRow, column: cursorColumn } = range.startCell());
+        }
+        anchorColumn = range.startColumn;
+        anchorRow = range.startRow;
+        selectionEndColumn = range.endColumn;
+        selectionEndRow = range.endRow;
+      }
+      const selection = state.selection
+        .withCommittedRanges(gridRanges, {
+          row: anchorRow,
+          column: anchorColumn,
+        })
+        .withCursor(cursorRow, cursorColumn)
+        .withSelectionEnd(selectionEndRow, selectionEndColumn);
+      return {
+        selection,
+        lastSelection: state.selection,
+      };
+    });
+  }
+
+  initContext(): void {
+    const { canvas } = this;
+    const { canvasOptions } = this.props;
+
+    if (!canvas) throw new Error('Canvas not set');
+
+    this.canvasContext = canvas.getContext('2d', canvasOptions);
+  }
+
+  requestUpdateCanvas(): void {
+    if (this.animationFrame != null) {
+      return;
+    }
+
+    this.animationFrame = requestAnimationFrame(() => {
+      this.animationFrame = null;
+
+      try {
+        this.updateCanvas();
+      } catch (e) {
+        // Errors thrown from the animation frame are uncaught by the grid panel
+        this.setState({ renderError: e });
+      }
+    });
+  }
+
+  /**
+   * Updates the canvas, metrics, and render state, then draws the canvas.
+   */
+  updateCanvas(): void {
+    this.updateCanvasScale();
+
+    this.updateMetrics();
+
+    this.updateRenderState();
+
+    const { canvasContext, metrics, renderState } = this;
+    assertNotNull(canvasContext);
+    assertNotNull(metrics);
+    assertNotNull(renderState);
+
+    this.renderer.configureContext(canvasContext, renderState);
+
+    const { onViewChanged } = this.props;
+    onViewChanged(metrics);
+
+    this.drawCanvas();
+  }
+
+  private updateCanvasScale(): void {
+    const { canvas, canvasContext, canvasWrapper } = this;
+    if (!canvas) throw new Error('canvas not set');
+    if (!canvasContext) throw new Error('canvasContext not set');
+    if (!canvasWrapper.current) throw new Error('canvasWrapper not set');
+
+    // the parent wrapper has 100% width/height, and is used for determining size
+    // we don't want to stretch the canvas to 100%, to avoid fractional pixels.
+    // A wrapper element must be used for sizing, and canvas size must be
+    // set manually to a floored value in css and a scaled value in width/height
+    const { width, height } = Grid.getFlooredLayoutSize(canvasWrapper.current);
+
+    // avoid triggering a dom re-calc if size hasn't changed
+    if (
+      parseFloat(canvas.style.width) === width &&
+      parseFloat(canvas.style.height) === height
+    ) {
+      return;
+    }
+
+    const scale = Grid.getScale(canvasContext);
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+    canvas.width = width * scale;
+    canvas.height = height * scale;
+    canvasContext.scale(scale, scale);
+  }
+
+  updateScrollBounds(): void {
+    if (!this.metrics) throw new Error('metrics not set');
+    const { left, top } = this.state;
+    const { lastLeft, lastTop } = this.metrics;
+    if (left > lastLeft) {
+      this.setState({ left: lastLeft, leftOffset: 0 });
+    }
+    if (top > lastTop) {
+      this.setState({ top: lastTop, topOffset: 0 });
+    }
+  }
+
+  /**
+   * Compares the current metrics with the previous metrics to see if we need to scroll when it is stuck to the bottom or the right
+   */
+  needToUpdateScroll(): boolean {
+    if (!this.metrics || !this.prevMetrics) {
+      return false;
+    }
+
+    const { rowCount, columnCount, height, width } = this.metrics;
+    const {
+      rowCount: prevRowCount,
+      columnCount: prevColumnCount,
+      height: prevHeight,
+      width: prevWidth,
+    } = this.prevMetrics;
+
+    if (prevRowCount !== rowCount || height !== prevHeight) {
+      const { isStuckToBottom } = this.state;
+      if (isStuckToBottom) {
+        return true;
+      }
+    }
+    if (prevColumnCount !== columnCount || width !== prevWidth) {
+      const { isStuckToRight } = this.state;
+      if (isStuckToRight) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  updateMetrics(state = this.state): GridMetrics {
+    this.prevMetrics = this.metrics;
+
+    const { metricCalculator } = this;
+    const metricState = this.getMetricState(state);
+    this.metrics = metricCalculator.getMetrics(metricState);
+    this.updateScrollBounds();
+
+    return this.metrics;
+  }
+
+  /**
+   * Check if the selection state has changed, and call the onSelectionChange callback if it has
+   * @param prevState The previous grid state
+   */
+  checkSelectionChange(prevState: GridState): void {
+    const { selection } = this.state;
+    if (selection !== prevState.selection) {
+      const { onSelectionChange } = this.props;
+      onSelectionChange(selection);
+    }
+  }
+
+  /**
+   * Validate the current selection, and reset if it is invalid
+   * @returns True if the selection is valid, false if the selection was invalid and has been reset
+   */
+  validateSelection(): boolean {
+    const { createEmptySelection } = this.props;
+    const { selection } = this.state;
+
+    // Validate that a RangedSelection is within the bounds of the grid model
+    if (isRangedSelection(selection) && !selection.isInBounds()) {
+      // Just clear the selection rather than trying to trim it.
+      const empty = createEmptySelection(this.getModel);
+      this.setState({
+        selection: empty,
+        lastSelection: empty,
+      });
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Clears all selected ranges
+   */
+  clearSelectedRanges(): void {
+    this.setState(state => ({
+      selection: state.selection.clear(),
+      lastSelection: state.selection,
+    }));
+  }
+
+  /** Clears all but the last selected range */
+  trimSelectedRanges(): void {
+    const { selection } = this.state;
+    const trimmed = selection.trimmed();
+    this.setState({
+      selection: trimmed,
+    });
+  }
+
+  /** Sets the selection directly, bypassing mouse/keyboard gesture state. */
+  setSelection(selection: Selection): void {
+    // Sync lastSelection so the next gesture compares against the just-installed
+    // committed state; otherwise a pending → resolved swap would leave the next
+    // ctrl+click's toggle referencing the pending selection's empty keys.
+    this.setState({
+      selection,
+      lastSelection: selection,
+    });
+  }
+
+  /** Gets the current selection */
+  getSelection(): Selection {
+    const { selection } = this.state;
+    return selection;
+  }
+
+  /**
+   * Queries the current grid model.
+   * @returns The current GridModel instance.
+   */
+  getModel(): GridModel {
+    const { model } = this.props;
+    return model;
+  }
+
+  /**
+   * Extend + commit a gesture at `cursor` and return the resulting partial
+   * state. Shared by mouse click-and-release and keyboard commits.
+   *
+   * @param selection Pre-gesture selection to fold against. Cursor landing
+   * reads its extended (pre-commit) form so `KeyedSelection`'s overlay is
+   * still available.
+   * @param cursor Gesture target cell.
+   * @param mode Modifier-derived gesture mode.
+   * @param opts.moveCursor Snap the cursor to `cursor` (default true).
+   * Pass false for keyboard extend / maximize / add so the cursor stays put.
+   * @param opts.allowDeselect Whether committing on top of the same
+   * single-row / single-cell selection should deselect (mouse affordance,
+   * default true). Keyboard callers pass false so arrowing onto an
+   * already-selected cell just moves the cursor.
+   * @param opts.settle Whether the commit should finalize (deselect check,
+   * hole-punch, consolidation). Mouse-down passes false so a drag can grow
+   * the last range before mouse-up finalizes.
+   */
+  private applyGestureAt(
+    selection: Selection,
+    cursor: { row: GridRangeIndex; column: GridRangeIndex },
+    mode: GestureMode,
+    opts: {
+      moveCursor?: boolean;
+      allowDeselect?: boolean;
+      settle?: boolean;
+    } = {}
+  ): GridSelectionState {
+    const { theme } = this.props;
+    const { moveCursor = true, allowDeselect = true, settle = true } = opts;
+    const lastSelection = selection;
+    const extendOpts: GestureExtendOptions = {
+      mode,
+      autoSelectRow: theme.autoSelectRow ?? false,
+      autoSelectColumn: theme.autoSelectColumn ?? false,
+    };
+    const extended = selection.withGestureExtend(cursor, extendOpts);
+    // `replace` snaps the cursor to the gesture; extend/maximize/add keep it put.
+    const cursorTarget = moveCursor
+      ? cursor
+      : { row: selection.cursorRow, column: selection.cursorColumn };
+    const settled = extended
+      .commitGesture(lastSelection, {
+        autoSelectRow: extendOpts.autoSelectRow,
+        cursor: cursorTarget,
+        allowDeselect,
+        settle,
+      })
+      .withSelectionEnd(cursor.row, cursor.column);
+
+    return {
+      selection: settled,
+      lastSelection,
+    };
+  }
+
+  /**
+   * Start a mouse-driven selection gesture at `cursor` with the given
+   * modifier-derived `mode`. Extends the selection per `mode` semantics
+   * and commits immediately so a click without drag settles the state.
+   */
+  handleMouseSelectStart(
+    cursor: { row: GridRangeIndex; column: GridRangeIndex },
+    mode: GestureMode
+  ): void {
+    this.setState(state => ({
+      // Defer settle to mouse-up so a drag can grow the last range before
+      // deselect / hole-punch / consolidation runs.
+      ...this.applyGestureAt(state.selection, cursor, mode, { settle: false }),
+      gestureMode: mode,
+    }));
+  }
+
+  /**
+   * Extend the current mouse selection gesture to `cursor`. Transient
+   * overlay only; the settled commit runs on `handleMouseSelectEnd`.
+   */
+  handleMouseSelectDrag(cursor: {
+    row: GridRangeIndex;
+    column: GridRangeIndex;
+  }): void {
+    const { theme } = this.props;
+    this.setState(state => {
+      // Additive gestures (ctrl+click, ctrl+shift+click) grow the last range
+      // via `maximize` so the prior committed selection survives the drag.
+      // Replace and shift-extend continue as `extend`, trimming to the last
+      // range.
+      const isAdditive =
+        state.gestureMode === 'add' || state.gestureMode === 'maximize';
+      const opts: GestureExtendOptions = {
+        mode: isAdditive ? 'maximize' : 'extend',
+        autoSelectRow: theme.autoSelectRow ?? false,
+        autoSelectColumn: theme.autoSelectColumn ?? false,
+      };
+      const extended = state.selection
+        .withGestureExtend(cursor, opts)
+        .withSelectionEnd(cursor.row, cursor.column);
+      return {
+        selection: extended,
+      };
+    });
+    this.moveViewToCell(cursor.column, cursor.row);
+  }
+
+  /** Settle the current mouse selection gesture. Called on mouse-up. */
+  handleMouseSelectEnd(): void {
+    const { theme } = this.props;
+    this.setState(state => {
+      const { selection, lastSelection } = state;
+      const settled = selection.commitGesture(lastSelection, {
+        autoSelectRow: theme.autoSelectRow ?? false,
+        // Mouse-up commit preserves the current cursor position.
+        cursor: {
+          row: selection.cursorRow,
+          column: selection.cursorColumn,
+        },
+      });
+      if (settled === selection) return null;
+      return {
+        selection: settled,
+        lastSelection: settled,
+      };
+    });
+    // Always clear the in-flight gesture mode on mouse-up. Kept as a
+    // separate setState so the settled-update above stays in a single Pick
+    // shape that React's typing narrows cleanly.
+    this.setState(({ gestureMode }) =>
+      gestureMode == null ? null : { gestureMode: null }
+    );
+  }
+
+  /**
+   * Apply a keyboard-driven selection gesture at `cursor` with `mode`, then
+   * optionally scroll the viewport to bring the cursor into view. Shared
+   * entry point for arrow keys, Home/End, and page-key movements.
+   *
+   * Only `replace` moves the cursor to `cursor`; extend/maximize/add
+   * preserve the existing cursor and update `selectionEnd` only. This
+   * matches long-standing Shift+Arrow semantics where the cursor stays put
+   * as the selection grows.
+   */
+  handleKeySelectAt(
+    cursor: { row: GridRangeIndex; column: GridRangeIndex },
+    mode: GestureMode,
+    opts: { keepCursorInView?: boolean } = {}
+  ): void {
+    const { keepCursorInView = true } = opts;
+    const moveCursor = mode === 'replace';
+    this.setState(state =>
+      this.applyGestureAt(state.selection, cursor, mode, {
+        moveCursor,
+        allowDeselect: false,
+      })
+    );
+    if (keepCursorInView && cursor.column != null && cursor.row != null) {
+      this.moveViewToCell(cursor.column, cursor.row);
+    }
+  }
+
+  /**
+   * Advance the cursor in `direction` through the current selection. Used
+   * by Tab/Enter — cycles within the selected ranges when there are
+   * multiple, wraps at grid edges when there is only a single cell.
+   * When the resulting cursor falls outside the current selection (e.g.
+   * from an initial empty state), installs a fresh single-cell selection.
+   */
+  handleKeyAdvanceCursor(direction: SELECTION_DIRECTION): void {
+    const { selection } = this.state;
+    const next = selection.getNextCursorInDirection(
+      { column: selection.cursorColumn, row: selection.cursorRow },
+      direction
+    );
+    if (next == null) return;
+
+    const { column, row } = next;
+    if (column == null || row == null) return;
+    if (selection.isCellSelected(column, row)) {
+      this.setState(state => ({
+        selection: state.selection.withCursor(row, column),
+      }));
+    } else {
+      this.setState(state =>
+        this.applyGestureAt(state.selection, { column, row }, 'replace', {
+          allowDeselect: false,
+        })
+      );
+    }
+
+    this.moveViewToCell(column, row);
+  }
+
+  /**
+   * Page-move gesture. `direction` is +1 (page-down) or -1 (page-up). Reads
+   * viewport metrics to compute the target cell, applies the gesture without
+   * auto-scrolling, then pins the viewport top so the cursor lands where it
+   * was on screen before.
+   */
+  private handleKeyPage(mode: GestureMode, direction: 1 | -1): void {
+    const { selection } = this.state;
+    const { cursorColumn, selectionEndRow } = selection;
+    if (selectionEndRow == null) return;
+    const row = selectionEndRow;
+
+    const metricState = this.getMetricState();
+    const { bottomVisible, topVisible, hasHorizontalBar, rowCount, lastTop } =
+      this.metricCalculator.getMetrics(metricState);
+    const pageSize = bottomVisible - topVisible + (hasHorizontalBar ? 0 : 1);
+
+    const target = clamp(row + direction * pageSize, 0, rowCount - 1);
+    const viewportPosition = clamp(target - (row - topVisible), 0, lastTop);
+
+    this.handleKeySelectAt({ column: cursorColumn, row: target }, mode, {
+      keepCursorInView: false,
+    });
+    this.setViewState({ top: viewportPosition });
+  }
+
+  handleKeyPageUp(mode: GestureMode): void {
+    this.handleKeyPage(mode, -1);
+  }
+
+  handleKeyPageDown(mode: GestureMode): void {
+    this.handleKeyPage(mode, 1);
+  }
+
+  /**
+   * Move the cursor to a cell without touching the selection.
+   */
+  handleKeyMoveCursor(column: VisibleIndex, row: VisibleIndex): void {
+    this.setState(state => ({
+      selection: state.selection
+        .withCursor(row, column)
+        .withSelectionEnd(row, column),
+    }));
+    this.moveViewToCell(column, row);
+  }
+
+  setFocusRow(focusedRow: number): void {
+    if (!this.metrics || !this.prevMetrics) {
+      return;
+    }
+
+    const { gridY, height, lastTop, userRowHeights, rowHeight } = this.metrics;
+
+    const tableHeight = height - gridY;
+
+    const halfViewportHeight =
+      Math.round(tableHeight / 2) +
+      (userRowHeights.get(focusedRow) ?? rowHeight);
+
+    const metricState = this.getMetricState();
+    const newTop = this.metricCalculator.getLastTop(
+      metricState,
+      focusedRow + 1,
+      halfViewportHeight
+    );
+    this.setState(state => {
+      const { cursorColumn } = state.selection;
+      const newSel = state.selection
+        .withCommittedRanges([
+          new GridRange(null, focusedRow, null, focusedRow),
+        ])
+        .withCursor(focusedRow, cursorColumn)
+        .withSelectionEnd(focusedRow, cursorColumn);
+      return {
+        top: Math.min(lastTop, newTop),
+        selection: newSel,
+        lastSelection: newSel,
+        isStuckToBottom: false,
+      };
+    });
+  }
+
+  /**
+   * Set the selection to the entire grid
+   */
+  selectAll(): void {
+    this.setState(state => {
+      const newSelection = state.selection.selectAll();
+      return {
+        selection: newSelection,
+        lastSelection: newSelection,
+      };
+    });
+  }
+
+  /**
+   * Moves the view to make the specified cell visible
+   *
+   * @param column The column index to bring into view
+   * @param row The row index to bring into view
+   */
+  moveViewToCell(column: GridRangeIndex, row: GridRangeIndex): void {
+    if (!this.metrics) throw new Error('metrics not set');
+
+    const { metricCalculator } = this;
+    const { bottomVisible, rightVisible, topVisible, leftVisible } =
+      this.metrics;
+    const metricState = this.getMetricState(this.state);
+    let { top, left, topOffset, leftOffset } = this.state;
+
+    if (row != null && !GridUtils.isFloatingRow(row, this.metrics)) {
+      if (row < topVisible) {
+        top = metricCalculator.getTopForTopVisible(metricState, row);
+        topOffset = 0;
+      } else if (row > bottomVisible) {
+        top = metricCalculator.getTopForBottomVisible(metricState, row);
+        topOffset = 0;
+      }
+    }
+
+    if (column != null && !GridUtils.isFloatingColumn(column, this.metrics)) {
+      if (column < leftVisible) {
+        left = metricCalculator.getLeftForLeftVisible(metricState, column);
+        leftOffset = 0;
+      } else if (column > rightVisible) {
+        left = metricCalculator.getLeftForRightVisible(metricState, column);
+        leftOffset = 0;
+      }
+    }
+
+    this.setViewState({ top, left, topOffset, leftOffset });
+  }
+
+  /**
+   * Checks the `top` and `left` properties that are set and updates the isStuckToBottom/Right properties
+   * Should be called when user interaction occurs
+   * @param viewState New state properties to set.
+   * @param forceUpdate Whether to force an update.
+   */
+  setViewState(viewState: Partial<GridState>, forceUpdate = false): void {
+    if (!this.metrics) throw new Error('metrics not set');
+
+    const { isStickyBottom, isStickyRight } = this.props;
+    const { top, left } = viewState;
+    const { lastTop, lastLeft, hasVerticalBar, hasHorizontalBar } =
+      this.metrics;
+    if (top != null && hasVerticalBar) {
+      this.setState({ isStuckToBottom: isStickyBottom && top >= lastTop });
+    }
+    if (left != null && hasHorizontalBar) {
+      this.setState({ isStuckToRight: isStickyRight && left >= lastLeft });
+    }
+
+    this.setState(viewState as GridState);
+    if (forceUpdate) {
+      this.forceUpdate();
+    }
+  }
+
+  /**
+   * Check if a given cell is within the current selection
+   * @param row Row to check
+   * @param column Column to check
+   * @returns True if the cell is in the current selection, false otherwise
+   */
+  isSelected(row: VisibleIndex, column: VisibleIndex): boolean {
+    const { selection } = this.state;
+    return selection.isCellSelected(column, row);
+  }
+
+  addDocumentCursor(cursor: string | null = null): void {
+    if (this.documentCursor === Grid.getCursorClassName(cursor)) return;
+    if (this.documentCursor != null) {
+      document.documentElement.classList.remove(this.documentCursor);
+    }
+    this.documentCursor = Grid.getCursorClassName(cursor);
+    if (this.documentCursor != null) {
+      document.documentElement.classList.add(this.documentCursor);
+    }
+    document.documentElement.classList.add('grid-block-events');
+    this.hasAddedBlockEvents = true;
+  }
+
+  removeDocumentCursor(): void {
+    if (this.documentCursor != null) {
+      document.documentElement.classList.remove(this.documentCursor);
+      this.documentCursor = null;
+    }
+    // Only remove grid-block-events if this Grid instance added it
+    // This prevents one Grid from removing the class on unmount while another Grid is still dragging
+    if (this.hasAddedBlockEvents) {
+      document.documentElement.classList.remove('grid-block-events');
+      this.hasAddedBlockEvents = false;
+    }
+  }
+
+  startDragTimer(event: React.MouseEvent): void {
+    this.stopDragTimer();
+
+    const mouseEvent = new MouseEvent('custom', event.nativeEvent);
+
+    this.dragTimer = setTimeout(() => {
+      this.handleMouseDrag(mouseEvent);
+    }, Grid.dragTimeout);
+  }
+
+  stopDragTimer(): void {
+    if (this.dragTimer) {
+      clearTimeout(this.dragTimer);
+      this.dragTimer = null;
+    }
+  }
+
+  /**
+   * Draw the grid with the metrics provided
+   * When scrolling you've have to re-draw the whole canvas. As a consequence, all these drawing methods
+   * must be very quick.
+   */
+  private drawCanvas(): void {
+    if (!this.canvas) throw new Error('canvas is not set');
+    if (!this.canvasContext) throw new Error('context not set');
+
+    const { renderer, canvasContext: context, renderState } = this;
+    assertNotNull(renderState);
+
+    context.save();
+
+    renderer.drawCanvas(renderState);
+
+    context.restore();
+  }
+
+  /**
+   * Set focus to this grid element
+   */
+  focus(): void {
+    this.canvas?.focus();
+  }
+
+  /**
+   * Check if this grid is currently focused
+   * @returns True if the active element is this grid
+   */
+  isFocused(): boolean {
+    return document.activeElement === this.canvas;
+  }
+
+  /**
+   * Handle a mouse click event. Pass the event to the registered mouse handlers until one handles it.
+   * Focuses the grid after the click.
+   * @param event The mouse event
+   */
+  handleClick(event: React.MouseEvent): void {
+    const gridPoint = this.getGridPointFromEvent(event);
+
+    const mouseHandlers = this.getMouseHandlers();
+    for (let i = 0; i < mouseHandlers.length; i += 1) {
+      const mouseHandler = mouseHandlers[i];
+      if (mouseHandler.onClick(gridPoint, this, event) !== false) {
+        event.stopPropagation();
+        event.preventDefault();
+        break;
+      }
+    }
+
+    this.canvas?.focus();
+  }
+
+  /**
+   * Handle a mouse context menu event. Pass the event to the registered mouse handlers until one handles it.
+   * @param event The mouse event triggering the context menu
+   */
+  handleContextMenu(event: React.MouseEvent): void {
+    const gridPoint = this.getGridPointFromEvent(event);
+
+    const mouseHandlers = this.getMouseHandlers();
+    for (let i = 0; i < mouseHandlers.length; i += 1) {
+      const mouseHandler = mouseHandlers[i];
+      if (mouseHandler.onContextMenu(gridPoint, this, event) !== false) {
+        event.stopPropagation();
+        event.preventDefault();
+        break;
+      }
+    }
+  }
+
+  /**
+   * Notify all of the keyboard handlers for this grid of a keyboard event.
+   * @param functionName The name of the function in the keyboard handler to call
+   * @param event The keyboard event to notify
+   */
+  notifyKeyboardHandlers(
+    functionName: GridKeyHandlerFunctionName,
+    event: GridKeyboardEvent
+  ): void {
+    const keyHandlers = this.getKeyHandlers();
+    let cursor = null;
+    for (let i = 0; i < keyHandlers.length; i += 1) {
+      const keyHandler = keyHandlers[i];
+      const result =
+        keyHandler[functionName] != null &&
+        keyHandler[functionName](event, this);
+      if (result !== false) {
+        if (keyHandler.cursor != null) {
+          ({ cursor } = keyHandler);
+        }
+        const options = result as EventHandlerResultOptions;
+        if (options?.stopPropagation ?? true) event.stopPropagation();
+        if (options?.preventDefault ?? true) event.preventDefault();
+        break;
+      }
+    }
+    this.setState({ cursor });
+  }
+
+  handleKeyDown(event: GridKeyboardEvent): void {
+    this.notifyKeyboardHandlers('onDown', event);
+  }
+
+  handleKeyUp(event: GridKeyboardEvent): void {
+    this.notifyKeyboardHandlers('onUp', event);
+  }
+
+  /**
+   * Notify all of the mouse handlers for this grid of a mouse event.
+   * @param functionName The name of the function in the mouse handler to call
+   * @param event The mouse event to notify
+   * @param updateCoordinates Whether to update the mouse coordinates
+   * @param addCursorToDocument Whether to add a cursor overlay or not (for dragging)
+   */
+  notifyMouseHandlers(
+    functionName: GridMouseHandlerFunctionName,
+    event: GridMouseEvent,
+    updateCoordinates = true,
+    addCursorToDocument = false
+  ): void {
+    const gridPoint = this.getGridPointFromEvent(event);
+    const mouseHandlers = this.getMouseHandlers();
+    let cursor = null;
+    for (let i = 0; i < mouseHandlers.length; i += 1) {
+      const mouseHandler = mouseHandlers[i];
+      const result =
+        mouseHandler[functionName] != null &&
+        mouseHandler[functionName](gridPoint, this, event);
+      if (result !== false) {
+        if (mouseHandler.cursor != null) {
+          ({ cursor } = mouseHandler);
+          if (addCursorToDocument) {
+            this.addDocumentCursor(cursor);
+          }
+        }
+
+        // result is bool or object, events are stopped by default
+        const options = result as EventHandlerResultOptions;
+        if (options?.stopPropagation ?? true) event.stopPropagation();
+        if (options?.preventDefault ?? true) event.preventDefault();
+        break;
+      }
+    }
+
+    this.setState({ cursor });
+
+    if (updateCoordinates) {
+      const { x, y } = gridPoint;
+      this.setState({ mouseX: x, mouseY: y });
+    }
+  }
+
+  handleMouseDown(event: React.MouseEvent): void {
+    window.addEventListener('mousemove', this.handleMouseDrag, true);
+    window.addEventListener('mouseup', this.handleMouseUp, true);
+
+    if (event.button != null && event.button !== 0) {
+      return;
+    }
+
+    this.notifyMouseHandlers('onDown', event);
+
+    this.startDragTimer(event);
+  }
+
+  handleDoubleClick(event: React.MouseEvent): void {
+    this.notifyMouseHandlers('onDoubleClick', event);
+  }
+
+  handleMouseMove(event: React.MouseEvent): void {
+    this.notifyMouseHandlers('onMove', event);
+  }
+
+  handleMouseLeave(event: React.MouseEvent): void {
+    this.notifyMouseHandlers('onLeave', event, false);
+    this.setState({ mouseX: null, mouseY: null });
+  }
+
+  handleMouseDrag(event: MouseEvent): void {
+    this.setState({ isDragging: true });
+    this.notifyMouseHandlers('onDrag', event, true, true);
+
+    this.stopDragTimer();
+  }
+
+  handleMouseUp(event: MouseEvent): void {
+    // Ignore non-left click while dragging to allow drag to continue
+    const { isDragging } = this.state;
+    if (isDragging && event.button !== 0) {
+      return;
+    }
+
+    window.removeEventListener('mousemove', this.handleMouseDrag, true);
+    window.removeEventListener('mouseup', this.handleMouseUp, true);
+
+    this.stopDragTimer();
+    this.removeDocumentCursor();
+
+    if (event.button != null && event.button !== 0) {
+      return;
+    }
+
+    this.notifyMouseHandlers('onUp', event, false);
+
+    // isDragging is set on any drag in handleMouseDrag, so it must be reset
+    // here for drags that aren't owned by a handler that resets it (e.g. a
+    // selection drag). Otherwise it stays stuck true and suppresses the
+    // column separator hover highlight.
+    if (isDragging) {
+      this.setState({ isDragging: false });
+    }
+  }
+
+  handleResize(): void {
+    /**
+     * We need to always redraw the canvas in the same frame as the updateCanvasScale
+     * because it clears the canvas by nature of direct dom manipulation. However,
+     * We also need to verify the state/metrics, which we currently have no way
+     * of doing outside of a full componentDidUpdate() call, so we force the update.
+     * Ideally, we could verify state/metrics without the forced update.
+     */
+    this.updateCanvas();
+
+    if (!this.metrics) throw new Error('metrics not set');
+
+    this.forceUpdate();
+  }
+
+  forceUpdate(callback?: (() => void) | undefined): void {
+    this.setState(({ updateRevision = 0 }) => ({
+      updateRevision: (updateRevision + 1) % Number.MAX_SAFE_INTEGER,
+    }));
+    super.forceUpdate(callback);
+  }
+
+  handleWheel(event: WheelEvent): void {
+    this.notifyMouseHandlers('onWheel', event);
+
+    if (event.defaultPrevented) {
+      return;
+    }
+
+    const { metricCalculator, metrics } = this;
+    const metricState = this.getMetricState();
+
+    if (!metrics) throw new Error('metrics not set');
+
+    const {
+      lastTop,
+      lastLeft,
+      columnCount,
+      rowCount,
+      scrollableContentWidth,
+      scrollableViewportWidth,
+      scrollableContentHeight,
+      scrollableViewportHeight,
+      hasHorizontalBar,
+      hasVerticalBar,
+    } = metrics;
+    let { top, left, topOffset, leftOffset } = metrics;
+
+    const theme = this.getTheme();
+
+    let { deltaX, deltaY } = GridUtils.getScrollDelta(
+      event,
+      metrics.barWidth,
+      metrics.barHeight,
+      metrics.rowHeight,
+      metrics.rowHeight
+    );
+
+    // iterate through each column to determine column width and figure out how far to scroll
+    // get column width of next column to scroll to, and subract it from the remaining distance to travel
+    while (hasHorizontalBar && deltaX !== 0) {
+      leftOffset += deltaX;
+      deltaX = 0;
+
+      if (columnCount > 1) {
+        // no scrolling needed, at directional edge
+        if (
+          (leftOffset > 0 && left >= lastLeft) ||
+          (leftOffset < 0 && left <= 0)
+        ) {
+          leftOffset = 0;
+          break;
+        }
+      } else {
+        // single column at edge
+        if (leftOffset <= 0) {
+          leftOffset = 0;
+          break;
+        }
+
+        const maxLeftOffset = scrollableContentWidth - scrollableViewportWidth;
+        if (leftOffset >= maxLeftOffset) {
+          leftOffset = maxLeftOffset;
+          break;
+        }
+      }
+
+      if (leftOffset > 0) {
+        // scroll right
+
+        // get width of next column
+        const columnWidth =
+          metrics.allColumnWidths.get(left) ??
+          metricCalculator.getVisibleColumnWidth(left, metricState);
+
+        if (leftOffset >= columnWidth) {
+          // remove width from balance and advance by 1 column
+          deltaX = leftOffset - columnWidth;
+          leftOffset = 0;
+          left += 1;
+        } else if (theme.scrollSnapToColumn && columnCount > 1) {
+          // if there's still a balance to travel but its less then a column and snapping is on
+          leftOffset = 0;
+          left += 1;
+        }
+      } else if (leftOffset < 0) {
+        // scroll left
+
+        // get width of next column
+        const columnWidth =
+          metrics.allColumnWidths.get(left - 1) ??
+          metricCalculator.getVisibleColumnWidth(left - 1, metricState);
+
+        if (
+          Math.abs(leftOffset) <= columnWidth &&
+          theme.scrollSnapToColumn &&
+          columnCount > 1
+        ) {
+          // if there's still a balance to travel but its less then a column and snapping is on
+          leftOffset = 0;
+          left -= 1;
+        } else {
+          // remove width from balance and advance by 1 column
+          deltaX = leftOffset + columnWidth;
+          leftOffset = 0;
+          left -= 1;
+        }
+      }
+    }
+
+    // iterate through each row to determine row height and figure out how far to scroll
+    // get row height of next row to scroll to, and subract it from the remaining distance to travel
+    while (hasVerticalBar && deltaY !== 0) {
+      topOffset += deltaY;
+      deltaY = 0;
+
+      if (rowCount > 1) {
+        // no scrolling needed, at directional edge
+        if ((topOffset > 0 && top >= lastTop) || (topOffset < 0 && top <= 0)) {
+          topOffset = 0;
+          break;
+        }
+      } else {
+        // single row at edge
+        if (topOffset <= 0) {
+          topOffset = 0;
+          break;
+        }
+
+        const maxTopOffset = scrollableContentHeight - scrollableViewportHeight;
+        if (topOffset >= maxTopOffset) {
+          topOffset = maxTopOffset;
+          break;
+        }
+      }
+
+      if (topOffset > 0) {
+        // scroll direction down
+
+        // get height of next row
+        const rowHeight =
+          metrics.allRowHeights.get(top) ??
+          metricCalculator.getVisibleRowHeight(top, metricState);
+
+        if (topOffset >= rowHeight) {
+          // remove height from balance and advance by 1 row
+          deltaY = topOffset - rowHeight;
+          topOffset = 0;
+          top += 1;
+        } else if (theme.scrollSnapToRow && rowCount > 1) {
+          // if there's still a balance to travel but its less then a row and snapping is on
+          topOffset = 0;
+          top += 1;
+        }
+      } else if (topOffset < 0) {
+        // scroll direction up
+
+        // get height of next row
+        const rowHeight =
+          metrics.allRowHeights.get(top - 1) ??
+          metricCalculator.getVisibleRowHeight(top - 1, metricState);
+
+        if (
+          Math.abs(topOffset) <= rowHeight &&
+          theme.scrollSnapToRow &&
+          rowCount > 1
+        ) {
+          // if there's still a balance to travel but its less then a row and snapping is on
+          topOffset = 0;
+          top -= 1;
+        } else {
+          // remove height from balance and advance by 1 row
+          deltaY = topOffset + rowHeight;
+          topOffset = 0;
+          top -= 1;
+        }
+      }
+    }
+
+    if (
+      metrics.top !== top ||
+      metrics.left !== left ||
+      metrics.topOffset !== topOffset ||
+      metrics.leftOffset !== leftOffset
+    ) {
+      this.setViewState({ top, left, topOffset, leftOffset });
+      event.stopPropagation();
+      event.preventDefault();
+    }
+  }
+
+  /**
+   * Gets the render state
+   * @returns The render state
+   */
+  updateRenderState(): GridRenderState {
+    if (!this.canvas) throw new Error('canvas is not set');
+    if (!this.canvasContext) throw new Error('context not set');
+
+    const {
+      draggingColumnSeparator,
+      gestureMode,
+      isDraggingHorizontalScrollBar,
+      isDraggingVerticalScrollBar,
+      isDragging,
+      mouseX,
+      mouseY,
+      selection,
+    } = this.state;
+    const { model, stateOverride } = this.props;
+    const { metrics } = this;
+    const context = this.canvasContext;
+    const theme = this.getTheme();
+    const width = this.canvas.clientWidth;
+    const height = this.canvas.clientHeight;
+
+    assertNotNull(metrics);
+
+    this.renderState = {
+      width,
+      height,
+      context,
+      theme,
+      model,
+      metrics,
+      mouseX,
+      mouseY,
+      selection,
+      draggingColumnSeparator,
+      isDraggingHorizontalScrollBar,
+      isDraggingVerticalScrollBar,
+      isDragging,
+      gestureMode,
+      ...stateOverride,
+    };
+
+    return this.renderState;
+  }
+
+  render(): ReactNode {
+    const { children } = this.props;
+    const { cursor } = this.state;
+
+    return (
+      <div className="grid-wrapper" ref={this.canvasWrapper}>
+        <canvas
+          className={classNames('grid-canvas', Grid.getCursorClassName(cursor))}
+          ref={canvas => {
+            this.canvas = canvas;
+          }}
+          onClick={this.handleClick}
+          onContextMenu={this.handleContextMenu}
+          onDoubleClick={this.handleDoubleClick}
+          onKeyDown={this.handleKeyDown}
+          onKeyUp={this.handleKeyUp}
+          onMouseDown={this.handleMouseDown}
+          onMouseMove={this.handleMouseMove}
+          onMouseLeave={this.handleMouseLeave}
+          tabIndex={0}
+        />
+        {children}
+      </div>
+    );
+  }
+}
+
+export default Grid;

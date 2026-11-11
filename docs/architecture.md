@@ -932,8 +932,12 @@ proven parts.
   the web UI, the same frames over WebSocket, later Barrage-style deltas over Flight (§9.6).
 - Hosts: Jupyter, JupyterLab, and VS Code through anywidget, installed with the
   `ursid[notebook]` extra (`anywidget`, `ipywidgets`, `jupyterlab-widgets`,
-  `widgetsnbextension`, `psygnal`; IPython and the kernel are already there), else tables show
-  the HTML preview; the web UI hosts the same component in React.
+  `widgetsnbextension`, `psygnal`; IPython and the kernel are already there). Without the extra,
+  or in kernels without IPython's widget comms (Tern's), tables keep the live HTML preview. The
+  web UI hosts the same component in React.
+- The bundle (`web/widget`, one ES module with React, the grid, and `apache-arrow`, 141 KB
+  gzipped) is built by `bun run build` into `python/ursid/static/`, which the wheel ships; it
+  is not checked in.
 - From day one: virtual scrolling over rows and columns; column resize and reorder; sort by
   clicking a header (shift-click adds a key); per-column quick filters; row and range
   selection; copy rows (Cmd/Ctrl-C, as tab-separated text) and copy one cell (Cmd/Ctrl-click);

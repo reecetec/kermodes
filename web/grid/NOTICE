@@ -1,0 +1,29 @@
+@ursid/grid
+Copyright Ursid contributors
+
+This package contains code adapted from @deephaven/grid and @deephaven/utils,
+part of the Deephaven web-client-ui project:
+
+  https://github.com/deephaven/web-client-ui
+  packages/grid and packages/utils at commit
+  0bab596c9c60a0613f1e6cfcd349203960fe85bb
+
+  Copyright (c) Deephaven Data Labs LLC
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+these files except in compliance with the License. You may obtain a copy of the
+License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed
+under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+Files adapted from Deephaven carry the header comment
+"Adapted from @deephaven/grid (Apache-2.0), web-client-ui 0bab596" and were
+modified: tree rows, data bars, links and token boxes, cell editing and paste,
+row and column moving, row resizing, the accessibility fallback, and the mock
+models were removed; @deephaven/utils, lodash.clamp, memoizee and color-convert
+were replaced with small local helpers; the theme was rewritten.

@@ -1,19 +1,23 @@
 """Tables in notebooks.
 
-Displaying a table shows its first rows as HTML. A ticking table's output is then re-rendered in
-place (Jupyter's `update_display_data`), at most ten times a second and only after a cycle that
-changed it. One background thread serves every live output in the process. This module imports
-IPython, so only notebooks load it, through `Table._ipython_display_`.
+Displaying a table shows the table viewer (`ursid._widget`, with the `ursid[notebook]` extra) or,
+without it, its first rows as HTML. A ticking table's view then follows it: the viewer gets
+fresh rows, the HTML is re-rendered in place (Jupyter's `update_display_data`), at most ten
+times a second and only after a cycle that changed the table. One background thread serves
+every live view in the process. This module imports IPython, so only notebooks load it,
+through `Table._ipython_display_`.
 
-Neither the live outputs nor IPython's output history keep a table alive: re-running a cell
+Neither the live views nor IPython's output history keep a table alive: re-running a cell
 that rebinds a name releases the table it held. Views hold tables weakly, and after each cell
 the history (`Out`, `_`, `__`, `___`, `_N`) keeps weak proxies to tables instead of the tables.
 """
 
+import importlib.util
 import re
 import threading
 import time
 import weakref
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,8 +35,8 @@ _HISTORY = re.compile(r"_{1,3}|_\d+")
 @dataclass
 class _View:
     table: weakref.ref[Table]
-    # IPython's DisplayHandle, or the equivalent from a frontend's own kernel (Tern has one).
-    handle: Any
+    # Shows the table's current rows: re-renders the HTML, or pushes rows to the viewer.
+    update: Callable[[Table], None]
     seen: int
 
 
@@ -47,18 +51,44 @@ def _bundle(table: Table) -> dict[str, str]:
     return {"text/html": table._preview_html(ROWS), "text/plain": repr(table)}
 
 
+def _viewer() -> "type | None":
+    """The table viewer's class where it can run: the `ursid[notebook]` extra and its bundle are
+    installed, and the kernel is IPython's, whose comms widgets talk over. Other kernels (Tern's
+    own) get the HTML view."""
+    shell = get_ipython()
+    if (
+        getattr(shell, "kernel", None) is None
+        or importlib.util.find_spec("anywidget") is None
+    ):
+        return None
+    from ursid._widget import Viewer
+
+    return Viewer
+
+
 def show(table: Table) -> None:
     shell = get_ipython()
     if shell is not None and shell not in _watched:
         shell.events.register("post_run_cell", _unpin_history)
         _watched.add(shell)
     seen = table._changed
-    handle = display(_bundle(table), raw=True, display_id=True)
-    if not table.is_refreshing or handle is None:
+    if (viewer_class := _viewer()) is not None:
+        viewer = viewer_class(table)
+        display(viewer)
+        update: Callable[[Table], None] = viewer.push
+    else:
+        handle = display(_bundle(table), raw=True, display_id=True)
+        if handle is None:
+            return
+
+        def update(table: Table) -> None:
+            handle.update(_bundle(table), raw=True)
+
+    if not table.is_refreshing:
         return
     global _refresher
     with _lock:
-        _views.append(_View(weakref.ref(table), handle, seen))
+        _views.append(_View(weakref.ref(table), update, seen))
         if _refresher is None:
             _refresher = threading.Thread(
                 target=_refresh, name="ursid-live", daemon=True
@@ -70,7 +100,7 @@ def _refresh() -> None:
     while True:
         time.sleep(INTERVAL)
         with _lock:
-            # A released table's output stays as last rendered.
+            # A released table's view stays as last shown.
             _views[:] = [view for view in _views if view.table() is not None]
             views = list(_views)
         for view in views:
@@ -80,7 +110,7 @@ def _refresh() -> None:
             changed = table._changed
             if changed != view.seen:
                 view.seen = changed
-                view.handle.update(_bundle(table), raw=True)
+                view.update(table)
             del table
 
 

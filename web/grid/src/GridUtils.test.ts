@@ -1,0 +1,1631 @@
+// Adapted from @deephaven/grid (Apache-2.0), web-client-ui 0bab596
+import { describe, expect, it, jest } from 'bun:test';
+import { type AxisRange, type BoundedAxisRange } from './GridAxisRange';
+import { type ModelIndex, type MoveOperation } from './GridMetrics';
+import type GridMetrics from './GridMetrics';
+import type GridModel from './GridModel';
+import GridRange, { type GridRangeIndex } from './GridRange';
+import GridTheme from './GridTheme';
+import GridUtils from './GridUtils';
+
+/** A GridModel stub: the given members, every other member a no-op function */
+function mockModel(members: Record<string, unknown>): GridModel {
+  return new Proxy(members, {
+    get: (target, property) =>
+      property in target ? target[property as string] : () => undefined,
+  }) as unknown as GridModel;
+}
+
+function expectModelIndexes(
+  movedItems: MoveOperation[],
+  indexes: ModelIndex[]
+) {
+  for (let i = 0; i < indexes.length; i += 1) {
+    expect(GridUtils.getModelIndex(i, movedItems)).toBe(indexes[i]);
+  }
+}
+
+function expectVisibleIndexes(
+  movedItems: MoveOperation[],
+  indexes: ModelIndex[]
+) {
+  for (let i = 0; i < indexes.length; i += 1) {
+    expect(GridUtils.getVisibleIndex(i, movedItems)).toBe(indexes[i]);
+  }
+}
+describe('move items', () => {
+  it('returns the proper model/visible index when one column is moved', () => {
+    const movedItems = GridUtils.moveItem(2, 1, []);
+
+    expectModelIndexes(movedItems, [0, 2, 1, 3]);
+    expectVisibleIndexes(movedItems, [0, 2, 1, 3]);
+  });
+
+  it('returns the proper model/visible index when one column is moved', () => {
+    const movedItems = GridUtils.moveItem(5, 2, []);
+
+    expectModelIndexes(movedItems, [0, 1, 5, 2, 3, 4, 6, 7]);
+    expectVisibleIndexes(movedItems, [0, 1, 3, 4, 5, 2, 6, 7]);
+  });
+
+  it('returns the proper model/visible index when two columns are moved', () => {
+    let movedItems = GridUtils.moveItem(5, 2, []);
+    movedItems = GridUtils.moveItem(7, 0, movedItems);
+
+    expectModelIndexes(movedItems, [7, 0, 1, 5, 2, 3, 4, 6]);
+    expectVisibleIndexes(movedItems, [1, 2, 4, 5, 6, 3, 7, 0]);
+  });
+
+  it('handles moving the last column to the front repeatedly', () => {
+    const itemCount = 3;
+    let movedItems: MoveOperation[] = [];
+
+    for (let i = 0; i < itemCount; i += 1) {
+      movedItems = GridUtils.moveItem(itemCount - 1, 0, movedItems);
+
+      for (let j = 0; j < itemCount; j += 1) {
+        expect(GridUtils.getModelIndex(j, movedItems)).toBe(
+          (j - i - 1 + itemCount) % itemCount
+        );
+        expect(GridUtils.getVisibleIndex(j, movedItems)).toBe(
+          (j + i + 1) % itemCount
+        );
+      }
+    }
+  });
+
+  it('condenses moving 1 column multiple times in a row', () => {
+    let movedItems = GridUtils.moveItem(0, 5, []);
+    movedItems = GridUtils.moveItem(5, 10, movedItems);
+    movedItems = GridUtils.moveItem(10, 3, movedItems);
+
+    expect(movedItems.length).toBe(1);
+    expectModelIndexes(movedItems, [1, 2, 3, 0, 4, 5]);
+    expectVisibleIndexes(movedItems, [3, 0, 1, 2, 4, 5]);
+
+    // Move back to start should result in no moves
+    movedItems = GridUtils.moveItem(3, 0, movedItems);
+    expect(movedItems.length).toBe(0);
+  });
+
+  it('skips moving an item to its original position', () => {
+    const originalMoved: MoveOperation[] = [];
+    const movedItems = GridUtils.moveItem(2, 2, originalMoved);
+
+    expect(movedItems).toBe(originalMoved);
+    expectModelIndexes(movedItems, [0, 1, 2, 3]);
+    expectVisibleIndexes(movedItems, [0, 1, 2, 3]);
+  });
+});
+
+describe('move ranges', () => {
+  it('returns the proper model/visible index when one range is moved', () => {
+    let movedItems = GridUtils.moveRange([3, 5], 1, []);
+
+    expectModelIndexes(movedItems, [0, 3, 4, 5, 1, 2]);
+    expectVisibleIndexes(movedItems, [0, 4, 5, 1, 2, 3]);
+
+    movedItems = GridUtils.moveRange([3, 5], 1, [], true);
+
+    expectModelIndexes(movedItems, [0, 3, 4, 5, 1, 2]);
+    expectVisibleIndexes(movedItems, [0, 4, 5, 1, 2, 3]);
+
+    movedItems = GridUtils.moveRange([2, 4], 3, [], false);
+
+    expectModelIndexes(movedItems, [0, 1, 5, 2, 3, 4]);
+    expectVisibleIndexes(movedItems, [0, 1, 3, 4, 5, 2]);
+
+    // Pick up [2, 4] and drop on 5 is equivalent to above
+    movedItems = GridUtils.moveRange([2, 4], 5, [], true);
+
+    expectModelIndexes(movedItems, [0, 1, 5, 2, 3, 4]);
+    expectVisibleIndexes(movedItems, [0, 1, 3, 4, 5, 2]);
+  });
+
+  it('returns the proper model/visible index when two ranges are moved', () => {
+    let movedItems = GridUtils.moveRange([3, 5], 1, []);
+    movedItems = GridUtils.moveRange([2, 4], 5, movedItems);
+
+    expectModelIndexes(movedItems, [0, 3, 2, 6, 7, 4, 5, 1]);
+    expectVisibleIndexes(movedItems, [0, 7, 2, 1, 5, 6, 3, 4]);
+  });
+
+  it('condenses moving 1 range multiple times in a row', () => {
+    let movedItems = GridUtils.moveRange([0, 2], 5, []);
+    movedItems = GridUtils.moveRange([5, 7], 10, movedItems);
+    movedItems = GridUtils.moveRange([10, 12], 3, movedItems);
+
+    expect(movedItems.length).toBe(1);
+    expectModelIndexes(movedItems, [3, 4, 5, 0, 1, 2, 6]);
+    expectVisibleIndexes(movedItems, [3, 4, 5, 0, 1, 2, 6]);
+
+    // Move back to start should result in no moves
+    movedItems = GridUtils.moveRange([3, 5], 0, movedItems);
+    expect(movedItems.length).toBe(0);
+  });
+
+  it('skips moving an item to its original position', () => {
+    const originalMoved: MoveOperation[] = [];
+    const movedItems = GridUtils.moveRange([0, 2], 0, originalMoved);
+
+    expect(movedItems).toBe(originalMoved);
+    expectModelIndexes(movedItems, [0, 1, 2, 3]);
+    expectVisibleIndexes(movedItems, [0, 1, 2, 3]);
+  });
+
+  it('converts a move range of 1 item to a move item', () => {
+    const movedItems = GridUtils.moveRange([0, 0], 1, []);
+
+    expectModelIndexes(movedItems, [1, 0, 2, 3]);
+    expectVisibleIndexes(movedItems, [1, 0, 2, 3]);
+  });
+});
+
+describe('move item or range', () => {
+  it('returns the proper model/visible index when one item or range is moved', () => {
+    let movedItems = GridUtils.moveItemOrRange([3, 5], 1, []);
+
+    expectModelIndexes(movedItems, [0, 3, 4, 5, 1, 2]);
+    expectVisibleIndexes(movedItems, [0, 4, 5, 1, 2, 3]);
+
+    movedItems = GridUtils.moveItemOrRange([3, 5], 1, [], true);
+
+    expectModelIndexes(movedItems, [0, 3, 4, 5, 1, 2]);
+    expectVisibleIndexes(movedItems, [0, 4, 5, 1, 2, 3]);
+
+    movedItems = GridUtils.moveItemOrRange(0, 1, []);
+
+    expectModelIndexes(movedItems, [1, 0, 2, 3, 4, 5]);
+    expectVisibleIndexes(movedItems, [1, 0, 2, 3, 4, 5]);
+  });
+});
+
+describe('iterate floating tests', () => {
+  function testCallbackCalledWithRange(
+    callback: (a: unknown) => unknown,
+    low: number,
+    high: number,
+    callIndex = 0
+  ) {
+    for (let i = low; i <= high; i += 1) {
+      expect(callback).toHaveBeenNthCalledWith(callIndex + i - low + 1, i);
+    }
+  }
+
+  it('does not iterate if no floating items', () => {
+    const callback = jest.fn();
+    GridUtils.iterateFloating(0, 0, 100, callback);
+    expect(callback).not.toHaveBeenCalled();
+  });
+
+  it('iterates floating items correctly', () => {
+    const callback = jest.fn();
+    GridUtils.iterateFloating(3, 5, 10, callback);
+    expect(callback).toHaveBeenCalledTimes(8);
+    testCallbackCalledWithRange(callback, 0, 2);
+    testCallbackCalledWithRange(callback, 5, 9, 3);
+  });
+
+  it('iterates visible items correctly', () => {
+    const callback = jest.fn();
+    GridUtils.iterateAllItems(0, 5, 0, 0, 20, callback);
+    expect(callback).toHaveBeenCalledTimes(6);
+    testCallbackCalledWithRange(callback, 0, 5);
+    callback.mockClear();
+
+    GridUtils.iterateAllItems(5, 10, 0, 0, 20, callback);
+    expect(callback).toHaveBeenCalledTimes(6);
+    testCallbackCalledWithRange(callback, 5, 10);
+    callback.mockClear();
+  });
+
+  it('iterates visible and floating items correctly, floating first', () => {
+    const callback = jest.fn();
+    GridUtils.iterateAllItems(4, 7, 2, 3, 20, callback);
+    expect(callback).toHaveBeenCalledTimes(9);
+    testCallbackCalledWithRange(callback, 0, 1);
+    testCallbackCalledWithRange(callback, 17, 19, 2);
+    testCallbackCalledWithRange(callback, 4, 7, 5);
+  });
+
+  it('stops when a value is returned from the callback', () => {
+    const result = 'TEST';
+    const callback = jest.fn(x => (x === 28 ? result : undefined));
+    expect(GridUtils.iterateAllItems(8, 13, 3, 5, 30, callback)).toBe(result);
+    expect(callback).toHaveBeenCalledTimes(7);
+    testCallbackCalledWithRange(callback, 0, 2);
+    testCallbackCalledWithRange(callback, 25, 28, 3);
+  });
+});
+
+describe('floating item checks', () => {
+  function makeMetrics(
+    floatingTopRowCount = 0,
+    floatingBottomRowCount = 0,
+    rowCount = 10,
+    floatingLeftColumnCount = 0,
+    floatingRightColumnCount = 0,
+    columnCount = 10
+  ): GridMetrics {
+    // We just return a partial metrics object but force it to GridMetrics for the tests
+    return {
+      floatingTopRowCount,
+      floatingBottomRowCount,
+      rowCount,
+      floatingLeftColumnCount,
+      floatingRightColumnCount,
+      columnCount,
+    } as GridMetrics;
+  }
+
+  it('checks floating rows correctly', () => {
+    expect(GridUtils.isFloatingRow(3, makeMetrics())).toBe(false);
+    expect(GridUtils.isFloatingRow(3, makeMetrics(5))).toBe(true);
+    expect(GridUtils.isFloatingRow(3, makeMetrics(0, 5))).toBe(false);
+    expect(GridUtils.isFloatingRow(8, makeMetrics())).toBe(false);
+    expect(GridUtils.isFloatingRow(8, makeMetrics(5))).toBe(false);
+    expect(GridUtils.isFloatingRow(8, makeMetrics(0, 5))).toBe(true);
+    expect(GridUtils.isFloatingRow(8, makeMetrics(0, 0, 10, 5, 5, 20))).toBe(
+      false
+    );
+  });
+
+  it('checks floating rows correctly', () => {
+    expect(GridUtils.isFloatingColumn(3, makeMetrics())).toBe(false);
+    expect(GridUtils.isFloatingColumn(3, makeMetrics(0, 0, 10, 5))).toBe(true);
+    expect(GridUtils.isFloatingColumn(3, makeMetrics(0, 0, 10, 0, 5))).toBe(
+      false
+    );
+    expect(GridUtils.isFloatingColumn(8, makeMetrics())).toBe(false);
+    expect(GridUtils.isFloatingColumn(8, makeMetrics(0, 0, 10, 5))).toBe(false);
+    expect(GridUtils.isFloatingColumn(8, makeMetrics(0, 0, 10, 0, 5))).toBe(
+      true
+    );
+  });
+});
+
+describe('start/end range adjustment in one dimension visible to model', () => {
+  function testRange(
+    start: GridRangeIndex,
+    end: GridRangeIndex,
+    movedItems: MoveOperation[] = [],
+    expectedResult: AxisRange[] = [[start, end]]
+  ) {
+    expect(GridUtils.getModelRangeIndexes(start, end, movedItems)).toEqual(
+      expectedResult
+    );
+  }
+  it('handles no transforms', () => {
+    testRange(0, 0);
+    testRange(100, 100);
+  });
+  it('handles transforms outside of range', () => {
+    let movedItems = GridUtils.moveItem(2, 1, []);
+    movedItems = GridUtils.moveItem(100, 200, movedItems);
+    testRange(5, 10, movedItems);
+    testRange(10, 20, movedItems);
+  });
+  it('handles items moved into the range', () => {
+    testRange(5, 10, GridUtils.moveItem(1, 7, []), [
+      [6, 7],
+      [1, 1],
+      [8, 10],
+    ]);
+
+    testRange(5, 10, GridUtils.moveItem(100, 7, []), [
+      [5, 6],
+      [100, 100],
+      [7, 9],
+    ]);
+
+    testRange(5, 10, GridUtils.moveItem(1, 5, []), [
+      [1, 1],
+      [6, 10],
+    ]);
+
+    testRange(5, 10, GridUtils.moveItem(1, 10, []), [
+      [6, 10],
+      [1, 1],
+    ]);
+
+    testRange(5, 10, GridUtils.moveItem(100, 5, []), [
+      [100, 100],
+      [5, 9],
+    ]);
+
+    testRange(5, 10, GridUtils.moveItem(100, 10, []), [
+      [5, 9],
+      [100, 100],
+    ]);
+  });
+  it('handles items moved outside the range', () => {
+    testRange(5, 10, GridUtils.moveItem(7, 100, []), [
+      [5, 6],
+      [8, 11],
+    ]);
+  });
+  it('handles items moved from before to after range', () => {
+    const movedItems = GridUtils.moveItem(1, 100, []);
+    testRange(5, 10, movedItems, [[6, 11]]);
+  });
+  it('handles items moved from after to before range', () => {
+    testRange(5, 10, GridUtils.moveItem(100, 1, []), [[4, 9]]);
+  });
+  it('handles multiple operations', () => {
+    let movedItems = GridUtils.moveItem(1, 100, []);
+    testRange(5, 10, movedItems, [[6, 11]]);
+    movedItems = GridUtils.moveItem(7, 100, movedItems);
+    testRange(5, 10, movedItems, [
+      [6, 7],
+      [9, 12],
+    ]);
+    movedItems = GridUtils.moveItem(50, 9, movedItems);
+    testRange(5, 10, movedItems, [
+      [6, 7],
+      [9, 10],
+      [52, 52],
+      [11, 11],
+    ]);
+  });
+  it('handles moves within the range', () => {
+    testRange(5, 10, GridUtils.moveItem(9, 6, []), [
+      [5, 5],
+      [9, 9],
+      [6, 8],
+      [10, 10],
+    ]);
+
+    testRange(5, 10, GridUtils.moveItem(6, 9, []), [
+      [5, 5],
+      [7, 9],
+      [6, 6],
+      [10, 10],
+    ]);
+
+    testRange(5, 10, GridUtils.moveItem(9, 5, []), [
+      [9, 9],
+      [5, 8],
+      [10, 10],
+    ]);
+
+    testRange(5, 10, GridUtils.moveItem(6, 10, []), [
+      [5, 5],
+      [7, 10],
+      [6, 6],
+    ]);
+
+    testRange(5, 10, GridUtils.moveItem(5, 10, []), [
+      [6, 10],
+      [5, 5],
+    ]);
+
+    testRange(5, 10, GridUtils.moveItem(10, 5, []), [
+      [10, 10],
+      [5, 9],
+    ]);
+  });
+
+  it('handles transforms with infinite ranges', () => {
+    testRange(null, null, GridUtils.moveItem(1, 10, []), [
+      [null, 0],
+      [2, 10],
+      [1, 1],
+      [11, null],
+    ]);
+
+    testRange(null, null, GridUtils.moveItem(0, 10, []), [
+      // We don't normally think of using negative indexes, but this is valid
+      // We go from the start (null) to the element before index 0 since 0 is moved
+      [null, -1],
+      [1, 10],
+      [0, 0],
+      [11, null],
+    ]);
+
+    testRange(5, null, GridUtils.moveItem(1, 10, []), [
+      [6, 10],
+      [1, 1],
+      [11, null],
+    ]);
+
+    testRange(5, null, GridUtils.moveItem(10, 1, []), [
+      [4, 9],
+      [11, null],
+    ]);
+
+    testRange(null, 10, GridUtils.moveItem(1, 15, []), [
+      [null, 0],
+      [2, 11],
+    ]);
+
+    testRange(null, 10, GridUtils.moveItem(15, 1, []), [
+      [null, 0],
+      [15, 15],
+      [1, 9],
+    ]);
+  });
+});
+
+describe('start/end range adjustment in one dimension model to visible', () => {
+  function testRange(
+    start: GridRangeIndex,
+    end: GridRangeIndex,
+    movedItems: MoveOperation[] = [],
+    expectedResult: AxisRange[] = [[start, end]]
+  ) {
+    expect(GridUtils.getVisibleRangeIndexes(start, end, movedItems)).toEqual(
+      expectedResult
+    );
+  }
+  it('handles no transforms', () => {
+    testRange(0, 0);
+    testRange(100, 100);
+  });
+  it('handles transforms outside of range', () => {
+    let movedItems = GridUtils.moveItem(2, 1, []);
+    movedItems = GridUtils.moveItem(100, 200, movedItems);
+    testRange(5, 10, movedItems);
+    testRange(10, 20, movedItems);
+  });
+  it('handles items moved into the range', () => {
+    testRange(5, 10, GridUtils.moveItem(1, 7, []), [
+      [4, 6],
+      [8, 10],
+    ]);
+
+    testRange(5, 10, GridUtils.moveItem(100, 7, []), [
+      [5, 6],
+      [8, 11],
+    ]);
+
+    testRange(5, 10, GridUtils.moveItem(1, 5, []), [
+      [4, 4],
+      [6, 10],
+    ]);
+
+    testRange(5, 10, GridUtils.moveItem(1, 10, []), [[4, 9]]);
+
+    testRange(5, 10, GridUtils.moveItem(100, 5, []), [[6, 11]]);
+
+    testRange(5, 10, GridUtils.moveItem(100, 10, []), [
+      [5, 9],
+      [11, 11],
+    ]);
+  });
+  it('handles items moved outside the range', () => {
+    testRange(5, 10, GridUtils.moveItem(7, 100, []), [
+      [5, 6],
+      [100, 100],
+      [7, 9],
+    ]);
+
+    testRange(5, 10, GridUtils.moveItem(7, 1, []), [
+      [6, 7],
+      [1, 1],
+      [8, 10],
+    ]);
+  });
+  it('handles items moved from before to after range', () => {
+    testRange(5, 10, GridUtils.moveItem(1, 100, []), [[4, 9]]);
+  });
+  it('handles items moved from after to before range', () => {
+    testRange(5, 10, GridUtils.moveItem(100, 1, []), [[6, 11]]);
+  });
+  it('handles multiple operations', () => {
+    let movedItems = GridUtils.moveItem(1, 100, []);
+    testRange(5, 10, movedItems, [[4, 9]]);
+    movedItems = GridUtils.moveItem(7, 100, movedItems);
+    testRange(5, 10, movedItems, [
+      [4, 6],
+      [100, 100],
+      [7, 8],
+    ]);
+    movedItems = GridUtils.moveItem(50, 8, movedItems);
+    testRange(5, 10, movedItems, [
+      [4, 6],
+      [100, 100],
+      [7, 7],
+      [9, 9],
+    ]);
+  });
+
+  it('handles moves within the range', () => {
+    testRange(5, 10, GridUtils.moveItem(9, 6, []), [
+      [5, 5],
+      [7, 9],
+      [6, 6],
+      [10, 10],
+    ]);
+
+    testRange(5, 10, GridUtils.moveItem(6, 9, []), [
+      [5, 5],
+      [9, 9],
+      [6, 8],
+      [10, 10],
+    ]);
+
+    testRange(5, 10, GridUtils.moveItem(9, 5, []), [
+      [6, 9],
+      [5, 5],
+      [10, 10],
+    ]);
+
+    testRange(5, 10, GridUtils.moveItem(6, 10, []), [
+      [5, 5],
+      [10, 10],
+      [6, 9],
+    ]);
+
+    testRange(5, 10, GridUtils.moveItem(5, 10, []), [
+      [10, 10],
+      [5, 9],
+    ]);
+
+    testRange(5, 10, GridUtils.moveItem(10, 5, []), [
+      [6, 10],
+      [5, 5],
+    ]);
+  });
+
+  it('handles transforms with infinite ranges', () => {
+    testRange(null, null, GridUtils.moveItem(1, 10, []), [
+      [null, 0],
+      [10, 10],
+      [1, 9],
+      [11, null],
+    ]);
+
+    testRange(null, null, GridUtils.moveItem(0, 10, []), [
+      // We don't normally think of using negative indexes, but this is valid
+      // We go from the start (null) to the element before index 0 since 0 is moved
+      [null, -1],
+      [10, 10],
+      [0, 9],
+      [11, null],
+    ]);
+
+    testRange(5, null, GridUtils.moveItem(1, 10, []), [
+      [4, 9],
+      [11, null],
+    ]);
+
+    testRange(5, null, GridUtils.moveItem(10, 1, []), [
+      [6, 10],
+      [1, 1],
+      [11, null],
+    ]);
+
+    testRange(null, 10, GridUtils.moveItem(1, 15, []), [
+      [null, 0],
+      [15, 15],
+      [1, 9],
+    ]);
+
+    testRange(null, 10, GridUtils.moveItem(15, 1, []), [
+      [null, 0],
+      [2, 11],
+    ]);
+  });
+});
+
+describe('Move ranges of items', () => {
+  function testModelToVisible(
+    start: GridRangeIndex,
+    end: GridRangeIndex,
+    movedItems: MoveOperation[] = [],
+    expectedResult: AxisRange[] = [[start, end]]
+  ) {
+    expect(GridUtils.getVisibleRangeIndexes(start, end, movedItems)).toEqual(
+      expectedResult
+    );
+  }
+
+  function testVisibleToModel(
+    start: GridRangeIndex,
+    end: GridRangeIndex,
+    movedItems: MoveOperation[] = [],
+    expectedResult: AxisRange[] = [[start, end]]
+  ) {
+    expect(GridUtils.getModelRangeIndexes(start, end, movedItems)).toEqual(
+      expectedResult
+    );
+  }
+
+  it('handles transforms outside of range', () => {
+    let movedItems = GridUtils.moveRange([2, 3], 1, []);
+    movedItems = GridUtils.moveRange([100, 104], 200, movedItems);
+    testModelToVisible(5, 10, movedItems);
+    testVisibleToModel(5, 10, movedItems);
+  });
+
+  it('handles items moved into the range', () => {
+    // Before to start
+    let movedItems = GridUtils.moveRange([1, 3], 5, []);
+    // 0 1 2 3 4 5 6 7 8 9 10 Before/Visible
+    // 0 4 5 6 7 1 2 3 8 9 10 After/Model
+    testModelToVisible(5, 10, movedItems, [
+      [2, 4],
+      [8, 10],
+    ]);
+    testVisibleToModel(5, 10, movedItems, [
+      [1, 3],
+      [8, 10],
+    ]);
+
+    // Before to within
+    movedItems = GridUtils.moveRange([1, 3], 6, []);
+    // 0 1 2 3 4 5 6 7 8 9 10 Before/Visible
+    // 0 4 5 6 7 8 1 2 3 9 10 After/Model
+    testModelToVisible(5, 10, movedItems, [
+      [2, 5],
+      [9, 10],
+    ]);
+    testVisibleToModel(5, 10, movedItems, [
+      [8, 8],
+      [1, 3],
+      [9, 10],
+    ]);
+
+    // Before to end
+    movedItems = GridUtils.moveRange([1, 3], 8, []);
+    // 0 1 2 3 4 5 6 7  8 9 10 Before/Visible
+    // 0 4 5 6 7 8 9 10 1 2 3 After/Model
+    testModelToVisible(5, 10, movedItems, [[2, 7]]);
+    testVisibleToModel(5, 10, movedItems, [
+      [8, 10],
+      [1, 3],
+    ]);
+
+    // Before to partially in start
+    movedItems = GridUtils.moveRange([1, 3], 4, []);
+    // 0 1 2 3 4 5 6 7 8 9 10 Before/Visible
+    // 0 4 5 6 1 2 3 7 8 9 10 After/Model
+    testModelToVisible(5, 10, movedItems, [
+      [2, 3],
+      [7, 10],
+    ]);
+    testVisibleToModel(5, 10, movedItems, [
+      [2, 3],
+      [7, 10],
+    ]);
+
+    // Before to partially in end
+    movedItems = GridUtils.moveRange([1, 3], 9, []);
+    // 0 1 2 3 4 5 6 7  8  9 10 11 Before/Visible
+    // 0 4 5 6 7 8 9 10 11 1 2  3 After/Model
+    testModelToVisible(5, 10, movedItems, [[2, 7]]);
+    testVisibleToModel(5, 10, movedItems, [
+      [8, 11],
+      [1, 2],
+    ]);
+
+    // After to end
+    movedItems = GridUtils.moveRange([12, 14], 8, []);
+    // 5 6 7  8  9  10 11 12 13 Before/Visible
+    // 5 6 7  12 13 14 8  9  10  After/Model
+    testModelToVisible(5, 10, movedItems, [
+      [5, 7],
+      [11, 13],
+    ]);
+    testVisibleToModel(5, 10, movedItems, [
+      [5, 7],
+      [12, 14],
+    ]);
+
+    // After to within
+    movedItems = GridUtils.moveRange([12, 14], 7, []);
+    // 5 6 7  8  9  10 11 12 13 Before/Visible
+    // 5 6 12 13 14 7  8  9  10 After/Model
+    testModelToVisible(5, 10, movedItems, [
+      [5, 6],
+      [10, 13],
+    ]);
+    testVisibleToModel(5, 10, movedItems, [
+      [5, 6],
+      [12, 14],
+      [7, 7],
+    ]);
+  });
+
+  it('handles items moved outside the range', () => {
+    // Within to before
+    let movedItems = GridUtils.moveRange([6, 8], 2, []);
+    // 0 1 2 3 4 5 6 7 8 9 10 Before/Visible
+    // 0 1 6 7 8 2 3 4 5 9 10 After/Model
+    testModelToVisible(5, 10, movedItems, [
+      [8, 8],
+      [2, 4],
+      [9, 10],
+    ]);
+    testVisibleToModel(5, 10, movedItems, [
+      [2, 5],
+      [9, 10],
+    ]);
+
+    // Start to before
+    movedItems = GridUtils.moveRange([5, 7], 2, []);
+    // 0 1 2 3 4 5 6 7 8 9 10 Before/Visible
+    // 0 1 5 6 7 2 3 4 8 9 10 After/Model
+    testModelToVisible(5, 10, movedItems, [
+      [2, 4],
+      [8, 10],
+    ]);
+    testVisibleToModel(5, 10, movedItems, [
+      [2, 4],
+      [8, 10],
+    ]);
+
+    // End to before
+    movedItems = GridUtils.moveRange([8, 10], 2, []);
+    // 0 1 2 3 4  5 6 7 8 9 10 Before/Visible
+    // 0 1 8 9 10 2 3 4 5 6 7 After/Model
+    testModelToVisible(5, 10, movedItems, [
+      [8, 10],
+      [2, 4],
+    ]);
+    testVisibleToModel(5, 10, movedItems, [[2, 7]]);
+
+    // Within to after
+    movedItems = GridUtils.moveRange([6, 8], 11, []);
+    // 5 6 7  8  9  10 11 12 13 Before/Visible
+    // 5 9 10 11 12 13 6  7  8 After/Model
+    testModelToVisible(5, 10, movedItems, [
+      [5, 5],
+      [11, 13],
+      [6, 7],
+    ]);
+    testVisibleToModel(5, 10, movedItems, [
+      [5, 5],
+      [9, 13],
+    ]);
+
+    // Start to after
+    movedItems = GridUtils.moveRange([5, 7], 11, []);
+    // 5 6 7  8  9  10 11 12 13 Before/Visible
+    // 8 9 10 11 12 13 5  6  7 After/Model
+    testModelToVisible(5, 10, movedItems, [
+      [11, 13],
+      [5, 7],
+    ]);
+    testVisibleToModel(5, 10, movedItems, [[8, 13]]);
+
+    // End to after
+    movedItems = GridUtils.moveRange([8, 10], 11, []);
+    // 5 6 7 8  9  10 11 12 13 Before/Visible
+    // 5 6 7 11 12 13 8  9  10 After/Model
+    testModelToVisible(5, 10, movedItems, [
+      [5, 7],
+      [11, 13],
+    ]);
+    testVisibleToModel(5, 10, movedItems, [
+      [5, 7],
+      [11, 13],
+    ]);
+  });
+
+  it('handles ranges moved from before to after range', () => {
+    // Before to after
+    let movedItems = GridUtils.moveRange([2, 4], 11, []);
+    // 2 3 4 5 6 7  8  9  10 11 12 13 Before/Visible
+    // 5 6 7 8 9 10 11 12 13 2  3  4 After/Model
+    testModelToVisible(5, 10, movedItems, [[2, 7]]);
+    testVisibleToModel(5, 10, movedItems, [[8, 13]]);
+
+    // After to before
+    movedItems = GridUtils.moveRange([11, 13], 4, []);
+    // 4  5  6  7 8 9 10 11 12 13 Before/Visible
+    // 11 12 13 4 5 6 7  8  9  10 After/Model
+    testModelToVisible(5, 10, movedItems, [[8, 13]]);
+    testVisibleToModel(5, 10, movedItems, [
+      [12, 13],
+      [4, 7],
+    ]);
+  });
+
+  it('handles ranges moved that contain the target range', () => {
+    let movedItems = GridUtils.moveRange([4, 11], 6, []);
+    // 2 3 4  5  6 7 8 9 10 11 12 13 Before/Visible
+    // 2 3 12 13 4 5 6 7 8  9  10 11 After/Model
+    testModelToVisible(5, 10, movedItems, [[7, 12]]);
+    testVisibleToModel(5, 10, movedItems, [
+      [13, 13],
+      [4, 8],
+    ]);
+
+    movedItems = GridUtils.moveRange([5, 10], 3, []);
+    // 2 3 4 5 6 7 8  9 10 11 Before/Visible
+    // 2 5 6 7 8 9 10 3 4  11 After/Model
+    testModelToVisible(5, 10, movedItems, [[3, 8]]);
+    testVisibleToModel(5, 10, movedItems, [
+      [7, 10],
+      [3, 4],
+    ]);
+  });
+  it('handles multiple operations', () => {
+    let movedItems = GridUtils.moveRange([2, 4], 11, []);
+    movedItems = GridUtils.moveRange([5, 10], 3, []);
+    // 2 3 4 5 6 7  8  9  10 11 12 13 Before/Visible
+    // 5 6 7 8 9 10 11 12 13 2  3  4 After 1st
+    // 2 5 6 7 8 9  10 3  4  11 12 13 After 2nd/Model
+
+    testModelToVisible(5, 10, movedItems, [[3, 8]]);
+    testVisibleToModel(5, 10, movedItems, [
+      [7, 10],
+      [3, 4],
+    ]);
+  });
+});
+
+describe('grid range transforms with moved items in both dimensions visible to model', () => {
+  function testRanges(
+    ranges: GridRange[],
+    movedColumns: MoveOperation[] = [],
+    movedRows: MoveOperation[] = [],
+    expectedRanges = ranges
+  ) {
+    expect(GridUtils.getModelRanges(ranges, movedColumns, movedRows)).toEqual(
+      expectedRanges
+    );
+  }
+  function testRange(
+    range: GridRange,
+    movedColumns: MoveOperation[] = [],
+    movedRows: MoveOperation[] = [],
+    expectedRanges = [range]
+  ) {
+    testRanges([range], movedColumns, movedRows, expectedRanges);
+  }
+  it('handles no transformations', () => {
+    testRange(new GridRange(0, 0, 0, 0));
+    testRange(new GridRange(1, 4, 2, 6));
+  });
+  it('handles transformations that do not affect the range', () => {
+    let movedItems: MoveOperation[] = GridUtils.moveItem(2, 1, []);
+    movedItems = GridUtils.moveItem(5, 0, movedItems);
+    movedItems = GridUtils.moveItem(100, 110, movedItems);
+    movedItems = GridUtils.moveItem(200, 220, movedItems);
+
+    testRange(new GridRange(50, 55, 60, 65), movedItems, movedItems);
+  });
+  it('handles moving items into the range', () => {
+    const movedColumns: MoveOperation[] = GridUtils.moveItem(25, 15, []);
+    const movedRows: MoveOperation[] = GridUtils.moveItem(27, 17, []);
+    testRange(new GridRange(10, 15, 20, 25), movedColumns, movedRows, [
+      new GridRange(10, 15, 14, 16),
+      new GridRange(10, 27, 14, 27),
+      new GridRange(10, 17, 14, 24),
+      new GridRange(25, 15, 25, 16),
+      new GridRange(25, 27, 25, 27),
+      new GridRange(25, 17, 25, 24),
+      new GridRange(15, 15, 19, 16),
+      new GridRange(15, 27, 19, 27),
+      new GridRange(15, 17, 19, 24),
+    ]);
+  });
+  it('handles multiple ranges', () => {
+    const movedColumns = GridUtils.moveItem(25, 15, []);
+    const movedRows = GridUtils.moveItem(27, 17, []);
+    testRanges(
+      [new GridRange(10, 15, 20, 25), new GridRange(30, 35, 40, 45)],
+      movedColumns,
+      movedRows,
+      [
+        new GridRange(10, 15, 14, 16),
+        new GridRange(10, 27, 14, 27),
+        new GridRange(10, 17, 14, 24),
+        new GridRange(25, 15, 25, 16),
+        new GridRange(25, 27, 25, 27),
+        new GridRange(25, 17, 25, 24),
+        new GridRange(15, 15, 19, 16),
+        new GridRange(15, 27, 19, 27),
+        new GridRange(15, 17, 19, 24),
+        new GridRange(30, 35, 40, 45),
+      ]
+    );
+  });
+});
+
+describe('grid range transforms with moved items in both dimensions model to visible', () => {
+  function testRanges(
+    ranges: GridRange[],
+    movedColumns: MoveOperation[] = [],
+    movedRows: MoveOperation[] = [],
+    expectedRanges = ranges
+  ) {
+    expect(GridUtils.getVisibleRanges(ranges, movedColumns, movedRows)).toEqual(
+      expectedRanges
+    );
+  }
+  function testRange(
+    range: GridRange,
+    movedColumns: MoveOperation[] = [],
+    movedRows: MoveOperation[] = [],
+    expectedRanges = [range]
+  ) {
+    testRanges([range], movedColumns, movedRows, expectedRanges);
+  }
+  it('handles no transformations', () => {
+    testRange(new GridRange(0, 0, 0, 0));
+    testRange(new GridRange(1, 4, 2, 6));
+  });
+  it('handles transformations that do not affect the range', () => {
+    let movedItems: MoveOperation[] = GridUtils.moveItem(2, 1, []);
+    movedItems = GridUtils.moveItem(5, 0, movedItems);
+    movedItems = GridUtils.moveItem(100, 110, movedItems);
+    movedItems = GridUtils.moveItem(200, 220, movedItems);
+
+    testRange(new GridRange(50, 55, 60, 65), movedItems, movedItems);
+  });
+  it('handles moving items into the range', () => {
+    const movedColumns: MoveOperation[] = GridUtils.moveItem(25, 15, []);
+    const movedRows: MoveOperation[] = GridUtils.moveItem(27, 17, []);
+    testRange(new GridRange(10, 15, 20, 25), movedColumns, movedRows, [
+      new GridRange(10, 15, 14, 16),
+      new GridRange(10, 18, 14, 26),
+      new GridRange(16, 15, 21, 16),
+      new GridRange(16, 18, 21, 26),
+    ]);
+  });
+  it('handles multiple ranges', () => {
+    const movedColumns = GridUtils.moveItem(25, 15, []);
+    const movedRows = GridUtils.moveItem(27, 17, []);
+    testRanges(
+      [new GridRange(10, 15, 20, 25), new GridRange(30, 35, 40, 45)],
+      movedColumns,
+      movedRows,
+      [
+        new GridRange(10, 15, 14, 16),
+        new GridRange(10, 18, 14, 26),
+        new GridRange(16, 15, 21, 16),
+        new GridRange(16, 18, 21, 26),
+        new GridRange(30, 35, 40, 45),
+      ]
+    );
+  });
+});
+
+describe('compareRange function works', () => {
+  it("returns negative when first range's start is before the second", () => {
+    const range1: AxisRange = [0, 5];
+    const range2: AxisRange = [1, 3];
+    expect(GridUtils.compareRanges(range1, range2) < 0).toBeTruthy();
+    expect(GridUtils.compareRanges(range1, range2) > 0).toBeFalsy();
+  });
+  it("returns negative when first range's end is before the second", () => {
+    const range1: AxisRange = [1, 2];
+    const range2: AxisRange = [1, 3];
+    expect(GridUtils.compareRanges(range1, range2) < 0).toBeTruthy();
+    expect(GridUtils.compareRanges(range1, range2) > 0).toBeFalsy();
+  });
+  it('returns positive when first range is after the second', () => {
+    const range1: AxisRange = [1, 5];
+    const range2: AxisRange = [1, 3];
+    expect(GridUtils.compareRanges(range1, range2) > 0).toBeTruthy();
+    expect(GridUtils.compareRanges(range1, range2) < 0).toBeFalsy();
+  });
+  it('returns 0 when the ranges are the same', () => {
+    const range1: AxisRange = [1, 3];
+    const range2: AxisRange = [1, 3];
+    expect(GridUtils.compareRanges(range1, range2) === 0).toBeTruthy();
+  });
+});
+
+describe('for each', () => {
+  it('works on a single array', () => {
+    const ranges: BoundedAxisRange[] = [[1, 2]];
+    expect(GridUtils.mergeSortedRanges(ranges)).toEqual(ranges);
+  });
+
+  it('works on a non-overlapping array', () => {
+    const ranges: BoundedAxisRange[] = [
+      [1, 2],
+      [4, 5],
+      [7, 8],
+    ];
+    expect(GridUtils.mergeSortedRanges(ranges)).toEqual(ranges);
+  });
+
+  it('works on a all overlapping array', () => {
+    const ranges: BoundedAxisRange[] = [
+      [1, 2],
+      [3, 4],
+      [5, 6],
+    ];
+    expect(GridUtils.mergeSortedRanges(ranges)).toEqual([[1, 6]]);
+  });
+
+  it('works on a partially overlapping array', () => {
+    const ranges: BoundedAxisRange[] = [
+      [1, 2],
+      [3, 4],
+      [7, 11],
+    ];
+    expect(GridUtils.mergeSortedRanges(ranges)).toEqual([
+      [1, 4],
+      [7, 11],
+    ]);
+  });
+});
+
+describe('getColumnSeparatorIndex', () => {
+  const mockTheme = {
+    ...GridTheme,
+    allowColumnResize: true,
+    headerSeparatorHandleSize: 10,
+    columnHeaderHeight: 30,
+  };
+
+  const createMockMetrics = (
+    columnHeaderMaxDepth = 1
+  ): Partial<GridMetrics> => ({
+    rowHeaderWidth: 50,
+    columnHeaderHeight: 30,
+    columnHeaderMaxDepth,
+    floatingColumns: [],
+    floatingLeftWidth: 0,
+    visibleColumns: [0, 1, 2, 3],
+    allColumnXs: new Map([
+      [0, 0],
+      [1, 100],
+      [2, 200],
+      [3, 300],
+    ]),
+    allColumnWidths: new Map([
+      [0, 100],
+      [1, 100],
+      [2, 100],
+      [3, 100],
+    ]),
+    modelColumns: new Map([
+      [0, 0],
+      [1, 1],
+      [2, 2],
+      [3, 3],
+    ]),
+    columnCount: 4,
+    movedColumns: [],
+    // Additional properties needed for getRowAtY (called by getColumnHeaderDepthAtY)
+    gridY: 30,
+    floatingTopRowCount: 0,
+    floatingBottomRowCount: 0,
+    rowCount: 100,
+    visibleRows: [],
+    allRowYs: new Map(),
+    allRowHeights: new Map(),
+  });
+
+  /**
+   * Creates a mock GridModel with grouped column headers for testing
+   */
+  const createMockGroupedGridModel = (
+    headerGroups: Map<number, Map<number, string>>,
+    columnHeaderGroups?: Map<number, Map<number, object>>
+  ): GridModel =>
+    mockModel({
+      columnCount: 4,
+      rowCount: 100,
+      columnHeaderMaxDepth: headerGroups.size,
+      textForColumnHeader: (column: ModelIndex, depth = 0) =>
+        headerGroups.get(depth)?.get(column),
+      getColumnHeaderGroup: (column: ModelIndex, depth: number) =>
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (columnHeaderGroups?.get(depth)?.get(column) as any) ?? undefined,
+    });
+
+  const singleLevelHeaderGroups = new Map([
+    [
+      0,
+      new Map([
+        [0, 'A'],
+        [1, 'B'],
+        [2, 'C'],
+        [3, 'D'],
+      ]),
+    ],
+  ]);
+
+  const multiLevelHeaderGroups = new Map([
+    [
+      0,
+      new Map([
+        [0, 'A'],
+        [1, 'B'],
+        [2, 'C'],
+        [3, 'D'],
+      ]),
+    ],
+    [
+      1,
+      new Map([
+        [0, 'Group1'],
+        [1, 'Group1'],
+        [2, 'Group2'],
+        [3, 'Group2'],
+      ]),
+    ],
+  ]);
+
+  // Leaf depth with repeated header text (e.g. pivot leaves all labeled "Sum")
+  const repeatedLeafHeaderGroups = new Map([
+    [
+      0,
+      new Map([
+        [0, 'Sum'],
+        [1, 'Sum'],
+        [2, 'Sum'],
+        [3, 'Sum'],
+      ]),
+    ],
+  ]);
+
+  // Two adjacent groups at depth 1 that share a display name but are
+  // distinct group instances (e.g. pivot Totals columns).
+  const sameNameGroupA = { name: 'Total', depth: 1 };
+  const sameNameGroupB = { name: 'Total', depth: 1 };
+  const sameNameAtDepth1Text = new Map([
+    [
+      0,
+      new Map([
+        [0, 'A'],
+        [1, 'B'],
+        [2, 'C'],
+        [3, 'D'],
+      ]),
+    ],
+    [
+      1,
+      new Map([
+        [0, 'Total'],
+        [1, 'Total'],
+        [2, 'Total'],
+        [3, 'Total'],
+      ]),
+    ],
+  ]);
+  const sameNameAtDepth1Groups = new Map([
+    [
+      1,
+      new Map<number, object>([
+        [0, sameNameGroupA],
+        [1, sameNameGroupA],
+        [2, sameNameGroupB],
+        [3, sameNameGroupB],
+      ]),
+    ],
+  ]);
+
+  // Single declared group spanning all four columns at depth 1.
+  const singleGroupInstance = { name: 'OnlyGroup', depth: 1 };
+  const singleGroupAtDepth1Groups = new Map([
+    [
+      1,
+      new Map<number, object>([
+        [0, singleGroupInstance],
+        [1, singleGroupInstance],
+        [2, singleGroupInstance],
+        [3, singleGroupInstance],
+      ]),
+    ],
+  ]);
+
+  // Columns 0-2 belong to a depth-1 group "G"; column 3 has no group above it
+  // at depth 1 (the depth-1 band above column 3 is visually empty).
+  const trailingUngroupedGroupInstance = { name: 'G', depth: 1 };
+  const trailingUngroupedHeaderGroups = new Map([
+    [
+      0,
+      new Map([
+        [0, 'A'],
+        [1, 'B'],
+        [2, 'C'],
+        [3, 'M'],
+      ]),
+    ],
+    [
+      1,
+      new Map([
+        [0, 'G'],
+        [1, 'G'],
+        [2, 'G'],
+        // column 3 intentionally absent at depth 1 (no group cell drawn)
+      ]),
+    ],
+  ]);
+  const trailingUngroupedColumnGroups = new Map([
+    [
+      1,
+      new Map<number, object>([
+        [0, trailingUngroupedGroupInstance],
+        [1, trailingUngroupedGroupInstance],
+        [2, trailingUngroupedGroupInstance],
+      ]),
+    ],
+  ]);
+
+  // Column 0 has no group above it at depth 1 (the depth-1 band above column 0
+  // is visually empty); columns 1-3 belong to a depth-1 group "G".
+  const leadingUngroupedGroupInstance = { name: 'G', depth: 1 };
+  const leadingUngroupedHeaderGroups = new Map([
+    [
+      0,
+      new Map([
+        [0, 'M'],
+        [1, 'A'],
+        [2, 'B'],
+        [3, 'C'],
+      ]),
+    ],
+    [
+      1,
+      new Map([
+        // column 0 intentionally absent at depth 1 (no group cell drawn)
+        [1, 'G'],
+        [2, 'G'],
+        [3, 'G'],
+      ]),
+    ],
+  ]);
+  const leadingUngroupedColumnGroups = new Map([
+    [
+      1,
+      new Map<number, object>([
+        [1, leadingUngroupedGroupInstance],
+        [2, leadingUngroupedGroupInstance],
+        [3, leadingUngroupedGroupInstance],
+      ]),
+    ],
+  ]);
+
+  it.each([
+    {
+      description: 'detects separator at column boundary',
+      x: 150, // At boundary between column 0 and 1 (100 + 50)
+      y: 15, // Middle of the top header (maxDepth - 1)
+      headerGroups: singleLevelHeaderGroups,
+      columnHeaderGroups: undefined,
+      maxDepth: 1,
+      expected: 0,
+    },
+    {
+      description: 'detects there is no separator within the column',
+      x: 120, // Within column 1
+      y: 15,
+      headerGroups: singleLevelHeaderGroups,
+      columnHeaderGroups: undefined,
+      maxDepth: 1,
+      expected: null,
+    },
+    {
+      description:
+        'should return null at depth 1 when no separator exists (columns in same group)',
+      x: 150, // Between column 0 and 1
+      y: 15, // Middle of the top header (maxDepth - 1)
+      headerGroups: multiLevelHeaderGroups,
+      columnHeaderGroups: undefined,
+      maxDepth: 2,
+      expected: null,
+    },
+    {
+      description: 'should detect separator at depth 1 when groups differ',
+      x: 250, // Between Group1 and Group2
+      y: 15,
+      headerGroups: multiLevelHeaderGroups,
+      columnHeaderGroups: undefined,
+      maxDepth: 2,
+      expected: 1,
+    },
+    {
+      description:
+        'detects leaf-depth separator even when adjacent header text is identical (pivot leaves)',
+      x: 150, // Between column 0 and 1, both labeled "Sum"
+      y: 15,
+      headerGroups: repeatedLeafHeaderGroups,
+      columnHeaderGroups: undefined,
+      maxDepth: 1,
+      expected: 0,
+    },
+    {
+      description:
+        'detects depth-1 separator between distinct group instances that share a display name (pivot Totals)',
+      x: 250, // Between column 1 (groupA) and column 2 (groupB)
+      y: 15, // Middle of the top header (maxDepth - 1 = 1)
+      headerGroups: sameNameAtDepth1Text,
+      columnHeaderGroups: sameNameAtDepth1Groups,
+      maxDepth: 2,
+      expected: 1,
+    },
+    {
+      description:
+        'returns no depth-1 separator within the same declared group instance even when text would differ',
+      x: 150, // Between column 0 and 1, both in same group instance
+      y: 15,
+      headerGroups: multiLevelHeaderGroups,
+      columnHeaderGroups: singleGroupAtDepth1Groups,
+      maxDepth: 2,
+      expected: null,
+    },
+    {
+      description:
+        'detects depth-1 separator at the right edge of a group that ends before an ungrouped column',
+      x: 350, // Between column 2 (in group G) and column 3 (no group at depth 1)
+      y: 15, // Middle of the top header (maxDepth - 1 = 1)
+      headerGroups: trailingUngroupedHeaderGroups,
+      columnHeaderGroups: trailingUngroupedColumnGroups,
+      maxDepth: 2,
+      expected: 2,
+    },
+    {
+      description:
+        'detects a depth-1 separator at the right edge of an ungrouped trailing column (true trailing edge of the table)',
+      x: 450, // Right edge of column 3, the last column in the table
+      y: 15,
+      headerGroups: trailingUngroupedHeaderGroups,
+      columnHeaderGroups: trailingUngroupedColumnGroups,
+      maxDepth: 2,
+      expected: 3,
+    },
+    {
+      description:
+        'detects depth-1 separator at the left edge of a group that starts after an ungrouped column',
+      x: 150, // Between column 0 (no group at depth 1) and column 1 (in group G)
+      y: 15, // Middle of the top header (maxDepth - 1 = 1)
+      headerGroups: leadingUngroupedHeaderGroups,
+      columnHeaderGroups: leadingUngroupedColumnGroups,
+      maxDepth: 2,
+      expected: 0,
+    },
+    {
+      description:
+        'returns no depth-1 separator at the left edge of an ungrouped leading column (empty band above)',
+      x: 50, // Left edge of column 0 (no group cell at depth 1 above it)
+      y: 15,
+      headerGroups: leadingUngroupedHeaderGroups,
+      columnHeaderGroups: leadingUngroupedColumnGroups,
+      maxDepth: 2,
+      expected: null,
+    },
+  ])(
+    '$description',
+    ({ x, y, headerGroups, columnHeaderGroups, maxDepth, expected }) => {
+      const metrics = createMockMetrics(maxDepth) as GridMetrics;
+      const model = createMockGroupedGridModel(
+        headerGroups,
+        columnHeaderGroups
+      );
+
+      const result = GridUtils.getColumnSeparatorIndex(
+        x,
+        y,
+        metrics,
+        mockTheme,
+        model
+      );
+
+      expect(result).toBe(expected);
+    }
+  );
+});
+
+describe('isSameColumnGroupAtDepth', () => {
+  const groupA = { name: 'G', depth: 1 };
+  const groupB = { name: 'G', depth: 1 };
+
+  const createModel = (
+    text: Map<number, Map<number, string>>,
+    groups?: Map<number, Map<number, object>>
+  ): GridModel =>
+    mockModel({
+      textForColumnHeader: (column: ModelIndex, depth = 0) =>
+        text.get(depth)?.get(column) ?? undefined,
+      getColumnHeaderGroup: (column: ModelIndex, depth: number) =>
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (groups?.get(depth)?.get(column) as any) ?? undefined,
+    });
+
+  const textOnly = new Map([
+    [
+      1,
+      new Map([
+        [0, 'X'],
+        [1, 'X'],
+        [2, 'Y'],
+      ]),
+    ],
+  ]);
+
+  it('returns true for the same declared group instance', () => {
+    const groups = new Map([
+      [
+        1,
+        new Map<number, object>([
+          [0, groupA],
+          [1, groupA],
+        ]),
+      ],
+    ]);
+    const model = createModel(textOnly, groups);
+    expect(GridUtils.isSameColumnGroupAtDepth(model, 1, 0, 1)).toBe(true);
+  });
+
+  it('returns false for distinct group instances that share a name', () => {
+    const groups = new Map([
+      [
+        1,
+        new Map<number, object>([
+          [0, groupA],
+          [1, groupB],
+        ]),
+      ],
+    ]);
+    const model = createModel(textOnly, groups);
+    expect(GridUtils.isSameColumnGroupAtDepth(model, 1, 0, 1)).toBe(false);
+  });
+
+  it('returns false when only one side has a declared group', () => {
+    const groups = new Map([[1, new Map<number, object>([[0, groupA]])]]);
+    const model = createModel(textOnly, groups);
+    expect(GridUtils.isSameColumnGroupAtDepth(model, 1, 0, 1)).toBe(false);
+  });
+
+  it('falls back to text equality when neither side has a declared group', () => {
+    const model = createModel(textOnly);
+    expect(GridUtils.isSameColumnGroupAtDepth(model, 1, 0, 1)).toBe(true);
+    expect(GridUtils.isSameColumnGroupAtDepth(model, 1, 1, 2)).toBe(false);
+  });
+});
+
+describe('hasColumnSeparatorAtDepth', () => {
+  const groupA = { name: 'G', depth: 1 };
+  const groupB = { name: 'G', depth: 1 };
+  const COLUMN_COUNT = 3;
+  const NO_MOVES: MoveOperation[] = [];
+
+  const createModel = (
+    text: Map<number, Map<number, string>>,
+    groups?: Map<number, Map<number, object>>
+  ): GridModel =>
+    mockModel({
+      textForColumnHeader: (column: ModelIndex, depth = 0) =>
+        text.get(depth)?.get(column) ?? undefined,
+      getColumnHeaderGroup: (column: ModelIndex, depth: number) =>
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (groups?.get(depth)?.get(column) as any) ?? undefined,
+    });
+
+  const textOnly = new Map([
+    [
+      1,
+      new Map([
+        [0, 'X'],
+        [1, 'X'],
+        [2, 'Y'],
+      ]),
+    ],
+  ]);
+
+  it('returns false when depth is undefined', () => {
+    const model = createModel(textOnly);
+    expect(
+      GridUtils.hasColumnSeparatorAtDepth(
+        model,
+        undefined,
+        0,
+        COLUMN_COUNT,
+        NO_MOVES
+      )
+    ).toBe(false);
+  });
+
+  it('returns false when visibleIndex is undefined', () => {
+    const model = createModel(textOnly);
+    expect(
+      GridUtils.hasColumnSeparatorAtDepth(
+        model,
+        1,
+        undefined,
+        COLUMN_COUNT,
+        NO_MOVES
+      )
+    ).toBe(false);
+  });
+
+  it('returns true at leaf depth regardless of text equality', () => {
+    const model = createModel(textOnly);
+    expect(
+      GridUtils.hasColumnSeparatorAtDepth(model, 0, 0, COLUMN_COUNT, NO_MOVES)
+    ).toBe(true);
+  });
+
+  it('returns true when only one side has a declared group (trailing ungrouped)', () => {
+    const mixedGroups = new Map([[1, new Map<number, object>([[0, groupA]])]]);
+    const model = createModel(textOnly, mixedGroups);
+    // column 0 in group, column 1 not in group -> separator at the group edge
+    expect(
+      GridUtils.hasColumnSeparatorAtDepth(model, 1, 0, COLUMN_COUNT, NO_MOVES)
+    ).toBe(true);
+  });
+
+  it('returns true for the true trailing edge of the table', () => {
+    const model = createModel(textOnly);
+    // visibleIndex === columnCount - 1 -> trailing edge
+    expect(
+      GridUtils.hasColumnSeparatorAtDepth(
+        model,
+        1,
+        COLUMN_COUNT - 1,
+        COLUMN_COUNT,
+        NO_MOVES
+      )
+    ).toBe(true);
+  });
+
+  it('does not treat an off-screen next column as the trailing edge', () => {
+    // Two adjacent columns in the same group; the next column is off-screen but
+    // still within columnCount, so there must NOT be a separator between them.
+    const groups = new Map([
+      [
+        1,
+        new Map<number, object>([
+          [0, groupA],
+          [1, groupA],
+        ]),
+      ],
+    ]);
+    const model = createModel(textOnly, groups);
+    expect(
+      GridUtils.hasColumnSeparatorAtDepth(model, 1, 0, COLUMN_COUNT, NO_MOVES)
+    ).toBe(false);
+  });
+
+  it('treats distinct group instances with identical names as separated', () => {
+    const groups = new Map([
+      [
+        1,
+        new Map<number, object>([
+          [0, groupA],
+          [1, groupB],
+        ]),
+      ],
+    ]);
+    const model = createModel(textOnly, groups);
+    expect(
+      GridUtils.hasColumnSeparatorAtDepth(model, 1, 0, COLUMN_COUNT, NO_MOVES)
+    ).toBe(true);
+  });
+
+  it('falls back to text inequality when neither side has a declared group', () => {
+    const model = createModel(textOnly);
+    expect(
+      GridUtils.hasColumnSeparatorAtDepth(model, 1, 0, COLUMN_COUNT, NO_MOVES)
+    ).toBe(false);
+    expect(
+      GridUtils.hasColumnSeparatorAtDepth(model, 1, 1, COLUMN_COUNT, NO_MOVES)
+    ).toBe(true);
+  });
+
+  it('uses movedColumns to resolve the adjacent model column', () => {
+    const FOUR_COLUMNS = 4;
+    // Move visible 3 to visible 0 -> visible order is [3, 0, 1, 2]
+    const moves: MoveOperation[] = [{ from: 3, to: 0 }];
+    const groups = new Map([
+      [
+        1,
+        new Map<number, object>([
+          [0, groupA],
+          [1, groupA],
+          [2, groupA],
+          // model column 3 has no group
+        ]),
+      ],
+    ]);
+    const model = createModel(textOnly, groups);
+    // visible 0 -> model 3 (ungrouped), visible 1 -> model 0 (groupA) -> separator
+    expect(
+      GridUtils.hasColumnSeparatorAtDepth(model, 1, 0, FOUR_COLUMNS, moves)
+    ).toBe(true);
+    // visible 1 -> model 0, visible 2 -> model 1 (both groupA) -> no separator
+    expect(
+      GridUtils.hasColumnSeparatorAtDepth(model, 1, 1, FOUR_COLUMNS, moves)
+    ).toBe(false);
+  });
+});

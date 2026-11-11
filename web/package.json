@@ -1,0 +1,15 @@
+{
+  "name": "ursid-web",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "grid",
+    "widget"
+  ],
+  "scripts": {
+    "build": "bun run --cwd widget build && mkdir -p ../python/ursid/static && cp widget/dist/widget.js ../python/ursid/static/widget.js",
+    "dev": "bun run --cwd grid dev",
+    "typecheck": "bun run --cwd grid typecheck && bun run --cwd widget typecheck",
+    "test": "bun test"
+  }
+}
