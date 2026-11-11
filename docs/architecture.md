@@ -893,7 +893,8 @@ namespaces).
   the same Rust crate. `db.sql(...)` and the table API build the same plans (§9.3, §9.8).
 - Tables convert to pyarrow, pandas, and polars without copying where possible (Arrow PyCapsule
   interface).
-- Ticking tables render in Jupyter via an anywidget-based widget subscribed to a viewport.
+- Tables render in Jupyter through the table viewer (§15.3), an anywidget subscribed to a
+  viewport.
 - Resource decorators: `us.table`, `@us.ingester`, `@us.deployment`, `@us.job`,
   `@us.feature_view`, `@us.source`; registry: `us.models.register(...)`; ingest:
   `us.ingest.writer(...)`.
@@ -906,16 +907,43 @@ namespaces).
   lucide icons, React Router — juicebear's web baseline plus shadcn.
 - `@ursid/client`: TypeScript package speaking the delta protocol over WebSocket and decoding Arrow
   IPC with `apache-arrow`. Used by the UI and any other TypeScript consumer.
-- Ticking tables: viewport subscription rendered with TanStack Virtual; updates applied once per
-  animation frame; only visible rows are in the DOM. A canvas grid is an optimization to adopt only
-  if profiling demands it. Static lists (catalog, pipelines, jobs, models) use TanStack Table with
-  shadcn table components.
+- Ticking and large tables: the table viewer (§15.3). Static lists (catalog, pipelines, jobs,
+  models) use TanStack Table with shadcn table components.
 - Auth: OIDC authorization code + PKCE (`oidc-client-ts`). Local mode skips login.
 - The production build ships inside the `ursid` wheel and is served by the gateway, so local mode
   and the cluster serve the same UI with no separate web server.
 - v1 surfaces: catalog (schemas, versions, lineage), live and historical table viewer, console
   (SQL and table-API editor on CodeMirror 6, `EXPLAIN` view), pipelines (commit → deploy per
   target), job runs and logs (live from `sys.*`), models and aliases, agent chat backed by ranger.
+
+### 15.3 Table viewer
+
+One canvas-rendered grid, `@ursid/grid` (`web/grid` in the Bun workspace), shows every table in
+notebooks and the web UI, in the spirit of Deephaven's. It is our own component, adapted from
+`@deephaven/grid` (Apache-2.0; the attribution is kept in `NOTICE` and in each adapted file):
+its virtualised metrics, canvas renderer, and mouse and keyboard handling are the hard,
+proven parts.
+
+- Data stays in the engine. The grid subscribes to a viewport (row range + columns) and
+  receives those rows as Arrow IPC; after each cycle that changes them, the changed rows. The
+  grid draws only visible cells on a canvas, so a billion-row ticking table costs what a
+  hundred-row one does, and the payload per update is the visible cells.
+- Transport: in notebooks, the widget's comm (a small JSON header plus Arrow IPC buffers); in
+  the web UI, the same frames over WebSocket, later Barrage-style deltas over Flight (§9.6).
+- Hosts: Jupyter, JupyterLab, and VS Code through anywidget, installed with the
+  `ursid[notebook]` extra (`anywidget`, `ipywidgets`, `jupyterlab-widgets`,
+  `widgetsnbextension`, `psygnal`; IPython and the kernel are already there), else tables show
+  the HTML preview; the web UI hosts the same component in React.
+- From day one: virtual scrolling over rows and columns; column resize and reorder; sort by
+  clicking a header (shift-click adds a key); per-column quick filters; row and range
+  selection; copy rows (Cmd/Ctrl-C, as tab-separated text) and copy one cell (Cmd/Ctrl-click);
+  ticking rows briefly highlighted when they change; row count and update status; dark and
+  light themes after Deephaven's.
+- Sort and filter run in the engine, on tables the viewer derives and releases with the view
+  (`where` for filters; `sort` for static tables and an incremental sort for ticking ones).
+  Fetching rows by position needs a rank index for keyed tables.
+- Targets: 60 fps scrolling over a billion rows; a change reaches the screen within one cycle
+  and one frame; no work while nothing changes.
 
 ## 16. Runtime and deployment
 

@@ -257,9 +257,9 @@ vol = ticks.rolling("sym", rows=100, std_price="std(price)")  # or time="5m", at
   weakly, and after each cell the history (`Out`, `_`, `__`, `___`, `_N`) keeps weak proxies to
   tables in place of the tables. A re-run cell's old table goes once its name is rebound, and
   its output stays as last rendered.
-- Scrolling past the first rows needs a widget (anywidget: the front end subscribes to a viewport
-  and receives Arrow IPC for the visible rows). That comes when a slice needs it, in frontends
-  that support widget comms.
+- The table viewer (`architecture.md` §15.3) replaces this view where `ursid[notebook]` is
+  installed: a canvas grid subscribed to a viewport, with scrolling over every row, sort,
+  filters, and copying. The HTML view stays for frontends without widget support.
 
 ## 9. Testing
 
