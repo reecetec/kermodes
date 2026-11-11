@@ -137,6 +137,14 @@ Delta { added: [(keys, rows)], removed: [(keys, last rows)], modified: [(keys, p
   error in Python.
 - Building a table on a refreshing parent takes the read lock, computes the initial state from a
   snapshot, and registers the node so it receives deltas from the next cycle.
+- A table lives while a handle refers to it (a Python `Table`) or a live table is computed from
+  it; a static table built on another has its own rows and doesn't count. When neither holds,
+  the table is released: its rows, operator state, and delta are freed, and the tables it was
+  computed from may go in turn. So re-running code that rebinds a name replaces the old table
+  instead of adding to the session (`Session.table_count` shows how many it holds). Released
+  tables stay as empty placeholders so ids never move. A handle dropped while a cycle runs (or a
+  reader holds the graph) releases its table the next time the graph changes: the next cycle,
+  or the next table built.
 
 ## 5. Operators
 
@@ -240,6 +248,10 @@ vol = ticks.rolling("sym", rows=100, std_price="std(price)")  # or time="5m", at
   background thread checks every live output ten times a second and re-renders those whose
   table changed since. This works in any frontend that honours display updates (Jupyter, VS
   Code, Tern), with no front-end code; `examples/live.ipynb` shows it.
+- Neither live outputs nor IPython's output history keep a table alive: views hold tables
+  weakly, and after each cell the history (`Out`, `_`, `__`, `___`, `_N`) keeps weak proxies to
+  tables in place of the tables. A re-run cell's old table goes once its name is rebound, and
+  its output stays as last rendered.
 - Scrolling past the first rows needs a widget (anywidget: the front end subscribes to a viewport
   and receives Arrow IPC for the visible rows). That comes when a slice needs it, in frontends
   that support widget comms.

@@ -36,6 +36,9 @@ struct Inner {
     arrived: Condvar,
     /// The background clock started by `Session::start`, if running.
     clock: Mutex<Option<Clock>>,
+    /// Tables whose last handle was dropped while the graph was busy; released the next time
+    /// the graph is written.
+    unheld: Mutex<Vec<usize>>,
 }
 
 /// A thread running a cycle whenever writes are pending. It holds the session only while it
@@ -58,8 +61,69 @@ enum Write {
 #[derive(Default)]
 struct Graph {
     /// In creation order, which is topological: a table is built only from existing tables.
+    /// Released tables stay as empty placeholders, so ids never move.
     tables: Vec<TableState>,
     cycle: u64,
+}
+
+impl Graph {
+    /// Adds a table; each table it is computed from gains a dependent.
+    fn push(&mut self, state: TableState) -> usize {
+        for parent in state.source.parents() {
+            self.tables[parent].dependents += 1;
+        }
+        self.tables.push(state);
+        self.tables.len() - 1
+    }
+
+    /// Marks the tables in `unheld` as having no handle left, then releases every table with
+    /// neither a handle nor a dependent: its rows, operator state, and delta are freed, and the
+    /// tables it was computed from lose a dependent, so an unused chain goes all at once.
+    fn release(&mut self, unheld: &Mutex<Vec<usize>>) {
+        let mut ids = std::mem::take(
+            &mut *unheld
+                .lock()
+                .expect("ursid release queue poisoned by an earlier panic"),
+        );
+        for id in &ids {
+            self.tables[*id].held = false;
+        }
+        while let Some(id) = ids.pop() {
+            let table = &mut self.tables[id];
+            if table.held || table.dependents > 0 || table.released {
+                continue;
+            }
+            let parents: Vec<usize> = table.source.parents().collect();
+            table.release();
+            for parent in parents {
+                self.tables[parent].dependents -= 1;
+                ids.push(parent);
+            }
+        }
+    }
+}
+
+/// Keeps a table alive while any clone of its `Table` exists. When the last one drops, the
+/// table is released at once if the graph is free, else the next time the graph is written (a
+/// cycle in progress finishes first); tables built on it keep it until they go too.
+struct Handle {
+    session: Session,
+    id: usize,
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        let inner = &self.session.inner;
+        inner
+            .unheld
+            .lock()
+            .expect("ursid release queue poisoned by an earlier panic")
+            .push(self.id);
+        // Never wait here: the dropping thread may be a reader, or a cycle may be running.
+        if let Ok(mut graph) = inner.graph.try_write() {
+            graph.release(&inner.unheld);
+        }
+    }
 }
 
 /// How a table's rows change, from least to most constrained; each step lets the operators built
@@ -88,6 +152,12 @@ struct TableState {
     /// The cycle that last changed this table's rows or failed it; 0 if none has.
     changed: u64,
     source: Source,
+    /// Whether a `Table` handle still refers to this table.
+    held: bool,
+    /// Live tables computed from this one (static ones have their own rows and don't count).
+    dependents: usize,
+    /// Released: an empty placeholder that no handle or table refers to.
+    released: bool,
 }
 
 enum Source {
@@ -439,12 +509,14 @@ struct Keyed {
     new: Vec<bool>,
 }
 
-/// A table in a session. Cheap to clone; clones refer to the same table.
+/// A table in a session. Cheap to clone; clones refer to the same table. The table lives while
+/// any clone does, or while a live table is computed from it.
 #[derive(Clone)]
 pub struct Table {
     session: Session,
     id: usize,
     schema: SchemaRef,
+    _alive: Arc<Handle>,
 }
 
 impl Session {
@@ -661,13 +733,14 @@ impl Session {
 
     fn add(&self, state: TableState) -> Table {
         let schema = state.schema.clone();
-        let mut graph = self.write();
-        graph.tables.push(state);
-        Table {
-            session: self.clone(),
-            id: graph.tables.len() - 1,
-            schema,
-        }
+        let id = self.write().push(state);
+        Table::new(self, id, schema)
+    }
+
+    /// How many tables the session holds: those with a handle, and those live tables are
+    /// computed from. Dropping a table's last handle releases it unless others need it.
+    pub fn table_count(&self) -> usize {
+        self.read().tables.iter().filter(|t| !t.released).count()
     }
 
     fn read(&self) -> RwLockReadGuard<'_, Graph> {
@@ -677,11 +750,15 @@ impl Session {
             .expect("ursid graph lock poisoned by an earlier panic")
     }
 
+    /// The graph, for changes; tables whose last handle dropped meanwhile are released first.
     fn write(&self) -> RwLockWriteGuard<'_, Graph> {
-        self.inner
+        let mut graph = self
+            .inner
             .graph
             .write()
-            .expect("ursid graph lock poisoned by an earlier panic")
+            .expect("ursid graph lock poisoned by an earlier panic");
+        graph.release(&self.inner.unheld);
+        graph
     }
 
     fn pending(&self) -> MutexGuard<'_, Vec<(usize, Write)>> {
@@ -748,13 +825,26 @@ impl TableState {
             delta: None,
             changed: 0,
             source,
+            held: true,
+            dependents: 0,
+            released: false,
         }
+    }
+
+    /// Frees everything but the description: no handle or live table refers to this one.
+    fn release(&mut self) {
+        self.released = true;
+        self.storage = None;
+        self.source = Source::Static;
+        self.delta = None;
+        self.failure = None;
     }
 
     /// Finishes building a derived table: its first rows are applied, so their delta goes. A
     /// table that never refreshes never runs its operator again, so the operator's state (join
-    /// indexes, aggregation shards, group tables) goes too, leaving only the rows. (A join that
-    /// computes its rows always refreshes: its right side ticks.)
+    /// indexes, aggregation shards, group tables) goes too, leaving only the rows, and it no
+    /// longer needs the tables it was computed from. (A join that computes its rows always
+    /// refreshes: its right side ticks.)
     fn settle(&mut self) {
         self.delta = None;
         if !self.refreshing {
@@ -898,6 +988,18 @@ impl Keyed {
 }
 
 impl Table {
+    fn new(session: &Session, id: usize, schema: SchemaRef) -> Self {
+        Self {
+            session: session.clone(),
+            id,
+            schema,
+            _alive: Arc::new(Handle {
+                session: session.clone(),
+                id,
+            }),
+        }
+    }
+
     pub fn schema(&self) -> &SchemaRef {
         &self.schema
     }
@@ -1047,12 +1149,8 @@ impl Table {
         let sorted = sorted(&self.schema, &rows, &keys).map_err(compute)?;
         let state =
             TableState::fixed(description.clone(), self.schema.clone(), sorted).map_err(compute)?;
-        graph.tables.push(state);
-        Ok(Table {
-            session: self.session.clone(),
-            id: graph.tables.len() - 1,
-            schema: self.schema.clone(),
-        })
+        let id = graph.push(state);
+        Ok(Table::new(&self.session, id, self.schema.clone()))
     }
 
     /// The first `n` rows in key order (arrival order for appended rows), kept current as rows
@@ -1500,12 +1598,8 @@ impl Table {
             return Err(error);
         }
         state.settle();
-        graph.tables.push(state);
-        Ok(Table {
-            session: self.session.clone(),
-            id: graph.tables.len() - 1,
-            schema,
-        })
+        let id = graph.push(state);
+        Ok(Table::new(&self.session, id, schema))
     }
 
     /// Every row of every one of `tables`, which need the same column names and types in the
@@ -1595,12 +1689,8 @@ impl Table {
             },
             Source::Merge { inputs },
         );
-        graph.tables.push(state);
-        Ok(Table {
-            session: first.session.clone(),
-            id: graph.tables.len() - 1,
-            schema,
-        })
+        let id = graph.push(state);
+        Ok(Table::new(&first.session, id, schema))
     }
 
     /// The table's current rows in key order, or the error that failed it.
@@ -1712,12 +1802,8 @@ impl Table {
             return Err(error);
         }
         state.settle();
-        graph.tables.push(state);
-        Ok(Table {
-            session: self.session.clone(),
-            id: graph.tables.len() - 1,
-            schema,
-        })
+        let id = graph.push(state);
+        Ok(Table::new(&self.session, id, schema))
     }
 }
 

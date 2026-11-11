@@ -126,6 +126,13 @@ impl Session {
     fn is_running(&self) -> bool {
         self.0.is_running()
     }
+
+    /// How many tables the session holds: those Python refers to, and those they are computed
+    /// from. A table goes as soon as neither is true.
+    #[getter]
+    fn table_count(&self) -> usize {
+        self.0.table_count()
+    }
 }
 
 /// A period such as `"100ms"`, `"0.5s"`, `"5m"`, or `"1h"`: a positive number and one of the
@@ -160,8 +167,9 @@ enum Span {
     Units(i64),
 }
 
-/// A table: static, or ticking with the session's cycles.
-#[pyclass(module = "ursid", name = "Table", frozen)]
+/// A table: static, or ticking with the session's cycles. It lives while Python refers to it or
+/// a live table is computed from it; weak references (the notebook view's) don't count.
+#[pyclass(module = "ursid", name = "Table", frozen, weakref)]
 pub struct Table(ursid_core::Table);
 
 #[pymethods]

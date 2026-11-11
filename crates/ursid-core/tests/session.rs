@@ -188,3 +188,74 @@ fn columns_are_matched_by_name_not_position() {
     session.step();
     assert_eq!(sizes(&input), vec![7]);
 }
+
+/// Re-running code that builds a table (a notebook cell, say) replaces the old table rather
+/// than adding to the session: dropping the last handle releases it.
+#[test]
+fn rebuilding_a_table_replaces_the_old_one() {
+    let session = Session::new();
+    let input = session.input_table(&schema()).unwrap();
+    let mut latest = input.last_by(&["sym"]).unwrap();
+    for size in 0..5 {
+        input
+            .append(&[rows(&["a", "b"], &[size, size + 1])])
+            .unwrap();
+        session.step();
+        latest = input.last_by(&["sym"]).unwrap();
+        assert_eq!(session.table_count(), 2, "the input and one last_by");
+    }
+    assert_eq!(sizes(&latest), vec![4, 5]);
+}
+
+/// A table lives while it has a handle or a live table is computed from it; dropping the end of
+/// a chain releases the whole unused chain, and the rest keeps ticking.
+#[test]
+fn tables_live_while_held_or_needed() {
+    let session = Session::new();
+    let input = session.input_table(&schema()).unwrap();
+    let chained = input
+        .filter("size > 1")
+        .unwrap()
+        .update(&["size = size * 10"])
+        .unwrap();
+    assert_eq!(
+        session.table_count(),
+        3,
+        "the unnamed filter stays for the update"
+    );
+
+    let other = session.input_table(&schema()).unwrap();
+    let both = Table::merge(&[&input.filter("size > 2").unwrap(), &other]).unwrap();
+    drop(other);
+    assert_eq!(session.table_count(), 6, "a merge keeps its inputs");
+
+    drop(chained);
+    assert_eq!(
+        session.table_count(),
+        4,
+        "the update and its filter went together"
+    );
+
+    input.append(&[rows(&["a", "b", "c"], &[1, 2, 3])]).unwrap();
+    session.step();
+    assert_eq!(sizes(&both), vec![3]);
+    drop(both);
+    assert_eq!(session.table_count(), 1);
+}
+
+/// A table built on a static table has its own rows, so the static table can go.
+#[test]
+fn static_results_outlive_their_inputs() {
+    let session = Session::new();
+    let fixed = session
+        .static_table(Arc::new(schema()), vec![rows(&["a", "b", "a"], &[1, 2, 3])])
+        .unwrap();
+    let total = fixed
+        .agg_by(&["sym"], &[("size", "sum(size)")])
+        .unwrap()
+        .sort(&["sym"])
+        .unwrap();
+    drop(fixed);
+    assert_eq!(session.table_count(), 1);
+    assert_eq!(sizes(&total), vec![4, 2]);
+}
