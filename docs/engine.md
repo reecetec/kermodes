@@ -291,6 +291,9 @@ workloads) and comparison scripts under `bench/`, all reading the same seeded da
   appended rows; cycle time p50/p99 and memory growth. Deephaven cycles are timed until its update
   graph finishes them (its exclusive lock), not until `add` returns.
 - `deephaven_book.py`: the `ursid-bench book` workload in Deephaven.
+- The targets below: `stream.py` / `deephaven_stream.py` (the stream, paced or unthrottled;
+  throughput is rows per second of cycle time), `ursid-bench book` / `deephaven_book.py`,
+  `agg_target.py` (100M-row `agg_by` against Polars), and `import_time.py`.
 
 Python comparisons need a release build of Ursid (`maturin develop --release`); `uv sync` builds
 a faster-to-compile profile. Numbers go in commit messages with the machine; nothing is checked in
