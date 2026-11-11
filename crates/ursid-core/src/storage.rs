@@ -266,6 +266,35 @@ impl Storage {
         }
     }
 
+    /// The keys at positions `start..start + count` in key order (fewer past the end). A sparse
+    /// table selects them in linear time and sorts only the window.
+    pub fn keys_at(&self, start: usize, count: usize) -> Vec<RowKey> {
+        match &self.index {
+            Index::Dense { len, .. } => {
+                let end = start.saturating_add(count) as RowKey;
+                (start as RowKey).min(*len)..end.min(*len)
+            }
+            .collect(),
+            Index::Sparse { slot_of, .. } => {
+                let end = start.saturating_add(count).min(slot_of.len());
+                if start >= end {
+                    return Vec::new();
+                }
+                let mut keys: Vec<RowKey> = slot_of.keys().copied().collect();
+                if end < keys.len() {
+                    keys.select_nth_unstable(end);
+                    keys.truncate(end);
+                }
+                if start > 0 {
+                    keys.select_nth_unstable(start);
+                    keys.drain(..start);
+                }
+                keys.sort_unstable();
+                keys
+            }
+        }
+    }
+
     /// Current rows in key order.
     pub fn snapshot(&self) -> Result<Vec<RecordBatch>, ArrowError> {
         match &self.index {

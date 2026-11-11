@@ -395,9 +395,31 @@ impl<'a> Reader<'a> {
             .collect()
     }
 
-    /// The first `n` rows in key order.
-    pub fn first_rows(self, n: usize) -> Result<RecordBatch, ArrowError> {
-        self.gather(&self.edge_keys(End::First, n, None)?)
+    /// The keys at positions `start..start + count` in key order (fewer past the end).
+    pub fn keys_at(self, start: usize, count: usize) -> Result<Vec<RowKey>, ArrowError> {
+        match self.place() {
+            Place::Stored(storage) => Ok(storage.keys_at(start, count)),
+            Place::Joined { left, .. } => left.keys_at(start, count),
+            // Merged keys order by input first: skip whole inputs before `start`.
+            Place::Merged { inputs, .. } => {
+                let (mut skip, mut keys) = (start, Vec::new());
+                for (index, id) in inputs.iter().enumerate() {
+                    if keys.len() == count {
+                        break;
+                    }
+                    let input = self.input(*id);
+                    let len = input.len();
+                    if skip >= len {
+                        skip -= len;
+                        continue;
+                    }
+                    let found = input.keys_at(skip, count - keys.len())?;
+                    skip = 0;
+                    keys.extend(merged_keys(index, &found)?);
+                }
+                Ok(keys)
+            }
+        }
     }
 
     /// As `Storage::edge_keys`.
@@ -1764,15 +1786,19 @@ impl Table {
             })
     }
 
-    /// The first `n` rows in key order, or the error that failed the table.
-    pub fn first_rows(&self, n: usize) -> Result<RecordBatch, Error> {
+    /// The rows at positions `start..start + count` in key order (fewer past the end), with the
+    /// table's row count, read together; or the error that failed the table.
+    pub fn rows_at(&self, start: usize, count: usize) -> Result<(RecordBatch, usize), Error> {
         let graph = self.session.read();
         let table = &graph.tables[self.id];
         if let Some(error) = &table.failure {
             return Err(error.clone());
         }
-        Reader::new(&graph.tables, self.id)
-            .first_rows(n)
+        let reader = Reader::new(&graph.tables, self.id);
+        reader
+            .keys_at(start, count)
+            .and_then(|keys| reader.gather(&keys))
+            .map(|rows| (rows, reader.len()))
             .map_err(|e| Error::Compute {
                 table: table.description.clone(),
                 message: e.to_string(),

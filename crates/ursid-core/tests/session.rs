@@ -259,3 +259,43 @@ fn static_results_outlive_their_inputs() {
     assert_eq!(session.table_count(), 1);
     assert_eq!(sizes(&total), vec![4, 2]);
 }
+
+/// Rows by position (what the table viewer fetches) match the snapshot, for each way a table
+/// keeps its rows: chunks, slots, a merge's inputs, and a join computed on read.
+#[test]
+fn rows_at_positions_match_the_snapshot() {
+    let session = Session::new();
+    let input = session.input_table(&schema()).unwrap();
+    let keyed = session.keyed_input_table(&schema(), &["sym"]).unwrap();
+    let names = ["a", "b", "c", "d", "e", "f", "g", "h"];
+    for round in 0..4 {
+        let sizes: Vec<i64> = (0..8).map(|i| round * 10 + i).collect();
+        input.append(&[rows(&names, &sizes)]).unwrap();
+        keyed
+            .upsert(&[rows(&names[round as usize..], &sizes[round as usize..])])
+            .unwrap();
+        session.step();
+    }
+    let merged = Table::merge(&[&input, &input.filter("size > 20").unwrap()]).unwrap();
+    let joined = input
+        .natural_join(&keyed, &["sym"], Some(&["latest=size"]))
+        .unwrap();
+    let latest = input.last_by(&["sym"]).unwrap();
+    for table in [&input, &keyed, &merged, &joined, &latest] {
+        let all = concat_batches(table.schema(), &table.snapshot().unwrap()).unwrap();
+        let len = all.num_rows();
+        for (start, count) in [
+            (0, 3),
+            (2, 5),
+            (len.saturating_sub(2), 10),
+            (len + 5, 3),
+            (0, len),
+        ] {
+            let (rows, total) = table.rows_at(start, count).unwrap();
+            let start = start.min(len);
+            let want = all.slice(start, count.min(len - start));
+            assert_eq!(total, len, "{}", table.description());
+            assert_eq!(rows, want, "{} at {start}+{count}", table.description());
+        }
+    }
+}

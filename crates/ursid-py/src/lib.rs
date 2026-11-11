@@ -6,11 +6,12 @@ use std::time::Duration;
 use arrow::array::{Array, ArrayIterator, ArrayRef, AsArray, RecordBatch, StructArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit, TimestampNanosecondType};
 use arrow::error::ArrowError;
+use arrow::ipc::writer::StreamWriter;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyCapsule, PyDict};
+use pyo3::types::{PyBytes, PyCapsule, PyDict};
 use pyo3_arrow::error::PyArrowError;
 use pyo3_arrow::ffi::to_stream_pycapsule;
 use pyo3_arrow::input::AnyRecordBatch;
@@ -431,8 +432,7 @@ impl Table {
 
     /// The first `rows` rows as an HTML table, with the row count, or the table's error.
     fn _preview_html(&self, py: Python<'_>, rows: usize) -> PyResult<String> {
-        let preview = py
-            .detach(|| Ok::<_, ursid_core::Error>((self.0.first_rows(rows)?, self.0.num_rows()?)));
+        let preview = py.detach(|| self.0.rows_at(0, rows));
         let status = if self.0.is_refreshing() {
             format!("ticking · updated in cycle {}", self.0.changed())
         } else {
@@ -442,6 +442,27 @@ impl Table {
             Ok((head, total)) => preview_html(&head, total, &status).map_err(arrow_error),
             Err(error) => Ok(failure_html(&error.to_string())),
         }
+    }
+
+    /// The rows at positions `start..start + count` in key order as one Arrow IPC stream, with
+    /// the table's row count: what the table viewer fetches for its viewport.
+    fn _viewport<'py>(
+        &self,
+        py: Python<'py>,
+        start: usize,
+        count: usize,
+    ) -> PyResult<(Bound<'py, PyBytes>, usize)> {
+        let (bytes, total) = py.detach(|| {
+            let (rows, total) = self.0.rows_at(start, count).map_err(engine_error)?;
+            let mut bytes = Vec::new();
+            let mut writer =
+                StreamWriter::try_new(&mut bytes, &rows.schema()).map_err(arrow_error)?;
+            writer.write(&rows).map_err(arrow_error)?;
+            writer.finish().map_err(arrow_error)?;
+            drop(writer);
+            Ok::<_, PyErr>((bytes, total))
+        })?;
+        Ok((PyBytes::new(py, &bytes), total))
     }
 
     /// Notebook display: a live view for ticking tables (see `ursid._live`).

@@ -260,3 +260,14 @@ def test_rolling_follows_row_and_time_windows():
     assert pa.table(recent)["n"].to_pylist() == [1, 2, 1, 1]
     with pytest.raises(ValueError, match="rows=n"):
         src.rolling("sym", rows=2, time="1s", at="ts", n="count(*)")
+
+
+def test_viewport_sends_rows_by_position_as_arrow_ipc():
+    s = us.local(manual=True)
+    src = s.input_table(COLUMNS)
+    src.append(ticks(["a", "b", "c"], [1.0, 2.0, 3.0], [1, 2, 3]))
+    s.step()
+    data, total = src._viewport(1, 5)
+    rows = pa.ipc.open_stream(data).read_all()
+    assert total == 3
+    assert rows["sym"].to_pylist() == ["b", "c"]
