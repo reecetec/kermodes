@@ -40,12 +40,14 @@ pub(crate) struct Storage {
 }
 
 /// Rows with their keys, in the same order.
+#[derive(Clone)]
 pub(crate) struct Rows {
     pub keys: Vec<RowKey>,
     pub batch: RecordBatch,
 }
 
 /// Modified rows: same keys, values before and after the cycle.
+#[derive(Clone)]
 pub(crate) struct Modified {
     pub keys: Vec<RowKey>,
     pub previous: RecordBatch,
@@ -54,7 +56,7 @@ pub(crate) struct Modified {
 
 /// What changed in a table during one cycle. `added`, `removed`, and `modified` keys are
 /// disjoint; removed rows carry their last values.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Delta {
     pub added: Vec<Rows>,
     pub removed: Vec<Rows>,

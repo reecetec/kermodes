@@ -33,6 +33,7 @@ OPERATIONS = [
     "merge + agg_by",
     "tail",
     "rolling",
+    "sort",
 ]
 WARM = 10
 MB = 1 << 20
@@ -92,6 +93,7 @@ def worker(op: str, cycles: int, batch: int) -> dict:
             ],
             by="sym",
         ),
+        "sort": lambda: ticks.sort(["price"]),
     }[op]()
 
     times = []

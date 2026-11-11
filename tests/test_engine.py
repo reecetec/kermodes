@@ -230,15 +230,23 @@ def test_head_and_tail_follow_the_ends_of_a_ticking_table():
     assert pa.table(last)["sym"].to_pylist() == ["c", "d"]
 
 
-def test_sort_orders_static_tables_with_nulls_last():
+def test_sort_orders_rows_with_nulls_last_and_ticking_sorts_order_reads():
     s = us.local(manual=True)
     fixed = s.static_table(
         ticks(["b", "a", "b", "a"], [1.0, 2.0, 3.0, 4.0], [1, None, 2, 3])
     )
     ordered = fixed.sort("sym", "size desc")
     assert pa.table(ordered)["size"].to_pylist() == [None, 3, 2, 1]
-    with pytest.raises(us.UrsidError, match="ORDER BY"):
-        s.input_table(COLUMNS).sort("sym")
+
+    src = s.input_table(COLUMNS)
+    live = src.sort("price desc")
+    src.append(ticks(["a", "b"], [1.0, 3.0], [1, 2]))
+    s.step()
+    src.append(ticks(["c"], [2.0], [3]))
+    s.step()
+    assert pa.table(live)["price"].to_pylist() == [3.0, 2.0, 1.0]
+    with pytest.raises(us.UrsidError, match="sort last"):
+        live.where("price > 0")
 
 
 def test_rolling_follows_row_and_time_windows():

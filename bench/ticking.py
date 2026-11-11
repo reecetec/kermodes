@@ -34,6 +34,7 @@ OPERATIONS = [
     "merge + agg_by",
     "tail",
     "rolling",
+    "sort",
 ]
 MB = 1 << 20
 
@@ -76,6 +77,7 @@ def worker(op: str, cycles: int, batch: int) -> dict:
         "rolling": lambda: ticks.rolling(
             "sym", rows=100, avg="mean(price)", vol="std(price)"
         ),
+        "sort": lambda: ticks.sort("price"),
     }[op]()
 
     def copy(table: pa.Table, start: int) -> pa.Table:

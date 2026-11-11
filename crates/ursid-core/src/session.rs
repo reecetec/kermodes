@@ -17,6 +17,7 @@ use crate::agg::{Accumulator, AggBy, Call, agg_schema, call_error};
 use crate::groups::{KeyKind, Membership, resolve};
 use crate::join::{AsOfJoin, Join, JoinShape, NaturalJoin, Tracking};
 use crate::ops::{Assignment, Edge, LastBy, Operator, Update, Where};
+use crate::order::Order;
 use crate::rolling::{Aggregate, Function, Input, Rolling, Span, Window};
 use crate::sort::sorted;
 use crate::storage::{Delta, End, Modified, RowKey, Rows, Storage};
@@ -85,13 +86,25 @@ struct Graph {
 }
 
 impl Graph {
-    /// Adds a table; each table it is computed from gains a dependent.
-    fn push(&mut self, state: TableState) -> usize {
+    /// Adds a table; each table it is computed from gains a dependent. Nothing is built on a
+    /// ticking sort: it orders how its table is read, and tables built on it would read by key.
+    fn push(&mut self, state: TableState) -> Result<usize, Error> {
+        if let Some(sorted) = state
+            .source
+            .parents()
+            .find(|p| matches!(self.tables[*p].source, Source::Order { .. }))
+        {
+            return Err(Error::Unsupported(format!(
+                "`{}` is a ticking sort, which orders how its rows are read; build `{}` on the \
+                 unsorted table and sort last",
+                self.tables[sorted].description, state.description
+            )));
+        }
         for parent in state.source.parents() {
             self.tables[parent].dependents += 1;
         }
         self.tables.push(state);
-        self.tables.len() - 1
+        Ok(self.tables.len() - 1)
     }
 
     /// Marks the tables in `unheld` as having no handle left, then releases every table with
@@ -196,13 +209,20 @@ enum Source {
     Merge {
         inputs: Vec<usize>,
     },
+    /// The parent's rows, read in `order` (a ticking sort): stores nothing.
+    Order {
+        parent: usize,
+        order: Box<Order>,
+    },
 }
 
 impl Source {
     /// The tables this one is computed from; none for inputs and static tables.
     fn parents(&self) -> impl Iterator<Item = usize> + '_ {
         let (first, second, rest): (_, _, &[usize]) = match self {
-            Source::Derived { parent, .. } => (Some(*parent), None, &[]),
+            Source::Derived { parent, .. } | Source::Order { parent, .. } => {
+                (Some(*parent), None, &[])
+            }
             Source::Join { left, right, .. } => (Some(*left), Some(*right), &[]),
             Source::Merge { inputs } => (None, None, inputs),
             Source::Append | Source::Keyed(_) | Source::Static => (None, None, &[]),
@@ -282,6 +302,10 @@ enum Place<'a> {
         inputs: &'a [usize],
         schema: &'a SchemaRef,
     },
+    Ordered {
+        input: Reader<'a>,
+        order: &'a Order,
+    },
 }
 
 impl<'a> Reader<'a> {
@@ -309,6 +333,10 @@ impl<'a> Reader<'a> {
                 inputs,
                 schema: &table.schema,
             },
+            (None, Source::Order { parent, order }) => Place::Ordered {
+                input: Self::new(self.tables, *parent),
+                order,
+            },
             (None, _) => unreachable!("{STORED}"),
         }
     }
@@ -322,6 +350,7 @@ impl<'a> Reader<'a> {
             Place::Stored(storage) => storage.len(),
             Place::Joined { left, .. } => left.len(),
             Place::Merged { inputs, .. } => inputs.iter().map(|id| self.input(*id).len()).sum(),
+            Place::Ordered { input, .. } => input.len(),
         }
     }
 
@@ -355,6 +384,7 @@ impl<'a> Reader<'a> {
                 let batches: Vec<&RecordBatch> = batches.iter().collect();
                 interleave_record_batch(&batches, &at)
             }
+            Place::Ordered { input, .. } => input.gather(keys),
         }
     }
 
@@ -395,7 +425,8 @@ impl<'a> Reader<'a> {
             .collect()
     }
 
-    /// The keys at positions `start..start + count` in key order (fewer past the end).
+    /// The keys at positions `start..start + count` in reading order (key order, or a ticking
+    /// sort's), fewer past the end.
     pub fn keys_at(self, start: usize, count: usize) -> Result<Vec<RowKey>, ArrowError> {
         match self.place() {
             Place::Stored(storage) => Ok(storage.keys_at(start, count)),
@@ -419,10 +450,11 @@ impl<'a> Reader<'a> {
                 }
                 Ok(keys)
             }
+            Place::Ordered { order, .. } => Ok(order.keys_at(start, count)),
         }
     }
 
-    /// As `Storage::edge_keys`.
+    /// As `Storage::edge_keys`, by key (a ticking sort's rows by key are its input's).
     pub fn edge_keys(
         self,
         end: End,
@@ -466,10 +498,11 @@ impl<'a> Reader<'a> {
                 }
                 Ok(chunks.concat())
             }
+            Place::Ordered { input, .. } => input.edge_keys(end, n, bound),
         }
     }
 
-    /// Current rows in key order.
+    /// Current rows in reading order: key order, or a ticking sort's.
     pub fn snapshot(self) -> Result<Vec<RecordBatch>, ArrowError> {
         match self.place() {
             Place::Stored(storage) => storage.snapshot(),
@@ -487,6 +520,10 @@ impl<'a> Reader<'a> {
                 }
                 Ok(batches)
             }
+            Place::Ordered { input, order } => match order.len() {
+                0 => Ok(Vec::new()),
+                len => Ok(vec![input.gather(&order.keys_at(0, len))?]),
+            },
         }
     }
 
@@ -515,6 +552,7 @@ impl<'a> Reader<'a> {
                 }
                 Ok(out)
             }
+            Place::Ordered { input, .. } => input.as_added(),
         }
     }
 }
@@ -686,6 +724,11 @@ impl Session {
                         .enumerate()
                         .filter_map(|(index, id)| before[*id].delta.as_ref().map(|d| (index, d))),
                 ),
+                // The sort's rows are its input's: the input's changes, applied to the order.
+                Source::Order { parent, order } => {
+                    let delta = delta_of(*parent);
+                    order.apply(delta).map(|()| delta.clone())
+                }
             };
             table.commit(result);
             if table.delta.is_some() || table.failure.is_some() {
@@ -776,7 +819,10 @@ impl Session {
 
     fn add(&self, state: TableState) -> Table {
         let schema = state.schema.clone();
-        let id = self.write().push(state);
+        let id = self
+            .write()
+            .push(state)
+            .expect("inputs are built on no table");
         idle();
         Table::new(self, id, schema)
     }
@@ -855,7 +901,7 @@ impl TableState {
     ) -> Self {
         let storage = match &source {
             Source::Join { operator, .. } if operator.computes_rows() => None,
-            Source::Merge { .. } => None,
+            Source::Merge { .. } | Source::Order { .. } => None,
             _ if growth == Growth::AppendOnly => Some(Storage::dense(schema.clone())),
             _ => Some(Storage::sparse(schema.clone())),
         };
@@ -1173,8 +1219,10 @@ impl Table {
     }
 
     /// Rows ordered by `by`, each entry `"name"` or `"name desc"` (`"name asc"` is the default),
-    /// earlier entries first. NULL sorts as the largest value; ties keep the input's order. The
-    /// table must be static: ticking sort arrives with SQL `ORDER BY`.
+    /// earlier entries first. NULL sorts as the largest value; ties keep the input's order. A
+    /// static table's sort is a new table of rows in that order. A ticking table's keeps the
+    /// input's rows and their keys in that order, cycle by cycle, so reads (snapshots, rows by
+    /// position) follow it; nothing can be built on it.
     pub fn sort(&self, by: &[&str]) -> Result<Table, Error> {
         if by.is_empty() {
             return Err(Error::Unsupported("sort needs at least one column".into()));
@@ -1206,10 +1254,30 @@ impl Table {
             });
         }
         if table.refreshing {
-            return Err(Error::Unsupported(format!(
-                "sort needs a static table, and `{}` ticks; ticking sort arrives with SQL ORDER BY",
-                table.description
-            )));
+            let compute = |e: ArrowError| Error::Compute {
+                table: description.clone(),
+                message: e.to_string(),
+            };
+            let mut order = Order::new(&self.schema, &keys).map_err(compute)?;
+            let input = Reader::new(&graph.tables, self.id);
+            input
+                .as_added()
+                .and_then(|everything| order.apply(&everything))
+                .map_err(compute)?;
+            let state = TableState::new(
+                description.clone(),
+                self.schema.clone(),
+                true,
+                table.growth,
+                Source::Order {
+                    parent: self.id,
+                    order: Box::new(order),
+                },
+            );
+            let id = graph.push(state)?;
+            drop(graph);
+            idle();
+            return Ok(Table::new(&self.session, id, self.schema.clone()));
         }
         let compute = |e: ArrowError| Error::Compute {
             table: description.clone(),
@@ -1221,7 +1289,7 @@ impl Table {
         let sorted = sorted(&self.schema, &rows, &keys).map_err(compute)?;
         let state =
             TableState::fixed(description.clone(), self.schema.clone(), sorted).map_err(compute)?;
-        let id = graph.push(state);
+        let id = graph.push(state)?;
         drop(graph);
         idle();
         Ok(Table::new(&self.session, id, self.schema.clone()))
@@ -1672,7 +1740,7 @@ impl Table {
             return Err(error);
         }
         state.settle();
-        let id = graph.push(state);
+        let id = graph.push(state)?;
         drop(graph);
         idle();
         Ok(Table::new(&self.session, id, schema))
@@ -1765,7 +1833,7 @@ impl Table {
             },
             Source::Merge { inputs },
         );
-        let id = graph.push(state);
+        let id = graph.push(state)?;
         drop(graph);
         idle();
         Ok(Table::new(&first.session, id, schema))
@@ -1884,7 +1952,7 @@ impl Table {
             return Err(error);
         }
         state.settle();
-        let id = graph.push(state);
+        let id = graph.push(state)?;
         drop(graph);
         idle();
         Ok(Table::new(&self.session, id, schema))

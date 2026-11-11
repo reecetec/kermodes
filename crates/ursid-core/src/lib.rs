@@ -8,6 +8,7 @@ mod expr;
 mod groups;
 mod join;
 mod ops;
+mod order;
 mod parallel;
 mod rolling;
 mod session;

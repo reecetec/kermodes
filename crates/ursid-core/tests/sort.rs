@@ -1,5 +1,6 @@
 //! Static sort against a reference built from Arrow's per-column comparators: a stable sort of
-//! row positions, NULL as the largest value.
+//! row positions, NULL as the largest value. Ticking sort against the static sort of the same
+//! rows, cycle by cycle.
 
 use std::sync::Arc;
 
@@ -146,15 +147,152 @@ fn sort_matches_a_column_by_column_stable_sort() {
     }
 }
 
+/// `table` sorted by `keys`, as `sort` entries.
+fn sort_by(table: &Table, keys: &[(&str, bool)]) -> Table {
+    let by: Vec<String> = keys
+        .iter()
+        .map(|(name, desc)| match desc {
+            true => format!("{name} desc"),
+            false => (*name).to_owned(),
+        })
+        .collect();
+    table
+        .sort(&by.iter().map(String::as_str).collect::<Vec<_>>())
+        .unwrap()
+}
+
+/// Rows by position (the viewer's reads) agree with the sorted snapshot.
+fn assert_windows_match(sorted: &Table, context: &str) {
+    let all = rows(sorted);
+    let len = all.num_rows();
+    for (start, count) in [(0, 7), (len / 2, 9), (len.saturating_sub(3), 9)] {
+        let (window, total) = sorted.rows_at(start, count).unwrap();
+        assert_eq!(total, len, "{context}");
+        assert_eq!(
+            window,
+            all.slice(start, count.min(len - start)),
+            "{context}"
+        );
+    }
+}
+
 #[test]
-fn sort_needs_a_static_table_and_clear_entries() {
+fn ticking_sort_reads_like_the_static_sort_of_its_rows() {
+    let keyed_schema = schema();
+    for seed in 1..=40 {
+        let mut rng = Rng(seed);
+        let session = Session::new();
+        let keyed = session
+            .keyed_input_table(&keyed_schema, &["sym", "size"])
+            .unwrap();
+        let appended = session.input_table(&schema()).unwrap();
+        let grouped = appended
+            .agg_by(
+                &["sym", "flag"],
+                &[("price", "max(price)"), ("size", "sum(size)")],
+            )
+            .unwrap();
+        // Each input with its sort by every order.
+        let sorted: Vec<(&Table, Vec<Table>)> = [&keyed, &grouped]
+            .into_iter()
+            .map(|table| {
+                (
+                    table,
+                    ORDERS.iter().map(|keys| sort_by(table, keys)).collect(),
+                )
+            })
+            .collect();
+        for cycle in 0..12 {
+            for _ in 0..rng.below(4) {
+                let rows = rng.below(30) as usize;
+                let batch = random_batch(&mut rng, rows);
+                match rng.below(3) {
+                    0 => keyed.delete(&[batch.project(&[0, 2]).unwrap()]).unwrap(),
+                    _ => keyed.upsert(std::slice::from_ref(&batch)).unwrap(),
+                }
+                appended.append(&[batch]).unwrap();
+            }
+            session.step();
+            for (input, sorts) in &sorted {
+                let fixed = session
+                    .static_table(input.schema().clone(), input.snapshot().unwrap())
+                    .unwrap();
+                for (sorted, keys) in sorts.iter().zip(ORDERS) {
+                    let context = format!(
+                        "seed {seed}, cycle {cycle}, {} by {keys:?}",
+                        input.description()
+                    );
+                    assert_eq!(rows(sorted), rows(&sort_by(&fixed, keys)), "{context}");
+                    assert_windows_match(sorted, &context);
+                }
+            }
+        }
+    }
+}
+
+/// Enough rows for many blocks: a bulk build, blocks that gain rows and are cut again, and blocks
+/// that lose rows and join their neighbours.
+#[test]
+fn large_ticking_sort_follows_heavy_churn() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("value", DataType::Int64, true),
+    ]));
+    let batch = |ids: Vec<i64>, values: Vec<i64>| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)) as ArrayRef,
+                Arc::new(Int64Array::from(values)),
+            ],
+        )
+        .unwrap()
+    };
+    let mut rng = Rng(11);
+    let session = Session::new();
+    let input = session.keyed_input_table(&schema, &["id"]).unwrap();
+    let sorted = input.sort(&["value desc"]).unwrap();
+    for cycle in 0..25 {
+        // After the first cycle, values crowd into a narrow range: rows pile into a few blocks,
+        // which split, and leave the others, which fold.
+        let (writes, spread) = if cycle == 0 {
+            (20_000, 5_000)
+        } else {
+            (600, 10)
+        };
+        let ids: Vec<i64> = (0..writes).map(|_| rng.below(25_000) as i64).collect();
+        let values: Vec<i64> = (0..writes)
+            .map(|_| 2_500 + rng.below(spread) as i64)
+            .collect();
+        input.upsert(&[batch(ids, values)]).unwrap();
+        let gone: Vec<i64> = (0..rng.below(400))
+            .map(|_| rng.below(25_000) as i64)
+            .collect();
+        let ids =
+            RecordBatch::try_from_iter([("id", Arc::new(Int64Array::from(gone)) as ArrayRef)])
+                .unwrap();
+        input.delete(&[ids]).unwrap();
+        session.step();
+        let fixed = session
+            .static_table(schema.clone(), input.snapshot().unwrap())
+            .unwrap();
+        assert_eq!(
+            rows(&sorted),
+            rows(&fixed.sort(&["value desc"]).unwrap()),
+            "cycle {cycle}"
+        );
+    }
+}
+
+#[test]
+fn nothing_is_built_on_a_ticking_sort_and_entries_are_clear() {
     let session = Session::new();
     let ticking = session.input_table(&schema()).unwrap();
-    let Err(Error::Unsupported(message)) = ticking.sort(&["sym"]) else {
-        panic!("sorting a ticking table should fail");
+    let sorted = ticking.sort(&["sym"]).unwrap();
+    let Err(Error::Unsupported(message)) = sorted.filter("size > 0") else {
+        panic!("building on a ticking sort should fail");
     };
-    assert!(message.contains("ORDER BY"), "{message}");
-
+    assert!(message.contains("sort last"), "{message}");
     let fixed = session.static_table(schema(), vec![]).unwrap();
     assert!(fixed.sort(&["sym"]).unwrap().snapshot().unwrap().is_empty());
     for (entry, expected) in [("sym upward", "\"name desc\""), ("prise", "price")] {

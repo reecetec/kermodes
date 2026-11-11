@@ -278,7 +278,8 @@ impl Table {
     }
 
     /// Rows ordered by `by`, each `"name"` or `"name desc"`, earlier entries first. NULL sorts as
-    /// the largest value; ties keep the input's order. Static tables only.
+    /// the largest value; ties keep the input's order. A ticking table's sort keeps its rows in
+    /// that order for reading; nothing can be built on it.
     #[pyo3(signature = (*by))]
     fn sort(&self, py: Python<'_>, by: Vec<String>) -> PyResult<Table> {
         let by: Vec<&str> = by.iter().map(String::as_str).collect();

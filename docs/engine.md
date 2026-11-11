@@ -11,12 +11,12 @@ In M0:
 - Tables, row sets, deltas, the update graph, and both operator paths (static and incremental).
 - Input tables: append-only and keyed (upsert/delete by key).
 - Operators: `where`, `select` / `update`, `last_by`, `agg_by`, `natural_join`, `as_of_join`,
-  `rolling`, `merge`, `head` / `tail`, static `sort`.
+  `rolling`, `merge`, `head` / `tail`, `sort` (ticking: an order for reading, §5).
 - Expressions in SQL syntax, parsed with `sqlparser`, compiled to arrow-rs kernels.
 - Python API through PyO3, a Jupyter widget, the oracle test harness, and benchmarks.
 
-Not in M0: weir, Flight, Parquet, full SQL queries, ticking `sort`, `predict`, multi-threaded
-cycles, memory budget enforcement.
+Not in M0: weir, Flight, Parquet, full SQL queries, operators over a ticking `sort`, `predict`,
+multi-threaded cycles, memory budget enforcement.
 
 ## 2. Data model
 
@@ -56,7 +56,7 @@ error saying which.
   Deltas carry key vectors aligned with their row batches. A range-based row set arrives with
   viewports if a measurement calls for it.
 - Display order is separate from keys: a viewport asks for positions, which are ranks in the row
-  set (or in a sort order, later).
+  set, or in a ticking sort's order.
 
 ### 2.4 Storage
 
@@ -167,7 +167,7 @@ keep no state) and an incremental path below. Static paths use the same kernels 
 | `rolling(by, window, aggs)` | Groups sharded by id; per group, its window's values in queues (oldest first) and, per aggregation, a running state: counts and sums, `std` as sums shifted by a value near the data (rebuilt from the window when the data drifts more than four spreads away), `min`/`max` as a monotonic queue | Added rows in key order: evict rows that fell out of the window (row windows: beyond the last `n`; time windows: at or before `t - span`), push the row, emit the aggregates as columns on it. Earlier rows never change. Large batches group their rows in two phases (as `last_by`) and roll shard by shard on every core. | Input must be `append_only`; windows look backward only; a time window's groups must not go back in time, and a row with a NULL time is in no window. count, sum, mean, std, min, max. |
 | `merge(tables)` | None; rows are read from the inputs (§2.4) | Re-key each input's delta with its input index; union. The batches are shared, not copied. A merge among the inputs contributes its own inputs, so merges never nest. | Same column names and types, in the same order; at most 256 inputs. |
 | `head(n)` / `tail(n)` | The input's `n` keys nearest that end, as an ordered set; every other input key lies beyond the boundary (the kept key farthest from the end). The kept rows are stored. | Kept rows the input removes leave; the set then refills with the input's next keys beyond the boundary (arithmetic for append-only inputs, a linear selection over slot tables, input by input for merges). Additions nearer than the boundary displace the farthest kept key; only a cycle's `n` nearest additions are considered, so a large append costs one linear selection. Kept rows the input modifies are modified. | Order is key order: arrival order for appended rows. |
-| `sort(by)` | — (static: the output is a new static table) | Each sort column becomes an order-preserving unsigned integer per row (sign-flipped integers, IEEE total order for floats, ranks among distinct values for strings), as many bits as its range needs plus one for NULL, the largest value; descending columns are inverted. Columns pack into as few 64- or 128-bit words as fit. Rows sort by their words with their position as the last tie-break (ties keep input order): one pass partitions by the key's top bits, then the partitions sort on every core, and the output is gathered in parallel pieces. | Static only in M0; ticking sort is M2 (SQL `ORDER BY`). Entries are `name` or `name desc`. |
+| `sort(by)` | Static: none (the output is a new static table). Ticking: the input's row keys in sort order, in blocks of at most 2048 holding each row's sort bytes back to back, its key, and nothing else; rows are read from the input | Static: each sort column becomes an order-preserving unsigned integer per row (sign-flipped integers, IEEE total order for floats, ranks among distinct values for strings), as many bits as its range needs plus one for NULL, the largest value; descending columns are inverted. Columns pack into as few 64- or 128-bit words as fit. Rows sort by their words with their position as the last tie-break (ties keep input order): one pass partitions by the key's top bits, then the partitions sort on every core, and the output is gathered in parallel pieces. Ticking: each changed row's sort columns become one order-preserving byte string (`arrow::row`, same order as the static sort, the key as tie-break); the cycle's removals (and modified rows' old values) and additions (and new values) are sorted, then one walk over the blocks rebuilds only those a change falls in, cutting rebuilt runs into half-full blocks; small blocks join their neighbour. Rows by position walk the block sizes. | A ticking sort orders reads (snapshots, rows by position, the viewer); its rows and keys are its input's, so nothing can be built on it until a re-keyed sort (M2, SQL `ORDER BY`). Entries are `name` or `name desc`. |
 
 Grouping keys:
 
@@ -234,7 +234,7 @@ enriched = live.natural_join(refs, on="sym")  # `joins=` picks and renames right
 priced = ticks.as_of_join(quotes, on="sym", at="ts")
 both = us.merge(east, west)  # rows of every table, uncopied
 recent = ticks.tail(100)  # head(n) / tail(n), kept current
-ranked = fixed.sort("sym", "ts desc")  # static tables only
+ranked = ticks.sort("sym", "ts desc")  # ticking: read in this order
 
 vol = ticks.rolling("sym", rows=100, std_price="std(price)")  # or time="5m", at="ts"
 ```
