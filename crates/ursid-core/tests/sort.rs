@@ -166,10 +166,10 @@ fn assert_windows_match(sorted: &Table, context: &str) {
     let all = rows(sorted);
     let len = all.num_rows();
     for (start, count) in [(0, 7), (len / 2, 9), (len.saturating_sub(3), 9)] {
-        let (window, total) = sorted.rows_at(start, count).unwrap();
-        assert_eq!(total, len, "{context}");
+        let window = sorted.rows_at(start, count).unwrap();
+        assert_eq!(window.total, len, "{context}");
         assert_eq!(
-            window,
+            window.rows,
             all.slice(start, count.min(len - start)),
             "{context}"
         );
@@ -252,6 +252,8 @@ fn large_ticking_sort_follows_heavy_churn() {
     let session = Session::new();
     let input = session.keyed_input_table(&schema, &["id"]).unwrap();
     let sorted = input.sort(&["value desc"]).unwrap();
+    // Each key's row id, as the viewer sees it: a key names one row while its position moves.
+    let mut key_ids: std::collections::HashMap<u64, i64> = std::collections::HashMap::new();
     for cycle in 0..25 {
         // After the first cycle, values crowd into a narrow range: rows pile into a few blocks,
         // which split, and leave the others, which fold.
@@ -281,6 +283,17 @@ fn large_ticking_sort_follows_heavy_churn() {
             rows(&fixed.sort(&["value desc"]).unwrap()),
             "cycle {cycle}"
         );
+        let window = sorted.rows_at(0, usize::MAX).unwrap();
+        let ids = window
+            .rows
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for (key, id) in window.keys.iter().zip(ids.values()) {
+            let known = *key_ids.entry(*key).or_insert(*id);
+            assert_eq!(known, *id, "cycle {cycle}: key {key} moved to another row");
+        }
     }
 }
 

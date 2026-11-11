@@ -588,6 +588,14 @@ struct Keyed {
     new: Vec<bool>,
 }
 
+/// Rows read by position (what the table viewer shows), read together with their keys and the
+/// table's row count. A key names one row for as long as it lives, wherever reads place it.
+pub struct RowsAt {
+    pub rows: RecordBatch,
+    pub keys: Vec<RowKey>,
+    pub total: usize,
+}
+
 /// A table in a session. Cheap to clone; clones refer to the same table. The table lives while
 /// any clone does, or while a live table is computed from it.
 #[derive(Clone)]
@@ -1854,9 +1862,9 @@ impl Table {
             })
     }
 
-    /// The rows at positions `start..start + count` in key order (fewer past the end), with the
-    /// table's row count, read together; or the error that failed the table.
-    pub fn rows_at(&self, start: usize, count: usize) -> Result<(RecordBatch, usize), Error> {
+    /// The rows at positions `start..start + count` in reading order (fewer past the end), with
+    /// their keys and the table's row count, read together; or the error that failed the table.
+    pub fn rows_at(&self, start: usize, count: usize) -> Result<RowsAt, Error> {
         let graph = self.session.read();
         let table = &graph.tables[self.id];
         if let Some(error) = &table.failure {
@@ -1865,8 +1873,13 @@ impl Table {
         let reader = Reader::new(&graph.tables, self.id);
         reader
             .keys_at(start, count)
-            .and_then(|keys| reader.gather(&keys))
-            .map(|rows| (rows, reader.len()))
+            .and_then(|keys| {
+                Ok(RowsAt {
+                    rows: reader.gather(&keys)?,
+                    keys,
+                    total: reader.len(),
+                })
+            })
             .map_err(|e| Error::Compute {
                 table: table.description.clone(),
                 message: e.to_string(),

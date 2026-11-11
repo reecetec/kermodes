@@ -452,30 +452,32 @@ impl Table {
             (self.0.rows_at(0, rows), status)
         });
         match preview {
-            Ok((head, total)) => preview_html(&head, total, &status).map_err(arrow_error),
+            Ok(window) => preview_html(&window.rows, window.total, &status).map_err(arrow_error),
             Err(error) => Ok(failure_html(&error.to_string())),
         }
     }
 
-    /// The rows at positions `start..start + count` in key order as one Arrow IPC stream, with
-    /// the table's row count: what the table viewer fetches for its viewport.
+    /// The rows at positions `start..start + count` in reading order as one Arrow IPC stream,
+    /// their row keys (little-endian u64), and the table's row count: what the table viewer
+    /// fetches for its viewport. Keys say which row is which across pushes, as positions shift.
     fn _viewport<'py>(
         &self,
         py: Python<'py>,
         start: usize,
         count: usize,
-    ) -> PyResult<(Bound<'py, PyBytes>, usize)> {
-        let (bytes, total) = py.detach(|| {
-            let (rows, total) = self.0.rows_at(start, count).map_err(engine_error)?;
+    ) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>, usize)> {
+        let (bytes, keys, total) = py.detach(|| {
+            let window = self.0.rows_at(start, count).map_err(engine_error)?;
             let mut bytes = Vec::new();
             let mut writer =
-                StreamWriter::try_new(&mut bytes, &rows.schema()).map_err(arrow_error)?;
-            writer.write(&rows).map_err(arrow_error)?;
+                StreamWriter::try_new(&mut bytes, &window.rows.schema()).map_err(arrow_error)?;
+            writer.write(&window.rows).map_err(arrow_error)?;
             writer.finish().map_err(arrow_error)?;
             drop(writer);
-            Ok::<_, PyErr>((bytes, total))
+            let keys: Vec<u8> = window.keys.iter().flat_map(|k| k.to_le_bytes()).collect();
+            Ok::<_, PyErr>((bytes, keys, window.total))
         })?;
-        Ok((PyBytes::new(py, &bytes), total))
+        Ok((PyBytes::new(py, &bytes), PyBytes::new(py, &keys), total))
     }
 
     /// Notebook display: a live view for ticking tables (see `ursid._live`).

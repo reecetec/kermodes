@@ -20,5 +20,5 @@ mod types;
 pub use error::Error;
 pub use expr::Expression;
 pub use rolling::Window;
-pub use session::{Session, Table, set_idle_hook};
+pub use session::{RowsAt, Session, Table, set_idle_hook};
 pub use types::{parse_type, type_name};

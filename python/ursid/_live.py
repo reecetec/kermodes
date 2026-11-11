@@ -37,6 +37,8 @@ class _View:
     table: weakref.ref[Table]
     # Shows the table's current rows: re-renders the HTML, or pushes rows to the viewer.
     update: Callable[[Table], None]
+    # Called once the table is gone: the viewer drops the sorted or filtered table it built.
+    release: Callable[[], None]
     seen: int
 
 
@@ -76,6 +78,7 @@ def show(table: Table) -> None:
         viewer = viewer_class(table)
         display(viewer)
         update: Callable[[Table], None] = viewer.push
+        release: Callable[[], None] = viewer.release
     else:
         handle = display(_bundle(table), raw=True, display_id=True)
         if handle is None:
@@ -84,11 +87,14 @@ def show(table: Table) -> None:
         def update(table: Table) -> None:
             handle.update(_bundle(table), raw=True)
 
+        def release() -> None:
+            pass
+
     if not table.is_refreshing:
         return
     global _refresher
     with _lock:
-        _views.append(_View(weakref.ref(table), update, seen))
+        _views.append(_View(weakref.ref(table), update, release, seen))
         if _refresher is None:
             _refresher = threading.Thread(
                 target=_refresh, name="ursid-live", daemon=True
@@ -101,8 +107,11 @@ def _refresh() -> None:
         time.sleep(INTERVAL)
         with _lock:
             # A released table's view stays as last shown.
+            gone = [view for view in _views if view.table() is None]
             _views[:] = [view for view in _views if view.table() is not None]
             views = list(_views)
+        for view in gone:
+            view.release()
         for view in views:
             table = view.table()
             if table is None:

@@ -291,11 +291,20 @@ fn rows_at_positions_match_the_snapshot() {
             (len + 5, 3),
             (0, len),
         ] {
-            let (rows, total) = table.rows_at(start, count).unwrap();
+            let window = table.rows_at(start, count).unwrap();
             let start = start.min(len);
             let want = all.slice(start, count.min(len - start));
-            assert_eq!(total, len, "{}", table.description());
-            assert_eq!(rows, want, "{} at {start}+{count}", table.description());
+            assert_eq!(window.total, len, "{}", table.description());
+            assert_eq!(
+                window.rows,
+                want,
+                "{} at {start}+{count}",
+                table.description()
+            );
+            let every = table.rows_at(0, len).unwrap().keys;
+            assert_eq!(window.keys, every[start..start + want.num_rows()]);
+            let distinct: std::collections::HashSet<u64> = every.iter().copied().collect();
+            assert_eq!(distinct.len(), len, "{}", table.description());
         }
     }
 }

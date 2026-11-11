@@ -278,9 +278,10 @@ def test_viewport_sends_rows_by_position_as_arrow_ipc():
     src = s.input_table(COLUMNS)
     src.append(ticks(["a", "b", "c"], [1.0, 2.0, 3.0], [1, 2, 3]))
     s.step()
-    data, total = src._viewport(1, 5)
+    data, keys, total = src._viewport(1, 5)
     rows = pa.ipc.open_stream(data).read_all()
     assert total == 3
+    assert len(keys) == 8 * rows.num_rows
     assert rows["sym"].to_pylist() == ["b", "c"]
 
 
