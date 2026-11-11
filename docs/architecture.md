@@ -1,6 +1,10 @@
 # Ursid architecture
 
-Status: draft. This document is the design contract; nothing here is implemented yet.
+Status: direction. These are ideals, not hard rules; nothing here is implemented yet, and the code
+corrects this document as it teaches us. "Writing a novel is like driving a car at night. You can
+see only as far as your headlights, but you can make the whole trip that way." (E. L. Doctorow)
+
+The engine's first milestone is designed in more detail in [engine.md](engine.md).
 
 Ursid is a cloud-native data platform where live and historical data share one table model.
 A real-time incremental engine, a columnar ingest log, a Parquet lake, a job scheduler, a model
@@ -1056,7 +1060,7 @@ failure; `plan` warns when a non-replayable source has no replicated ack.
 Cargo.toml        Cargo workspace; shared versions in [workspace.dependencies]
 pyproject.toml    `ursid` Python package (maturin, builds crates/ursid-py)
 uv.lock
-crates/
+crates/           target split; crates start merged and split when they earn it
   ursid-core      Arrow tables, row sets, update graph, clocks, memory accounting
   ursid-ops       static and incremental operators
   ursid-plan      Ursid plan, SQL and expression binder (via sqlparser), type checker, kernel compiler
@@ -1104,7 +1108,7 @@ Verified against maturin 1.16, PyO3 0.30, and uv.
 
 | Milestone | Deliverable | Toy example |
 |---|---|---|
-| M0 | Engine crate: chunks, update graph, static + incremental operators, expression language; PyO3 module; notebook widget | Random-walk ticker → rolling mean/vol, live in Jupyter |
+| M0 | Engine library: row sets, update graph, static + incremental operators, expressions; PyO3 module; notebook widget; oracle tests; benchmarks ([engine.md](engine.md)) | Random-walk ticker → rolling mean/vol, live in Jupyter |
 | M1 | weir (DoPut, segments, seq dedup, epochs, snapshot + tail); `db.live_table`; WebSocket connector; `ursid dev`; Helm chart (weir + engine) | Synthetic ticker over WebSocket → weir → engine, on a laptop and in the cluster |
 | M2 | Parquet writer and pruned reader, catalog with snapshots, merge job, `db.historical_table`, `db.table`, replay clock; SQL frontend with `EXPLAIN`; column IDs and compatible schema changes | Same SQL query over last month (static) and today (ticking); ticker merged nightly, replayed as a backtest |
 | M3 | Projects: `ursid init` / `dev` / `test` / `plan`, manifest discovery, environments, pipeline (build, test, plan, deploy), targets and promotion, preview/shadow; scheduler and `sys.*` tables | Toy ticker project: push to `main` deploys to staging, promotion to prod, PR shadow preview with `ursid diff` |
