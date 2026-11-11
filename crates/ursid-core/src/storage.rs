@@ -1,36 +1,40 @@
 //! Table storage and the per-cycle changes that flow between tables.
 //!
-//! Row versions are appended to immutable chunks; an index maps each live row key to the chunk
-//! and row holding its current version. A modified row gets a new version and its key is
-//! re-pointed; the old version stays readable, so a cycle's previous values cost nothing extra.
+//! Append-only tables keep the batches they were given as immutable chunks, keyed by position.
+//! Every other table gives each live row a slot in mutable columns (`slots`): a new version
+//! overwrites the row's slot and a removed row's slot is reused, so memory follows the live rows.
+//! Deltas carry previous values as their own copies, taken before a cycle is applied.
 
 use ahash::RandomState;
 use arrow::compute::interleave_record_batch;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use hashbrown::HashMap;
+
+use crate::slots::Slots;
 
 /// A row's identity within one table. Keys are never reused.
 pub(crate) type RowKey = u64;
 
-#[derive(Debug, Clone, Copy)]
-struct Location {
-    chunk: u32,
-    row: u32,
-}
-
 enum Index {
     /// Keys `0..len`, in chunk order: append-only tables.
-    Dense { starts: Vec<RowKey>, len: RowKey },
-    /// Any keys. A hash map: lookups are the hot path (gathering previous values, applying
-    /// versions); key order is needed only for snapshots, which sort.
-    Sparse(HashMap<RowKey, Location, RandomState>),
+    Dense {
+        chunks: Vec<RecordBatch>,
+        starts: Vec<RowKey>,
+        len: RowKey,
+    },
+    /// Any keys, each in a slot. A hash map from key to slot: lookups are the hot path; key order
+    /// is needed only for snapshots, which sort.
+    Sparse {
+        slot_of: HashMap<RowKey, u32, RandomState>,
+        columns: Slots,
+        free: Vec<u32>,
+    },
 }
 
 pub(crate) struct Storage {
     schema: SchemaRef,
-    chunks: Vec<RecordBatch>,
     index: Index,
 }
 
@@ -64,13 +68,17 @@ impl Delta {
     }
 }
 
+fn no_row(key: RowKey) -> ArrowError {
+    ArrowError::InvalidArgumentError(format!("no row {key}"))
+}
+
 impl Storage {
     /// For tables that only ever append, keyed by position.
     pub fn dense(schema: SchemaRef) -> Self {
         Self {
             schema,
-            chunks: Vec::new(),
             index: Index::Dense {
+                chunks: Vec::new(),
                 starts: Vec::new(),
                 len: 0,
             },
@@ -79,16 +87,19 @@ impl Storage {
 
     pub fn sparse(schema: SchemaRef) -> Self {
         Self {
+            index: Index::Sparse {
+                slot_of: HashMap::with_hasher(RandomState::new()),
+                columns: Slots::new(&schema),
+                free: Vec::new(),
+            },
             schema,
-            chunks: Vec::new(),
-            index: Index::Sparse(HashMap::with_hasher(RandomState::new())),
         }
     }
 
     pub fn len(&self) -> usize {
         match &self.index {
             Index::Dense { len, .. } => *len as usize,
-            Index::Sparse(map) => map.len(),
+            Index::Sparse { slot_of, .. } => slot_of.len(),
         }
     }
 
@@ -98,19 +109,9 @@ impl Storage {
     }
 
     pub fn contains(&self, key: RowKey) -> bool {
-        self.location(key).is_some()
-    }
-
-    fn location(&self, key: RowKey) -> Option<Location> {
         match &self.index {
-            Index::Dense { starts, len } => (key < *len).then(|| {
-                let chunk = starts.partition_point(|start| *start <= key) - 1;
-                Location {
-                    chunk: chunk as u32,
-                    row: (key - starts[chunk]) as u32,
-                }
-            }),
-            Index::Sparse(map) => map.get(&key).copied(),
+            Index::Dense { len, .. } => key < *len,
+            Index::Sparse { slot_of, .. } => slot_of.contains_key(&key),
         }
     }
 
@@ -119,24 +120,48 @@ impl Storage {
         if keys.is_empty() {
             return Ok(RecordBatch::new_empty(self.schema.clone()));
         }
-        let indices = keys
-            .iter()
-            .map(|key| {
-                self.location(*key)
-                    .map(|l| (l.chunk as usize, l.row as usize))
-                    .ok_or_else(|| ArrowError::InvalidArgumentError(format!("no row {key}")))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let chunks: Vec<&RecordBatch> = self.chunks.iter().collect();
-        interleave_record_batch(&chunks, &indices)
+        match &self.index {
+            Index::Dense {
+                chunks,
+                starts,
+                len,
+            } => {
+                let indices = keys
+                    .iter()
+                    .map(|&key| {
+                        if key >= *len {
+                            return Err(no_row(key));
+                        }
+                        let chunk = starts.partition_point(|start| *start <= key) - 1;
+                        Ok((chunk, (key - starts[chunk]) as usize))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let chunks: Vec<&RecordBatch> = chunks.iter().collect();
+                interleave_record_batch(&chunks, &indices)
+            }
+            Index::Sparse {
+                slot_of, columns, ..
+            } => {
+                let slots = keys
+                    .iter()
+                    .map(|key| slot_of.get(key).copied().ok_or_else(|| no_row(*key)))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let options = RecordBatchOptions::new().with_row_count(Some(slots.len()));
+                RecordBatch::try_new_with_options(
+                    self.schema.clone(),
+                    columns.read(&slots)?,
+                    &options,
+                )
+            }
+        }
     }
 
     /// Live keys in order.
     pub fn keys(&self) -> Vec<RowKey> {
         match &self.index {
             Index::Dense { len, .. } => (0..*len).collect(),
-            Index::Sparse(map) => {
-                let mut keys: Vec<RowKey> = map.keys().copied().collect();
+            Index::Sparse { slot_of, .. } => {
+                let mut keys: Vec<RowKey> = slot_of.keys().copied().collect();
                 keys.sort_unstable();
                 keys
             }
@@ -146,17 +171,16 @@ impl Storage {
     /// Current rows in key order.
     pub fn snapshot(&self) -> Result<Vec<RecordBatch>, ArrowError> {
         match &self.index {
-            Index::Dense { .. } => Ok(self.chunks.clone()),
-            Index::Sparse(map) if map.is_empty() => Ok(Vec::new()),
-            Index::Sparse(_) => Ok(vec![self.gather(&self.keys())?]),
+            Index::Dense { chunks, .. } => Ok(chunks.clone()),
+            Index::Sparse { slot_of, .. } if slot_of.is_empty() => Ok(Vec::new()),
+            Index::Sparse { .. } => Ok(vec![self.gather(&self.keys())?]),
         }
     }
 
     /// Every current row as an addition: how a newly built table catches up with its input.
     pub fn as_added(&self) -> Result<Delta, ArrowError> {
         let added = match &self.index {
-            Index::Dense { starts, .. } => self
-                .chunks
+            Index::Dense { chunks, starts, .. } => chunks
                 .iter()
                 .zip(starts)
                 .map(|(batch, start)| Rows {
@@ -164,8 +188,8 @@ impl Storage {
                     batch: batch.clone(),
                 })
                 .collect(),
-            Index::Sparse(map) if map.is_empty() => Vec::new(),
-            Index::Sparse(_) => {
+            Index::Sparse { slot_of, .. } if slot_of.is_empty() => Vec::new(),
+            Index::Sparse { .. } => {
                 let keys = self.keys();
                 let batch = self.gather(&keys)?;
                 vec![Rows { keys, batch }]
@@ -179,7 +203,11 @@ impl Storage {
 
     pub fn apply(&mut self, delta: &Delta) -> Result<(), ArrowError> {
         match &mut self.index {
-            Index::Dense { starts, len } => {
+            Index::Dense {
+                chunks,
+                starts,
+                len,
+            } => {
                 if delta.removed.iter().any(|r| !r.keys.is_empty())
                     || delta.modified.iter().any(|m| !m.keys.is_empty())
                 {
@@ -195,40 +223,55 @@ impl Storage {
                     }
                     starts.push(*len);
                     *len += rows.keys.len() as RowKey;
-                    self.chunks.push(rows.batch.clone());
+                    chunks.push(rows.batch.clone());
                 }
             }
-            Index::Sparse(map) => {
-                for rows in &delta.removed {
+            Index::Sparse {
+                slot_of,
+                columns,
+                free,
+            } => {
+                for key in delta.removed.iter().flat_map(|r| &r.keys) {
+                    let slot = slot_of.remove(key).ok_or_else(|| no_row(*key))?;
+                    columns.clear(slot);
+                    free.push(slot);
+                }
+                for modified in &delta.modified {
+                    let slots = modified
+                        .keys
+                        .iter()
+                        .map(|key| slot_of.get(key).copied().ok_or_else(|| no_row(*key)))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    columns.write(&modified.current, &slots);
+                }
+                for rows in &delta.added {
+                    let mut slots = Vec::with_capacity(rows.keys.len());
+                    let mut len = columns.len();
                     for key in &rows.keys {
-                        map.remove(key);
+                        let slot = match free.pop() {
+                            Some(slot) => slot,
+                            None => {
+                                len += 1;
+                                u32::try_from(len - 1).map_err(|_| {
+                                    ArrowError::InvalidArgumentError(
+                                        "over 2^32 rows in one table".into(),
+                                    )
+                                })?
+                            }
+                        };
+                        if slot_of.insert(*key, slot).is_some() {
+                            return Err(ArrowError::InvalidArgumentError(format!(
+                                "row {key} added twice"
+                            )));
+                        }
+                        slots.push(slot);
                     }
+                    if len > columns.len() {
+                        columns.resize(len);
+                    }
+                    columns.write(&rows.batch, &slots);
                 }
-                let versions = delta
-                    .modified
-                    .iter()
-                    .map(|m| (&m.keys, &m.current))
-                    .chain(delta.added.iter().map(|r| (&r.keys, &r.batch)));
-                for (keys, batch) in versions {
-                    if keys.is_empty() {
-                        continue;
-                    }
-                    let too_many =
-                        || ArrowError::InvalidArgumentError("over 2^32 chunks or rows".into());
-                    let chunk = u32::try_from(self.chunks.len()).map_err(|_| too_many())?;
-                    u32::try_from(keys.len()).map_err(|_| too_many())?;
-                    self.chunks.push(batch.clone());
-                    map.reserve(keys.len());
-                    for (row, key) in keys.iter().enumerate() {
-                        map.insert(
-                            *key,
-                            Location {
-                                chunk,
-                                row: row as u32,
-                            },
-                        );
-                    }
-                }
+                columns.compact();
             }
         }
         Ok(())

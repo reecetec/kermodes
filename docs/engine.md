@@ -23,7 +23,8 @@ cycles, memory budget enforcement.
 ### 2.1 Types
 
 `bool`, `int32`, `int64`, `float64`, `utf8`, `date32`, `timestamp[ns, UTC]`. Nulls everywhere.
-More types (decimal, dictionary, lists, `utf8_view`) when a slice needs them.
+Creating a table with any other column type fails. More types (decimal, dictionary, lists,
+`utf8_view`) when a slice needs them.
 
 ### 2.2 Tables
 
@@ -57,21 +58,28 @@ needs an attribute its input lacks is rejected at plan time with an error saying
 
 ### 2.4 Storage
 
-Every table stores row versions in immutable Arrow chunks, with an index from key to the chunk
-and row holding its current version:
+Append-only tables keep the batches they receive as immutable Arrow chunks, keyed by position,
+and hand them out without copying.
 
-- An addition appends a chunk.
-- A modification appends the new version and re-points the key; the old version stays readable,
-  so previous values for the cycle cost nothing extra.
-- A removal drops the key from the index.
+Every other table (keyed inputs, `where` over them, `last_by` and `agg_by` outputs) gives each
+live row a slot in mutable columns, with a hash map from key to slot:
+
+- An addition takes a free slot or a new one.
+- A modification overwrites the row's slot in place.
+- A removal frees the slot for the next addition.
+
+Memory follows the live rows, not the history of writes. Strings of up to 12 bytes live in the
+slot (Arrow's string-view layout); longer ones in a per-column byte heap, rewritten once its
+superseded bytes outweigh the live ones (and exceed 1 MiB). Deltas carry previous values as
+copies taken before a cycle is applied, so overwriting loses nothing.
 
 Every operator materializes its output this way, including `where` (Arrow `filter`), `last_by`
-(the group's last row is copied), and `agg_by`. Redirected views over a parent's rows, slot
-columns mutated in place, chunk coalescing, and compaction of superseded versions are later
-optimizations, taken when memory measurements call for them.
+(the group's last row is copied), and `agg_by`. Redirected views over a parent's rows and
+coalescing small append-only chunks are later optimizations, taken when measurements call for
+them.
 
-Reading rows out produces Arrow `RecordBatch`es: the chunks themselves for append-only tables,
-`interleave` for everything else.
+Reading rows out produces Arrow `RecordBatch`es: the chunks themselves for append-only tables
+(`interleave` for selected rows), and a gather from the slot columns for everything else.
 
 ## 3. Deltas
 

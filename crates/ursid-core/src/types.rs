@@ -1,4 +1,4 @@
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::{DataType, Schema, TimeUnit};
 
 use crate::Error;
 
@@ -20,6 +20,31 @@ pub fn parse_type(name: &str) -> Result<DataType, Error> {
             )));
         }
     })
+}
+
+/// Rejects columns outside the engine's types: every table's columns have one of the types
+/// `parse_type` names.
+pub(crate) fn check_types(schema: &Schema) -> Result<(), Error> {
+    for field in schema.fields() {
+        let data_type = field.data_type();
+        let supported = matches!(
+            data_type,
+            DataType::Boolean
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Float64
+                | DataType::Utf8
+                | DataType::Date32
+        ) || matches!(data_type, DataType::Timestamp(TimeUnit::Nanosecond, Some(tz)) if tz.as_ref() == "UTC");
+        if !supported {
+            return Err(Error::Schema(format!(
+                "column `{}` is {}; supported types are {NAMES}",
+                field.name(),
+                type_name(data_type)
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The name `parse_type` accepts for a type, or Arrow's own name for types outside that set.

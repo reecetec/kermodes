@@ -8,6 +8,7 @@ mod expr;
 mod groups;
 mod ops;
 mod session;
+mod slots;
 mod storage;
 mod types;
 

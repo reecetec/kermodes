@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Float64Array, Int32Array, Int64Array, StringArray};
-use arrow::compute::concat_batches;
+use arrow::array::{
+    ArrayRef, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array, StringArray,
+    TimestampNanosecondArray,
+};
+use arrow::compute::{concat_batches, sort_to_indices, take_record_batch};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
@@ -53,6 +56,99 @@ fn rows(table: &Table) -> Vec<String> {
                 .join(", ")
         })
         .collect()
+}
+
+/// A row per id in every column type, values and nulls varying with `round`; `long` holds 2 KB
+/// strings, which live outside their slots.
+fn every_type(ids: &[i64], round: i64) -> RecordBatch {
+    let null = |id: i64, column: i64| (id + round + column) % 5 == 0;
+    let present = |column: i64| ids.iter().map(move |&id| (id, !null(id, column)));
+    let columns: Vec<(&str, ArrayRef)> = vec![
+        ("id", Arc::new(Int64Array::from(ids.to_vec()))),
+        (
+            "flag",
+            Arc::new(BooleanArray::from_iter(
+                present(1).map(|(id, p)| p.then_some((id + round) % 2 == 0)),
+            )),
+        ),
+        (
+            "small",
+            Arc::new(Int32Array::from_iter(
+                present(2).map(|(id, p)| p.then_some((id * round) as i32 - 7)),
+            )),
+        ),
+        (
+            "price",
+            Arc::new(Float64Array::from_iter(
+                present(3).map(|(id, p)| p.then_some(id as f64 / 4.0 + round as f64)),
+            )),
+        ),
+        (
+            "short",
+            Arc::new(StringArray::from_iter(
+                present(4).map(|(id, p)| p.then(|| format!("s{id}-{round}"))),
+            )),
+        ),
+        (
+            "long",
+            Arc::new(StringArray::from_iter(present(0).map(|(id, p)| {
+                p.then(|| format!("{id}:{round}:{}", "x".repeat(2000)))
+            }))),
+        ),
+        (
+            "day",
+            Arc::new(Date32Array::from_iter(
+                present(1).map(|(id, p)| p.then_some(19_000 + (id + round) as i32)),
+            )),
+        ),
+        (
+            "ts",
+            Arc::new(
+                TimestampNanosecondArray::from_iter(
+                    present(2)
+                        .map(|(id, p)| p.then_some(1_700_000_000_000_000_000 + id * 1000 + round)),
+                )
+                .with_timezone("UTC"),
+            ),
+        ),
+    ];
+    RecordBatch::try_from_iter_with_nullable(columns.into_iter().map(|(n, a)| (n, a, true)))
+        .unwrap()
+}
+
+#[test]
+fn keyed_tables_keep_every_column_type_through_rewrites() {
+    let session = Session::new();
+    let schema = every_type(&[], 0).schema();
+    let book = session.keyed_input_table(&schema, &["id"]).unwrap();
+    let ids: Vec<i64> = (0..300).collect();
+    // Six rounds supersede enough 2 KB strings to rewrite the string heap more than once.
+    for round in 0..6 {
+        book.upsert(&[every_type(&ids, round)]).unwrap();
+        session.step();
+    }
+    // Deleting a third frees slots; new keys take them.
+    let gone: ArrayRef = Arc::new(Int64Array::from_iter_values(
+        ids.iter().copied().filter(|id| id % 3 == 0),
+    ));
+    book.delete(&[RecordBatch::try_from_iter([("id", gone)]).unwrap()])
+        .unwrap();
+    session.step();
+    let fresh: Vec<i64> = (1000..1100).collect();
+    book.upsert(&[every_type(&fresh, 9)]).unwrap();
+    session.step();
+
+    let kept: Vec<i64> = ids.iter().copied().filter(|id| id % 3 != 0).collect();
+    let expected = session
+        .static_table(schema, vec![every_type(&kept, 5), every_type(&fresh, 9)])
+        .unwrap();
+    // Compared as batches: Arrow's formatter cannot render the `UTC` zone without chrono-tz.
+    let by_id = |table: &Table| {
+        let all = concat_batches(table.schema(), &table.snapshot().unwrap()).unwrap();
+        let order = sort_to_indices(all.column(0), None, None).unwrap();
+        take_record_batch(&all, &order).unwrap()
+    };
+    assert_eq!(by_id(&book), by_id(&expected));
 }
 
 #[test]
@@ -181,6 +277,21 @@ fn last_by_keeps_the_newest_row_per_group() {
     ticks.append(&[quotes(&[("b", 4.0)])]).unwrap();
     session.step();
     assert_eq!(rows(&latest), ["sym=a, price=3.0", "sym=b, price=4.0"]);
+}
+
+#[test]
+fn tables_take_only_engine_column_types() {
+    let session = Session::new();
+    let odd = Schema::new(vec![Field::new("x", DataType::Float32, true)]);
+    assert!(matches!(session.input_table(&odd), Err(Error::Schema(_))));
+    assert!(matches!(
+        session.keyed_input_table(&odd, &["x"]),
+        Err(Error::Schema(_))
+    ));
+    assert!(matches!(
+        session.static_table(Arc::new(odd), Vec::new()),
+        Err(Error::Schema(_))
+    ));
 }
 
 #[test]

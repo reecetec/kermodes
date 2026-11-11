@@ -11,6 +11,7 @@ use crate::agg::{Accumulator, AggBy, agg_schema};
 use crate::groups::{KeyKind, Membership, resolve};
 use crate::ops::{Assignment, LastBy, Operator, Update, Where};
 use crate::storage::{Delta, Modified, RowKey, Rows, Storage};
+use crate::types::check_types;
 use crate::{Error, Expression, type_name};
 
 /// An engine instance: one update graph and the tables in it. Clones share the graph.
@@ -139,6 +140,7 @@ impl Session {
         schema: SchemaRef,
         batches: Vec<RecordBatch>,
     ) -> Result<Table, Error> {
+        check_types(&schema)?;
         let batches = conform_all(&schema, &batches)?;
         let mut state = TableState::new("static".into(), schema, false, true, Source::Static);
         let mut next = 0;
@@ -631,7 +633,9 @@ impl Table {
     }
 }
 
+/// An input table's schema: supported types, unique names, every column nullable.
 fn nullable(schema: &Schema) -> Result<SchemaRef, Error> {
+    check_types(schema)?;
     let fields: Vec<Field> = schema
         .fields()
         .iter()
