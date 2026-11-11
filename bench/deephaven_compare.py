@@ -40,7 +40,7 @@ def main() -> None:
 
     # Deephaven's modules import only once the server runs.
     import jpy
-    from deephaven import agg
+    from deephaven import agg, merge
     from deephaven.arrow import to_arrow, to_table
 
     runtime = jpy.get_type("java.lang.Runtime").getRuntime()
@@ -73,6 +73,13 @@ def main() -> None:
             ("sector", "count"),
         ),
         "as_of_join": (lambda: ticks.aj(quotes, on=["sym", "ts"]), ("bid", "sum")),
+        "merge": (lambda: merge([ticks, ticks]), ("price", "sum")),
+        "merge + agg_by": (
+            lambda: merge([ticks, ticks]).agg_by(
+                [agg.count_("n"), agg.avg("avg=price")], by="sym"
+            ),
+            ("n", "sum"),
+        ),
     }
 
     print(

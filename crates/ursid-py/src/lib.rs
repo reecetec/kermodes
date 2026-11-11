@@ -357,10 +357,23 @@ impl Table {
     }
 }
 
+/// Every row of every table, which need the same column names and types in the same order. Rows
+/// keep their table's order and tables follow one another; nothing is copied. Ticks if any table
+/// does.
+#[pyfunction]
+#[pyo3(signature = (*tables))]
+fn merge(py: Python<'_>, tables: Vec<PyRef<'_, Table>>) -> PyResult<Table> {
+    let tables: Vec<&ursid_core::Table> = tables.iter().map(|t| &t.0).collect();
+    let table = py
+        .detach(|| ursid_core::Table::merge(&tables))
+        .map_err(engine_error)?;
+    Ok(Table(table))
+}
+
 #[pymodule]
 mod _native {
     #[pymodule_export]
-    use super::{Session, Table};
+    use super::{Session, Table, merge};
 
     use pyo3::prelude::*;
 

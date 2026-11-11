@@ -35,7 +35,15 @@ import data  # bench/ is not a package: found through sys.path above
 
 REPEATS = 3
 ENGINES = ["ursid", "duckdb", "polars"]
-OPERATIONS = ["where + update", "last_by", "agg_by", "natural_join", "as_of_join"]
+OPERATIONS = [
+    "where + update",
+    "last_by",
+    "agg_by",
+    "natural_join",
+    "as_of_join",
+    "merge",
+    "merge + agg_by",
+]
 # Each result's row count plus a checksum: the sum (or non-null count) of one column.
 CHECKS = {
     "where + update": ("notional", "sum"),
@@ -43,6 +51,8 @@ CHECKS = {
     "agg_by": ("n", "sum"),
     "natural_join": ("sector", "count"),
     "as_of_join": ("bid", "sum"),
+    "merge": ("price", "sum"),
+    "merge + agg_by": ("n", "sum"),
 }
 MB = 1 << 20
 
@@ -64,6 +74,10 @@ def operations(engine: str, ticks, quotes, refs):
             ),
             "natural_join": lambda: t.natural_join(r, "sym"),
             "as_of_join": lambda: t.as_of_join(q, "sym", "ts"),
+            "merge": lambda: us.merge(t, t),
+            "merge + agg_by": lambda: us.merge(t, t).agg_by(
+                "sym", n="count(*)", avg="mean(price)"
+            ),
         }
     if engine == "duckdb":
         import duckdb
@@ -85,6 +99,9 @@ def operations(engine: str, ticks, quotes, refs):
             "natural_join": "select t.*, r.sector from ticks t left join refs r on t.sym = r.sym",
             "as_of_join": "select t.*, q.bid from ticks t asof left join quotes q "
             "on t.sym = q.sym and t.ts >= q.ts",
+            "merge": "select * from ticks union all select * from ticks",
+            "merge + agg_by": "select sym, count(*) as n, avg(price) as avg from "
+            "(select * from ticks union all select * from ticks) group by sym",
         }
 
         def query(text: str):
@@ -111,6 +128,12 @@ def operations(engine: str, ticks, quotes, refs):
         ),
         "natural_join": lambda: t.join(r, on="sym", how="left"),
         "as_of_join": lambda: t.join_asof(q, on="ts", by="sym"),
+        "merge": lambda: pl.concat([t, t]),
+        "merge + agg_by": lambda: (
+            pl.concat([t, t])
+            .group_by("sym")
+            .agg(n=pl.len(), avg=pl.col("price").mean())
+        ),
     }
 
 

@@ -75,6 +75,30 @@ const PIPELINES: &[(&str, Pipeline)] = &[
     ("where then last_by", |t| {
         t.filter("flag").unwrap().last_by(&["sym"]).unwrap()
     }),
+    ("merge", |t| {
+        let flagged = t.filter("flag").unwrap();
+        Table::merge(&[t, &flagged, t]).unwrap()
+    }),
+    ("merge then last_by", |t| {
+        let flagged = t.filter("flag").unwrap();
+        let rest = t.filter("NOT flag OR flag IS NULL").unwrap();
+        Table::merge(&[&flagged, &rest])
+            .unwrap()
+            .last_by(&["sym"])
+            .unwrap()
+    }),
+    ("merge then agg_by", |t| {
+        let doubled = t.update(&["size = size * 2"]).unwrap();
+        Table::merge(&[t, &doubled])
+            .unwrap()
+            .agg_by(&["flag"], AGGREGATIONS)
+            .unwrap()
+    }),
+    ("merge of merges", |t| {
+        let latest = t.last_by(&["sym"]).unwrap();
+        let inner = Table::merge(&[t, &latest]).unwrap();
+        Table::merge(&[&latest, &inner]).unwrap()
+    }),
 ];
 
 /// xorshift64*: small, seedable, and enough to shake out ordering and chunking bugs.

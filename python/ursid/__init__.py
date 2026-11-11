@@ -1,6 +1,6 @@
 """Ursid: live and historical tables on Arrow."""
 
-from ursid._native import Session, Table, UrsidError
+from ursid._native import Session, Table, UrsidError, merge
 
 __all__ = [
     "Session",
@@ -12,6 +12,7 @@ __all__ = [
     "int32",
     "int64",
     "local",
+    "merge",
     "string",
     "timestamp",
 ]

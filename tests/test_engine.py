@@ -187,3 +187,21 @@ def test_trades_pick_up_the_prevailing_quote_and_reference_data():
         {"qty": 4, "bid": None, "sector": None},
         {"qty": 5, "bid": 12.0, "sector": "tech"},
     ]
+
+
+def test_merge_follows_its_tables_in_order_and_needs_matching_columns():
+    s = us.local(manual=True)
+    east, west = s.input_table(COLUMNS), s.input_table(COLUMNS)
+    both = us.merge(east, west)
+    east.append(ticks(["a"], [1.0], [1]))
+    west.append(ticks(["b", "c"], [2.0, 3.0], [2, 3]))
+    s.step()
+    assert pa.table(both)["sym"].to_pylist() == ["a", "b", "c"]
+    east.append(ticks(["d"], [4.0], [4]))
+    s.step()
+    assert pa.table(both)["sym"].to_pylist() == ["a", "d", "b", "c"]
+    assert len(both) == 4 and both.is_refreshing
+
+    other = s.input_table({"sym": us.string(), "price": us.float64()})
+    with pytest.raises(us.UrsidError, match="same columns"):
+        us.merge(east, other)

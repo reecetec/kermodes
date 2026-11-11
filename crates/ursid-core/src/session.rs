@@ -89,14 +89,79 @@ enum Source {
         right: usize,
         operator: Box<Join>,
     },
+    /// Every row of `inputs`, read through them: a merge stores nothing.
+    Merge {
+        inputs: Vec<usize>,
+    },
 }
 
-const STORED: &str = "only joins compute their rows; inputs and derived tables store theirs";
+impl Source {
+    /// The tables this one is computed from; none for inputs and static tables.
+    fn parents(&self) -> impl Iterator<Item = usize> + '_ {
+        let (first, second, rest): (_, _, &[usize]) = match self {
+            Source::Derived { parent, .. } => (Some(*parent), None, &[]),
+            Source::Join { left, right, .. } => (Some(*left), Some(*right), &[]),
+            Source::Merge { inputs } => (None, None, inputs),
+            Source::Append | Source::Keyed(_) | Source::Static => (None, None, &[]),
+        };
+        first.into_iter().chain(second).chain(rest.iter().copied())
+    }
+}
 
-/// A table's current rows, wherever they are. Most tables store theirs. A join whose right side
-/// ticks stores none: a row is computed on read from its left row, the join's current match for
-/// it, and that right row, so the join costs no memory per row. Reads resolve through earlier
-/// tables, so `tables` holds every table up to the one read.
+const STORED: &str = "only joins and merges compute their rows; other tables store theirs";
+
+/// Bits of a merged row's key that hold its input's key; the input's index takes the top 8.
+const MERGE_KEY_BITS: u32 = 56;
+
+/// The merged key of input `index`'s row `key`.
+fn merged_key(index: usize, key: RowKey) -> Result<RowKey, ArrowError> {
+    if key >> MERGE_KEY_BITS != 0 {
+        return Err(ArrowError::ComputeError(format!(
+            "merge: input row key {key} needs more than {MERGE_KEY_BITS} bits"
+        )));
+    }
+    Ok(((index as RowKey) << MERGE_KEY_BITS) | key)
+}
+
+fn merged_keys(index: usize, keys: &[RowKey]) -> Result<Vec<RowKey>, ArrowError> {
+    keys.iter().map(|key| merged_key(index, *key)).collect()
+}
+
+/// Inputs' changes as a merged table's: the same rows (shared, not copied) under merged keys and
+/// the merged schema. `deltas` pairs each changed input's index with its delta.
+fn merged_delta<'a>(
+    schema: &SchemaRef,
+    deltas: impl Iterator<Item = (usize, &'a Delta)>,
+) -> Result<Delta, ArrowError> {
+    let mut out = Delta::default();
+    for (index, delta) in deltas {
+        for rows in &delta.added {
+            out.added.push(Rows {
+                keys: merged_keys(index, &rows.keys)?,
+                batch: rows.batch.clone().with_schema(schema.clone())?,
+            });
+        }
+        for rows in &delta.removed {
+            out.removed.push(Rows {
+                keys: merged_keys(index, &rows.keys)?,
+                batch: rows.batch.clone().with_schema(schema.clone())?,
+            });
+        }
+        for modified in &delta.modified {
+            out.modified.push(Modified {
+                keys: merged_keys(index, &modified.keys)?,
+                previous: modified.previous.clone().with_schema(schema.clone())?,
+                current: modified.current.clone().with_schema(schema.clone())?,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// A table's current rows, wherever they are. Most tables store theirs. Two kinds store none: a
+/// join whose right side ticks computes a row on read from its left row, the join's current match
+/// for it, and that right row; a merge reads each row from the input it came from. Reads resolve
+/// through earlier tables, so `tables` holds every table up to the one read.
 #[derive(Clone, Copy)]
 pub(crate) struct Reader<'a> {
     tables: &'a [TableState],
@@ -109,6 +174,10 @@ enum Place<'a> {
         join: &'a Join,
         left: Reader<'a>,
         right: Reader<'a>,
+    },
+    Merged {
+        inputs: &'a [usize],
+        schema: &'a SchemaRef,
     },
 }
 
@@ -133,14 +202,23 @@ impl<'a> Reader<'a> {
                 left: Self::new(self.tables, *left),
                 right: Self::new(self.tables, *right),
             },
+            (None, Source::Merge { inputs }) => Place::Merged {
+                inputs,
+                schema: &table.schema,
+            },
             (None, _) => unreachable!("{STORED}"),
         }
+    }
+
+    fn input(self, id: usize) -> Self {
+        Self::new(self.tables, id)
     }
 
     pub fn len(self) -> usize {
         match self.place() {
             Place::Stored(storage) => storage.len(),
             Place::Joined { left, .. } => left.len(),
+            Place::Merged { inputs, .. } => inputs.iter().map(|id| self.input(*id).len()).sum(),
         }
     }
 
@@ -149,6 +227,31 @@ impl<'a> Reader<'a> {
         match self.place() {
             Place::Stored(storage) => storage.gather(keys),
             Place::Joined { join, left, right } => join.rows(&left.gather(keys)?, right),
+            Place::Merged { inputs, schema } => {
+                // Each key's input and position among the keys asked of that input.
+                let mut wanted = vec![Vec::new(); inputs.len()];
+                let mut at = Vec::with_capacity(keys.len());
+                for key in keys {
+                    let index = (key >> MERGE_KEY_BITS) as usize;
+                    let Some(input_keys) = wanted.get_mut(index) else {
+                        return Err(ArrowError::InvalidArgumentError(format!("no row {key}")));
+                    };
+                    at.push((index, input_keys.len()));
+                    input_keys.push(key & ((1 << MERGE_KEY_BITS) - 1));
+                }
+                let batches = inputs
+                    .iter()
+                    .zip(&wanted)
+                    .map(|(id, keys)| self.input(*id).gather(keys)?.with_schema(schema.clone()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if let [(only, _), ..] = at[..]
+                    && at.iter().all(|(index, _)| *index == only)
+                {
+                    return Ok(batches[only].clone());
+                }
+                let batches: Vec<&RecordBatch> = batches.iter().collect();
+                interleave_record_batch(&batches, &at)
+            }
         }
     }
 
@@ -191,13 +294,25 @@ impl<'a> Reader<'a> {
 
     /// The first `n` rows in key order.
     pub fn head(self, n: usize) -> Result<RecordBatch, ArrowError> {
-        self.gather(&self.head_keys(n))
+        self.gather(&self.head_keys(n)?)
     }
 
-    fn head_keys(self, n: usize) -> Vec<RowKey> {
+    fn head_keys(self, n: usize) -> Result<Vec<RowKey>, ArrowError> {
         match self.place() {
-            Place::Stored(storage) => storage.head_keys(n),
+            Place::Stored(storage) => Ok(storage.head_keys(n)),
             Place::Joined { left, .. } => left.head_keys(n),
+            // Merged keys order by input first, so the first rows are the first inputs'.
+            Place::Merged { inputs, .. } => {
+                let mut keys = Vec::new();
+                for (index, id) in inputs.iter().enumerate() {
+                    if keys.len() == n {
+                        break;
+                    }
+                    let first = self.input(*id).head_keys(n - keys.len())?;
+                    keys.extend(merged_keys(index, &first)?);
+                }
+                Ok(keys)
+            }
         }
     }
 
@@ -210,6 +325,15 @@ impl<'a> Reader<'a> {
                 .iter()
                 .map(|batch| join.rows(batch, right))
                 .collect(),
+            Place::Merged { inputs, schema } => {
+                let mut batches = Vec::new();
+                for id in inputs {
+                    for batch in self.input(*id).snapshot()? {
+                        batches.push(batch.with_schema(schema.clone())?);
+                    }
+                }
+                Ok(batches)
+            }
         }
     }
 
@@ -223,6 +347,20 @@ impl<'a> Reader<'a> {
                     rows.batch = join.rows(&rows.batch, right)?;
                 }
                 Ok(delta)
+            }
+            Place::Merged { inputs, schema } => {
+                // The inputs' key vectors are this call's own: re-key them in place.
+                let mut out = Delta::default();
+                for (index, id) in inputs.iter().enumerate() {
+                    for mut rows in self.input(*id).as_added()?.added {
+                        for key in &mut rows.keys {
+                            *key = merged_key(index, *key)?;
+                        }
+                        rows.batch = rows.batch.with_schema(schema.clone())?;
+                        out.added.push(rows);
+                    }
+                }
+                Ok(out)
             }
         }
     }
@@ -363,62 +501,57 @@ impl Session {
             if table.failure.is_some() {
                 continue;
             }
+            if table.source.parents().next().is_some() {
+                // A computed table updates only while refreshing, and only on its parents' changes.
+                if !table.refreshing {
+                    continue;
+                }
+                let failed = table
+                    .source
+                    .parents()
+                    .find_map(|p| before[p].failure.clone());
+                if let Some(cause) = failed {
+                    table.fail(Error::Upstream {
+                        table: table.description.clone(),
+                        cause: Arc::new(cause),
+                    });
+                    table.changed = cycle;
+                    continue;
+                }
+                if table.source.parents().all(|p| before[p].delta.is_none()) {
+                    continue;
+                }
+            }
+            let unchanged = Delta::default();
+            let delta_of = |id: usize| before[id].delta.as_ref().unwrap_or(&unchanged);
             let result = match &mut table.source {
                 Source::Static => continue,
                 Source::Append => Ok(appended(table.storage.as_ref().expect(STORED), writes)),
                 Source::Keyed(keyed) => {
                     keyed.resolve(table.storage.as_ref().expect(STORED), writes)
                 }
-                Source::Derived { parent, operator } => {
-                    if !table.refreshing {
-                        continue;
-                    }
-                    let (id, parent) = (*parent, &before[*parent]);
-                    if let Some(cause) = &parent.failure {
-                        table.fail(Error::Upstream {
-                            table: table.description.clone(),
-                            cause: Arc::new(cause.clone()),
-                        });
-                        table.changed = cycle;
-                        continue;
-                    }
-                    let Some(delta) = &parent.delta else {
-                        continue;
-                    };
-                    operator.process(
-                        Reader::new(before, id),
-                        delta,
-                        table.storage.as_ref().expect(STORED),
-                    )
-                }
+                Source::Derived { parent, operator } => operator.process(
+                    Reader::new(before, *parent),
+                    delta_of(*parent),
+                    table.storage.as_ref().expect(STORED),
+                ),
                 Source::Join {
                     left,
                     right,
                     operator,
-                } => {
-                    if !table.refreshing {
-                        continue;
-                    }
-                    let (ids, left, right) = ((*left, *right), &before[*left], &before[*right]);
-                    if let Some(cause) = left.failure.as_ref().or(right.failure.as_ref()) {
-                        table.fail(Error::Upstream {
-                            table: table.description.clone(),
-                            cause: Arc::new(cause.clone()),
-                        });
-                        table.changed = cycle;
-                        continue;
-                    }
-                    if left.delta.is_none() && right.delta.is_none() {
-                        continue;
-                    }
-                    let unchanged = Delta::default();
-                    operator.process(
-                        Reader::new(before, ids.0),
-                        left.delta.as_ref().unwrap_or(&unchanged),
-                        Reader::new(before, ids.1),
-                        right.delta.as_ref().unwrap_or(&unchanged),
-                    )
-                }
+                } => operator.process(
+                    Reader::new(before, *left),
+                    delta_of(*left),
+                    Reader::new(before, *right),
+                    delta_of(*right),
+                ),
+                Source::Merge { inputs } => merged_delta(
+                    &table.schema,
+                    inputs
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, id)| before[*id].delta.as_ref().map(|d| (index, d))),
+                ),
             };
             table.commit(result);
             if table.delta.is_some() || table.failure.is_some() {
@@ -548,6 +681,7 @@ impl TableState {
     ) -> Self {
         let storage = match &source {
             Source::Join { operator, .. } if operator.computes_rows() => None,
+            Source::Merge { .. } => None,
             _ if add_only => Some(Storage::dense(schema.clone())),
             _ => Some(Storage::sparse(schema.clone())),
         };
@@ -1067,6 +1201,94 @@ impl Table {
         graph.tables.push(state);
         Ok(Table {
             session: self.session.clone(),
+            id: graph.tables.len() - 1,
+            schema,
+        })
+    }
+
+    /// Every row of every one of `tables`, which need the same column names and types in the
+    /// same order. Rows keep their table's order, tables follow one another, and nothing is
+    /// copied: the merge reads each row from its table. It ticks if any table does, and a merge
+    /// among `tables` contributes its own tables.
+    pub fn merge(tables: &[&Table]) -> Result<Table, Error> {
+        let Some(first) = tables.first() else {
+            return Err(Error::Unsupported("merge needs at least one table".into()));
+        };
+        if tables
+            .iter()
+            .any(|t| !Arc::ptr_eq(&t.session.inner, &first.session.inner))
+        {
+            return Err(Error::Unsupported(
+                "tables from different sessions cannot be merged".into(),
+            ));
+        }
+        let columns = |schema: &Schema| -> Vec<(String, DataType)> {
+            schema
+                .fields()
+                .iter()
+                .map(|f| (f.name().clone(), f.data_type().clone()))
+                .collect()
+        };
+        let listed = |schema: &Schema| -> String {
+            schema
+                .fields()
+                .iter()
+                .map(|f| format!("{} {}", f.name(), type_name(f.data_type())))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        if let Some(other) = tables
+            .iter()
+            .find(|t| columns(&t.schema) != columns(&first.schema))
+        {
+            return Err(Error::Schema(format!(
+                "merge needs the same columns in every table, in the same order: ({}) and ({})",
+                listed(&first.schema),
+                listed(&other.schema)
+            )));
+        }
+        let mut graph = first.session.write();
+        let mut inputs = Vec::new();
+        for table in tables {
+            let state = &graph.tables[table.id];
+            if let Some(cause) = &state.failure {
+                return Err(Error::Upstream {
+                    table: "merge".into(),
+                    cause: Arc::new(cause.clone()),
+                });
+            }
+            match &state.source {
+                Source::Merge { inputs: theirs } => inputs.extend(theirs),
+                _ => inputs.push(table.id),
+            }
+        }
+        if inputs.len() > 1 << (RowKey::BITS - MERGE_KEY_BITS) {
+            return Err(Error::Unsupported(format!(
+                "merge takes at most {} tables",
+                1 << (RowKey::BITS - MERGE_KEY_BITS)
+            )));
+        }
+        let fields: Vec<Field> = first
+            .schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, field)| {
+                let nullable = tables.iter().any(|t| t.schema.field(i).is_nullable());
+                field.as_ref().clone().with_nullable(nullable)
+            })
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+        let state = TableState::new(
+            format!("merge({} tables)", inputs.len()),
+            schema.clone(),
+            inputs.iter().any(|id| graph.tables[*id].refreshing),
+            inputs.iter().all(|id| graph.tables[*id].add_only),
+            Source::Merge { inputs },
+        );
+        graph.tables.push(state);
+        Ok(Table {
+            session: first.session.clone(),
             id: graph.tables.len() - 1,
             schema,
         })

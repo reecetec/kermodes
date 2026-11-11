@@ -30,6 +30,7 @@ OPERATIONS = [
     "agg_by",
     "natural_join",
     "as_of_join",
+    "merge + agg_by",
 ]
 WARM = 10
 MB = 1 << 20
@@ -42,7 +43,7 @@ def worker(op: str, cycles: int, batch: int) -> dict:
 
     # Deephaven's modules import only once the server runs.
     import jpy
-    from deephaven import agg, input_table
+    from deephaven import agg, input_table, merge
     from deephaven import dtypes as dht
     from deephaven.arrow import to_table
     from deephaven.update_graph import exclusive_lock
@@ -77,6 +78,9 @@ def worker(op: str, cycles: int, batch: int) -> dict:
         ),
         "natural_join": lambda: ticks.natural_join(refs, on="sym"),
         "as_of_join": lambda: ticks.aj(quotes, on=["sym", "ts"]),
+        "merge + agg_by": lambda: merge([ticks, ticks.where("price > 100")]).agg_by(
+            [agg.count_("n"), agg.avg("avg=price")], by="sym"
+        ),
     }[op]()
 
     times = []

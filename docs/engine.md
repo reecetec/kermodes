@@ -88,6 +88,9 @@ left column per row, about as much again as the left table. Previous values are 
 either: the join builds them from the cycle's deltas (the left row's previous values, and the
 right columns of its previous match as they were before the cycle).
 
+A `merge` stores no rows either: a row's key names its input (top 8 bits) and its key there, so a
+read goes to the input, and a snapshot is the inputs' snapshots one after another, uncopied.
+
 ## 3. Deltas
 
 One delta per table per cycle, carrying data:
@@ -147,7 +150,7 @@ keep no state) and an incremental path below. Static paths use the same kernels 
 | `natural_join(right, on, joins)` | One grouping table for key values from both sides (NULL matches NULL, as in `agg_by`); per group its right rows and, only if the right side can change, its left rows (appended in key order when the left side only gains rows, else a sorted set) | Right changes first: a key with more than one right row fails the table. Then the left rows already joined whose key's right row changed are collected; then left removes, modifies, and adds are applied, looked up against the new right rows; finally the collected rows, minus those the left side removed or modified, are emitted as modified. Output rows keep the left keys and only gain rows when the left side only gains rows and the right side is static. If the right side can change, the output stores no rows and computes them on read (§2.4). | — |
 | `as_of_join(right, on, at, joins)` | The same grouping table; per group, right rows as a vector sorted by `(time, row key)` (appended when they arrive in time order), and left rows by `(time, row key)` only if the right side ticks | A left row matches the right row with the greatest time not after its own, the latest arrival among equal times; NULL times never match. Lookups within a cycle resume from the group's previous one, galloping forward when times increase, so time-ordered rows cost a short scan rather than a binary search each. A right row added at time `t` re-matches exactly the left rows timed from `t` up to the group's next right time. Cycles order work as for `natural_join`; with a ticking right side, the output computes its rows on read (§2.4). | Right must only gain rows; `at` is an integer, date, or timestamp column. |
 | `rolling(by, window, aggs)` | Per group: a ring buffer (row windows) or deque (time windows) with running accumulators | Added rows in key order: push, evict out-of-window, emit the aggregate as columns on the added row. Earlier rows never change. | Input must be `append_only`; windows look backward only. |
-| `merge(tables)` | None | Re-key each input's delta with its input index; union. | Same schema required. |
+| `merge(tables)` | None; rows are read from the inputs (§2.4) | Re-key each input's delta with its input index; union. The batches are shared, not copied. A merge among the inputs contributes its own inputs, so merges never nest. | Same column names and types, in the same order; at most 256 inputs. |
 | `head(n)` / `tail(n)` | Output row set | Positions over the parent's row set; recompute the boundary on deltas. | — |
 | `sort(by)` | — | Static only in M0. | Ticking sort is M2 (SQL `ORDER BY`). |
 
@@ -214,6 +217,7 @@ m = us.local(manual=True)  # only m.step() runs cycles; m.start() / m.stop()
 
 enriched = live.natural_join(refs, on="sym")  # `joins=` picks and renames right columns
 priced = ticks.as_of_join(quotes, on="sym", at="ts")
+both = us.merge(east, west)  # rows of every table, uncopied
 
 # Still to come in M0:
 vol = ticks.rolling("sym", rows=100, std_price="std(price)")
