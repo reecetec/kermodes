@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, Notify};
 
 use crate::git::{self, Credentials, Repository};
 use crate::k8s::{Kube, Rollout};
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, Update};
 use crate::plan::{self, Decision, Target};
 use crate::state::State;
 
@@ -284,10 +284,15 @@ async fn reconcile(controller: &Controller, project: &ProjectConfig) -> Result<(
                     project.name, resource.name, latest.commit
                 );
             }
-            // Recreate what someone deleted, at the commit it ran.
+            // The commit it runs stays applied. For an `auto` resource that carries platform
+            // upgrades too: applying an unchanged Deployment is a no-op, and a new image rolls
+            // it like a new commit. A `manual` one restarts only when someone rolls it out, so
+            // it is only recreated if someone deleted it, and takes a new image at its next
+            // rollout.
             Decision::Current | Decision::Hold => {
-                if controller.kube.rollout(name).await? == Rollout::Absent
-                    && let Some(commit) = running
+                if let Some(commit) = running
+                    && (resource.update == Update::Auto
+                        || controller.kube.rollout(name).await? == Rollout::Absent)
                 {
                     let target = target(controller, project, commit);
                     controller

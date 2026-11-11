@@ -924,6 +924,9 @@ def book(db): ...
   input positions make the handover exactly-once.
 - Changes the plan does not class as compatible (§5.4) are never rolled out automatically; they
   wait for an explicit rollout, whatever the update policy.
+- A platform upgrade is a new artifact too, until environment images pin the platform per
+  project (§10.6): `auto` resources roll onto the new image as the controller starts, and
+  `manual` ones take it at their next rollout.
 - Jobs run the newest artifact at their next trigger; a running attempt finishes on the artifact it
   started with.
 - Node drains move runs the same way (§17.1).
