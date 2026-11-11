@@ -107,7 +107,8 @@ def test_last_by_and_agg_by_match_a_plain_python_recomputation():
     for r in rows:
         by_sym.setdefault(r["sym"], []).append(r)
     assert pa.table(latest).to_pylist() == [group[-1] for group in by_sym.values()]
-    assert pa.table(stats).to_pylist() == [
+    got = sorted(pa.table(stats).to_pylist(), key=lambda r: r["sym"])
+    assert got == [
         {
             "sym": sym,
             "n": len(group),

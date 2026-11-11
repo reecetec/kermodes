@@ -137,11 +137,12 @@ fn aggregations_follow_upserts_and_deletes() {
     ])])
     .unwrap();
     session.step();
+    // agg_by row order follows its shards, so compare as sets.
     assert_eq!(
-        rows(&by_sector),
+        sorted(rows(&by_sector)),
         [
-            "sector=tech, n=2, total=40, big=30",
-            "sector=energy, n=1, total=5, big=5"
+            "sector=energy, n=1, total=5, big=5",
+            "sector=tech, n=2, total=40, big=30"
         ]
     );
 
@@ -155,12 +156,17 @@ fn aggregations_follow_upserts_and_deletes() {
         .unwrap();
     session.step();
     assert_eq!(
-        rows(&by_sector),
+        sorted(rows(&by_sector)),
         [
-            "sector=tech, n=1, total=10, big=10",
-            "sector=energy, n=1, total=7, big=7"
+            "sector=energy, n=1, total=7, big=7",
+            "sector=tech, n=1, total=10, big=10"
         ]
     );
+}
+
+fn sorted(mut rows: Vec<String>) -> Vec<String> {
+    rows.sort();
+    rows
 }
 
 #[test]

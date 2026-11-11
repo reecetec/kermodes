@@ -8,8 +8,9 @@ use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
-use crate::groups::Grouper;
-use crate::ops::{AggBy, Aggregation, Assignment, LastBy, Operator, Update, Where, agg_schema};
+use crate::agg::{Accumulator, AggBy, agg_schema};
+use crate::groups::{Grouper, Membership, resolve};
+use crate::ops::{Assignment, LastBy, Operator, Update, Where};
 use crate::storage::{Delta, Modified, RowKey, Rows, Storage};
 use crate::{Error, Expression, type_name};
 
@@ -57,7 +58,10 @@ enum Source {
     Append,
     Keyed(Keyed),
     Static,
-    Derived { parent: usize, operator: Operator },
+    Derived {
+        parent: usize,
+        operator: Box<Operator>,
+    },
 }
 
 /// An input table with one row per key value: upserts replace, deletes remove.
@@ -322,9 +326,9 @@ impl Keyed {
             let index = upserts.len();
             let upserting = batch.is_some();
             upserts.extend(batch);
-            for row in 0..keys.len() {
+            for row in 0..keys.num_rows() {
                 let target = upserting.then_some((index, row));
-                let key = keys.get(row);
+                let key = keys.row(row).data();
                 if latest.insert(key.to_vec(), target).is_none() {
                     order.push(key.to_vec());
                 }
@@ -478,12 +482,12 @@ impl Table {
 
     /// The last row (in arrival order) for each value of `columns`.
     pub fn last_by(&self, columns: &[&str]) -> Result<Table, Error> {
-        let grouper = Grouper::new(&self.schema, columns)?;
+        let groups = self.membership(columns)?;
         self.derive(
             format!("last_by({})", columns.join(", ")),
             self.schema.clone(),
             false,
-            Operator::LastBy(LastBy::new(grouper, self.add_only())),
+            Operator::LastBy(LastBy::new(groups)),
         )
     }
 
@@ -495,23 +499,32 @@ impl Table {
                 "agg_by needs at least one aggregation".into(),
             ));
         }
-        let grouper = Grouper::new(&self.schema, columns)?;
-        let mut parsed = Vec::with_capacity(aggregations.len());
+        let group_columns = resolve(&self.schema, columns)?;
         let mut outputs = Vec::with_capacity(aggregations.len());
         for (name, spec) in aggregations {
-            let (aggregation, data_type): (Aggregation, DataType) =
-                Aggregation::parse(spec, &self.schema)?;
-            parsed.push(aggregation);
+            let (_, data_type): (Accumulator, DataType) = Accumulator::parse(spec, &self.schema)?;
             outputs.push(((*name).to_owned(), data_type));
         }
-        let output = agg_schema(&self.schema, &grouper, &outputs)?;
-        let specs: Vec<String> = aggregations
+        let output = agg_schema(&self.schema, &group_columns, &outputs)?;
+        let specs: Vec<&str> = aggregations.iter().map(|(_, spec)| *spec).collect();
+        let operator = AggBy::new(
+            &self.schema,
+            group_columns,
+            &specs,
+            self.add_only(),
+            output.clone(),
+        )?;
+        let named: Vec<String> = aggregations
             .iter()
             .map(|(name, spec)| format!("{name}={spec}"))
             .collect();
-        let description = format!("agg_by([{}], {})", columns.join(", "), specs.join(", "));
-        let operator = AggBy::new(grouper, parsed, self.add_only(), output.clone());
+        let description = format!("agg_by([{}], {})", columns.join(", "), named.join(", "));
         self.derive(description, output, false, Operator::AggBy(operator))
+    }
+
+    fn membership(&self, columns: &[&str]) -> Result<Membership, Error> {
+        let columns = resolve(&self.schema, columns)?;
+        Membership::new(&self.schema, columns, self.add_only(), 0, 1).map_err(schema_error)
     }
 
     /// The table's current rows in key order, or the error that failed it.
@@ -569,7 +582,7 @@ impl Table {
         let parent = &graph.tables[self.id];
         let source = Source::Derived {
             parent: self.id,
-            operator,
+            operator: Box::new(operator),
         };
         let mut state = TableState::new(
             description,

@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod agg;
 mod error;
 mod expr;
 mod groups;

@@ -4,7 +4,8 @@
 //!
 //! Each cycle appends one batch, then times `step()`: a ticking `where` → `update` →
 //! `last_by(sym)` and an `agg_by(sym)` with count, mean, and std. Afterwards the same `agg_by`
-//! runs once over a static copy of everything appended. Batch generation is not timed.
+//! runs over a static copy of everything appended, `--static-repeats` times (more repeats give a
+//! profiler more samples); the fastest run is reported. Batch generation is not timed.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,6 +19,7 @@ struct Args {
     rows: usize,
     cycles: usize,
     symbols: usize,
+    static_repeats: usize,
 }
 
 impl Args {
@@ -26,6 +28,7 @@ impl Args {
             rows: 100_000,
             cycles: 100,
             symbols: 10_000,
+            static_repeats: 1,
         };
         let mut words = std::env::args().skip(1);
         while let Some(flag) = words.next() {
@@ -37,7 +40,10 @@ impl Args {
                 "--rows" => args.rows = value,
                 "--cycles" => args.cycles = value,
                 "--symbols" => args.symbols = value,
-                other => panic!("unknown flag {other}; expected --rows, --cycles, --symbols"),
+                "--static-repeats" => args.static_repeats = value.max(1),
+                other => panic!(
+                    "unknown flag {other}; expected --rows, --cycles, --symbols, --static-repeats"
+                ),
             }
         }
         args
@@ -167,16 +173,21 @@ fn main() {
     let fixed = session
         .static_table(schema.clone(), everything)
         .expect("same schema");
-    let start = Instant::now();
-    let grouped = fixed
-        .agg_by(&["sym"], &aggregations)
-        .expect("valid aggregation");
-    let elapsed = start.elapsed();
+    let mut fastest = Duration::MAX;
+    let mut groups = 0;
+    for _ in 0..args.static_repeats {
+        let start = Instant::now();
+        let grouped = fixed
+            .agg_by(&["sym"], &aggregations)
+            .expect("valid aggregation");
+        fastest = fastest.min(start.elapsed());
+        groups = grouped.num_rows().expect("not failed");
+    }
     println!(
         "static agg_by over {} rows: {:.1} ms ({:.0} rows/s), {} groups",
         total_rows,
-        millis(elapsed),
-        total_rows as f64 / elapsed.as_secs_f64(),
-        grouped.num_rows().expect("not failed")
+        millis(fastest),
+        total_rows as f64 / fastest.as_secs_f64(),
+        groups
     );
 }

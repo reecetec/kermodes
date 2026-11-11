@@ -186,6 +186,41 @@ fn ticking_tables_over_appends_match_their_static_recomputation() {
     }
 }
 
+/// Large deltas aggregate on every core; small ones on one. Both must give the same result.
+#[test]
+fn parallel_aggregation_matches_cycle_by_cycle_aggregation() {
+    let mut rng = Rng(7);
+    let session = Session::new();
+    let input = session.input_table(&schema()).unwrap();
+    let grouped = [
+        input.agg_by(&["sym"], AGGREGATIONS).unwrap(),
+        input.agg_by(&["id"], AGGREGATIONS).unwrap(),
+        input.agg_by(&["sym", "flag"], AGGREGATIONS).unwrap(),
+        input.agg_by(&[], AGGREGATIONS).unwrap(),
+    ];
+    for _ in 0..100 {
+        input.append(&[random_batch(&mut rng, 2_000)]).unwrap();
+        session.step();
+    }
+    let everything = session
+        .static_table(input.schema().clone(), input.snapshot().unwrap())
+        .unwrap();
+    let all_at_once = [
+        everything.agg_by(&["sym"], AGGREGATIONS).unwrap(),
+        everything.agg_by(&["id"], AGGREGATIONS).unwrap(),
+        everything.agg_by(&["sym", "flag"], AGGREGATIONS).unwrap(),
+        everything.agg_by(&[], AGGREGATIONS).unwrap(),
+    ];
+    for (ticking, fixed) in grouped.iter().zip(&all_at_once) {
+        assert_eq!(
+            contents(ticking),
+            contents(fixed),
+            "{}",
+            fixed.description()
+        );
+    }
+}
+
 #[test]
 fn ticking_tables_over_upserts_and_deletes_match_their_static_recomputation() {
     for seed in 1..=150 {
