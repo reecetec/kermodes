@@ -92,6 +92,15 @@ fn values_follow_sql_semantics() {
             bools(&[Some(true), Some(false), None]),
         ),
         ("(price + 1) * 2", floats(&[Some(5.0), Some(-2.0), None])),
+        ("sym LIKE 'a%'", bools(&[Some(true), Some(false), None])),
+        ("sym LIKE 'A'", bools(&[Some(false), Some(false), None])),
+        ("sym ILIKE 'A'", bools(&[Some(true), Some(false), None])),
+        (
+            "sym NOT ILIKE '_'",
+            bools(&[Some(false), Some(false), None]),
+        ),
+        ("sym NOT LIKE 'b'", bools(&[Some(true), Some(false), None])),
+        ("sym LIKE NULL", bools(&[None, None, None])),
     ];
     for (text, expected) in cases {
         let got = eval(text).unwrap_or_else(|e| panic!("{text}: {e}"));
@@ -128,6 +137,11 @@ fn binding_errors_name_the_problem_and_its_position() {
             "price IN (1, 2)",
             Some(1),
             "not supported in expressions yet",
+        ),
+        (
+            "size LIKE '1%'",
+            Some(1),
+            "`LIKE` needs strings, but `size` is int64",
         ),
     ];
     for (text, column, message) in cases {

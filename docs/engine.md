@@ -190,7 +190,8 @@ Grouping keys:
 - Compile to a tree of arrow-rs kernel calls evaluated per chunk: arithmetic (`arrow::compute`
   numeric kernels), comparison (`cmp`), boolean with SQL three-valued logic (`and_kleene`,
   `or_kleene`), `CASE` via `zip`, `CAST` via `cast`, `IN` via comparison chains or a hash set for
-  long lists, `IS [NOT] NULL` from validity.
+  long lists, `IS [NOT] NULL` from validity, `[NOT] LIKE` / `ILIKE` via the `like` kernels
+  (`%`, `_`; no `ESCAPE`).
 - Literals become scalars, never broadcast arrays. Constant subtrees fold at compile time.
 - Integer division by zero yields null; overflow on checked arithmetic fails the table.
 - M0 functions: `abs`, `round`, `floor`, `ceil`, `sqrt`, `ln`, `exp`, `power`, `least`,

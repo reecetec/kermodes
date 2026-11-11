@@ -6,6 +6,7 @@ use arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Datum, Float64Array, Int32Array, Int64Array, NullArray,
     Scalar, StringArray, UInt32Array,
 };
+use arrow::compute::kernels::comparison::{ilike, like, nilike, nlike};
 use arrow::compute::kernels::{cmp, numeric};
 use arrow::compute::{and_kleene, cast, is_not_null, is_null, not, nullif, or_kleene, take};
 use arrow::datatypes::{DataType, Schema};
@@ -167,6 +168,35 @@ impl Binder<'_> {
                 }
             }
             Ast::BinaryOp { left, op, right } => self.binary(ast, left, op, right),
+            Ast::Like {
+                negated,
+                any,
+                expr,
+                pattern,
+                escape_char,
+            }
+            | Ast::ILike {
+                negated,
+                any,
+                expr,
+                pattern,
+                escape_char,
+            } => {
+                if *any || escape_char.is_some() {
+                    return Err(self.error(
+                        ast.span(),
+                        "`LIKE ANY` and `ESCAPE` are not supported".into(),
+                    ));
+                }
+                let pattern_match = PatternMatch {
+                    case_insensitive: matches!(ast, Ast::ILike { .. }),
+                    negated: *negated,
+                };
+                let text = self.string(expr)?;
+                let pattern = self.string(pattern)?;
+                let node = Node::Like(pattern_match, Box::new(text), Box::new(pattern));
+                Ok((self.fold(ast, node)?, DataType::Boolean))
+            }
             other => Err(self.error(
                 ast.span(),
                 format!("`{other}` is not supported in expressions yet"),
@@ -340,6 +370,19 @@ impl Binder<'_> {
         self.fold(ast, Node::Cast(Box::new(node), to.clone()))
     }
 
+    /// A `LIKE` operand: a string, or NULL read as one.
+    fn string(&self, ast: &Ast) -> Result<Node, Error> {
+        let (node, data_type) = self.bind(ast)?;
+        match data_type {
+            DataType::Utf8 => Ok(node),
+            DataType::Null => self.cast(ast, node, &DataType::Utf8),
+            other => Err(self.error(
+                ast.span(),
+                format!("`LIKE` needs strings, but `{ast}` is {}", type_name(&other)),
+            )),
+        }
+    }
+
     fn boolean(&self, ast: &Ast, node: Node, data_type: DataType) -> Result<Node, Error> {
         match data_type {
             DataType::Boolean => Ok(node),
@@ -383,6 +426,14 @@ enum Node {
     Or(Box<Node>, Box<Node>),
     Compare(Comparison, Box<Node>, Box<Node>),
     Arithmetic(Arithmetic, Box<Node>, Box<Node>),
+    /// Text, then pattern (`%` any run, `_` one character).
+    Like(PatternMatch, Box<Node>, Box<Node>),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PatternMatch {
+    case_insensitive: bool,
+    negated: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -412,7 +463,8 @@ impl Node {
             Node::And(l, r)
             | Node::Or(l, r)
             | Node::Compare(_, l, r)
-            | Node::Arithmetic(_, l, r) => vec![l, r],
+            | Node::Arithmetic(_, l, r)
+            | Node::Like(_, l, r) => vec![l, r],
         }
     }
 
@@ -443,6 +495,15 @@ impl Node {
                     Comparison::LtEq => cmp::lt_eq(a, b),
                     Comparison::Gt => cmp::gt(a, b),
                     Comparison::GtEq => cmp::gt_eq(a, b),
+                }?;
+                Ok(Arc::new(mask) as ArrayRef)
+            }),
+            Node::Like(how, l, r) => binary(l.eval(batch)?, r.eval(batch)?, |a, b| {
+                let mask = match (how.case_insensitive, how.negated) {
+                    (false, false) => like(a, b),
+                    (false, true) => nlike(a, b),
+                    (true, false) => ilike(a, b),
+                    (true, true) => nilike(a, b),
                 }?;
                 Ok(Arc::new(mask) as ArrayRef)
             }),
