@@ -330,6 +330,27 @@ def parse_odds(msgs: km.Batch) -> km.Batch: ...
 - Batch imports (CSV, API backfills) are ordinary jobs that write either through weir (live) or
   directly into the lake (historical, via the merge writer).
 
+### 6.3 Managed Postgres and change data capture
+
+Transactional workloads (a sportsbook's bets, wallets, and ledger) need ACID writes and one
+source of truth for balances; the engine is neither. Kermodes provides them as a managed
+resource, separate from the control plane's own Postgres, and brings their changes into the
+catalog as live tables.
+
+- A managed database is declared in a project or created in the web UI. The controller provisions
+  it on CloudNativePG (a database in a shared cluster, or a cluster of its own), keeps its
+  credentials in a Secret, and injects them into the project's services.
+- Branches apply: `staging`, PR previews, and sandboxes get their own database (cloned from prod
+  or built from the project's migrations), never prod's.
+- A built-in CDC connector reads Postgres logical replication (`pgoutput`): an initial snapshot,
+  then every committed change, into keyed live tables (key: the primary key), so `bets` and
+  `wallets` tick next to the odds and merge into history like any other table. The source is
+  replayable: the connector's position is the replication slot's confirmed LSN, so a restart
+  resumes without gaps or duplicates.
+- The web UI sets it up: create the database or point at an existing one, choose the tables to
+  capture and the catalog namespace, and watch replication lag and slot size.
+- A schema change in the source is a planned schema change of the captured table (§5.4).
+
 ## 7. weir
 
 ### 7.1 Storage
@@ -1123,8 +1144,8 @@ local (§16.6).
 | Merge, jobs, pipeline stages, environment builds | `batch/v1` Job | rustfs, OCI registry |
 | Lake | Parquet in a rustfs bucket | catalog in Postgres |
 
-Telemetry: OpenTelemetry traces to Tempo, logs to Loki, metrics to Prometheus; platform state stays
-in `sys.*` tables.
+Telemetry: OpenTelemetry traces to Tempo, logs to Loki, metrics to Prometheus (§16.7); platform
+state stays in `sys.*` tables.
 
 ### 16.6 Local mode
 
@@ -1155,6 +1176,21 @@ No JVM, Docker, or Kubernetes.
   `$KERMODES_URL`, else that local server; `Session.serve_store()` serves a store the same way
   from any process that opened it.
 - Startup targets: `km.local()` under 100 ms; `kermodes dev` ready under 1 s.
+
+### 16.7 Monitoring
+
+An operator sees what the platform uses and why, in the platform: table space, CPU and memory per
+worker, ingest rates, and cycle times, without leaving the web UI. The design is open (§21); what
+is fixed:
+
+- Every Kermodes process emits OpenTelemetry metrics, traces, and logs over OTLP to a collector.
+  The backends are open source and values of the chart (the reference deployment's Prometheus,
+  Tempo, and Loki); Kermodes runs none of its own.
+- Kermodes' own facts are also live tables, so they can be queried, joined, and alerted on like
+  any data: table space and rows per table and date in weir and the lake, live-table memory per
+  worker (§9.7), ingest rates and lag per source, cycle times per worker.
+- Container CPU and memory come from Kubernetes metrics (cAdvisor through Prometheus); the UI shows
+  them next to the worker's tables, so a worker near its memory limit shows which tables hold it.
 
 ## 17. Scaling and high availability
 
@@ -1265,10 +1301,11 @@ Verified against maturin 1.16, PyO3 0.30, and uv.
 | M1 | weir (DoPut, segments, seq dedup, epochs, snapshot + tail); `db.live_table`; WebSocket connector; `kermodes dev`; Helm chart (weir + engine) | Synthetic ticker over WebSocket → weir → engine, on a laptop and in the cluster |
 | M2 | Parquet writer and pruned reader, catalog with snapshots, merge job, `db.historical_table`, `db.table`, replay clock; SQL frontend with `EXPLAIN`; column IDs and compatible schema changes | Same SQL query over last month (static) and today (ticking); ticker merged nightly, replayed as a backtest |
 | M3 | Projects: `kermodes init` / `dev` / `test` / `plan`, manifest discovery, environments, pipeline (build, test, plan, deploy), targets and promotion, preview/shadow; scheduler and `sys.*` tables | Toy ticker project: push to `main` deploys to staging, promotion to prod, PR shadow preview with `kermodes diff` |
-| M4 | Multi-user: OIDC, RBAC, `KermodesWorker` controller, gateway, worker classes, sandboxes; ranger MCP; web UI v1 | Two users with their own sessions; an agent opens a PR that previews in shadow |
+| M4 | Multi-user: OIDC, RBAC, `KermodesWorker` controller, gateway, worker classes, sandboxes; ranger MCP; web UI v1 with monitoring v1 (§16.7) | Two users with their own sessions; an agent opens a PR that previews in shadow; the UI shows each worker's CPU, memory, and table space |
 | M5 | den: register sklearn LinearRegression → ONNX → `predict`; torch MLP; aliases, shadow mode | Live prediction; swap champion without restart |
 | M6 | forage: feature views, training sets, online `last_by`, served-feature logging | Toy sportsbook: simulated games + odds → form features → live win probability vs implied odds |
-| M7 | Port juicebear sportsflow as a Kermodes project | Real data |
+| M7 | Managed Postgres and CDC (§6.3), set up from the web UI | Toy sportsbook's bets and wallets in Postgres, ticking in Kermodes next to the odds |
+| M8 | Port juicebear sportsflow as a Kermodes project | Real data |
 
 ## 21. Open questions
 
@@ -1277,6 +1314,8 @@ Verified against maturin 1.16, PyO3 0.30, and uv.
 3. Derived-state checkpointing: replay from start of day vs periodic engine snapshots.
 4. weir placement policy once sharded: hashing vs explicit assignment (deferred; §17 keeps it
    additive).
+5. Monitoring (§16.7): which facts are `sys.*` tables and which only metrics, how the UI reads
+   Prometheus, retention, and alerting.
 
 ## 22. Risks
 
