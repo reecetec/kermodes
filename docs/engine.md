@@ -69,7 +69,7 @@ live row a slot in mutable columns, with a hash map from key to slot:
 - A removal frees the slot for the next addition.
 
 Memory follows the live rows, not the history of writes. Strings of up to 12 bytes live in the
-slot (Arrow's string-view layout); longer ones in a per-column byte heap, rewritten once its
+slot (Arrow's string-view layout); longer ones in a per-column byte buffer, rewritten once its
 superseded bytes outweigh the live ones (and exceed 1 MiB). Deltas carry previous values as
 copies taken before a cycle is applied, so overwriting loses nothing.
 

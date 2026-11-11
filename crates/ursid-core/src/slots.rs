@@ -40,7 +40,7 @@ impl Bits {
 const INLINE: usize = 12;
 
 /// A string slot, in Arrow's string-view layout: the length, then the bytes when they fit, or
-/// else the offset of the bytes in the column's heap.
+/// else the offset of the bytes in the column's string buffer.
 #[derive(Clone, Copy, Default)]
 struct View {
     len: u32,
@@ -57,18 +57,18 @@ impl View {
     }
 }
 
-/// Strings by slot. Short ones live inline; longer ones in a shared heap whose superseded bytes
+/// Strings by slot. Short ones live inline; longer ones in a shared buffer whose superseded bytes
 /// are reclaimed once they outweigh the live ones.
 #[derive(Default)]
 struct Strings {
     views: Vec<View>,
-    heap: Vec<u8>,
+    buffer: Vec<u8>,
     live: usize,
     dead: usize,
 }
 
 impl Strings {
-    /// Below this many superseded bytes, the heap is not worth rewriting.
+    /// Below this many superseded bytes, the buffer is not worth rewriting.
     const SLACK: usize = 1 << 20;
 
     fn get(&self, slot: usize) -> &[u8] {
@@ -77,7 +77,7 @@ impl Strings {
         if len <= INLINE {
             &view.bytes[..len]
         } else {
-            &self.heap[view.offset()..view.offset() + len]
+            &self.buffer[view.offset()..view.offset() + len]
         }
     }
 
@@ -100,29 +100,29 @@ impl Strings {
         if value.len() <= INLINE {
             view.bytes[..value.len()].copy_from_slice(value);
         } else {
-            view.set_offset(self.heap.len());
-            self.heap.extend_from_slice(value);
+            view.set_offset(self.buffer.len());
+            self.buffer.extend_from_slice(value);
             self.live += value.len();
         }
         self.views[slot] = view;
     }
 
-    /// Rewrites the heap with only live bytes once superseded ones outweigh them: the copy is
+    /// Rewrites the buffer with only live bytes once superseded ones outweigh them: the copy is
     /// paid for by the writes that superseded at least as many bytes.
     fn compact(&mut self) {
         if self.dead <= self.live.max(Self::SLACK) {
             return;
         }
-        let mut heap = Vec::with_capacity(self.live);
+        let mut buffer = Vec::with_capacity(self.live);
         for view in &mut self.views {
             let len = view.len as usize;
             if len > INLINE {
                 let at = view.offset();
-                view.set_offset(heap.len());
-                heap.extend_from_slice(&self.heap[at..at + len]);
+                view.set_offset(buffer.len());
+                buffer.extend_from_slice(&self.buffer[at..at + len]);
             }
         }
-        self.heap = heap;
+        self.buffer = buffer;
         self.dead = 0;
     }
 

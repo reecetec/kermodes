@@ -122,7 +122,7 @@ fn keyed_tables_keep_every_column_type_through_rewrites() {
     let schema = every_type(&[], 0).schema();
     let book = session.keyed_input_table(&schema, &["id"]).unwrap();
     let ids: Vec<i64> = (0..300).collect();
-    // Six rounds supersede enough 2 KB strings to rewrite the string heap more than once.
+    // Six rounds supersede enough 2 KB strings to rewrite the string buffer more than once.
     for round in 0..6 {
         book.upsert(&[every_type(&ids, round)]).unwrap();
         session.step();
