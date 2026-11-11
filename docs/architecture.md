@@ -31,8 +31,9 @@ Parquet for history. One engine evaluates live and historical data with the same
 whether the query comes from the table API or SQL. No embedded third-party query engine.
 
 **Git is the source of truth.** Tables, deployments, jobs, feature views, and models are declared
-in project repositories, developed and tested locally, and delivered to the cluster by a pipeline
-that builds once and promotes the same artifact through targets.
+in project repositories on any git host, developed locally against live production data, and
+delivered by syncing the mainline: each merged commit is built once and rolled out without
+downtime.
 
 ## 2. Goals and non-goals
 
@@ -90,7 +91,7 @@ from file format.
 | Merge | — | Rust job | Daily intraday → sorted Parquet → catalog commit |
 | Control plane | — | Rust | Catalog, spec API, scheduler, pipeline, Kubernetes controller, registry, audit |
 | Scheduler | run | Rust (in control plane) | Cron, DAGs, retries, leases |
-| Pipeline | — | Rust (in control plane) | Build, test, plan, deploy, promote project commits |
+| Pipeline | — | Rust (in control plane) | Sync project commits from git; build, test, plan, roll out |
 | Model registry | den | Rust (in control plane) | Model versions, aliases, signatures |
 | Feature store | forage | Rust + Python SDK | Feature views, point-in-time training sets, online state |
 | Agent surface | ranger | Rust | MCP server over the spec API, pipeline, and query surface |
@@ -214,8 +215,8 @@ historical at a cycle boundary; the rows are identical, so downstream sees no ch
 ### 5.4 Schema evolution
 
 Table schemas are declared in the owning project. Changing one is a code change that goes through
-the pipeline: the plan classifies it, and applying the commit applies the change. Sandbox
-branches (§10.1) also accept direct changes from the SDK, CLI, or an agent.
+the pipeline: the plan classifies it, and rolling out the commit applies the change. A change the
+plan does not class as compatible waits for an explicit rollout (§11.4).
 
 ```python
 odds = km.table(
@@ -340,8 +341,8 @@ catalog as live tables.
 - A managed database is declared in a project or created in the web UI. The controller provisions
   it on CloudNativePG (a database in a shared cluster, or a cluster of its own), keeps its
   credentials in a Secret, and injects them into the project's services.
-- Branches apply: `staging`, PR previews, and sandboxes get their own database (cloned from prod
-  or built from the project's migrations), never prod's.
+- Branches apply: PR previews and local runs get their own database (cloned from prod or built
+  from the project's migrations), never prod's.
 - A built-in CDC connector reads Postgres logical replication (`pgoutput`): an initial snapshot,
   then every committed change, into keyed live tables (key: the primary key), so `bets` and
   `wallets` tick next to the odds and merge into history like any other table. The source is
@@ -393,10 +394,26 @@ catalog as live tables.
 At UTC midnight + a short grace window weir seals all open segments for `D` and rejects new
 writes to `D`. Writers have already rolled to `D+1` because `date` comes from ingest time.
 
-### 7.4 Durability
+### 7.4 Source leases
+
+One writer per source is enforced by weir, not by whatever runs the writers: rollouts and node
+drains run old and new runs side by side (§11.4, §17.1), and a run on a partitioned node can
+outlive what Kubernetes believes.
+
+- A writer holds a lease on `(table, source)`. A second writer waits for it, or fails at once if
+  it asks to.
+- Taking a lease increments the source's epoch. Each batch is recorded with its writer's epoch,
+  and writes from an older epoch are rejected, so a fenced run's late writes never land.
+- A lease is released when its writer closes or its connection drops, and expires if its holder
+  stops renewing it.
+- The new holder resumes from `last_seq`. A program whose output seqs derive from its inputs'
+  positions (§17) recomputes the same batches with the same seqs, so a handover writes each batch
+  exactly once.
+
+### 7.5 Durability
 
 - Initial: single writer per internal partition on a Longhorn PVC (replicated block storage).
-  weir is a StatefulSet.
+  weir is a StatefulSet with one replica; draining its node is a brief outage (§17.1).
 - Later: copy sealed segments to S3 (rustfs) so node loss costs at most the open segment (§17).
 - Retention: intraday partitions are deleted N days after their merge validates.
 
@@ -622,24 +639,23 @@ Supported subset, mapped to operators
 Every resource is a typed spec (Rust types, JSON Schema generated from them):
 `Project`, `Table`, `Ingester`, `Deployment` (long-running engine graph), `Job`, `Dag`,
 `FeatureView`, `Model`, `ModelVersion`, `Alias`, `WorkerClass`, `Environment`, `Repository`,
-`Target`, `Secret` reference.
+`Secret` reference.
 
 Tables live on **branches** of the catalog, as code lives on branches of a repository. Code always
 names tables `ns.table`; the branch comes from where it runs.
 
 | Branch | Source of truth | How changes arrive |
 |---|---|---|
-| `prod` | A project repository at a commit | Only through the pipeline (§11) |
-| `staging` | The mainline commit being promoted | The pipeline |
-| `pr-<n>` (preview) | The pull request's head commit | The pipeline; expires with the PR |
-| `sandbox-<user>` | The control plane | Direct apply from the SDK, CLI, or agents; `kermodes deploy --target sandbox` |
+| `prod` | A project repository's mainline at a commit | Synced on merge and rolled out per resource (§11.3–11.4) |
+| `pr-<n>` (preview, opt-in) | The pull request's head commit | The pipeline; expires with the PR |
+| `local` | A developer's working tree, on their machine | `kermodes run` and `kermodes dev` (§11.2); never reaches the cluster |
 
 - Every branch but `prod` is an overlay on a parent (`prod` unless stated): reading a table the
   branch does not produce reads the parent's, live and historical. A branch writes only the
   tables it produces, so nothing outside `prod` can change `prod`'s data; the catalog enforces
   it.
-- A shadowing branch (previews, and staging by default) runs no ingesters: it reads ingested
-  tables from its parent, so a source is never consumed twice.
+- A shadowing branch (previews, and `local` unless the developer runs an ingester) runs no
+  ingesters: it reads ingested tables from its parent, so a source is never consumed twice.
 - `ns.table@branch` names a table on another branch, and is only needed across branches:
   `kermodes diff`, comparisons in a notebook, reads a grant allows.
 - One install hosts every branch. Worker classes, quotas, and optionally node pools keep
@@ -652,11 +668,11 @@ It never holds the only copy of a managed resource's definition.
 ### 10.2 validate → plan → apply
 
 - `validate`: type-check specs; infer output schemas using the engine's planner.
-- `plan`: diff desired state (a commit, or a sandbox spec) against what is deployed on a target;
+- `plan`: diff desired state (a commit, or a working tree) against what is deployed on prod;
   inferred schemas, schema change classes (§5.4), sample rows (bounded), cost and cardinality
   estimates, environment status, affected downstream resources across projects.
-- `apply`: execute the plan. For managed namespaces only the pipeline applies, using a commit's
-  build artifact (§11.3).
+- `apply`: execute the plan. For managed namespaces only the pipeline applies, rolling out a
+  commit's build artifact (§11.3–11.4).
 
 Humans (CLI, SDK, UI) and agents use the same calls.
 
@@ -719,7 +735,7 @@ s = km.connect().session(env="sportsflow@main", worker_class="medium", memory="8
 An environment is an immutable, prebuilt Python environment. Nothing is installed when a worker
 starts.
 
-- Source: the project's `pyproject.toml` + `uv.lock` at the commit. Sandbox sessions may instead
+- Source: the project's `pyproject.toml` + `uv.lock` at the commit. Notebook sessions may instead
   use an inline dependency list, which the control plane resolves with uv into a lock stored with
   the `Environment` version.
 - Identity: hash of `uv.lock`, `pyproject.toml`, Python version, Kermodes version, and platform.
@@ -727,7 +743,7 @@ starts.
 - Build, in the pipeline's build stage and only on a cache miss: an unprivileged Kubernetes Job
   starts from the `kermodes:<version>` image, runs `uv sync --frozen --no-dev --no-install-project`
   into `/opt/kermodes/env`, and pushes that directory as one OCI layer on top of the base (no Docker
-  daemon, no privileged builder) to the Gitea OCI registry as `kermodes-env:<hash>`.
+  daemon, no privileged builder) to the platform's OCI registry as `kermodes-env:<hash>`.
 - Workers reference the image by digest. The kubelet's image cache makes later starts on a node
   instant; an optional pre-pull DaemonSet warms environments marked hot.
 - Sessions may `%pip install` into a session-only overlay for exploration. The session is then marked
@@ -736,18 +752,19 @@ starts.
 
 ## 11. Projects and delivery
 
-Kermodes follows continuous integration and continuous delivery practice (Fowler; Humble & Farley):
-everything in version control, a self-testing build, every push to mainline triggers the
-pipeline, build once and promote the same artifact, test in a clone of production, everyone can
-see the pipeline, and deployment and rollback are automated and cheap.
+Kermodes follows continuous integration and continuous deployment practice (Fowler; Humble &
+Farley): everything in version control, a self-testing build, every merge to mainline goes through
+the pipeline, build once and deploy that artifact, everyone can see the pipeline, and deployment
+and rollback are automated, cheap, and without downtime. Iteration happens on the developer's
+machine against live production data; the cluster runs what is merged.
 
 ### 11.1 Project
 
-A project is a directory in a git repository (one repository may hold several).
+A project is a directory in a git repository on any host (one repository may hold several).
 
 ```
 sportsflow/
-  kermodes.toml          project name, owned namespaces, targets, test config
+  kermodes.toml          project name, owned namespaces, mainline, test config
   pyproject.toml      Python dependencies (kermodes + project deps)
   uv.lock             → environment (§10.6)
   src/sportsflow/
@@ -761,6 +778,7 @@ sportsflow/
 name = "sportsflow"
 entry = "sportsflow.kermodes_app"       # module whose decorators declare resources
 namespaces = ["sports"]              # namespaces this project owns
+mainline = "main"                    # merged commits deploy to prod (§11.3)
 
 [sources]                            # code from other repositories, mounted on PYTHONPATH (§11.7)
 quant = { git = "https://git.rcolclough.com/rcolclough/quant-lib", rev = "main", path = "src" }
@@ -771,17 +789,8 @@ columns = { sym = "utf8", price = "float64", ts = "timestamp" }
 [tests]
 replay = [{ tables = ["sports.odds", "sports.games"], dates = "2026-10-01..2026-10-07" }]
 
-[targets.preview]
-on = "pull_request"
-mode = "shadow"                      # read prod's inputs, write to branch pr-<n>
+[preview]                            # opt-in: shadow deployments of pull requests (§11.5)
 ttl = "3d"
-
-[targets.staging]
-on = "push:main"
-
-[targets.prod]
-promote_from = "staging"
-gate = { healthy_for = "30m", approval = "sports-admins" }
 ```
 
 Resources are declared in Python with decorators (`km.table`, `@km.ingester`, `@km.deployment`,
@@ -795,91 +804,129 @@ and emits a **manifest**: the resolved specs as JSON. The manifest, not the Pyth
 
 ```mermaid
 flowchart LR
-  E[Edit code] --> D["kermodes dev\nhot reload"]
-  D --> T[kermodes test]
-  T --> P["kermodes plan --target staging"]
-  P --> G[git push]
-  G --> PL[Pipeline]
+  E[Edit code] --> R["kermodes run / dev\nlocal, prod's inputs"]
+  R --> T[kermodes test]
+  T --> P[kermodes plan]
+  P --> PR[Pull request]
+  PR --> M[Merge]
+  M --> S[Sync and roll out]
 ```
 
-- `kermodes dev` runs the project on the local platform (§16.6) and restarts affected deployments on
-  file save; their state rebuilds from local weir and lake.
-- Local data, in increasing realism:
+- `kermodes run <resource>` runs one deployment, ingester, or job from the working tree in a local
+  process; `kermodes dev` runs the whole project on the local platform (§16.6) and restarts what
+  changed on file save.
+- Inputs, in increasing realism:
   - synthetic sources declared in the project (`@km.source` generators) for tests and demos;
   - `kermodes data pull sports.odds --dates 2026-11-01..2026-11-07` copies Parquet partitions from the
     cluster lake (subject to read grants);
-  - `kermodes dev --live <cluster>` subscribes local deployments to the cluster's live tables
-    read-only through the gateway. Outputs stay local.
+  - `--live <cluster>` reads prod's live and historical tables through the gateway with the
+    developer's grants.
+- Outputs always stay on the machine: tables a local run produces are written to its local store,
+  on the `local` branch (§10.1), and shadow prod's for that run only. Nothing a local run does can
+  write to the cluster.
 - `kermodes test` runs the same tests the pipeline runs: pytest on `km.local()`, plus replay tests over
   the dates in `kermodes.toml` with the replay clock (§9.4).
-- `kermodes plan --target <t>` diffs the working tree against what is deployed on `t`.
-- `kermodes deploy --target sandbox` deploys the working tree, including uncommitted changes, to the
-  user's sandbox branch in the cluster (§10.1), marked dirty. Shared targets only
-  accept pipeline deployments of pushed commits.
+- `kermodes plan` diffs the working tree against what is deployed on prod: resources added, changed,
+  and removed, schema change classes, downstream impact, and how each change will roll out (§11.4).
 
-### 11.3 Pipeline
+### 11.3 Sync and pipeline
 
 Kermodes runs the pipeline itself, in the cluster, because every stage needs the production
-environment images, data access, and worker resources. The git host stores code and displays
-results; generic CI (lint, formatting) can still run in Gitea Actions.
+environment images, data access, and worker resources. The git host stores code and reviews;
+generic CI (lint, formatting) runs wherever the repository's CI does.
 
 ```mermaid
 flowchart LR
-  W[Webhook: push / PR] --> R[Resolve\nSHA, discover manifest]
-  R --> B[Build\nenvironment image, code snapshot]
-  B --> T[Test\npytest + replay]
-  T --> PL[Plan\nper target]
-  PL --> PV[Preview\nshadow]
-  PL --> ST[Staging]
-  ST -->|gate| PR[Prod]
+  G["git host: push / merge"] -->|"webhook or polling"| R["Resolve\nfetch, discover manifest"]
+  R --> B["Build\nenvironment image, code snapshot"]
+  B --> T["Test\npytest + replay"]
+  T --> PL["Plan\nagainst prod"]
+  PL -->|mainline| RO["Roll out\nper resource (§11.4)"]
+  PL -->|pull request| RP["Report\nstatus, plan, preview"]
 ```
 
-1. **Resolve**: fetch the commit, run discovery in the environment, store the manifest.
+1. **Resolve**: fetch the commit over SSH or HTTPS, run discovery in the project's environment (a
+   Job, never inside the control plane), and store the manifest.
 2. **Build**: environment image (cached by hash, §10.6) and code snapshot (content-addressed by
    SHA and path). Manifest + image digest + snapshot = the **artifact**, built once per commit.
 3. **Test**: pytest and replay tests as a Kermodes job using the artifact's image and worker class,
    against production history read-only. A failed test stops the pipeline for that commit.
-4. **Plan**: per target; schema change classes and cross-project impact.
-5. **Deploy**: per target policy (§11.4), always deploying the artifact, never rebuilding.
+4. **Plan**: against what is deployed on prod; schema change classes and cross-project impact.
+5. **Roll out**: for mainline commits, each changed resource by its update policy (§11.4), always
+   deploying the artifact, never rebuilding. Pull requests stop at the plan, plus a preview if the
+   project enables them (§11.5).
 
-- Triggers: Gitea push and pull-request webhooks, with polling as a fallback.
-- Results go back to the git host as commit statuses (`kermodes/test`, `kermodes/plan`) and a PR comment
-  with the plan and preview links.
-- Every stage is a row in `sys.pipeline_runs`; the UI shows commit → build → test → plan → deploy
-  per target, live.
+- Triggers: a push webhook from any git host (GitHub, GitLab, and Gitea signatures are verified; a
+  generic endpoint takes a shared secret), with polling as the fallback, so a lost webhook only
+  delays a sync.
+- With a host adapter (§11.7), results go back to the host as commit statuses (`kermodes/test`,
+  `kermodes/plan`) and a PR comment with the plan.
+- Every stage is a row in `sys.pipeline_runs`. The UI shows commit → build → test → plan → roll out,
+  live, and each resource's running commit next to the newest synced one.
 - Build stays fast by caching: environments by lock hash, snapshots by SHA, test data by catalog
   snapshot on the worker cache.
-- A failing `main` blocks promotion until fixed; previous artifacts stay deployed.
+- A commit that fails a stage is not rolled out; what runs keeps running.
 
-### 11.4 Targets and promotion
+### 11.4 Rollout
 
-- A target is a named deployment destination with a trigger and a gate: `preview` (pull
-  requests), `staging` (pushes to `main`), `prod` (promotion from staging), and per-user
-  `sandbox`.
-- Promotion deploys the same artifact to the next target once its gate passes: health for a
-  duration (deployments caught up, no errors), approval by a role, or both.
-- Staging and prod differ by branch and worker classes, not by code or environment.
-- Kargo continues to promote the Kermodes platform itself (Helm chart); Kermodes promotes user projects.
+Every deployment and ingester has an update policy (when a synced commit reaches it) and a rollout
+strategy (how its run is replaced).
+
+```python
+@km.deployment(update="auto", rollout="rolling")  # the defaults
+def edges(db): ...
+
+@km.deployment(rollout="recreate")  # too large to run twice
+def book(db): ...
+```
+
+| Update policy | A new artifact for the resource is deployed |
+|---|---|
+| `auto` (default) | As soon as its commit passes the pipeline |
+| `manual` | When someone rolls it out (UI, CLI, or API); until then the UI shows the update, with its plan |
+| `on_start` | At the resource's next scheduled start (`schedule=`), as Deephaven's persistent queries pick up changes on their daily restart |
+
+| Strategy | Replacement |
+|---|---|
+| `rolling` (default) | The new run starts beside the old one, rebuilds its state, and becomes ready: its tables built and caught up to its inputs. Then the old run stops and the new one takes over its source leases (§7.4). No downtime; resources double during the overlap. |
+| `recreate` | The old run stops, then the new one starts; downtime is the rebuild. For engines too large to run twice, or that hold a single-attach disk. |
+
+- A run that is not ready within the rollout deadline fails the rollout: the new run stops, the old
+  one keeps serving, and the UI shows why.
+- Writers are handed over by weir, not by timing: the new run computes while it waits for the
+  source lease and writes only once the old run has released it (§7.4). Output seqs derived from
+  input positions make the handover exactly-once.
+- Changes the plan does not class as compatible (§5.4) are never rolled out automatically; they
+  wait for an explicit rollout, whatever the update policy.
+- Jobs run the newest artifact at their next trigger; a running attempt finishes on the artifact it
+  started with.
+- Node drains move runs the same way (§17.1).
+- Kargo continues to promote the Kermodes platform itself (Helm chart); Kermodes deploys user
+  projects.
 
 ### 11.5 Preview and shadow deployments
 
-- `mode = "shadow"` deploys the PR's artifact on branch `pr-<n>`: it reads prod's inputs and
-  writes its own outputs (§10.1). Production consumers never see them.
+Opt-in per project (`[preview]` in `kermodes.toml`).
+
+- A pull request's artifact runs on branch `pr-<n>`: it reads prod's inputs and writes its own
+  outputs (§10.1). Production consumers never see them.
 - `kermodes diff sports.edges --branch pr-123 --window 1h` compares the branch's table with
   prod's over the same inputs: row counts, keys on one side only, and per-column differences
   (count, maximum absolute and relative error), with sample rows for each.
-- The pipeline's gate diffs on replayed history, where both sides see identical inputs under the
-  replay clock (§9.4) and any difference is the code's. Diffs of live shadow output are a sanity
-  check only: timing alone makes them differ.
+- Diffs over replayed history, where both sides see identical inputs under the replay clock
+  (§9.4), show differences that are the code's. Diffs of live shadow output are a sanity check
+  only: timing alone makes them differ.
 - Model changes can additionally run as a challenger alias in production (§12.1) to hide work in
   progress behind a flag.
 - Previews expire with the PR or after `ttl`.
 
 ### 11.6 Rollback
 
-Rollback deploys a previous artifact to the target. Environment images and snapshots are cached,
-so it is a restart, not a rebuild. Schema changes are the exception: rollback across a
-contract or rewrite change requires a forward fix, and `plan` says so.
+Rollback is a revert on the mainline: the reverted-to artifact is cached, so it rolls out like any
+commit, a restart rather than a rebuild. When a revert is too slow, the UI or CLI rolls one
+resource back to a previous artifact directly; the resource is then pinned and shown as diverged
+from the mainline until a newer commit supersedes it. Schema changes are the exception: rollback
+across a contract or rewrite change requires a forward fix, and `plan` says so.
 
 A bad release can also write bad data, which a restart does not undo. `sys.lineage` records which
 derived partitions each deployment wrote, by artifact and input positions, so
@@ -889,8 +936,11 @@ them with the fixed artifact on the replay clock, committing each date atomicall
 
 ### 11.7 Repositories and credentials
 
-- A `Repository` registers a git remote (Gitea first), its credentials (secret reference), and a
-  webhook secret. Credentials stay in the control plane; worker pods never hold them.
+- A `Repository` registers a git remote on any host, fetched over SSH or HTTPS, with its
+  credentials (secret reference) and a webhook secret. Credentials stay in the control plane;
+  worker pods never hold them.
+- Host adapters are optional: the GitHub, GitLab, and Gitea adapters post commit statuses and plan
+  comments. Without one, results are in the UI.
 - Code snapshots reach workers through an init container with a short-lived token and are mounted
   read-only. The project's package is placed on `PYTHONPATH`, so a code-only change is a snapshot
   download, not an environment build.
@@ -901,7 +951,7 @@ them with the fixed artifact on the replay clock, committing each date atomicall
 - Every deployment, job run, and session records the commit it ran (`sys.deployments`,
   `sys.task_runs`, `sys.audit`).
 - The pipeline acts as the project's service identity with grants on the project's namespaces;
-  gate approvals require a role on the target.
+  manual rollouts and rollbacks require a role on the namespace.
 
 ## 12. ML
 
@@ -916,9 +966,9 @@ A model version is:
 - the commit and job run that trained it;
 - link to an MLflow run (MLflow stays as experiment tracking).
 
-Models are registered by jobs (training runs from a project commit) or from notebooks into sandbox
-branches. Aliases (`champion`, `challenger`) are pointers to versions; alias changes on `prod` go
-through the pipeline or an approval and are events in `sys.model_events`.
+Models are registered by jobs (training runs from a project commit) or from notebooks. Aliases
+(`champion`, `challenger`) are pointers to versions; alias changes on `prod` go through the
+pipeline or an approval and are events in `sys.model_events`.
 
 ### 12.2 Feature store (forage)
 
@@ -946,11 +996,12 @@ MCP server over the control plane, pipeline, and query surface.
 
 - Catalog: search namespaces/tables, describe schema, sample rows, lineage.
 - Query: bounded static queries and bounded live snapshots, in SQL or the table API.
-- Sandbox: validate / plan / apply directly on the agent's sandbox branch.
+- Local: agents iterate as developers do, with `kermodes run` and `kermodes test` on prod's inputs,
+  read-only.
 - Managed namespaces: agents work on a git branch, run `test` and `plan`, push, and open a pull
-  request; its preview branch shows their outputs in shadow; humans merge.
+  request; with previews enabled, its preview branch shows their outputs in shadow; humans merge.
 - Pipeline: read runs, logs, test failures, plans; re-run stages.
-- Sandboxes: agent sessions run in their own engine processes with memory, CPU, and time quotas.
+- Sessions: agent sessions run in their own engine processes with memory, CPU, and time quotas.
 - Agents act with a delegated, optionally narrowed token from their user (§14); they never exceed
   the user's grants.
 - Every agent action is recorded in `sys.audit`.
@@ -978,10 +1029,9 @@ Workload identity
 Authorization
 
 - RBAC per namespace. Roles: `viewer` (read tables), `writer` (ingest, publish derived tables),
-  `editor` (sandbox resources, sandbox deploys, PR previews), `admin` (gate approvals, grants,
-  purges).
+  `editor` (manual rollouts, rollbacks, PR previews), `admin` (grants, purges).
 - Bindings map users or OIDC groups to roles.
-- Managed resources run with their project's grants; sandbox resources with their owner's.
+- Managed resources run with their project's grants; local runs and sessions with their user's.
 - `sys.*` rows are filtered to namespaces the caller can view.
 
 Enforcement points: control plane (spec operations, pipeline), gateway (which workers a caller may
@@ -1026,10 +1076,13 @@ namespaces).
 - First slice, before the cluster gateway: `server = session.serve()` serves the app for one
   local session, and `server.publish(name, table)` lists a table there (held until unpublished
   or the server stops). It listens on 127.0.0.1 and has no authentication; the WebSocket
-  protocol is in `kermodes-gateway`'s module doc. `kermodes dev` will start the same server.
+  protocol is in `kermodes-gateway`'s module doc. `kermodes dev` and `kermodes ui` start the same
+  server.
 - v1 surfaces: catalog (schemas, versions, lineage), live and historical table viewer, console
-  (SQL and table-API editor on CodeMirror 6, `EXPLAIN` view), pipelines (commit → deploy per
-  target), job runs and logs (live from `sys.*`), models and aliases, agent chat backed by ranger.
+  (SQL and table-API editor on CodeMirror 6, `EXPLAIN` view), pipelines (commit → build → test →
+  plan → roll out), deployments (running commit, available update, rollout state, Restart and Roll
+  back, logs), job runs and logs (live from `sys.*`), models and aliases, agent chat backed by
+  ranger.
 
 ### 15.3 Table viewer
 
@@ -1090,8 +1143,8 @@ host it: Kubernetes (§16.1–16.5) and local (§16.6).
   its `values.yaml`); Kargo promotes a release by updating that pin.
 - The chart installs weir (a StatefulSet on a PVC, reachable only from its namespace until Flight
   has authentication) and `kermodes ui` (a Deployment, with an optional Gateway API route). It
-  grows to CRDs, `kermodes-control`, `kermodes-gateway`, ServiceAccounts and RBAC, and config. It
-  does not contain workers, ingesters, or jobs; the controller creates those at runtime.
+  grows to `kermodes-control`, `kermodes-gateway`, ServiceAccounts and RBAC, and config. It does
+  not contain workers, ingesters, or jobs; the controller creates those at runtime.
 - External dependencies are values: Postgres (existing CNPG cluster or connection secret; the
   chart can optionally render a CNPG `Cluster`), S3 endpoint and bucket (rustfs), OCI registry for
   environment images, git hosts, OIDC issuer.
@@ -1101,19 +1154,19 @@ host it: Kubernetes (§16.1–16.5) and local (§16.6).
 - `kermodes control` runs API, catalog, scheduler, pipeline, reconciler, and ranger. It runs with
   several replicas; scheduler, pipeline, and reconciler loops use leader election via a Kubernetes
   `Lease`, and every replica serves the API.
-- Two layers of state:
-  - **Intent**: managed resources come from project commits (§11); sandbox resources, catalog,
-    deployments, runs, and audit are in Postgres.
-  - **Runtime** in Kubernetes: custom resources the controller writes from intent and reconciles
-    into native objects. `kubectl get kermodesworkers` shows what is running.
-- Status flows back: the controller watches Pods and Jobs and writes status to the custom
-  resource and to `sys.deployments` / `sys.task_runs` / `sys.pipeline_runs`.
-- Owner references garbage-collect everything a worker created.
+- Desired state is git (resource definitions, by commit) and Postgres (what is deployed where,
+  runs, audit). Kubernetes holds only native objects the controller derives from it, labelled
+  `kermodes.io/project`, `kermodes.io/resource`, and `kermodes.io/commit`; there is no custom
+  resource. `kubectl get deploy -l kermodes.io/project=sportsflow` shows what runs.
+- Status flows back: the controller watches Deployments, Pods, and Jobs and writes
+  `sys.deployments`, `sys.task_runs`, and `sys.pipeline_runs`.
+- Owner references garbage-collect what each resource's Deployment or Job created.
 
-| Runtime object | Created for | Reconciled into |
+| Kubernetes object | Created for | Notes |
 |---|---|---|
-| `KermodesWorker` (CRD) | deployment, ingester, session | StatefulSet (1 replica) or Pod, Service, ServiceAccount |
-| `batch/v1` Job | scheduled task attempt, pipeline stage, environment build | created directly by the scheduler or pipeline; history in Postgres |
+| `apps/v1` Deployment | deployment, ingester | One replica, two for a hot standby. `RollingUpdate` (`maxSurge: 1`, `maxUnavailable: 0`) or `Recreate` (§11.4); the controller changes the template only to roll out an artifact. A PodDisruptionBudget per resource (§17.1). |
+| Pod | session | `restartPolicy: Never`, reaped after the idle timeout |
+| `batch/v1` Job | scheduled task attempt, pipeline stage, discovery, environment build | Created by the scheduler or pipeline; history in Postgres |
 
 ### 16.3 Worker pods
 
@@ -1123,9 +1176,11 @@ host it: Kubernetes (§16.1–16.5) and local (§16.6).
   by a Unix socket on a shared `emptyDir`. User code runs in the sidecar process, never in the
   engine process. Each container gets its own memory limit from the worker spec (§10.5).
 - An init container fetches the code snapshot (§11.7) into a read-only volume.
-- Deployments and ingesters: StatefulSet with one replica. This guarantees at most one pod per
-  identity (no rollout overlap double-publishing derived tables), stable DNS, and a PVC for the
-  segment/Parquet cache. Restarts rebuild state from weir and history.
+- Deployments and ingesters: a Kubernetes Deployment (§16.2). Kubernetes does not keep a single
+  copy: rollouts and drains run old and new pods together, and a pod on a partitioned node can
+  outlive its replacement, so weir's source leases enforce one writer (§7.4). Readiness is the
+  engine's: its tables built and caught up to their inputs. A PVC for the segment/Parquet cache is
+  optional and implies `recreate`. Restarts rebuild state from weir and history.
 - Sessions: bare Pod, `restartPolicy: Never`, reaped after the idle timeout; resources from the
   session request within the user's quota.
 - Jobs: one `batch/v1` Job per task attempt with `backoffLimit: 0`; the Kermodes scheduler owns
@@ -1148,7 +1203,7 @@ host it: Kubernetes (§16.1–16.5) and local (§16.6).
 | weir | StatefulSet (chart) | Longhorn PVC |
 | kermodes-control | Deployment, 2+ replicas (chart) | Postgres (CNPG) |
 | kermodes-gateway | Deployment (chart) | — |
-| Workers | `KermodesWorker` → StatefulSet / Pod (controller) | PVC cache for deployments |
+| Workers | Deployment per resource (controller) | Optional PVC cache |
 | Merge, jobs, pipeline stages, environment builds | `batch/v1` Job | rustfs, OCI registry |
 | Lake | Parquet in a rustfs bucket | catalog in Postgres |
 
@@ -1177,8 +1232,9 @@ No JVM, Docker, or Kubernetes.
 - Workers are `kermodes worker` child processes; Python sidecars are child processes using the
   environment built by uv into `.kermodes/envs/<hash>` (same hash as §10.6, built once, then reused).
   Same protocols as pods, so behaviour matches the cluster.
-- The controller has a runtime trait (`Local`: child processes; `Kubernetes`: `KermodesWorker`) and a
-  storage trait (SQLite, Postgres) with one conformance suite run against both.
+- The controller has a runtime trait (`Local`: child processes; `Kubernetes`: Deployments, Pods,
+  and Jobs) and a storage trait (SQLite, Postgres) with one conformance suite run against both.
+  Locally too, a rolling rollout starts the new process before stopping the old one.
 - `kermodes dev` serves the web UI on port 8730 and the store over Flight on 8731 (`--port`,
   `--flight-port`), and shows every stored table in the UI as it appears. `km.connect()` uses
   `$KERMODES_URL`, else that local server; `Session.serve_store()` serves a store the same way
@@ -1212,6 +1268,7 @@ sharding and HA are additive later instead of a redesign.
 | Clients resolve endpoints per internal partition via Flight `GetFlightInfo`; no client hardcodes a weir address | Moving partitions between weir shards without client changes |
 | Placement unit is the internal partition `(table, date, source_id)`; weir never coordinates across partitions | Spreading partitions over any number of shards |
 | Each partition's owner holds an epoch (fencing token) from the control plane; segments and acks record it; stale-epoch writes are rejected | Failover without split-brain |
+| Writers hold a lease per `(table, source)`; taking it bumps the source's epoch and fences the previous holder (§7.4) | Rolling replacement, drains, and standbys without two writers |
 | Sealed segments are immutable and self-describing (schema version, seq range, row range, epoch) | Serving them from any node or from S3 |
 | Subscriptions resume by `(partition, row position)` | Readers reconnecting to a different weir mid-stream |
 | Derived publications record the input positions they cover | Restarted workers resuming output without duplicates |
@@ -1225,10 +1282,31 @@ failure; `plan` warns when a non-replayable source has no replicated ack.
 |---|---|---|
 | weir | Single StatefulSet on a Longhorn-replicated volume; pod reschedules and volume reattaches (minutes); writers buffer and resume from `last_seq` | Shards via a placement map in Postgres; sealed segments copied to S3; `ack: replicated` (primary + follower for open segments) |
 | Ingesters | Restart; replayable sources lose nothing; non-replayable sources lose the outage window | Replicated ack; standby ingester |
-| Engine deployments | Restart and rebuild from weir and history; recovery time = rebuild time | State checkpoints; hot standby with input-driven (deterministic) cycles |
+| Engine deployments | Rollouts and drains replace runs without downtime (§11.4, §17.1); a crash restarts and rebuilds from weir and history, so recovery time = rebuild time | State checkpoints; hot standby (`replicas=2`) with input-driven (deterministic) cycles |
 | Sessions | Lost with the pod | — |
 | Control plane, gateway | 2+ replicas | — |
 | Postgres, lake | CNPG replicas; rustfs | — |
+
+### 17.1 Planned disruption
+
+Node drains (Talos or Kubernetes upgrades, `kubectl drain`) evict pods, and an eviction is not a
+rollout: `maxSurge` applies only to template changes, so an evicted single-replica Deployment is
+down until its replacement has rebuilt. Kermodes moves runs before they are evicted:
+
+- Each deployment and ingester has a PodDisruptionBudget that blocks eviction of its only ready
+  run.
+- The controller watches for cordoned nodes and rolls the resources on them (§11.4): the new run is
+  scheduled elsewhere, catches up, and takes the source leases; the old run then stops, and the
+  drain proceeds.
+- A hot standby (`replicas=2`) needs no move: eviction takes one run and the other takes the lease.
+  It also covers unplanned node loss, at twice the resources all the time.
+
+| Component | Draining its node |
+|---|---|
+| Deployments, ingesters | No downtime |
+| Control plane, gateway, `kermodes ui` | No downtime: stateless, 2+ replicas and a PodDisruptionBudget |
+| Postgres (CNPG) | No downtime: CNPG switches the primary over before eviction |
+| weir | A brief outage until it is replicated: the pod reschedules and its volume reattaches. Writers buffer and resume from `last_seq`; readers restart and rebuild until subscriptions resume by row position (§7.2) |
 
 ## 18. Technology choices
 
@@ -1248,8 +1326,8 @@ failure; `plan` warns when a non-replayable source has no replicated ack.
 | Python environments | uv lockfiles → OCI environment images |
 | Notebook widget | anywidget |
 | Auth | OIDC (`openidconnect`), JWT (`jsonwebtoken`) |
-| Packaging | Helm chart, OCI registry on Gitea |
-| Git hosting | Gitea first (webhooks, commit statuses, PR comments); other hosts behind the same trait |
+| Packaging | Helm chart, OCI registry (Gitea's in the reference deployment) |
+| Git | Any remote over SSH or HTTPS; host adapters (GitHub, GitLab, Gitea) for webhooks, commit statuses, PR comments |
 | Web UI | React, TypeScript, Vite, Bun, shadcn/ui, Tailwind CSS, React Router |
 | Browser data | `apache-arrow` (JS), TanStack Virtual, TanStack Table, CodeMirror 6 |
 
@@ -1310,8 +1388,8 @@ Verified against maturin 1.16, PyO3 0.30, and uv.
 | M0 | Engine library: row sets, update graph, static + incremental operators, expressions; PyO3 module; notebook widget; oracle tests; benchmarks ([engine.md](engine.md)) | Random-walk ticker → rolling mean/vol, live in Jupyter |
 | M1 | weir (DoPut, segments, seq dedup, epochs, snapshot + tail); `db.live_table`; WebSocket connector; `kermodes dev`; Helm chart (weir + engine) | Synthetic ticker over WebSocket → weir → engine, on a laptop and in the cluster |
 | M2 | Parquet writer and pruned reader, catalog with snapshots, merge job, `db.historical_table`, `db.table`, replay clock; SQL frontend with `EXPLAIN`; column IDs and compatible schema changes | Same SQL query over last month (static) and today (ticking); ticker merged nightly, replayed as a backtest |
-| M3 | Projects: `kermodes init` / `dev` / `test` / `plan`, manifest discovery, environments, pipeline (build, test, plan, deploy), targets and promotion, preview/shadow; scheduler and `sys.*` tables | Toy ticker project: push to `main` deploys to staging, promotion to prod, PR shadow preview with `kermodes diff` |
-| M4 | Multi-user: OIDC, RBAC, `KermodesWorker` controller, gateway, worker classes, sandboxes; ranger MCP; web UI v1 with monitoring v1 (§16.7) | Two users with their own sessions; an agent opens a PR that previews in shadow; the UI shows each worker's CPU, memory, and table space |
+| M3 | Projects and the pipeline: `kermodes init` / `run` / `dev` / `test` / `plan`, manifest discovery, environments, git sync from any host, rollouts (`auto` / `manual` / `on_start`; `rolling` / `recreate`) on weir source leases, a drain-aware controller on Kubernetes Deployments, scheduler and `sys.*` tables | Toy ticker project: merging to `main` rolls it out with no gap in its output, and draining its node moves it with none either |
+| M4 | Multi-user: OIDC, RBAC, gateway, worker classes, `--live` local runs on prod's inputs, PR previews in shadow; ranger MCP; web UI v1 with monitoring v1 (§16.7) | Two users with their own sessions; a developer runs a deployment locally on prod's live inputs; an agent opens a PR that previews in shadow; the UI shows each worker's CPU, memory, and table space |
 | M5 | den: register sklearn LinearRegression → ONNX → `predict`; torch MLP; aliases, shadow mode | Live prediction; swap champion without restart |
 | M6 | forage: feature views, training sets, online `last_by`, served-feature logging | Toy sportsbook: simulated games + odds → form features → live win probability vs implied odds |
 | M7 | Managed Postgres and CDC (§6.3), set up from the web UI | Toy sportsbook's bets and wallets in Postgres, ticking in Kermodes next to the odds |
