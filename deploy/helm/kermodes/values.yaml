@@ -4,6 +4,12 @@ image:
   tag: ""
   pullPolicy: IfNotPresent
 
+# The catalog's Postgres (architecture.md §8.2): a Secret holding its connection URI, such as a
+# CloudNativePG cluster's `<cluster>-app` Secret. Empty: SQLite on weir's PVC, for one weir only.
+catalog:
+  secretName: ""
+  secretKey: uri
+
 imagePullSecrets: []
 
 weir:

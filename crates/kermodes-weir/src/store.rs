@@ -32,6 +32,8 @@ pub struct Store {
     /// Held for the store's life: the OS releases the lock when the process ends, however.
     _lock: File,
     catalog: Mutex<Catalog>,
+    /// The catalog branch whose tables this store holds (§10.1).
+    branch: String,
     logs: Mutex<HashMap<i64, Arc<Log>>>,
 }
 
@@ -54,50 +56,47 @@ struct TableLog {
 }
 
 impl Store {
-    /// Opens the store in `root`, creating it if needed. Fails if another process has it open.
+    /// Opens the store in `root`, creating it if needed, with its catalog in SQLite beside its
+    /// data: the `local` branch (§16.6). Fails if another process has it open.
     pub fn open(root: &Path) -> Result<Self, Error> {
-        fs::create_dir_all(root).map_err(|e| Error::io(root, e))?;
-        let lock_path = root.join("lock");
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)
-            .map_err(|e| Error::io(&lock_path, e))?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => {
-                return Err(Error::Busy(format!(
-                    "{} is open in another process; to share it, serve it with `kermodes dev` \
-                     and connect to that",
-                    root.display()
-                )));
-            }
-            Err(TryLockError::Error(e)) => return Err(Error::io(&lock_path, e)),
-        }
-        let catalog = Catalog::open(&root.join("catalog.sqlite"))?;
-        Ok(Self {
+        let lock = lock_dir(root)?;
+        let catalog = Catalog::sqlite(&root.join("catalog.sqlite"))?;
+        Ok(Self::new(root, lock, catalog, BRANCH))
+    }
+
+    /// Opens the store in `root` with its catalog in Postgres at `url`, as the cluster's weir:
+    /// the tables of `branch`, which every client of that catalog sees alike, and lease epochs
+    /// that rise across all of them. Fails if another process has `root` open.
+    pub fn open_with_catalog(root: &Path, url: &str, branch: &str) -> Result<Self, Error> {
+        let lock = lock_dir(root)?;
+        let catalog = Catalog::postgres(url)?;
+        Ok(Self::new(root, lock, catalog, branch))
+    }
+
+    fn new(root: &Path, lock: File, catalog: Catalog, branch: &str) -> Self {
+        Self {
             root: root.to_owned(),
             _lock: lock,
             catalog: Mutex::new(catalog),
+            branch: branch.to_owned(),
             logs: Mutex::new(HashMap::new()),
-        })
+        }
     }
 
     /// Creates `name` with `schema`, or returns it if it exists with the same columns.
     pub fn create_table(&self, name: &TableName, schema: &Schema) -> Result<TableEntry, Error> {
-        lock(&self.catalog).create(BRANCH, name, schema)
+        lock(&self.catalog).create(&self.branch, name, schema)
     }
 
     /// Every table, by name.
     pub fn tables(&self) -> Result<Vec<TableEntry>, Error> {
-        lock(&self.catalog).list(BRANCH)
+        lock(&self.catalog).list(&self.branch)
     }
 
     /// The table called `name`.
     pub fn table(&self, name: &TableName) -> Result<TableEntry, Error> {
         lock(&self.catalog)
-            .get(BRANCH, name)?
+            .get(&self.branch, name)?
             .ok_or_else(|| Error::NotFound(format!("no table {name}; create it first")))
     }
 
@@ -263,6 +262,27 @@ impl Drop for Writer {
     fn drop(&mut self) {
         lock(&self.log.state).writing.remove(&self.source);
         self.log.released.notify_all();
+    }
+}
+
+/// Creates `root` if needed and takes its lock: one process owns a store directory.
+fn lock_dir(root: &Path) -> Result<File, Error> {
+    fs::create_dir_all(root).map_err(|e| Error::io(root, e))?;
+    let lock_path = root.join("lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| Error::io(&lock_path, e))?;
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(TryLockError::WouldBlock) => Err(Error::Busy(format!(
+            "{} is open in another process; to share it, serve it with `kermodes dev` and \
+             connect to that",
+            root.display()
+        ))),
+        Err(TryLockError::Error(e)) => Err(Error::io(&lock_path, e)),
     }
 }
 

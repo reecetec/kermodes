@@ -3,6 +3,7 @@
 import argparse
 import itertools
 import json
+import os
 import signal
 import time
 from collections.abc import Callable
@@ -50,6 +51,15 @@ def main(argv: list[str] | None = None) -> None:
     weir.add_argument("--data-dir", type=Path, required=True)
     weir.add_argument("--host", default="127.0.0.1")
     weir.add_argument("--port", type=int, default=DEV_PORT + 1)
+    weir.add_argument(
+        "--catalog",
+        default=os.environ.get("KERMODES_CATALOG"),
+        help="the catalog's Postgres URL, shared by every weir (default: $KERMODES_CATALOG; "
+        "without one, SQLite in --data-dir)",
+    )
+    weir.add_argument(
+        "--branch", default="prod", help="the catalog branch it serves (with --catalog)"
+    )
 
     ui = commands.add_parser(
         "ui",
@@ -148,7 +158,7 @@ def main(argv: list[str] | None = None) -> None:
             project,
         )
     elif args.command == "weir":
-        run_weir(args.data_dir, args.host, args.port)
+        run_weir(args.data_dir, args.host, args.port, args.catalog, args.branch)
     elif args.command == "ui":
         run_ui(args.server, args.host, args.port)
     elif args.command == "ingest":
@@ -204,10 +214,18 @@ def run_dev(
             supervisor.stop()
 
 
-def run_weir(data_dir: Path, host: str, port: int) -> None:
-    session = km.local(data_dir)
+def run_weir(
+    data_dir: Path, host: str, port: int, catalog: str | None, branch: str
+) -> None:
+    if catalog:
+        session = km.Session(data_dir, catalog=catalog, branch=branch)
+        session.start()
+        where = f"{data_dir.resolve()}, catalog branch {branch} in Postgres"
+    else:
+        session = km.local(data_dir)
+        where = str(data_dir.resolve())
     flight = session.serve_store(port=port, host=host)
-    print(f"kermodes weir: {data_dir.resolve()}\n  serving  {flight.url}", flush=True)
+    print(f"kermodes weir: {where}\n  serving  {flight.url}", flush=True)
     try:
         while True:
             time.sleep(3600)

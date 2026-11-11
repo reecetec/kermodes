@@ -38,14 +38,6 @@ impl Error {
     fn io(path: &Path, error: std::io::Error) -> Self {
         Self::Io(format!("{}: {error}", path.display()))
     }
-
-    fn catalog(path: &Path, error: rusqlite::Error) -> Self {
-        Self::Catalog(format!("{}: {error}", path.display()))
-    }
-
-    fn sql(error: rusqlite::Error) -> Self {
-        Self::Catalog(error.to_string())
-    }
 }
 
 impl fmt::Display for Error {

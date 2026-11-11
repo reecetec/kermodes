@@ -129,7 +129,7 @@ Core data path: the arrow-rs family only — `arrow` (array, compute kernels, IP
 workspace.
 
 Infrastructure crates are allowed where writing our own would add risk without value: `tokio`,
-`tonic` (via arrow-flight), `sqlx` (Postgres), `kube`, `ort` (ONNX Runtime), `pyo3` +
+`tonic` (via arrow-flight), `postgres` / `tokio-postgres`, `kube`, `ort` (ONNX Runtime), `pyo3` +
 `pyo3-arrow`, `openidconnect`, `jsonwebtoken`, `clap`, `serde`, `tracing`/OpenTelemetry.
 
 `sqlparser` is the one parsing dependency: it turns SQL text into an AST and does nothing else (its
@@ -140,9 +140,13 @@ than it saves.
 crate to the build.
 
 `rusqlite` (with SQLite bundled) holds the local catalog: a synchronous, in-process database is
-what an embedded store (`km.local(path)`) and `kermodes dev` need, with no runtime to start; the
-cluster's catalog is Postgres through `sqlx`, behind the same storage interface. `crc32fast`
-checks weir's index records, so recovery can tell a committed record from one a crash cut short.
+what an embedded store (`km.local(path)`) and `kermodes dev` need, with no runtime to start. The
+cluster's catalog is Postgres, shared by every weir, through the rust-postgres family: weir's
+catalog calls are synchronous (made under the store's locks), which its `postgres` client is, and
+the async control plane uses `tokio-postgres` from the same family; `sqlx` would be async-only and
+bring compile-time query macros nothing here needs. Both catalogs hold the same rows and pass one
+test suite. `crc32fast` checks weir's index records, so recovery can tell a committed record from
+one a crash cut short.
 
 `mimalloc` is the Python extension's global allocator. The system allocators keep freed memory
 resident (macOS keeps large freed blocks cached; glibc keeps freed memory in its heaps), so a
@@ -1164,9 +1168,10 @@ host it: Kubernetes (§16.1–16.5) and local (§16.6).
   has authentication) and `kermodes ui` (a Deployment, with an optional Gateway API route). It
   grows to `kermodes-control`, `kermodes-gateway`, ServiceAccounts and RBAC, and config. It does
   not contain workers, ingesters, or jobs; the controller creates those at runtime.
-- External dependencies are values: Postgres (existing CNPG cluster or connection secret; the
-  chart can optionally render a CNPG `Cluster`), S3 endpoint and bucket (rustfs), OCI registry for
-  environment images, git hosts, OIDC issuer.
+- External dependencies are values: Postgres (a Secret with its connection URI; the reference
+  deployment uses a CloudNativePG cluster's `<cluster>-app` Secret, the cluster defined beside
+  Kermodes' values), S3 endpoint and bucket (rustfs), OCI registry for environment images, git
+  hosts, OIDC issuer.
 
 ### 16.2 Controller
 
@@ -1338,7 +1343,7 @@ down until its replacement has rebuilt. Kermodes moves runs before they are evic
 | Historical files | `parquet` |
 | Object storage | `object_store` (S3 / rustfs, local filesystem) |
 | Query frontends | Python table API and SQL (`sqlparser` for parsing), both compiled to the Kermodes plan (§9.3, §9.8) |
-| Catalog and control-plane DB | Postgres via `sqlx` (cluster); SQLite via `rusqlite` (local) |
+| Catalog and control-plane DB | Postgres via `postgres` / `tokio-postgres` (cluster); SQLite via `rusqlite` (local) |
 | Inference | ONNX Runtime via `ort`; Python sidecar for other flavors |
 | Kubernetes | `kube` |
 | Python bindings | PyO3 (abi3), `pyo3-arrow` (Arrow PyCapsule interface), maturin, uv |

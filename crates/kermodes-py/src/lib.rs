@@ -173,25 +173,42 @@ enum SourceWriter {
 impl Session {
     /// An engine in this process. With `path`, it also opens the store in that directory
     /// (created if needed), whose tables, rows, and writers' progress survive the process; with
-    /// `url`, it uses the tables of the server there (`kermodes dev`) instead.
+    /// `url`, it uses the tables of the server there (`kermodes dev`) instead. With `path` and
+    /// `catalog` (a Postgres URL), the store's catalog is that Postgres, shared with every weir
+    /// using it, and holds the tables of `branch` (the cluster's weir).
     #[new]
-    #[pyo3(signature = (path=None, url=None))]
-    fn new(py: Python<'_>, path: Option<PathBuf>, url: Option<String>) -> PyResult<Self> {
-        let tables = match (path, url) {
-            (Some(_), Some(_)) => {
+    #[pyo3(signature = (path=None, url=None, catalog=None, branch="prod"))]
+    fn new(
+        py: Python<'_>,
+        path: Option<PathBuf>,
+        url: Option<String>,
+        catalog: Option<String>,
+        branch: &str,
+    ) -> PyResult<Self> {
+        let tables = match (path, url, catalog) {
+            (Some(_), Some(_), _) => {
                 return Err(PyValueError::new_err(
                     "a session opens a store directory or connects to a server, not both",
                 ));
             }
-            (Some(path), None) => Some(Tables::Local(Arc::new(
+            (None, _, Some(_)) => {
+                return Err(PyValueError::new_err(
+                    "a catalog belongs to a store: give its directory as `path`",
+                ));
+            }
+            (Some(path), None, None) => Some(Tables::Local(Arc::new(
                 py.detach(|| kermodes_weir::Store::open(&path))
                     .map_err(store_error)?,
             ))),
-            (None, Some(url)) => Some(Tables::Remote(
+            (Some(path), None, Some(catalog)) => Some(Tables::Local(Arc::new(
+                py.detach(|| kermodes_weir::Store::open_with_catalog(&path, &catalog, branch))
+                    .map_err(store_error)?,
+            ))),
+            (None, Some(url), None) => Some(Tables::Remote(
                 py.detach(|| kermodes_flight::Client::connect(&url))
                     .map_err(store_error)?,
             )),
-            (None, None) => None,
+            (None, None, None) => None,
         };
         Ok(Self {
             engine: kermodes_core::Session::new(),

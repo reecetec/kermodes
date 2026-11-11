@@ -1,13 +1,17 @@
-//! The local catalog (architecture.md §8.2): which tables exist, their IDs, storage locations, and
-//! columns, in SQLite. The cluster's catalog is Postgres; both sit behind the control plane's
-//! storage interface once it exists.
+//! The catalog (architecture.md §8.2): which tables exist, their IDs, storage locations, and
+//! columns, and each source's lease epoch (§7.4). Locally it is SQLite in the store's directory;
+//! in the cluster it is Postgres, shared by every weir (and later the control plane), so weirs
+//! agree on tables and epochs rise across them. Both backends hold the same rows and pass the
+//! same tests (`tests/catalog.rs`).
+
+mod postgres;
+mod sqlite;
 
 use std::path::Path;
 use std::sync::Arc;
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use kermodes_core::{parse_type, type_name};
-use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
 use crate::{Error, SourceId, TableName};
@@ -26,56 +30,22 @@ pub struct TableEntry {
     pub schema: SchemaRef,
 }
 
-pub(crate) struct Catalog {
-    conn: Connection,
+pub(crate) enum Catalog {
+    Sqlite(sqlite::Sqlite),
+    // Boxed: its client is several times the SQLite connection's size.
+    Postgres(Box<postgres::Postgres>),
 }
 
+/// A table's row: id, namespace, name, location, and columns as stored.
+type Row = (i64, String, String, String, String);
+
 impl Catalog {
-    pub(crate) fn open(path: &Path) -> Result<Self, Error> {
-        let conn = Connection::open(path).map_err(|e| Error::catalog(path, e))?;
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = FULL;
-             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS tables (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 branch TEXT NOT NULL,
-                 namespace TEXT NOT NULL,
-                 name TEXT NOT NULL,
-                 location TEXT NOT NULL,
-                 columns TEXT NOT NULL,
-                 UNIQUE (branch, namespace, name)
-             );
-             -- Each source's lease epoch (§7.4). Added after format 1 shipped: a table of its
-             -- own, so catalogs without it still open, and older versions ignore it.
-             CREATE TABLE IF NOT EXISTS sources (
-                 table_id INTEGER NOT NULL REFERENCES tables (id),
-                 source TEXT NOT NULL,
-                 epoch INTEGER NOT NULL,
-                 PRIMARY KEY (table_id, source)
-             );",
-        )
-        .map_err(|e| Error::catalog(path, e))?;
-        let format: Option<i64> = conn
-            .query_row("SELECT value FROM meta WHERE key = 'format'", [], |row| {
-                row.get(0)
-            })
-            .optional()
-            .map_err(|e| Error::catalog(path, e))?;
-        match format {
-            None => {
-                conn.execute("INSERT INTO meta VALUES ('format', ?1)", [FORMAT])
-                    .map_err(|e| Error::catalog(path, e))?;
-            }
-            Some(FORMAT) => {}
-            Some(other) => {
-                return Err(Error::Corrupt(format!(
-                    "{}: catalog format {other}; this version reads {FORMAT}",
-                    path.display()
-                )));
-            }
-        }
-        Ok(Self { conn })
+    pub(crate) fn sqlite(path: &Path) -> Result<Self, Error> {
+        Ok(Self::Sqlite(sqlite::Sqlite::open(path)?))
+    }
+
+    pub(crate) fn postgres(url: &str) -> Result<Self, Error> {
+        Ok(Self::Postgres(Box::new(postgres::Postgres::open(url)?)))
     }
 
     /// Creates `name` on `branch` with `schema`, or returns it if it exists with the same
@@ -87,14 +57,7 @@ impl Catalog {
         schema: &Schema,
     ) -> Result<TableEntry, Error> {
         if let Some(existing) = self.get(branch, name)? {
-            if columns(&existing.schema) != columns(schema) {
-                return Err(Error::Schema(format!(
-                    "{name} already exists with columns ({}), not ({})",
-                    listed(&existing.schema),
-                    listed(schema)
-                )));
-            }
-            return Ok(existing);
+            return same_columns(name, existing, schema);
         }
         for field in schema.fields() {
             let kind = type_name(field.data_type());
@@ -106,46 +69,36 @@ impl Catalog {
             }
         }
         let columns = encode(schema).to_string();
-        let tx = self.conn.transaction().map_err(Error::sql)?;
-        tx.execute(
-            "INSERT INTO tables (branch, namespace, name, location, columns)
-             VALUES (?1, ?2, ?3, '', ?4)",
-            params![branch, name.namespace(), name.table(), columns],
-        )
-        .map_err(Error::sql)?;
-        let id = tx.last_insert_rowid();
-        let location = format!("{branch}/{}/{}.{id}", name.namespace(), name.table());
-        tx.execute(
-            "UPDATE tables SET location = ?1 WHERE id = ?2",
-            params![location, id],
-        )
-        .map_err(Error::sql)?;
-        tx.commit().map_err(Error::sql)?;
-        Ok(TableEntry {
-            id,
-            name: name.clone(),
-            location,
-            schema: Arc::new(nullable(schema)),
-        })
+        let inserted = match self {
+            Self::Sqlite(c) => c.insert(branch, name, &columns)?,
+            Self::Postgres(c) => c.insert(branch, name, &columns)?,
+        };
+        match inserted {
+            Some((id, location)) => Ok(TableEntry {
+                id,
+                name: name.clone(),
+                location,
+                schema: Arc::new(nullable(schema)),
+            }),
+            // Another catalog client created it first: it must agree.
+            None => {
+                let existing = self.get(branch, name)?.ok_or_else(|| {
+                    Error::Catalog(format!("{name} was created and then vanished"))
+                })?;
+                same_columns(name, existing, schema)
+            }
+        }
     }
 
-    pub(crate) fn get(&self, branch: &str, name: &TableName) -> Result<Option<TableEntry>, Error> {
-        let row = self
-            .conn
-            .query_row(
-                "SELECT id, location, columns FROM tables
-                 WHERE branch = ?1 AND namespace = ?2 AND name = ?3",
-                params![branch, name.namespace(), name.table()],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(Error::sql)?;
+    pub(crate) fn get(
+        &mut self,
+        branch: &str,
+        name: &TableName,
+    ) -> Result<Option<TableEntry>, Error> {
+        let row = match self {
+            Self::Sqlite(c) => c.get(branch, name)?,
+            Self::Postgres(c) => c.get(branch, name)?,
+        };
         row.map(|(id, location, columns)| {
             Ok(TableEntry {
                 id,
@@ -158,64 +111,57 @@ impl Catalog {
     }
 
     /// Every table on `branch`, by name.
-    pub(crate) fn list(&self, branch: &str) -> Result<Vec<TableEntry>, Error> {
-        let mut statement = self
-            .conn
-            .prepare(
-                "SELECT id, namespace, name, location, columns FROM tables
-                 WHERE branch = ?1 ORDER BY namespace, name",
-            )
-            .map_err(Error::sql)?;
-        let rows = statement
-            .query_map([branch], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
+    pub(crate) fn list(&mut self, branch: &str) -> Result<Vec<TableEntry>, Error> {
+        let rows = match self {
+            Self::Sqlite(c) => c.list(branch)?,
+            Self::Postgres(c) => c.list(branch)?,
+        };
+        rows.into_iter()
+            .map(|(id, namespace, table, location, columns)| {
+                Ok(TableEntry {
+                    id,
+                    name: TableName::parse(&format!("{namespace}.{table}"))?,
+                    location,
+                    schema: Arc::new(decode(&columns)?),
+                })
             })
-            .map_err(Error::sql)?;
-        let mut tables = Vec::new();
-        for row in rows {
-            let (id, namespace, table, location, columns) = row.map_err(Error::sql)?;
-            tables.push(TableEntry {
-                id,
-                name: TableName::parse(&format!("{namespace}.{table}"))?,
-                location,
-                schema: Arc::new(decode(&columns)?),
-            });
-        }
-        Ok(tables)
+            .collect()
     }
 
     /// Takes the next lease on a table's source: its epoch, one above the last ever taken.
     pub(crate) fn next_epoch(&mut self, table_id: i64, source: &SourceId) -> Result<u64, Error> {
-        self.conn
-            .query_row(
-                "INSERT INTO sources (table_id, source, epoch) VALUES (?1, ?2, 1)
-                 ON CONFLICT (table_id, source) DO UPDATE SET epoch = epoch + 1
-                 RETURNING epoch",
-                params![table_id, source.as_str()],
-                |row| row.get::<_, i64>(0),
-            )
-            .map(|epoch| epoch as u64)
-            .map_err(Error::sql)
+        match self {
+            Self::Sqlite(c) => c.next_epoch(table_id, source),
+            Self::Postgres(c) => c.next_epoch(table_id, source),
+        }
     }
 
     /// The epoch of a table source's latest lease; `None` before its first writer.
-    pub(crate) fn epoch(&self, table_id: i64, source: &SourceId) -> Result<Option<u64>, Error> {
-        self.conn
-            .query_row(
-                "SELECT epoch FROM sources WHERE table_id = ?1 AND source = ?2",
-                params![table_id, source.as_str()],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map(|epoch| epoch.map(|e| e as u64))
-            .map_err(Error::sql)
+    pub(crate) fn epoch(&mut self, table_id: i64, source: &SourceId) -> Result<Option<u64>, Error> {
+        match self {
+            Self::Sqlite(c) => c.epoch(table_id, source),
+            Self::Postgres(c) => c.epoch(table_id, source),
+        }
     }
+}
+
+fn location(branch: &str, name: &TableName, id: i64) -> String {
+    format!("{branch}/{}/{}.{id}", name.namespace(), name.table())
+}
+
+fn same_columns(
+    name: &TableName,
+    existing: TableEntry,
+    schema: &Schema,
+) -> Result<TableEntry, Error> {
+    if columns(&existing.schema) != columns(schema) {
+        return Err(Error::Schema(format!(
+            "{name} already exists with columns ({}), not ({})",
+            listed(&existing.schema),
+            listed(schema)
+        )));
+    }
+    Ok(existing)
 }
 
 /// Column names and type names, in order: what makes two definitions the same.

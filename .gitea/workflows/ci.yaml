@@ -19,10 +19,17 @@ jobs:
     runs-on: arc
     container:
       image: ghcr.io/astral-sh/uv:0.13.7-python3.14-trixie-slim
+    # The Postgres catalog's tests (crates/kermodes-weir/tests/catalog.rs) run against it.
+    services:
+      postgres:
+        image: docker.io/library/postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: kermodes
     env:
       CARGO_HOME: /usr/local/cargo
       RUSTUP_HOME: /usr/local/rustup
       UV_LINK_MODE: copy
+      KERMODES_TEST_POSTGRES: postgres://postgres:kermodes@postgres:5432/postgres
 
     steps:
       - name: Install system packages

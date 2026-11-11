@@ -48,6 +48,15 @@ spec:
           image: {{ include "kermodes.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: [weir, --data-dir, /var/lib/kermodes, --host, 0.0.0.0, --port, "8731"]
+          {{- with .Values.catalog.secretName }}
+          # The catalog in Postgres, shared by every weir (§8.2); without it, SQLite on the PVC.
+          env:
+            - name: KERMODES_CATALOG
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ $.Values.catalog.secretKey }}
+          {{- end }}
           ports:
             - name: flight
               containerPort: 8731

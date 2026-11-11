@@ -6,7 +6,11 @@ def merge(*tables: Table) -> Table: ...
 
 class Session:
     def __init__(
-        self, path: str | PathLike[str] | None = None, url: str | None = None
+        self,
+        path: str | PathLike[str] | None = None,
+        url: str | None = None,
+        catalog: str | None = None,
+        branch: str = "prod",
     ) -> None: ...
     def input_table(
         self, columns: dict[str, str], key: str | list[str] | None = None
