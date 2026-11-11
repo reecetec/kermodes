@@ -321,6 +321,41 @@ impl Session {
         Ok(Table(table))
     }
 
+    /// Reads the WebSocket feed at `url` into `table` through a writer for `source`, until
+    /// stopped: each message a JSON object or an array of them, fields matched to columns by name
+    /// (others ignored, missing ones NULL, an unreadable record skipped and counted). Rows are
+    /// written every `flush` or `max_rows`, whichever comes first.
+    #[pyo3(signature = (url, table, source="websocket", flush="100ms", max_rows=10_000))]
+    fn ingest_websocket(
+        &self,
+        py: Python<'_>,
+        url: &str,
+        table: &str,
+        source: &str,
+        flush: &str,
+        max_rows: usize,
+    ) -> PyResult<Ingest> {
+        let tables = self.stored()?;
+        let name = kermodes_weir::TableName::parse(table).map_err(store_error)?;
+        let source = kermodes_weir::SourceId::parse(source).map_err(store_error)?;
+        let options = kermodes_ingest::Options {
+            flush: parse_period(flush)?,
+            max_rows,
+        };
+        let ingest = py.detach(|| {
+            let schema = tables.schema(&name).map_err(store_error)?;
+            let writer = tables.writer(&name, &source).map_err(store_error)?;
+            kermodes_ingest::websocket(
+                url,
+                schema,
+                options,
+                Box::new(move |batch| writer.write(batch, None)),
+            )
+            .map_err(|e| KermodesError::new_err(format!("cannot start the connector: {e}")))
+        })?;
+        Ok(Ingest(Mutex::new(ingest)))
+    }
+
     /// Serves this session's store to other processes over Arrow Flight on `host:port` (port 0
     /// picks a free one); they connect with `km.connect(server.url)`. Only a session that opened
     /// a store directory can serve it.
@@ -397,11 +432,7 @@ impl Writer {
         let (schema, batches) = read_batches(data)?;
         py.detach(|| {
             let batch = arrow::compute::concat_batches(&schema, &batches).map_err(arrow_error)?;
-            match &self.0 {
-                SourceWriter::Local(writer) => writer.write(&batch, seq),
-                SourceWriter::Remote(writer) => writer.write(&batch, seq),
-            }
-            .map_err(store_error)
+            self.0.write(&batch, seq).map_err(store_error)
         })
     }
 
@@ -413,6 +444,117 @@ impl Writer {
             SourceWriter::Remote(writer) => writer.last_seq(),
         })
     }
+}
+
+impl SourceWriter {
+    fn write(&self, batch: &RecordBatch, seq: Option<u64>) -> Result<bool, kermodes_weir::Error> {
+        match self {
+            SourceWriter::Local(writer) => writer.write(batch, seq),
+            SourceWriter::Remote(writer) => writer.write(batch, seq),
+        }
+    }
+}
+
+/// A running connector (`Session.ingest_websocket`); stops when this object goes, or with
+/// `stop()`.
+#[pyclass(module = "kermodes", name = "Ingest", frozen)]
+pub struct Ingest(Mutex<kermodes_ingest::Ingest>);
+
+#[pymethods]
+impl Ingest {
+    /// What the connector has done so far.
+    #[getter]
+    fn stats(&self) -> IngestStats {
+        let stats = self.lock().stats();
+        IngestStats {
+            messages: stats.messages,
+            rows: stats.rows,
+            skipped: stats.skipped,
+            batches: stats.batches,
+            reconnects: stats.reconnects,
+            failed_writes: stats.failed_writes,
+            last_error: stats.last_error,
+        }
+    }
+
+    /// Stops reading and writes what is buffered.
+    fn stop(&self, py: Python<'_>) {
+        py.detach(|| self.lock().stop());
+    }
+}
+
+impl Ingest {
+    fn lock(&self) -> std::sync::MutexGuard<'_, kermodes_ingest::Ingest> {
+        self.0
+            .lock()
+            .expect("kermodes connector poisoned by an earlier panic")
+    }
+}
+
+/// A connector's counts, as of when they were read (`Ingest.stats`).
+#[pyclass(module = "kermodes", name = "IngestStats", frozen, get_all)]
+pub struct IngestStats {
+    /// Messages received from the feed.
+    messages: u64,
+    /// Rows written to the table.
+    rows: u64,
+    /// Records skipped because they could not be read as the table's columns.
+    skipped: u64,
+    batches: u64,
+    /// Times the feed was reconnected after it dropped.
+    reconnects: u64,
+    /// Writes that failed; their rows are lost, as the feed cannot be replayed.
+    failed_writes: u64,
+    last_error: Option<String>,
+}
+
+#[pymethods]
+impl IngestStats {
+    fn __repr__(&self) -> String {
+        format!(
+            "<IngestStats {} rows from {} messages, {} skipped, {} reconnects, {} failed writes>",
+            self.rows, self.messages, self.skipped, self.reconnects, self.failed_writes
+        )
+    }
+}
+
+/// A synthetic market-data feed over WebSocket (`ticker(...)`), for demos and tests.
+#[pyclass(module = "kermodes", name = "Ticker", frozen)]
+pub struct Ticker(Mutex<kermodes_ingest::Ticker>);
+
+#[pymethods]
+impl Ticker {
+    /// Where to read it: `ws://host:port/`.
+    #[getter]
+    fn url(&self) -> String {
+        format!("ws://{}/", self.lock().addr())
+    }
+
+    fn stop(&self, py: Python<'_>) {
+        py.detach(|| self.lock().stop());
+    }
+}
+
+impl Ticker {
+    fn lock(&self) -> std::sync::MutexGuard<'_, kermodes_ingest::Ticker> {
+        self.0
+            .lock()
+            .expect("kermodes ticker poisoned by an earlier panic")
+    }
+}
+
+/// Serves a synthetic feed on `host:port` (port 0 picks a free one): about `rate` ticks a second
+/// over `symbols` symbols, as JSON arrays of `{sym, price, size, ts}` every 10 ms.
+#[pyfunction]
+#[pyo3(signature = (port=0, rate=1_000, symbols=100, host="127.0.0.1"))]
+fn ticker(py: Python<'_>, port: u16, rate: u32, symbols: u32, host: &str) -> PyResult<Ticker> {
+    let addr: SocketAddr = format!("{host}:{port}")
+        .parse()
+        .map_err(|e| PyValueError::new_err(format!("cannot listen on {host}:{port}: {e}")))?;
+    let feed = py
+        .detach(|| kermodes_ingest::ticker(addr, rate, symbols))
+        .map_err(|e| PyValueError::new_err(format!("cannot listen on {addr}: {e}")))?;
+    Ok(Ticker(Mutex::new(feed)))
 }
 
 fn store_error(error: kermodes_weir::Error) -> PyErr {
@@ -814,7 +956,7 @@ fn merge(py: Python<'_>, tables: Vec<PyRef<'_, Table>>) -> PyResult<Table> {
     Ok(Table(table))
 }
 
-/// One open grid's server side (`kermodes_core::viewer`): `kermodes._widget` carries its messages over
+/// One open grid's server side (`kermodes_core::viewer`): `kermodes.notebook` carries its messages over
 /// the notebook comm. Frames are `(header, rows, keys)`: a dict, an Arrow IPC stream, and the
 /// rows' keys as little-endian u64. Holds its table weakly.
 #[pyclass(module = "kermodes", name = "Viewer", frozen)]
@@ -960,7 +1102,10 @@ impl Viewer {
 #[pymodule]
 mod _native {
     #[pymodule_export]
-    use super::{Server, Session, StoreServer, Table, Viewer, Writer, merge};
+    use super::{
+        Ingest, IngestStats, Server, Session, StoreServer, Table, Ticker, Viewer, Writer, merge,
+        ticker,
+    };
 
     use pyo3::prelude::*;
 

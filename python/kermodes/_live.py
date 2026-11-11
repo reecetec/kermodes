@@ -1,6 +1,6 @@
 """Tables in notebooks.
 
-Displaying a table shows the table viewer (`kermodes._widget`, with the `kermodes[notebook]` extra) or,
+Displaying a table shows the table viewer (`kermodes.notebook`, with the `kermodes[notebook]` extra) or,
 without it, its first rows as HTML. A ticking table's view then follows it: the viewer gets
 fresh rows, the HTML is re-rendered in place (Jupyter's `update_display_data`), at most ten
 times a second and only after a cycle that changed the table. One background thread serves
@@ -63,7 +63,7 @@ def _viewer() -> "type | None":
         or importlib.util.find_spec("anywidget") is None
     ):
         return None
-    from kermodes._widget import Widget
+    from kermodes.notebook import Widget
 
     return Widget
 

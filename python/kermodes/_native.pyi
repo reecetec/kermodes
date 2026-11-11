@@ -26,6 +26,37 @@ class Session:
     def writer(self, name: str, source: str = "default") -> Writer: ...
     def live_table(self, name: str) -> Table: ...
     def serve_store(self, port: int = 0, host: str = "127.0.0.1") -> StoreServer: ...
+    def ingest_websocket(
+        self,
+        url: str,
+        table: str,
+        source: str = "websocket",
+        flush: str = "100ms",
+        max_rows: int = 10_000,
+    ) -> Ingest: ...
+
+class Ingest:
+    @property
+    def stats(self) -> IngestStats: ...
+    def stop(self) -> None: ...
+
+class IngestStats:
+    messages: int
+    rows: int
+    skipped: int
+    batches: int
+    reconnects: int
+    failed_writes: int
+    last_error: str | None
+
+class Ticker:
+    @property
+    def url(self) -> str: ...
+    def stop(self) -> None: ...
+
+def ticker(
+    port: int = 0, rate: int = 1_000, symbols: int = 100, host: str = "127.0.0.1"
+) -> Ticker: ...
 
 class StoreServer:
     @property

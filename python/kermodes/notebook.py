@@ -4,7 +4,7 @@ The viewer's work (rows by position, sorting and quick filters in the engine, fe
 engine's `Viewer`, shared with the web UI's server. This widget only carries its messages over
 the notebook comm: grid messages in, frames out (a header and two buffers, the rows as Arrow IPC
 and their keys), and the viewer's state as synced traits. Needs the `kermodes[notebook]` extra;
-`kermodes._live` falls back to the HTML view without it.
+`kermodes._live` (how tables display) falls back to the HTML view without it.
 """
 
 import threading

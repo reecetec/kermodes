@@ -153,7 +153,9 @@ Polars ships a tuned jemalloc for the same reason.
 `axum` (hyper, with tokio-tungstenite for WebSocket) serves HTTP and WebSocket for the gateway:
 today the local server behind `Session.serve`, later the cluster gateway. HTTP and WebSocket
 protocol handling written ourselves would be risk without value. `serde_json` reads and writes
-the web app's JSON messages.
+the web app's JSON messages. The WebSocket connector is a tokio-tungstenite client, the same
+crate axum's WebSocket is, and decodes JSON records with `arrow-json` straight into Arrow
+columns.
 
 No embedded query engines (DataFusion, DuckDB, Polars). A new data-path dependency needs a written
 reason in this section.
@@ -315,8 +317,15 @@ declared in a project like any other resource.
 def parse_odds(msgs: km.Batch) -> km.Batch: ...
 ```
 
-- Built-in Rust connectors: NATS JetStream, Kafka, WebSocket, HTTP poll, file drop.
-- Python connectors use `km.ingest.writer(ns, table, source=...)`, the SDK equivalent of a
+- Built-in Rust connectors (`kermodes-ingest`): NATS JetStream, Kafka, WebSocket, HTTP poll,
+  file drop. Connectors are Tolerant Readers: fields map to columns by name, unknown fields are
+  ignored, missing ones are NULL, and an unreadable record is skipped and counted without losing
+  its neighbours. Built so far: WebSocket feeds of JSON (an object or an array of them per
+  message), flushed every `flush` or `max_rows`, reconnecting with backoff:
+  `session.ingest_websocket(url, "md.ticks")` or `kermodes ingest websocket URL --table md.ticks`.
+  A raw WebSocket feed is not replayable, so a restarted connector resumes from the feed's
+  present. `kermodes demo ticker` (`km.demo.ticker()`) serves a synthetic feed.
+- Python connectors use a session's `writer(table, source=...)`, the SDK equivalent of a
   Deephaven logger.
 - Batch imports (CSV, API backfills) are ordinary jobs that write either through weir (live) or
   directly into the lake (historical, via the merge writer).

@@ -21,4 +21,5 @@ pyo3-arrow.workspace = true
 kermodes-core.workspace = true
 kermodes-flight.workspace = true
 kermodes-gateway.workspace = true
+kermodes-ingest.workspace = true
 kermodes-weir.workspace = true

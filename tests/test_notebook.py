@@ -3,7 +3,7 @@ import array
 import kermodes as km
 import pyarrow as pa
 from IPython.core.interactiveshell import InteractiveShell
-from kermodes._widget import TableView
+from kermodes.notebook import TableView
 
 
 def test_rerunning_a_cell_replaces_the_table_it_built():

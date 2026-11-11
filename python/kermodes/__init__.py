@@ -3,6 +3,7 @@
 import os
 from os import PathLike
 
+from kermodes import demo
 from kermodes._native import KermodesError, Session, Table, Writer, merge
 
 __all__ = [
@@ -13,6 +14,7 @@ __all__ = [
     "boolean",
     "connect",
     "date32",
+    "demo",
     "float64",
     "int32",
     "int64",

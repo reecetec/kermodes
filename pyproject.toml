@@ -10,7 +10,7 @@ dependencies = []
 kermodes = "kermodes.cli:main"
 
 [project.optional-dependencies]
-# The table viewer in notebooks (kermodes._widget); without it tables show as HTML.
+# The table viewer in notebooks (kermodes.notebook); without it tables show as HTML.
 notebook = ["anywidget>=0.9"]
 
 [dependency-groups]
