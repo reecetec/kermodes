@@ -12,6 +12,7 @@ use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
 use crate::agg::{Accumulator, AggBy, agg_schema};
 use crate::groups::{KeyKind, Membership, resolve};
+use crate::join::{AsOfJoin, Join, JoinShape, NaturalJoin, Tracking};
 use crate::ops::{Assignment, LastBy, Operator, Update, Where};
 use crate::storage::{Delta, Modified, RowKey, Rows, Storage};
 use crate::types::check_types;
@@ -81,6 +82,26 @@ enum Source {
         parent: usize,
         operator: Box<Operator>,
     },
+    Join {
+        left: usize,
+        right: usize,
+        operator: Box<Join>,
+    },
+}
+
+/// A join's resolved columns: its shape, the left `on` columns, and the `at` columns if any.
+struct JoinPlan {
+    shape: JoinShape,
+    left_on: Vec<usize>,
+    at: Option<(usize, usize)>,
+}
+
+/// `"left=right"` as `("left", "right")`; a bare `"name"` names both sides.
+fn pair(text: &str) -> (&str, &str) {
+    match text.split_once('=') {
+        Some((left, right)) => (left.trim(), right.trim()),
+        None => (text.trim(), text.trim()),
+    }
 }
 
 /// An input table with one row per key value: upserts replace, deletes remove.
@@ -222,6 +243,35 @@ impl Session {
                         continue;
                     };
                     operator.process(&parent.storage, delta, &table.storage)
+                }
+                Source::Join {
+                    left,
+                    right,
+                    operator,
+                } => {
+                    if !table.refreshing {
+                        continue;
+                    }
+                    let (left, right) = (&before[*left], &before[*right]);
+                    if let Some(cause) = left.failure.as_ref().or(right.failure.as_ref()) {
+                        table.fail(Error::Upstream {
+                            table: table.description.clone(),
+                            cause: Arc::new(cause.clone()),
+                        });
+                        table.changed = cycle;
+                        continue;
+                    }
+                    if left.delta.is_none() && right.delta.is_none() {
+                        continue;
+                    }
+                    let unchanged = Delta::default();
+                    operator.process(
+                        &left.storage,
+                        left.delta.as_ref().unwrap_or(&unchanged),
+                        &right.storage,
+                        right.delta.as_ref().unwrap_or(&unchanged),
+                        &table.storage,
+                    )
                 }
             };
             table.commit(result);
@@ -642,6 +692,225 @@ impl Table {
     fn membership(&self, columns: &[&str]) -> Result<Membership, Error> {
         let columns = resolve(&self.schema, columns)?;
         Membership::new(&self.schema, columns, self.add_only(), 0, 1).map_err(schema_error)
+    }
+
+    /// Each row of this table with columns from the row of `right` whose `on` columns hold the
+    /// same values, or NULLs if none does; a key with more than one right row fails the table.
+    /// `on` entries are `name` or `left_name=right_name`. `joins` lists the right columns to add,
+    /// as `name` or `new_name=right_name`; by default every right column not in `on`.
+    pub fn natural_join(
+        &self,
+        right: &Table,
+        on: &[&str],
+        joins: Option<&[&str]>,
+    ) -> Result<Table, Error> {
+        let plan = self.join_plan(right, on, None, joins)?;
+        // Group members go unused: the join keeps its own left rows (`Tracking`).
+        let groups =
+            Membership::new(&self.schema, plan.left_on, true, 0, 1).map_err(schema_error)?;
+        let tracking = if !right.is_refreshing() {
+            Tracking::None
+        } else if self.add_only() {
+            Tracking::Appended
+        } else {
+            Tracking::Changing
+        };
+        let description = format!("natural_join(on=[{}])", on.join(", "));
+        let output = plan.shape.output.clone();
+        let operator = Join::Natural(NaturalJoin::new(plan.shape, tracking, groups));
+        self.join(right, description, output, operator)
+    }
+
+    /// Each row of this table with columns from the row of `right` whose `on` columns hold the
+    /// same values and whose `at` time is the latest not after this row's, or NULLs if none;
+    /// among equal times, the right row that arrived last. `at` is `name` or
+    /// `left_name=right_name`, an integer, date, or timestamp column on both sides. `right` must
+    /// only gain rows. `on` and `joins` are as for `natural_join`; `joins` defaults to every
+    /// right column not in `on` or `at`.
+    pub fn as_of_join(
+        &self,
+        right: &Table,
+        on: &[&str],
+        at: &str,
+        joins: Option<&[&str]>,
+    ) -> Result<Table, Error> {
+        if !right.add_only() {
+            return Err(Error::Unsupported(
+                "as_of_join needs a right table that only gains rows: an append-only input, or \
+                 where/update over one"
+                    .into(),
+            ));
+        }
+        let plan = self.join_plan(right, on, Some(at), joins)?;
+        let (left_at, right_at) = plan.at.expect("planned with `at`");
+        let left_at = KeyKind::new(&self.schema, vec![left_at]).map_err(schema_error)?;
+        let right_at = KeyKind::new(&right.schema, vec![right_at]).map_err(schema_error)?;
+        let groups =
+            Membership::new(&self.schema, plan.left_on, true, 0, 1).map_err(schema_error)?;
+        let description = format!("as_of_join(on=[{}], at={at})", on.join(", "));
+        let output = plan.shape.output.clone();
+        let tracking = right.is_refreshing();
+        let operator = Join::AsOf(AsOfJoin::new(
+            plan.shape, tracking, left_at, right_at, groups,
+        ));
+        self.join(right, description, output, operator)
+    }
+
+    /// Resolves a join's columns on both sides and its output schema.
+    fn join_plan(
+        &self,
+        right: &Table,
+        on: &[&str],
+        at: Option<&str>,
+        joins: Option<&[&str]>,
+    ) -> Result<JoinPlan, Error> {
+        let pairs: Vec<(&str, &str)> = on.iter().map(|text| pair(text)).collect();
+        let left_names: Vec<&str> = pairs.iter().map(|p| p.0).collect();
+        let right_names: Vec<&str> = pairs.iter().map(|p| p.1).collect();
+        let left_on = resolve(&self.schema, &left_names)?;
+        let right_on = resolve(&right.schema, &right_names)?;
+        let same_type = |l: usize, r: usize, what: &str| {
+            let (lt, rt) = (
+                self.schema.field(l).data_type(),
+                right.schema.field(r).data_type(),
+            );
+            if lt == rt {
+                return Ok(());
+            }
+            Err(Error::Schema(format!(
+                "{what} `{}` is {} on the left but `{}` is {} on the right; they must have the \
+                 same type",
+                self.schema.field(l).name(),
+                type_name(lt),
+                right.schema.field(r).name(),
+                type_name(rt)
+            )))
+        };
+        for (l, r) in left_on.iter().zip(&right_on) {
+            same_type(*l, *r, "join key")?;
+        }
+        let at = match at {
+            None => None,
+            Some(text) => {
+                let (l, r) = pair(text);
+                let (l, r) = (
+                    resolve(&self.schema, &[l])?[0],
+                    resolve(&right.schema, &[r])?[0],
+                );
+                same_type(l, r, "time column")?;
+                if !matches!(
+                    self.schema.field(l).data_type(),
+                    DataType::Int32
+                        | DataType::Int64
+                        | DataType::Date32
+                        | DataType::Timestamp(_, _)
+                ) {
+                    return Err(Error::Schema(format!(
+                        "as_of_join matches on an integer, date, or timestamp; `{}` is {}",
+                        self.schema.field(l).name(),
+                        type_name(self.schema.field(l).data_type())
+                    )));
+                }
+                Some((l, r))
+            }
+        };
+        let added: Vec<(String, usize)> = match joins {
+            Some(joins) => joins
+                .iter()
+                .map(|text| {
+                    let (name, column) = pair(text);
+                    Ok((name.to_owned(), resolve(&right.schema, &[column])?[0]))
+                })
+                .collect::<Result<_, Error>>()?,
+            None => (0..right.schema.fields().len())
+                .filter(|c| !right_on.contains(c) && at.is_none_or(|(_, r)| r != *c))
+                .map(|c| (right.schema.field(c).name().clone(), c))
+                .collect(),
+        };
+        let mut fields: Vec<Field> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        for (name, column) in &added {
+            if fields.iter().any(|f| f.name() == name) {
+                return Err(Error::Schema(format!(
+                    "column `{name}` is in both tables; rename the right one with \
+                     joins=[\"right_{name}={name}\", ...]"
+                )));
+            }
+            let data_type = right.schema.field(*column).data_type().clone();
+            fields.push(Field::new(name, data_type, true));
+        }
+        let shape = JoinShape {
+            left_keys: KeyKind::new(&self.schema, left_on.clone()).map_err(schema_error)?,
+            right_keys: KeyKind::new(&right.schema, right_on).map_err(schema_error)?,
+            right_columns: added.into_iter().map(|(_, c)| c).collect(),
+            output: Arc::new(Schema::new(fields)),
+        };
+        Ok(JoinPlan { shape, left_on, at })
+    }
+
+    /// Builds a join of this table and `right`, computed from both tables' current rows. It
+    /// ticks if either side does, and only gains rows if this side only gains rows and `right`
+    /// never changes.
+    fn join(
+        &self,
+        right: &Table,
+        description: String,
+        schema: SchemaRef,
+        operator: Join,
+    ) -> Result<Table, Error> {
+        if !Arc::ptr_eq(&self.session.inner, &right.session.inner) {
+            return Err(Error::Unsupported(
+                "tables from different sessions cannot be joined".into(),
+            ));
+        }
+        let mut graph = self.session.write();
+        let (left, other) = (&graph.tables[self.id], &graph.tables[right.id]);
+        if let Some(cause) = left.failure.as_ref().or(other.failure.as_ref()) {
+            return Err(Error::Upstream {
+                table: description,
+                cause: Arc::new(cause.clone()),
+            });
+        }
+        let source = Source::Join {
+            left: self.id,
+            right: right.id,
+            operator: Box::new(operator),
+        };
+        let mut state = TableState::new(
+            description,
+            schema.clone(),
+            left.refreshing || other.refreshing,
+            left.add_only && !other.refreshing,
+            source,
+        );
+        let result = left.storage.as_added().and_then(|left_rows| {
+            let right_rows = other.storage.as_added()?;
+            let Source::Join { operator, .. } = &mut state.source else {
+                unreachable!("built as a join above");
+            };
+            operator.process(
+                &left.storage,
+                &left_rows,
+                &other.storage,
+                &right_rows,
+                &state.storage,
+            )
+        });
+        state.commit(result);
+        if let Some(error) = state.failure {
+            return Err(error);
+        }
+        state.delta = None;
+        graph.tables.push(state);
+        Ok(Table {
+            session: self.session.clone(),
+            id: graph.tables.len() - 1,
+            schema,
+        })
     }
 
     /// The table's current rows in key order, or the error that failed it.

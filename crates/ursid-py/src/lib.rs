@@ -217,6 +217,53 @@ impl Table {
         Ok(Table(table))
     }
 
+    /// Each row with columns from the `right` row whose `on` columns hold the same values, or
+    /// NULLs; a key with more than one right row fails the table. `on` and `joins` entries are
+    /// `"name"` or `"left=right"` (`"new=old"` for `joins`); `joins` defaults to every right
+    /// column not in `on`.
+    #[pyo3(signature = (right, on, joins=None))]
+    fn natural_join(
+        &self,
+        py: Python<'_>,
+        right: &Table,
+        on: Key,
+        joins: Option<Vec<String>>,
+    ) -> PyResult<Table> {
+        let on = on.names();
+        let on: Vec<&str> = on.iter().map(String::as_str).collect();
+        let joins: Option<Vec<&str>> = joins
+            .as_ref()
+            .map(|j| j.iter().map(String::as_str).collect());
+        let table = py
+            .detach(|| self.0.natural_join(&right.0, &on, joins.as_deref()))
+            .map_err(engine_error)?;
+        Ok(Table(table))
+    }
+
+    /// Each row with columns from the `right` row whose `on` columns match and whose `at` time
+    /// is the latest not after this row's (the last to arrive among equal times), or NULLs.
+    /// `right` must only gain rows. `at` is `"name"` or `"left=right"`; `joins` defaults to
+    /// every right column not in `on` or `at`.
+    #[pyo3(signature = (right, on, at, joins=None))]
+    fn as_of_join(
+        &self,
+        py: Python<'_>,
+        right: &Table,
+        on: Key,
+        at: &str,
+        joins: Option<Vec<String>>,
+    ) -> PyResult<Table> {
+        let on = on.names();
+        let on: Vec<&str> = on.iter().map(String::as_str).collect();
+        let joins: Option<Vec<&str>> = joins
+            .as_ref()
+            .map(|j| j.iter().map(String::as_str).collect());
+        let table = py
+            .detach(|| self.0.as_of_join(&right.0, &on, at, joins.as_deref()))
+            .map_err(engine_error)?;
+        Ok(Table(table))
+    }
+
     /// One row per value of `columns`, with each `name="function(column)"` aggregation.
     #[pyo3(signature = (*columns, **aggregations))]
     fn agg_by(

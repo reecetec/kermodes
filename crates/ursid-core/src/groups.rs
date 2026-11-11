@@ -253,6 +253,14 @@ impl Keys<'_> {
             Keys::Rows(rows) => OwnedKey::Bytes(rows.row(row).data().into()),
         }
     }
+
+    /// An integer, date, or timestamp key's value as `i64`; `None` for NULL.
+    pub fn int(&self, row: usize) -> Option<i64> {
+        match self {
+            Keys::Int(ints) => (!ints.is_null(row)).then(|| ints.get(row)),
+            _ => unreachable!("only integer-like keys are read as integers"),
+        }
+    }
 }
 
 /// A key packed into fixed-width words. Equal keys pack equally; keys of at most 16 bytes pack

@@ -6,6 +6,7 @@ mod agg;
 mod error;
 mod expr;
 mod groups;
+mod join;
 mod ops;
 mod session;
 mod slots;

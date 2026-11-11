@@ -139,3 +139,51 @@ def test_last_by_and_agg_by_match_a_plain_python_recomputation():
         }
         for sym, group in by_sym.items()
     ]
+
+
+def test_trades_pick_up_the_prevailing_quote_and_reference_data():
+    s = us.local(manual=True)
+    stamp = us.timestamp()
+    trades = s.input_table({"sym": us.string(), "ts": stamp, "qty": us.int64()})
+    quotes = s.input_table({"sym": us.string(), "ts": stamp, "bid": us.float64()})
+    refs = s.input_table({"sym": us.string(), "sector": us.string()}, key="sym")
+    enriched = trades.as_of_join(quotes, "sym", "ts").natural_join(refs, "sym")
+
+    def at(*seconds: int) -> pa.Array:
+        return pa.array([t * 10**9 for t in seconds], pa.timestamp("ns", tz="UTC"))
+
+    quotes.append(
+        pa.table({"sym": ["a", "a", "b"], "ts": at(1, 5, 2), "bid": [10.0, 11.0, 20.0]})
+    )
+    refs.upsert(pa.table({"sym": ["a"], "sector": ["tech"]}))
+    trades.append(
+        pa.table(
+            {
+                "sym": ["a", "a", "b", "c", "a"],
+                "ts": at(0, 6, 3, 9, 4),
+                "qty": [1, 2, 3, 4, 5],
+            }
+        )
+    )
+    s.step()
+    rows = pa.table(enriched).select(["sym", "qty", "bid", "sector"]).to_pylist()
+    assert sorted(rows, key=lambda r: r["qty"]) == [
+        {"sym": "a", "qty": 1, "bid": None, "sector": "tech"},
+        {"sym": "a", "qty": 2, "bid": 11.0, "sector": "tech"},
+        {"sym": "b", "qty": 3, "bid": 20.0, "sector": None},
+        {"sym": "c", "qty": 4, "bid": None, "sector": None},
+        {"sym": "a", "qty": 5, "bid": 10.0, "sector": "tech"},
+    ]
+
+    # A later quote re-prices only the trades it now precedes; new reference data reaches all.
+    quotes.append(pa.table({"sym": ["a"], "ts": at(3), "bid": [12.0]}))
+    refs.upsert(pa.table({"sym": ["b"], "sector": ["energy"]}))
+    s.step()
+    rows = pa.table(enriched).select(["qty", "bid", "sector"]).to_pylist()
+    assert sorted(rows, key=lambda r: r["qty"]) == [
+        {"qty": 1, "bid": None, "sector": "tech"},
+        {"qty": 2, "bid": 11.0, "sector": "tech"},
+        {"qty": 3, "bid": 20.0, "sector": "energy"},
+        {"qty": 4, "bid": None, "sector": None},
+        {"qty": 5, "bid": 12.0, "sector": "tech"},
+    ]
