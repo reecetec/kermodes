@@ -24,10 +24,10 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path as UrlPath, State};
+use axum::extract::{Path as UrlPath, RawQuery, State};
 use axum::http::{Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
 use http_body_util::Full;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -123,8 +123,11 @@ pub fn serve(
     let (shutdown, stopped) = oneshot::channel::<()>();
     let router = Router::new()
         .route("/ws", get(upgrade))
-        .route("/api/programs", get(programs))
-        .route("/api/programs/{project}/{resource}/rollout", post(roll_out))
+        .route("/api/projects", get(projects))
+        .route(
+            "/api/deployments/{project}/{resource}/{action}",
+            get(deployment_get).post(deployment_post),
+        )
         .route("/", get(index))
         .route("/{*path}", get(asset))
         .with_state(shared.clone());
@@ -200,15 +203,52 @@ async fn index(State(shared): State<Arc<Shared>>) -> Response {
     file(&shared, Path::new("index.html")).await
 }
 
-/// Every program the controller runs, as `kermodes control` reports them (`GET /api/status`).
-async fn programs(State(shared): State<Arc<Shared>>) -> Response {
-    to_control(&shared, Method::GET, "/api/status").await
+/// Every project the controller syncs, with the commit it runs and any that failed discovery.
+async fn projects(State(shared): State<Arc<Shared>>) -> Response {
+    to_control(&shared, Method::GET, "/api/projects").await
 }
 
-/// Rolls a resource out to its project's newest deployable commit (`update="manual"`).
-async fn roll_out(
+/// A deployment's `events` or `logs` (`?tail=` lines).
+async fn deployment_get(
     State(shared): State<Arc<Shared>>,
-    UrlPath((project, resource)): UrlPath<(String, String)>,
+    UrlPath((project, resource, action)): UrlPath<(String, String, String)>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let tail = query
+        .as_deref()
+        .and_then(|q| q.strip_prefix("tail="))
+        .and_then(|t| t.parse::<u32>().ok());
+    match (action.as_str(), tail) {
+        ("events", _) => to_deployment(&shared, Method::GET, &project, &resource, "events").await,
+        ("logs", None) => to_deployment(&shared, Method::GET, &project, &resource, "logs").await,
+        ("logs", Some(tail)) => {
+            let action = format!("logs?tail={tail}");
+            to_deployment(&shared, Method::GET, &project, &resource, &action).await
+        }
+        _ => control_error(StatusCode::NOT_FOUND, "no such deployment page"),
+    }
+}
+
+/// Rolls a deployment out to its project's newest deployable commit (`rollout`, for
+/// `update="manual"`), or starts it afresh at the same commit (`restart`).
+async fn deployment_post(
+    State(shared): State<Arc<Shared>>,
+    UrlPath((project, resource, action)): UrlPath<(String, String, String)>,
+) -> Response {
+    match action.as_str() {
+        "rollout" | "restart" => {
+            to_deployment(&shared, Method::POST, &project, &resource, &action).await
+        }
+        _ => control_error(StatusCode::NOT_FOUND, "no such deployment action"),
+    }
+}
+
+async fn to_deployment(
+    shared: &Shared,
+    method: Method,
+    project: &str,
+    resource: &str,
+    action: &str,
 ) -> Response {
     // Names, never paths: nothing else of the controller's API is reachable from here.
     let plain = |s: &str| {
@@ -216,11 +256,11 @@ async fn roll_out(
             && s.bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
     };
-    if !plain(&project) || !plain(&resource) {
+    if !plain(project) || !plain(resource) {
         return control_error(StatusCode::BAD_REQUEST, "not a project and resource name");
     }
-    let path = format!("/api/projects/{project}/resources/{resource}/rollout");
-    to_control(&shared, Method::POST, &path).await
+    let path = format!("/api/deployments/{project}/{resource}/{action}");
+    to_control(shared, method, &path).await
 }
 
 /// Passes a request to the controller and its answer back.
@@ -228,7 +268,7 @@ async fn to_control(shared: &Shared, method: Method, path: &str) -> Response {
     let Some(control) = &shared.control else {
         return control_error(
             StatusCode::NOT_FOUND,
-            "no controller: programs run under `kermodes control`",
+            "no controller: deployments run under `kermodes control`",
         );
     };
     let request = axum::http::Request::builder()

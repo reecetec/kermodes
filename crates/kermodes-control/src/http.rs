@@ -1,30 +1,101 @@
 //! The controller's HTTP surface: code snapshots for runs' init containers, the sync webhook any
-//! git host can call (§11.3), project status, and manual rollouts (§11.4). It is reachable only
-//! inside its namespace until the gateway authenticates callers (§16.4).
+//! git host can call (§11.3), projects' status, and each deployment's events, logs, rollouts,
+//! and restarts. It is reachable only inside its namespace until the gateway authenticates
+//! callers (§16.4); the web UI reaches it through its own server.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 
+use crate::plan;
 use crate::run::{self, Controller};
 
 pub async fn serve(controller: Arc<Controller>, listener: tokio::net::TcpListener) {
     let app = Router::new()
         .route("/snapshots/{project}/{commit}", get(snapshot))
         .route("/hooks/sync", post(sync))
-        .route("/api/status", get(status))
+        .route("/api/projects", get(projects))
+        .route("/api/deployments/{project}/{resource}/events", get(events))
+        .route("/api/deployments/{project}/{resource}/logs", get(logs))
         .route(
-            "/api/projects/{project}/resources/{resource}/rollout",
+            "/api/deployments/{project}/{resource}/rollout",
             post(roll_out),
+        )
+        .route(
+            "/api/deployments/{project}/{resource}/restart",
+            post(restart),
         )
         .with_state(controller);
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("kermodes control: the HTTP server stopped: {e}");
+    }
+}
+
+/// The Kubernetes name of a configured project's resource.
+fn deployment(
+    controller: &Controller,
+    project: &str,
+    resource: &str,
+) -> Result<String, (StatusCode, String)> {
+    if !controller.config.projects.iter().any(|p| p.name == project) {
+        return Err((StatusCode::NOT_FOUND, format!("no project `{project}`")));
+    }
+    plan::object_name(project, resource).map_err(|e| (StatusCode::BAD_REQUEST, e))
+}
+
+async fn events(
+    State(controller): State<Arc<Controller>>,
+    Path((project, resource)): Path<(String, String)>,
+) -> Response {
+    let name = match deployment(&controller, &project, &resource) {
+        Ok(name) => name,
+        Err(refused) => return refused.into_response(),
+    };
+    match controller.kube.events(&name).await {
+        Ok(events) => axum::Json(events).into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+    }
+}
+
+/// The serving run's last `tail` lines (default 300, at most 5,000).
+async fn logs(
+    State(controller): State<Arc<Controller>>,
+    Path((project, resource)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let name = match deployment(&controller, &project, &resource) {
+        Ok(name) => name,
+        Err(refused) => return refused.into_response(),
+    };
+    let tail = query
+        .get("tail")
+        .and_then(|t| t.parse::<i64>().ok())
+        .unwrap_or(300)
+        .clamp(1, 5_000);
+    match controller.kube.logs(&name, tail).await {
+        Ok(text) => text.into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, e).into_response(),
+    }
+}
+
+/// Fresh runs at the same commit (`kubectl rollout restart`), rolled as the resource rolls.
+async fn restart(
+    State(controller): State<Arc<Controller>>,
+    Path((project, resource)): Path<(String, String)>,
+) -> Response {
+    let name = match deployment(&controller, &project, &resource) {
+        Ok(name) => name,
+        Err(refused) => return refused.into_response(),
+    };
+    match controller.kube.restart(&name).await {
+        Ok(()) => (StatusCode::ACCEPTED, format!("{resource} restarting")).into_response(),
+        Err(e) => (StatusCode::CONFLICT, e).into_response(),
     }
 }
 
@@ -105,7 +176,7 @@ fn signed(secret: &str, body: &[u8], signature: Option<&str>) -> bool {
     ring::hmac::verify(&key, body, &tag).is_ok()
 }
 
-async fn status(State(controller): State<Arc<Controller>>) -> Response {
+async fn projects(State(controller): State<Arc<Controller>>) -> Response {
     match run::status(&controller).await {
         Ok(status) => axum::Json(status).into_response(),
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),

@@ -15,7 +15,7 @@ import {
   type KermodesConnection,
 } from '@kermodes/client';
 import { TableViewer, gridThemes, type GridThemeName } from '@kermodes/grid';
-import { ProgramsPage, usePrograms } from '@/Programs';
+import { DEPLOYMENTS_TABLE, DeploymentsPage } from '@/Deployments';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -32,7 +32,7 @@ import { cn } from '@/lib/utils';
 const THEME_KEY = 'kermodes-theme';
 
 type Tab = { key: string; view: SocketView };
-type Page = 'tables' | 'programs';
+type Page = 'deployments' | 'tables';
 
 /** Re-render when the connection's status, tables, or last error change */
 function useConnection(connection: KermodesConnection): void {
@@ -95,14 +95,14 @@ function TopBar({
   onToggleTheme,
   page,
   onPage,
-  hasPrograms,
+  hasDeployments,
 }: {
   connection: KermodesConnection;
   themeName: GridThemeName;
   onToggleTheme: () => void;
   page: Page;
   onPage: (page: Page) => void;
-  hasPrograms: boolean;
+  hasDeployments: boolean;
 }) {
   return (
     <header className="flex h-12 shrink-0 items-center gap-3 border-b bg-sidebar px-4">
@@ -110,16 +110,16 @@ function TopBar({
         <PawPrint className="size-4" />
       </div>
       <span className="text-[15px] font-semibold tracking-tight">Kermodes</span>
-      {hasPrograms ? (
+      {hasDeployments ? (
         <nav className="flex items-center gap-1">
-          {(['tables', 'programs'] as const).map(name => (
+          {(['deployments', 'tables'] as const).map(name => (
             <Button
               key={name}
               variant={page === name ? 'secondary' : 'ghost'}
               size="sm"
               onClick={() => onPage(name)}
             >
-              {name === 'tables' ? 'Tables' : 'Programs'}
+              {name === 'tables' ? 'Tables' : 'Deployments'}
             </Button>
           ))}
         </nav>
@@ -257,9 +257,10 @@ export default function App({ connection }: { connection: KermodesConnection }) 
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [active, setActive] = useState<string | null>(null);
   const theme = gridThemes[themeName];
-  const [page, setPage] = useState<Page>('tables');
-  const [programs, refreshPrograms] = usePrograms();
-  const hasPrograms = programs.state === 'ok' || programs.state === 'error';
+  // Deployments is the main tab wherever a controller reports them, until someone picks a tab.
+  const hasDeployments = connection.tables.some(t => t.name === DEPLOYMENTS_TABLE);
+  const [picked, setPicked] = useState<Page | null>(null);
+  const page: Page = hasDeployments ? (picked ?? 'deployments') : 'tables';
 
   const openTable = useCallback(
     (table: string) => {
@@ -304,20 +305,13 @@ export default function App({ connection }: { connection: KermodesConnection }) 
           connection={connection}
           themeName={themeName}
           onToggleTheme={toggleTheme}
-          page={hasPrograms ? page : 'tables'}
-          onPage={setPage}
-          hasPrograms={hasPrograms}
+          page={page}
+          onPage={setPicked}
+          hasDeployments={hasDeployments}
         />
-        {hasPrograms && page === 'programs' && (
-          <ProgramsPage programs={programs} onChanged={refreshPrograms} />
-        )}
+        {page === 'deployments' && <DeploymentsPage connection={connection} />}
         {/* Hidden rather than unmounted, so open tables keep their views. */}
-        <div
-          className={cn(
-            'flex min-h-0 flex-1',
-            hasPrograms && page === 'programs' && 'hidden'
-          )}
-        >
+        <div className={cn('flex min-h-0 flex-1', page === 'deployments' && 'hidden')}>
           <Sidebar
             tables={connection.tables}
             activeTable={activeTable}

@@ -306,8 +306,15 @@ def run_ui(server: str | None, host: str, port: int, control: str | None) -> Non
     session = km.connect(server)
     ui = session.serve(port=port, host=host, control=control)
     print(f"kermodes ui: {ui.url}", flush=True)
+
+    def publish(name: str, table: km.Table) -> None:
+        ui.publish(name, table)
+        if name == "sys.deployments":
+            # The Deployments tab: each deployment's newest row.
+            ui.publish("deployments", table.last_by("project", "name"))
+
     try:
-        follow(session, ui.publish)
+        follow(session, publish)
     except KeyboardInterrupt:
         pass
 

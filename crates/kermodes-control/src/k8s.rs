@@ -151,26 +151,11 @@ impl Kube {
             if event.type_.as_deref() != Some("Warning") {
                 continue;
             }
-            let object = &event.involved_object;
-            let name = object.name.as_deref().unwrap_or_default();
-            // A Deployment's own events, its ReplicaSets' (`{deployment}-{hash}`), its pods'.
-            let deployment = match object.kind.as_deref() {
-                Some("Pod") => owner.get(name).cloned(),
-                Some("ReplicaSet") => name.rsplit_once('-').map(|(d, _)| d.to_owned()),
-                _ => Some(name.to_owned()),
-            };
-            let Some(seen) = deployment.and_then(|d| observed.get_mut(&d)) else {
+            let Some(seen) = deployment_of(&event, &owner).and_then(|d| observed.get_mut(&d))
+            else {
                 continue;
             };
-            let at = event
-                .last_timestamp
-                .as_ref()
-                .map(|t| t.0)
-                .or_else(|| event.event_time.as_ref().map(|t| t.0))
-                .or_else(|| event.first_timestamp.as_ref().map(|t| t.0));
-            let Some(at) = at.and_then(|t| i64::try_from(t.as_nanosecond()).ok()) else {
-                continue;
-            };
+            let Some(at) = event_ns(&event) else { continue };
             if seen.warning.as_ref().is_none_or(|(_, newest)| at > *newest) {
                 let text = format!(
                     "{}: {}",
@@ -181,6 +166,76 @@ impl Kube {
             }
         }
         Ok(observed)
+    }
+
+    /// A Deployment's events, newest first: its own, its ReplicaSets', and its pods'.
+    pub async fn events(&self, name: &str) -> Result<Vec<serde_json::Value>, String> {
+        let owner: BTreeMap<String, String> = self
+            .pods_of(name)
+            .await?
+            .into_iter()
+            .filter_map(|p| Some((p.metadata.name?, name.to_owned())))
+            .collect();
+        let mut events: Vec<(i64, serde_json::Value)> = self
+            .events
+            .list(&ListParams::default())
+            .await
+            .map_err(|e| format!("cannot list events: {e}"))?
+            .items
+            .into_iter()
+            .filter(|e| deployment_of(e, &owner).as_deref() == Some(name))
+            .filter_map(|e| {
+                let at = event_ns(&e)?;
+                let json = serde_json::json!({
+                    "type": e.type_,
+                    "reason": e.reason,
+                    "message": e.message.as_deref().map(str::trim),
+                    "count": e.count,
+                    "at_ns": at,
+                    "object": format!(
+                        "{}/{}",
+                        e.involved_object.kind.as_deref().unwrap_or_default(),
+                        e.involved_object.name.as_deref().unwrap_or_default()
+                    ),
+                });
+                Some((at, json))
+            })
+            .collect();
+        events.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+        Ok(events.into_iter().take(100).map(|(_, e)| e).collect())
+    }
+
+    /// The last `tail` lines of the serving run's log: its ready pod's, else its newest's.
+    pub async fn logs(&self, name: &str, tail: i64) -> Result<String, String> {
+        let mut pods = self.pods_of(name).await?;
+        pods.sort_by_key(|p| p.metadata.creation_timestamp.as_ref().map(|t| t.0));
+        let serving = pods
+            .iter()
+            .find(|p| pod_state(p).ready)
+            .or_else(|| pods.last())
+            .and_then(|p| p.metadata.name.clone())
+            .ok_or_else(|| format!("nothing runs {name}"))?;
+        let params = LogParams {
+            container: Some("run".into()),
+            tail_lines: Some(tail),
+            timestamps: true,
+            ..LogParams::default()
+        };
+        self.pods
+            .logs(&serving, &params)
+            .await
+            .map_err(|e| format!("cannot read {serving}'s log: {e}"))
+    }
+
+    async fn pods_of(&self, name: &str) -> Result<Vec<Pod>, String> {
+        Ok(self
+            .pods
+            .list(&ListParams::default().labels(&format!(
+                "app.kubernetes.io/name={name},app.kubernetes.io/managed-by={MANAGER}"
+            )))
+            .await
+            .map_err(|e| format!("cannot list {name}'s pods: {e}"))?
+            .items)
     }
 
     pub async fn apply(&self, deployment: &Deployment) -> Result<(), String> {
@@ -441,4 +496,27 @@ fn pod_state(pod: &Pod) -> report::Pod {
         unschedulable: condition("PodScheduled")
             .is_some_and(|c| c.status == "False" && c.reason.as_deref() == Some("Unschedulable")),
     }
+}
+
+/// The Deployment an event is about: its own, a ReplicaSet's (`{deployment}-{hash}`), or one of
+/// the pods in `owner` (pod name to Deployment).
+fn deployment_of(event: &Event, owner: &BTreeMap<String, String>) -> Option<String> {
+    let object = &event.involved_object;
+    let name = object.name.as_deref()?;
+    match object.kind.as_deref() {
+        Some("Pod") => owner.get(name).cloned(),
+        Some("ReplicaSet") => name.rsplit_once('-').map(|(d, _)| d.to_owned()),
+        _ => Some(name.to_owned()),
+    }
+}
+
+/// When an event last happened, in nanoseconds since the epoch.
+fn event_ns(event: &Event) -> Option<i64> {
+    let at = event
+        .last_timestamp
+        .as_ref()
+        .map(|t| t.0)
+        .or_else(|| event.event_time.as_ref().map(|t| t.0))
+        .or_else(|| event.first_timestamp.as_ref().map(|t| t.0))?;
+    i64::try_from(at.as_nanosecond()).ok()
 }

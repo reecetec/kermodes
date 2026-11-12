@@ -8,7 +8,7 @@ publish.workspace = true
 [dependencies]
 base64 = "0.22.1"
 arrow.workspace = true
-axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
 # HMAC for signed webhooks; already built for kube's TLS.
 ring = "0.17.14"
 kermodes-flight.workspace = true
