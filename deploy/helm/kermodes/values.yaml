@@ -14,6 +14,8 @@ catalog:
 # Needs `catalog`: it keeps its state in the catalog's Postgres.
 control:
   enabled: false
+  # One leads; the other serves the API and takes over within seconds (a Postgres lock).
+  replicas: 2
   pollSeconds: 30
   # Each: name (its kermodes.toml's), url (any git host, HTTPS), branch (its mainline), and path
   # (its directory in the repository; empty for the root).

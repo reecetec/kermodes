@@ -78,8 +78,11 @@ async fn sync(
         )
             .into_response();
     }
-    controller.wake.notify_one();
-    StatusCode::ACCEPTED.into_response()
+    // Whichever replica took the request, the leader syncs.
+    match controller.state.lock().await.request_sync().await {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+    }
 }
 
 /// Whether `signature` (an `X-Hub-Signature-256` value) signs `body` under `secret`.

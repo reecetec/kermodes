@@ -1,6 +1,7 @@
 //! The controller's loop (architecture.md §11.3): for each project, sync the mainline's head,
 //! discover a new commit in a Job, and reconcile every resource by its update policy. A commit
-//! whose discovery fails is never rolled out; what runs keeps running.
+//! whose discovery fails is never rolled out; what runs keeps running. Every replica serves the
+//! HTTP API; only the leader (`leader`) runs the loops.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -8,10 +9,11 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Mutex;
 
 use crate::git::{self, Credentials, Repository};
 use crate::k8s::{Kube, Rollout};
+use crate::leader::{Leadership, Wake};
 use crate::manifest::{Manifest, Update};
 use crate::plan::{self, Decision, Target};
 use crate::state::State;
@@ -73,8 +75,6 @@ pub struct Controller {
     pub config: Config,
     pub state: Mutex<State>,
     pub kube: Kube,
-    /// Wakes the loop early (the sync webhook).
-    pub wake: Notify,
     /// Per project, the mainline head last seen leaving the project's directory as it was, so
     /// it is not fetched again at every poll.
     unchanged: Mutex<HashMap<String, String>>,
@@ -91,39 +91,67 @@ pub fn run_blocking(config: Config) -> Result<(), String> {
         .block_on(run(config))
 }
 
-/// Runs the controller until SIGTERM or SIGINT.
+/// Runs the controller until SIGTERM or SIGINT: the HTTP API at once, and the loops whenever this
+/// replica leads.
 pub async fn run(config: Config) -> Result<(), String> {
     let controller = Arc::new(Controller {
         state: Mutex::new(State::open(&config.database).await?),
         kube: Kube::connect(&config.namespace).await?,
         config,
-        wake: Notify::new(),
         unchanged: Mutex::new(HashMap::new()),
     });
     let listener = tokio::net::TcpListener::bind(&controller.config.listen)
         .await
         .map_err(|e| format!("cannot listen on {}: {e}", controller.config.listen))?;
     let server = tokio::spawn(crate::http::serve(controller.clone(), listener));
-    let mover = tokio::spawn(move_off_cordoned(controller.clone()));
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| format!("cannot handle SIGTERM: {e}"))?;
-    let poll = Duration::from_secs(controller.config.poll_seconds);
     loop {
-        for project in &controller.config.projects {
-            if let Err(e) = sync(&controller, project).await {
-                eprintln!("kermodes control: {}: {e}", project.name);
-            }
-        }
         tokio::select! {
-            _ = tokio::time::sleep(poll) => {}
-            _ = controller.wake.notified() => {}
+            reason = lead(&controller) => {
+                eprintln!("kermodes control: not leading: {reason}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
             _ = terminate.recv() => break,
             _ = tokio::signal::ctrl_c() => break,
         }
     }
+    // Returning drops the leadership, which frees the lock for another replica at once.
     server.abort();
-    mover.abort();
     Ok(())
+}
+
+/// Waits for the leader lock, then syncs, reconciles, and moves runs off cordoned nodes until it
+/// is lost; returns why.
+async fn lead(controller: &Controller) -> String {
+    let (mut leadership, mut wake) = match Leadership::acquire(&controller.config.database).await {
+        Ok(won) => won,
+        Err(e) => return e,
+    };
+    eprintln!("kermodes control: leading");
+    tokio::select! {
+        reason = leadership.lost() => reason,
+        () = sync_forever(controller, &mut wake) => unreachable!("syncs until stopped"),
+        () = move_off_cordoned(controller) => unreachable!("moves until stopped"),
+    }
+}
+
+/// Syncs every project now, then at each poll or sync request.
+async fn sync_forever(controller: &Controller, wake: &mut Wake) {
+    let poll = Duration::from_secs(controller.config.poll_seconds);
+    loop {
+        for project in &controller.config.projects {
+            if let Err(e) = sync(controller, project).await {
+                eprintln!("kermodes control: {}: {e}", project.name);
+            }
+        }
+        tokio::select! {
+            () = tokio::time::sleep(poll) => {}
+            Some(()) = wake.recv() => {}
+        }
+        // Requests queued meanwhile are answered by the sync about to run.
+        while wake.try_recv().is_ok() {}
+    }
 }
 
 /// How often runs on cordoned nodes are looked for: a drain waits this long at most before the
@@ -132,7 +160,7 @@ const CORDON_CHECK: Duration = Duration::from_secs(5);
 
 /// Moves runs off cordoned nodes, so a drain never evicts a healthy run (§17.1): each run's
 /// disruption budget blocks the eviction, and its Deployment rolls onto another node instead.
-async fn move_off_cordoned(controller: Arc<Controller>) {
+async fn move_off_cordoned(controller: &Controller) {
     loop {
         if let Err(e) = move_once(&controller.kube).await {
             eprintln!("kermodes control: moving runs off cordoned nodes: {e}");

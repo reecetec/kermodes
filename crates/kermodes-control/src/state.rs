@@ -230,6 +230,15 @@ impl State {
         Ok(())
     }
 
+    /// Asks the leader, whichever replica it is, to sync now (the push webhook).
+    pub async fn request_sync(&mut self) -> Result<(), String> {
+        self.client()
+            .await?
+            .batch_execute(&format!("NOTIFY {}", crate::leader::SYNC_CHANNEL))
+            .await
+            .map_err(sql)
+    }
+
     /// The connection, reopened if Postgres closed it (a restart, a CNPG switchover).
     async fn client(&mut self) -> Result<&mut Client, String> {
         if self.client.is_closed() {
@@ -257,39 +266,41 @@ fn sql(error: tokio_postgres::Error) -> String {
     }
 }
 
+/// A fresh schema of the test Postgres for the test `name`, or `None` without one (CI always has
+/// one).
+#[cfg(test)]
+pub(crate) async fn test_database(name: &str) -> Option<String> {
+    let Ok(url) = std::env::var("KERMODES_TEST_POSTGRES") else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI must set KERMODES_TEST_POSTGRES"
+        );
+        return None;
+    };
+    let schema = format!("kermodes_control_{name}_{}", std::process::id());
+    let (client, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(connection);
+    client
+        .batch_execute(&format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}"
+        ))
+        .await
+        .unwrap();
+    let separator = if url.contains('?') { '&' } else { '?' };
+    Some(format!("{url}{separator}options=-csearch_path%3D{schema}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::State;
-
-    /// A fresh schema of the test Postgres, or `None` without one (CI always has one).
-    async fn database() -> Option<String> {
-        let Ok(url) = std::env::var("KERMODES_TEST_POSTGRES") else {
-            assert!(
-                std::env::var_os("CI").is_none(),
-                "CI must set KERMODES_TEST_POSTGRES"
-            );
-            return None;
-        };
-        let schema = format!("kermodes_control_test_{}", std::process::id());
-        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
-            .await
-            .unwrap();
-        tokio::spawn(connection);
-        client
-            .batch_execute(&format!(
-                "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}"
-            ))
-            .await
-            .unwrap();
-        let separator = if url.contains('?') { '&' } else { '?' };
-        Some(format!("{url}{separator}options=-csearch_path%3D{schema}"))
-    }
 
     /// A commit that fails discovery is never what a project runs: the newest deployable commit
     /// stays the one before it.
     #[tokio::test]
     async fn a_failed_commit_never_replaces_the_deployable_one() {
-        let Some(url) = database().await else { return };
+        let Some(url) = super::test_database("state").await else {
+            return;
+        };
         let mut state = State::open(&url).await.unwrap();
         state
             .add_commit("ticker", "a", "tree a", b"tar a")

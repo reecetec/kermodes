@@ -118,8 +118,9 @@ spec:
       port: 8732
       targetPort: http
 ---
-# One replica, replaced by stopping it first: until it elects a leader, two controllers must never
-# run at once.
+# Every replica serves the API (snapshots, status, rollouts, the webhook); one leads, by a
+# Postgres lock, and runs the loops. On separate nodes, a drain or a lost node costs a handover,
+# not the snapshots new runs fetch as they start.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -128,9 +129,12 @@ metadata:
     {{- include "kermodes.labels" . | nindent 4 }}
     app.kubernetes.io/component: control
 spec:
-  replicas: 1
+  replicas: {{ .Values.control.replicas }}
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       {{- include "kermodes.selectorLabels" $selector | nindent 6 }}
@@ -144,6 +148,15 @@ spec:
         checksum/config: {{ .Values.control | toJson | sha256sum }}
     spec:
       serviceAccountName: {{ $name }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "kermodes.selectorLabels" $selector | nindent 20 }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -210,6 +223,20 @@ spec:
             name: {{ $name }}
         - name: tmp
           emptyDir: {}
+---
+# A drain takes one replica at a time.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "kermodes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "kermodes.selectorLabels" $selector | nindent 6 }}
 ---
 # Its API is unauthenticated until the gateway (architecture.md §16.4): only its namespace may
 # reach it, where runs fetch their snapshots, and the namespaces of git hosts that call the sync

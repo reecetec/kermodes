@@ -8,6 +8,7 @@
 mod git;
 mod http;
 mod k8s;
+mod leader;
 pub mod manifest;
 pub mod plan;
 mod run;

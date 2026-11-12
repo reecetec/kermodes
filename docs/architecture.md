@@ -1188,14 +1188,19 @@ host it: Kubernetes (§16.1–16.5) and local (§16.6).
 
 ### 16.2 Controller
 
-- `kermodes control` runs API, catalog, scheduler, pipeline, reconciler, and ranger. It runs with
-  several replicas; scheduler, pipeline, and reconciler loops use leader election via a Kubernetes
-  `Lease`, and every replica serves the API. Built so far: one replica (replaced with `Recreate`
-  until it elects a leader) that syncs the projects listed in the chart's values, keeps each
-  synced commit's snapshot and manifest in the catalog's Postgres, discovers each commit in a
-  Job, reconciles each resource's Deployment by its update policy, and serves snapshots, the sync
-  webhook, status (`GET /api/status`), and manual rollouts (`POST
-  /api/projects/{project}/resources/{resource}/rollout`) on port 8732.
+- `kermodes control` runs API, catalog, scheduler, pipeline, reconciler, and ranger. It runs two
+  replicas on separate nodes. Every replica serves the API; one, the leader, runs the loops. The
+  leader holds a Postgres advisory lock on a connection of its own, so Postgres frees it the
+  moment that connection ends (a stopped replica hands over within a second), and a vanished
+  node's lock within about 25 s by session TCP keepalives. The leader checks its connection every
+  2 s and stops acting when a check fails, long before its lock could pass on. Postgres rather
+  than a Kubernetes `Lease`: the controller already depends on it, and the same connection
+  carries sync requests from the webhook on either replica (`NOTIFY`). Built so far: the
+  projects listed in the chart's values are synced, each synced commit's snapshot and manifest
+  kept in the catalog's Postgres, each commit discovered in a Job, each resource's Deployment
+  reconciled by its update policy, and snapshots, the sync webhook, status (`GET /api/status`),
+  and manual rollouts (`POST /api/projects/{project}/resources/{resource}/rollout`) served on
+  port 8732.
 - Desired state is git (resource definitions, by commit) and Postgres (what is deployed where,
   runs, audit). Kubernetes holds only native objects the controller derives from it, labelled
   `kermodes.io/project`, `kermodes.io/resource`, and `kermodes.io/commit`; there is no custom
@@ -1350,7 +1355,7 @@ down until its replacement has rebuilt. Kermodes moves runs before they are evic
 |---|---|
 | Deployments, ingesters | No downtime |
 | Gateway, `kermodes ui` | No downtime: stateless, 2+ replicas and a PodDisruptionBudget |
-| Control plane | Until it elects a leader, one replica: syncs, rollouts, and moves pause while it reschedules; what runs keeps running |
+| Control plane | No downtime for the API; the loops hand over to the other replica within a second (a PodDisruptionBudget keeps one up) |
 | Postgres (CNPG) | No downtime: CNPG switches the primary over before eviction |
 | weir | A brief outage until it is replicated: the pod reschedules and its volume reattaches. Writers buffer and resume from `last_seq`; readers restart and rebuild until subscriptions resume by row position (§7.2) |
 
