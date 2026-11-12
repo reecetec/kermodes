@@ -1,5 +1,6 @@
 # A synthetic market-data feed, generated and ingested into md.ticks. Locally:
-# `kermodes dev --project examples/ticker`.
+# `kermodes dev --project examples/ticker`. In the cluster, `kermodes control` runs it from this
+# repository's master, syncing on each push through Gitea's webhook.
 [project]
 name = "ticker"
 entry = "ticker.app"
