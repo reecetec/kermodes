@@ -212,7 +212,8 @@ spec:
           emptyDir: {}
 ---
 # Its API is unauthenticated until the gateway (architecture.md §16.4): only its namespace may
-# reach it, where runs fetch their snapshots.
+# reach it, where runs fetch their snapshots, and the namespaces of git hosts that call the sync
+# webhook.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -228,6 +229,11 @@ spec:
   ingress:
     - from:
         - podSelector: {}
+        {{- range .Values.control.webhook.namespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
       ports:
         - protocol: TCP
           port: 8732

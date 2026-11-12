@@ -53,9 +53,14 @@ async fn snapshot(
     }
 }
 
-/// A push happened: sync now rather than at the next poll. Any git host can call it with the
-/// shared secret in `X-Kermodes-Secret`.
-async fn sync(State(controller): State<Arc<Controller>>, headers: HeaderMap) -> Response {
+/// A push happened: sync now rather than at the next poll. Any git host that signs its webhooks
+/// as GitHub, Gitea, and Forgejo do can call it: `X-Hub-Signature-256` is `sha256=` and the hex
+/// HMAC-SHA256 of the body under the shared secret, so the secret itself never travels.
+async fn sync(
+    State(controller): State<Arc<Controller>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
     let Some(secret) = &controller.config.webhook_secret else {
         return (
             StatusCode::NOT_FOUND,
@@ -63,18 +68,38 @@ async fn sync(State(controller): State<Arc<Controller>>, headers: HeaderMap) -> 
         )
             .into_response();
     };
-    let given = headers
-        .get("x-kermodes-secret")
+    let signature = headers
+        .get("x-hub-signature-256")
         .and_then(|v| v.to_str().ok());
-    if given != Some(secret.as_str()) {
+    if !signed(secret, &body, signature) {
         return (
             StatusCode::UNAUTHORIZED,
-            "wrong or missing X-Kermodes-Secret",
+            "wrong or missing X-Hub-Signature-256",
         )
             .into_response();
     }
     controller.wake.notify_one();
     StatusCode::ACCEPTED.into_response()
+}
+
+/// Whether `signature` (an `X-Hub-Signature-256` value) signs `body` under `secret`.
+fn signed(secret: &str, body: &[u8], signature: Option<&str>) -> bool {
+    let Some(hex) = signature.and_then(|s| s.strip_prefix("sha256=")) else {
+        return false;
+    };
+    if !hex.is_ascii() || hex.len() % 2 != 0 {
+        return false;
+    }
+    let Ok(tag) = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+        .collect::<Result<Vec<u8>, _>>()
+    else {
+        return false;
+    };
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+    // Constant-time: a wrong guess reveals nothing about the right one.
+    ring::hmac::verify(&key, body, &tag).is_ok()
 }
 
 async fn status(State(controller): State<Arc<Controller>>) -> Response {
@@ -95,5 +120,26 @@ async fn roll_out(
         )
             .into_response(),
         Err(e) => (StatusCode::CONFLICT, e).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::signed;
+
+    /// GitHub's published example (docs: "Validating webhook deliveries"), which Gitea and
+    /// Forgejo compute the same way.
+    #[test]
+    fn only_the_secrets_signature_of_this_body_wakes_the_controller() {
+        let secret = "It's a Secret to Everybody";
+        let body = b"Hello, World!";
+        let good = "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17";
+        assert!(signed(secret, body, Some(good)));
+        assert!(!signed("another secret", body, Some(good)));
+        assert!(!signed(secret, b"Hello, World?", Some(good)));
+        assert!(!signed(secret, body, Some(&good["sha256=".len()..])));
+        assert!(!signed(secret, body, Some("sha256=zz")));
+        assert!(!signed(secret, body, Some("sha256=é7")));
+        assert!(!signed(secret, body, None));
     }
 }

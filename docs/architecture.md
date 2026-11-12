@@ -878,9 +878,10 @@ flowchart LR
    deploying the artifact, never rebuilding. Pull requests stop at the plan, plus a preview if the
    project enables them (§11.5).
 
-- Triggers: polling (every 30 s by default), and a push webhook any git host can call:
-  `POST /hooks/sync` with a shared secret in `X-Kermodes-Secret`. A host adapter (§11.7) adds that
-  host's own webhook signature. A lost webhook only delays a sync.
+- Triggers: polling (every 30 s by default), and a push webhook, `POST /hooks/sync`, signed with
+  a shared secret as GitHub, Gitea, and Forgejo sign theirs (`X-Hub-Signature-256`, an
+  HMAC-SHA256 of the body), so the secret never travels. A host adapter (§11.7) adds hosts that
+  sign differently, such as GitLab. A lost webhook only delays a sync.
 - A commit that leaves the project's directory as it was (the same git tree) is not a new version
   of the project: nothing is discovered or rolled out, so commits elsewhere in a shared
   repository restart nothing.

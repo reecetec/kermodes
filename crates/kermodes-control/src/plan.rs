@@ -138,6 +138,9 @@ pub fn deployment(target: &Target, resource: &Resource, name: &str) -> Deploymen
         "metadata": {"name": name, "labels": labels},
         "spec": {
             "replicas": 1,
+            // Rollbacks are rollouts of an earlier commit, never `kubectl rollout undo`, so old
+            // ReplicaSets have no use once a rollout is done.
+            "revisionHistoryLimit": 0,
             "selector": {"matchLabels": selector},
             "strategy": strategy,
             // A new run that never becomes ready fails its rollout; the old one keeps serving.

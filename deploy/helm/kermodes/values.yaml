@@ -21,9 +21,12 @@ control:
   # A Secret with `username` and `password` (a token) for the projects' repositories.
   git:
     secretName: ""
-  # A Secret with `secret`, required on POST /hooks/sync; without one, the webhook is off.
+  # A Secret with `secret`, which signs pushes to POST /hooks/sync (X-Hub-Signature-256, as
+  # GitHub, Gitea, and Forgejo send it); without one, the webhook is off.
   webhook:
     secretName: ""
+    # Namespaces outside the controller's own that may call it: a git host in the cluster.
+    namespaces: []
   resources:
     requests:
       cpu: 50m
