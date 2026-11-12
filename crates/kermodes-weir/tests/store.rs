@@ -295,20 +295,17 @@ fn a_waiting_writer_takes_the_lease_with_a_new_epoch() {
 
 #[test]
 fn names_definitions_and_columns_are_checked() {
-    for bad in [
-        "ticks",
-        "md.Ticks",
-        "md.ticks.x",
-        "1md.ticks",
-        "sys.ticks",
-        "md.",
-    ] {
+    for bad in ["ticks", "md.Ticks", "md.ticks.x", "1md.ticks", "md."] {
         assert!(TableName::parse(bad).is_err(), "{bad}");
     }
     assert_eq!(
         TableName::parse("md_2.ticks_1m").unwrap().to_string(),
         "md_2.ticks_1m"
     );
+    // The platform's tables are readable by name; user code cannot create or write them.
+    assert!(TableName::parse("sys.deployments").is_ok());
+    assert!(TableName::parse_user("sys.deployments").is_err());
+    assert!(TableName::parse_user("md.ticks").is_ok());
     for bad in ["", "Feed", "-feed", "a/b", "../x"] {
         assert!(SourceId::parse(bad).is_err(), "{bad}");
     }

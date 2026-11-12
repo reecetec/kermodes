@@ -313,7 +313,7 @@ impl Session {
         columns: &Bound<'_, PyDict>,
     ) -> PyResult<()> {
         let tables = self.stored()?;
-        let name = kermodes_weir::TableName::parse(name).map_err(store_error)?;
+        let name = kermodes_weir::TableName::parse_user(name).map_err(store_error)?;
         let schema = schema_from(columns)?;
         py.detach(|| tables.create_table(&name, &schema))
             .map_err(store_error)
@@ -332,7 +332,7 @@ impl Session {
     #[pyo3(signature = (name, source="default", wait=false))]
     fn writer(&self, py: Python<'_>, name: &str, source: &str, wait: bool) -> PyResult<Writer> {
         let tables = self.stored()?;
-        let name = kermodes_weir::TableName::parse(name).map_err(store_error)?;
+        let name = kermodes_weir::TableName::parse_user(name).map_err(store_error)?;
         let source = kermodes_weir::SourceId::parse(source).map_err(store_error)?;
         let writer = py
             .detach(|| tables.writer(&name, &source, wait))
@@ -380,7 +380,7 @@ impl Session {
         seq: Option<&str>,
     ) -> PyResult<Ingest> {
         let tables = self.stored()?.clone();
-        let name = kermodes_weir::TableName::parse(table).map_err(store_error)?;
+        let name = kermodes_weir::TableName::parse_user(table).map_err(store_error)?;
         let source = kermodes_weir::SourceId::parse(source).map_err(store_error)?;
         let options = kermodes_ingest::Options {
             flush: parse_period(flush)?,

@@ -5,7 +5,8 @@ use std::fmt;
 use crate::Error;
 
 /// A table's name: `namespace.table`, both lowercase identifiers (`[a-z][a-z0-9_]*`, at most 63
-/// characters); the `sys` namespace is the platform's.
+/// characters). The `sys` namespace is the platform's: anyone reads it, and only the platform
+/// (the controller's `sys.deployments`) writes it, which `parse_user` holds user code to.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TableName {
     namespace: String,
@@ -25,13 +26,21 @@ impl TableName {
                 ));
             }
         }
-        if namespace == "sys" {
-            return Err(invalid("the `sys` namespace is reserved"));
-        }
         Ok(Self {
             namespace: namespace.to_owned(),
             table: table.to_owned(),
         })
+    }
+
+    /// A table user code may create or write: any but the platform's `sys` namespace.
+    pub fn parse_user(text: &str) -> Result<Self, Error> {
+        let name = Self::parse(text)?;
+        if name.namespace == "sys" {
+            return Err(Error::Name(format!(
+                "`{text}` is the platform's: the `sys` namespace is reserved"
+            )));
+        }
+        Ok(name)
     }
 
     pub fn namespace(&self) -> &str {

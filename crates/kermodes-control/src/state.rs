@@ -23,9 +23,12 @@ pub struct Commit {
     pub tree: Option<String>,
     pub manifest: Option<String>,
     pub error: Option<String>,
+    /// The platform image whose `kermodes manifest` read it; unknown for commits read before
+    /// this was recorded.
+    pub discovered_by: Option<String>,
 }
 
-const COMMIT_COLUMNS: &str = "commit, tree, manifest, error";
+const COMMIT_COLUMNS: &str = "commit, tree, manifest, error, discovered_by";
 
 fn commit_row(row: tokio_postgres::Row) -> Commit {
     Commit {
@@ -33,6 +36,7 @@ fn commit_row(row: tokio_postgres::Row) -> Commit {
         tree: row.get(1),
         manifest: row.get(2),
         error: row.get(3),
+        discovered_by: row.get(4),
     }
 }
 
@@ -54,6 +58,7 @@ impl State {
                  PRIMARY KEY (project, commit)
              );
              ALTER TABLE kermodes_control_commits ADD COLUMN IF NOT EXISTS tree TEXT;
+             ALTER TABLE kermodes_control_commits ADD COLUMN IF NOT EXISTS discovered_by TEXT;
              CREATE TABLE IF NOT EXISTS kermodes_control_deployed (
                  project TEXT NOT NULL,
                  resource TEXT NOT NULL,
@@ -93,11 +98,13 @@ impl State {
         Ok(())
     }
 
-    /// Records what discovery found for a commit: its manifest, or why there is none.
+    /// Records what discovery under `image` found for a commit: its manifest, or why there is
+    /// none.
     pub async fn discovered(
         &mut self,
         project: &str,
         commit: &str,
+        image: &str,
         result: &Result<String, String>,
     ) -> Result<(), String> {
         let (manifest, error) = match result {
@@ -107,9 +114,32 @@ impl State {
         self.client()
             .await?
             .execute(
-                "UPDATE kermodes_control_commits SET manifest = $3, error = $4
+                "UPDATE kermodes_control_commits
+                 SET manifest = $3, error = $4, discovered_by = $5
                  WHERE project = $1 AND commit = $2",
-                &[&project, &commit, &manifest, &error],
+                &[&project, &commit, &manifest, &error, &image],
+            )
+            .await
+            .map_err(sql)?;
+        Ok(())
+    }
+
+    /// Records a deployable commit read again under `image`: its new manifest, or, when the new
+    /// platform could not read it, its old one kept, so what runs keeps running.
+    pub async fn rediscovered(
+        &mut self,
+        project: &str,
+        commit: &str,
+        image: &str,
+        manifest: Option<&str>,
+    ) -> Result<(), String> {
+        self.client()
+            .await?
+            .execute(
+                "UPDATE kermodes_control_commits
+                 SET manifest = COALESCE($3, manifest), discovered_by = $4
+                 WHERE project = $1 AND commit = $2",
+                &[&project, &commit, &manifest, &image],
             )
             .await
             .map_err(sql)?;
@@ -351,7 +381,7 @@ mod tests {
         // Known but not yet discovered: not deployable.
         assert_eq!(state.latest_discovered("ticker").await.unwrap(), None);
         state
-            .discovered("ticker", "a", &Ok("{\"manifest\": \"a\"}".into()))
+            .discovered("ticker", "a", "img:1", &Ok("{\"manifest\": \"a\"}".into()))
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -360,11 +390,29 @@ mod tests {
             .await
             .unwrap();
         state
-            .discovered("ticker", "b", &Err("SyntaxError".into()))
+            .discovered("ticker", "b", "img:1", &Err("SyntaxError".into()))
             .await
             .unwrap();
         let latest = state.latest_discovered("ticker").await.unwrap().unwrap();
         assert_eq!(latest.commit, "a");
+        assert_eq!(latest.discovered_by.as_deref(), Some("img:1"));
+        // Read again by a new platform: a new manifest replaces the old; one it could not read
+        // keeps the old, so what runs keeps running.
+        state
+            .rediscovered("ticker", "a", "img:2", None)
+            .await
+            .unwrap();
+        let kept = state.latest_discovered("ticker").await.unwrap().unwrap();
+        assert_eq!(
+            (kept.manifest.as_deref(), kept.discovered_by.as_deref()),
+            (Some("{\"manifest\": \"a\"}"), Some("img:2"))
+        );
+        state
+            .rediscovered("ticker", "a", "img:3", Some("{\"manifest\": \"a3\"}"))
+            .await
+            .unwrap();
+        let read = state.latest_discovered("ticker").await.unwrap().unwrap();
+        assert_eq!(read.manifest.as_deref(), Some("{\"manifest\": \"a3\"}"));
         // The mainline is at the failed commit; it shows as failed, not as what runs.
         let head = state.latest("ticker").await.unwrap().unwrap();
         assert_eq!(

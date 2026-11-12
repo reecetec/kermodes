@@ -314,7 +314,7 @@ async fn sync(controller: &Controller, project: &ProjectConfig) -> Result<(), St
             .state
             .lock()
             .await
-            .discovered(&project.name, &commit, &result)
+            .discovered(&project.name, &commit, &controller.config.image, &result)
             .await?;
     }
     reconcile(controller, project).await
@@ -340,8 +340,45 @@ async fn discover(
     Ok(output)
 }
 
+/// A manifest is what one platform reads of a commit. After an upgrade, the commit a project
+/// runs is read again, so what the new platform knows of it (sizes, say) reaches its runs; if the
+/// new platform cannot read it, the old manifest stays and the failure is logged, once.
+async fn rediscover_if_stale(
+    controller: &Controller,
+    project: &ProjectConfig,
+) -> Result<(), String> {
+    let image = &controller.config.image;
+    let latest = controller
+        .state
+        .lock()
+        .await
+        .latest_discovered(&project.name)
+        .await?;
+    let Some(latest) = latest.filter(|c| c.discovered_by.as_deref() != Some(image.as_str())) else {
+        return Ok(());
+    };
+    let result = discover(controller, project, &latest.commit).await;
+    match &result {
+        Ok(_) => eprintln!(
+            "kermodes control: {}: {} read again by {image}",
+            project.name, latest.commit
+        ),
+        Err(e) => eprintln!(
+            "kermodes control: {}: {image} cannot read {}, which keeps its manifest: {e}",
+            project.name, latest.commit
+        ),
+    }
+    controller
+        .state
+        .lock()
+        .await
+        .rediscovered(&project.name, &latest.commit, image, result.ok().as_deref())
+        .await
+}
+
 /// Brings a project's Deployments to its newest deployable commit, resource by resource.
 async fn reconcile(controller: &Controller, project: &ProjectConfig) -> Result<(), String> {
+    rediscover_if_stale(controller, project).await?;
     let mut state = controller.state.lock().await;
     let Some(latest) = state.latest_discovered(&project.name).await? else {
         return Ok(());

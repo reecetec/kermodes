@@ -212,7 +212,7 @@ pub fn to_move<'a>(placements: &'a [Placement], cordoned: &BTreeSet<String>) -> 
 /// The Job that discovers what the target's commit declares: `kermodes manifest` on its code,
 /// read back from the Job's log.
 pub fn discovery_job(target: &Target) -> Job {
-    let name = discovery_job_name(&target.project, &target.commit);
+    let name = discovery_job_name(&target.project, &target.commit, &target.image);
     let discover = json!({
         "name": "discover",
         "image": target.image,
@@ -245,10 +245,16 @@ pub fn discovery_job(target: &Target) -> Job {
     serde_json::from_value(object).expect("a Job built from known fields")
 }
 
-pub fn discovery_job_name(project: &str, commit: &str) -> String {
+/// One Job per commit and platform image: the same commit read again by a new platform is a new
+/// Job, never a finished one's log from the old platform.
+pub fn discovery_job_name(project: &str, commit: &str, image: &str) -> String {
     let short = &commit[..commit.len().min(12)];
-    let project: String = project.replace('_', "-").chars().take(40).collect();
-    format!("{project}-discover-{short}")
+    let project: String = project.replace('_', "-").chars().take(33).collect();
+    // FNV-1a: stable across Rust versions, unlike the standard hasher.
+    let platform = image.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    format!("{project}-discover-{short}-{:06x}", platform & 0xff_ffff)
 }
 
 fn project_dir(target: &Target) -> String {
@@ -368,6 +374,21 @@ mod tests {
         ];
         assert!(object_names("p", &clash).is_err());
         assert!(object_name(&"p".repeat(40), &"r".repeat(30)).is_err());
+    }
+
+    #[test]
+    fn a_commit_is_discovered_once_per_platform_in_a_dns_label() {
+        let commit = "4e3ffa8e08d69a78837b330be99141a6901ba7b9";
+        let a = discovery_job_name("ticker", commit, "registry/kermodes:0.3.5");
+        let b = discovery_job_name("ticker", commit, "registry/kermodes:0.3.6");
+        assert_ne!(a, b);
+        assert_eq!(
+            a,
+            discovery_job_name("ticker", commit, "registry/kermodes:0.3.5")
+        );
+        assert!(a.starts_with("ticker-discover-4e3ffa8e08d6-"));
+        let long = discovery_job_name(&"p".repeat(63), commit, "registry/kermodes:0.3.5");
+        assert!(long.len() <= 63, "{long}");
     }
 
     #[test]
