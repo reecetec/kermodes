@@ -122,22 +122,28 @@ pub struct Row {
 
 impl Row {
     /// `resource` of `project`, running `commit` while `latest` is its newest deployable commit,
-    /// as Kubernetes shows it (`None`: nothing runs it).
+    /// stopped or not, as Kubernetes shows it (`None`: nothing runs it).
     pub fn new(
         project: &str,
         resource: &Resource,
         commit: Option<&str>,
         latest: &str,
+        stopped: bool,
         observed: Option<&Observed>,
     ) -> Self {
         let pods = observed.map_or(&[][..], |o| &o.pods);
+        let status = match (stopped, pods.is_empty()) {
+            (true, true) => "Stopped",
+            (true, false) => "Stopping",
+            (false, _) => status(observed.map_or(Rollout::Absent, |o| o.rollout), pods),
+        };
         // The run serving: a ready pod, else the newest there is.
         let serving = pods.iter().find(|p| p.ready).or_else(|| pods.last());
         Self {
             project: project.into(),
             name: resource.name.clone(),
             kind: resource.kind.clone(),
-            status: status(observed.map_or(Rollout::Absent, |o| o.rollout), pods).into(),
+            status: status.into(),
             update: format!("{:?}", resource.update).to_lowercase(),
             commit: commit.map(str::to_owned),
             available: (commit != Some(latest)).then(|| latest.to_owned()),
@@ -373,7 +379,7 @@ mod tests {
             memory: 64 << 20,
             warning: Some(("BackOff: restarting".into(), 9)),
         };
-        let row = Row::new("ticker", &resource, Some("a"), "b", Some(&observed));
+        let row = Row::new("ticker", &resource, Some("a"), "b", false, Some(&observed));
         assert_eq!(
             (
                 row.status.as_str(),
@@ -401,7 +407,15 @@ mod tests {
         assert!((pct("memory_pct") - 25.0).abs() < 1e-9);
 
         // Nothing runs it, and it is current: no update, no usage.
-        let idle = Row::new("ticker", &resource, Some("b"), "b", None);
+        // Someone stopped it: stopping while its run shuts down, then stopped.
+        let stopping = Row::new("ticker", &resource, Some("b"), "b", true, Some(&observed));
+        let stopped = Row::new("ticker", &resource, Some("b"), "b", true, None);
+        assert_eq!(
+            (stopping.status.as_str(), stopped.status.as_str()),
+            ("Stopping", "Stopped")
+        );
+
+        let idle = Row::new("ticker", &resource, Some("b"), "b", false, None);
         assert_eq!(
             (
                 idle.status.as_str(),

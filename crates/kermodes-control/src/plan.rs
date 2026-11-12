@@ -95,8 +95,10 @@ fn selector(project: &str, resource: &str) -> Value {
     json!({"kermodes.io/project": project, "kermodes.io/resource": resource})
 }
 
-/// The Deployment that runs `resource` at the target's commit.
-pub fn deployment(target: &Target, resource: &Resource, name: &str) -> Deployment {
+/// The Deployment that runs `resource` at the target's commit, with one run, or none while it is
+/// stopped: a stopped Deployment's template still follows commits, so starting it runs the
+/// right one without another rollout.
+pub fn deployment(target: &Target, resource: &Resource, name: &str, stopped: bool) -> Deployment {
     let selector = selector(&target.project, &resource.name);
     let mut labels = selector.clone();
     labels["app.kubernetes.io/name"] = json!(name);
@@ -143,7 +145,7 @@ pub fn deployment(target: &Target, resource: &Resource, name: &str) -> Deploymen
         "kind": "Deployment",
         "metadata": {"name": name, "labels": labels},
         "spec": {
-            "replicas": 1,
+            "replicas": i32::from(!stopped),
             // Rollbacks are rollouts of an earlier commit, never `kubectl rollout undo`, so old
             // ReplicaSets have no use once a rollout is done.
             "revisionHistoryLimit": 0,
@@ -371,8 +373,8 @@ mod tests {
     #[test]
     fn a_deployment_rolls_only_on_a_new_commit_and_as_its_resource_asks() {
         let rolling = resource("ticks", Update::Auto, Rollout::Rolling);
-        let a = deployment(&target("a"), &rolling, "ticker-ticks");
-        let b = deployment(&target("b"), &rolling, "ticker-ticks");
+        let a = deployment(&target("a"), &rolling, "ticker-ticks", false);
+        let b = deployment(&target("b"), &rolling, "ticker-ticks", false);
         let spec = |d: &Deployment| d.spec.clone().unwrap();
         // The selector is stable across commits; only the template's commit changes.
         assert_eq!(spec(&a).selector, spec(&b).selector);
@@ -380,6 +382,13 @@ mod tests {
             spec(d).template.metadata.unwrap().labels.unwrap()["kermodes.io/commit"].clone()
         };
         assert_eq!((commit(&a), commit(&b)), ("a".into(), "b".into()));
+        // Stopped: no run, and the same template, so starting it again rolls nothing.
+        let stopped = deployment(&target("a"), &rolling, "ticker-ticks", true);
+        assert_eq!(
+            (spec(&a).replicas, spec(&stopped).replicas),
+            (Some(1), Some(0))
+        );
+        assert_eq!(spec(&stopped).template, spec(&a).template);
         let strategy = spec(&a).strategy.unwrap();
         assert_eq!(strategy.type_.as_deref(), Some("RollingUpdate"));
         let rolling_update = strategy.rolling_update.unwrap();
@@ -392,7 +401,7 @@ mod tests {
         );
 
         let recreate = resource("book", Update::Auto, Rollout::Recreate);
-        let r = deployment(&target("a"), &recreate, "ticker-book");
+        let r = deployment(&target("a"), &recreate, "ticker-book", false);
         assert_eq!(
             spec(&r).strategy.unwrap().type_.as_deref(),
             Some("Recreate")
@@ -427,7 +436,7 @@ mod tests {
     #[test]
     fn a_budget_guards_exactly_its_resources_runs_and_never_a_broken_one() {
         let ticks = resource("ticks", Update::Auto, Rollout::Rolling);
-        let d = deployment(&target("a"), &ticks, "ticker-ticks");
+        let d = deployment(&target("a"), &ticks, "ticker-ticks", false);
         let budget = disruption_budget("ticker", "ticks", "ticker-ticks")
             .spec
             .unwrap();

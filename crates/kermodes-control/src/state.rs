@@ -2,7 +2,7 @@
 //! commit with its code snapshot and what it declares, and the commit each resource runs. Git
 //! holds the definitions; this records what was seen and done with them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tokio_postgres::{Client, NoTls};
 
@@ -60,7 +60,9 @@ impl State {
                  commit TEXT NOT NULL,
                  applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                  PRIMARY KEY (project, resource)
-             );",
+             );
+             ALTER TABLE kermodes_control_deployed
+                 ADD COLUMN IF NOT EXISTS stopped BOOLEAN NOT NULL DEFAULT false;",
         )
         .await
         .map_err(sql)?;
@@ -230,6 +232,46 @@ impl State {
         Ok(())
     }
 
+    /// The resources of a project someone stopped: they keep following commits, with no run.
+    pub async fn stopped(&mut self, project: &str) -> Result<BTreeSet<String>, String> {
+        Ok(self
+            .client()
+            .await?
+            .query(
+                "SELECT resource FROM kermodes_control_deployed
+                 WHERE project = $1 AND stopped",
+                &[&project],
+            )
+            .await
+            .map_err(sql)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect())
+    }
+
+    /// Stops or starts a deployed resource; an error if it never ran.
+    pub async fn set_stopped(
+        &mut self,
+        project: &str,
+        resource: &str,
+        stopped: bool,
+    ) -> Result<(), String> {
+        let changed = self
+            .client()
+            .await?
+            .execute(
+                "UPDATE kermodes_control_deployed SET stopped = $3
+                 WHERE project = $1 AND resource = $2",
+                &[&project, &resource, &stopped],
+            )
+            .await
+            .map_err(sql)?;
+        if changed == 0 {
+            return Err(format!("{project} has no deployed `{resource}`"));
+        }
+        Ok(())
+    }
+
     /// Asks the leader, whichever replica it is, to sync now (the push webhook).
     pub async fn request_sync(&mut self) -> Result<(), String> {
         self.client()
@@ -351,6 +393,14 @@ mod tests {
         state.set_deployed("ticker", "ticks", "a").await.unwrap();
         state.set_deployed("ticker", "ticks", "c").await.unwrap();
         assert_eq!(state.deployed("ticker").await.unwrap()["ticks"], "c");
+
+        // Stopped stays stopped as commits roll on, until started; only what ran can stop.
+        state.set_stopped("ticker", "ticks", true).await.unwrap();
+        state.set_deployed("ticker", "ticks", "d").await.unwrap();
+        assert!(state.stopped("ticker").await.unwrap().contains("ticks"));
+        state.set_stopped("ticker", "ticks", false).await.unwrap();
+        assert!(state.stopped("ticker").await.unwrap().is_empty());
+        assert!(state.set_stopped("ticker", "never", true).await.is_err());
         state.remove_deployed("ticker", "ticks").await.unwrap();
         assert!(state.deployed("ticker").await.unwrap().is_empty());
     }

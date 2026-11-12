@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use crate::git::{self, Credentials, Repository};
-use crate::k8s::{Kube, Rollout};
+use crate::k8s::Kube;
 use crate::leader::{Leadership, Wake};
 use crate::manifest::{Manifest, Update};
 use crate::plan::{self, Decision, Target};
@@ -162,11 +162,12 @@ async fn report_once(controller: &Controller) -> Result<RecordBatch, String> {
     let observed = controller.kube.observe().await?;
     let mut rows = Vec::new();
     for project in &controller.config.projects {
-        let (latest, deployed) = {
+        let (latest, deployed, stopped) = {
             let mut state = controller.state.lock().await;
             (
                 state.latest_discovered(&project.name).await?,
                 state.deployed(&project.name).await?,
+                state.stopped(&project.name).await?,
             )
         };
         let Some(latest) = latest else { continue };
@@ -178,6 +179,7 @@ async fn report_once(controller: &Controller) -> Result<RecordBatch, String> {
                 resource,
                 deployed.get(&resource.name).map(String::as_str),
                 &latest.commit,
+                stopped.contains(&resource.name),
                 observed.get(&name),
             ));
         }
@@ -347,15 +349,17 @@ async fn reconcile(controller: &Controller, project: &ProjectConfig) -> Result<(
     let manifest = Manifest::parse(latest.manifest.as_deref().unwrap_or_default())?;
     let names = plan::object_names(&project.name, &manifest.resources)?;
     let deployed = state.deployed(&project.name).await?;
+    let stopped = state.stopped(&project.name).await?;
     for resource in &manifest.resources {
         let name = &names[&resource.name];
         let running = deployed.get(&resource.name).map(String::as_str);
+        let is_stopped = stopped.contains(&resource.name);
         match plan::decide(resource.update, running, &latest.commit) {
             Decision::Apply => {
                 let target = target(controller, project, &latest.commit);
                 controller
                     .kube
-                    .apply(&plan::deployment(&target, resource, name))
+                    .apply(&plan::deployment(&target, resource, name, is_stopped))
                     .await?;
                 state
                     .set_deployed(&project.name, &resource.name, &latest.commit)
@@ -368,17 +372,18 @@ async fn reconcile(controller: &Controller, project: &ProjectConfig) -> Result<(
             // The commit it runs stays applied. For an `auto` resource that carries platform
             // upgrades too: applying an unchanged Deployment is a no-op, and a new image rolls
             // it like a new commit. A `manual` one restarts only when someone rolls it out, so
-            // it is only recreated if someone deleted it, and takes a new image at its next
-            // rollout.
+            // it is applied only to recreate it after someone deleted it, or to stop or start it;
+            // it takes a new image at its next rollout or start.
             Decision::Current | Decision::Hold => {
+                let desired = i32::from(!is_stopped);
                 if let Some(commit) = running
                     && (resource.update == Update::Auto
-                        || controller.kube.rollout(name).await? == Rollout::Absent)
+                        || controller.kube.replicas(name).await? != Some(desired))
                 {
                     let target = target(controller, project, commit);
                     controller
                         .kube
-                        .apply(&plan::deployment(&target, resource, name))
+                        .apply(&plan::deployment(&target, resource, name, is_stopped))
                         .await?;
                 }
             }
@@ -432,12 +437,14 @@ pub async fn roll_out(
         .find(|r| r.name == resource)
         .ok_or_else(|| format!("{project} declares no resource {resource}"))?;
     let name = plan::object_name(project, resource)?;
+    let is_stopped = state.stopped(project).await?.contains(resource);
     controller
         .kube
         .apply(&plan::deployment(
             &target(controller, config, &latest.commit),
             declared,
             &name,
+            is_stopped,
         ))
         .await?;
     state

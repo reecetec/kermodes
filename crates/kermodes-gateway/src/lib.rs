@@ -230,13 +230,13 @@ async fn deployment_get(
 }
 
 /// Rolls a deployment out to its project's newest deployable commit (`rollout`, for
-/// `update="manual"`), or starts it afresh at the same commit (`restart`).
+/// `update="manual"`), starts it afresh at the same commit (`restart`), or stops or starts it.
 async fn deployment_post(
     State(shared): State<Arc<Shared>>,
     UrlPath((project, resource, action)): UrlPath<(String, String, String)>,
 ) -> Response {
     match action.as_str() {
-        "rollout" | "restart" => {
+        "rollout" | "restart" | "stop" | "start" => {
             to_deployment(&shared, Method::POST, &project, &resource, &action).await
         }
         _ => control_error(StatusCode::NOT_FOUND, "no such deployment action"),

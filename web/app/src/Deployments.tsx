@@ -2,9 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   GitCommitHorizontal,
+  Play,
   RotateCcw,
   Rocket,
   ServerCog,
+  Square,
   X,
 } from 'lucide-react';
 import { tableFromIPC } from 'apache-arrow';
@@ -128,6 +130,8 @@ const STATUS_VARIANT: Record<string, 'success' | 'warning' | 'destructive' | 'ou
   'Rolling out': 'warning',
   Starting: 'warning',
   'Not running': 'outline',
+  Stopped: 'outline',
+  Stopping: 'warning',
 };
 
 function Status({ status }: { status: string }) {
@@ -311,7 +315,8 @@ function Detail({ deployment, onClose }: { deployment: Deployment; onClose: () =
   const path = `/api/deployments/${encodeURIComponent(d.project)}/${encodeURIComponent(d.name)}`;
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const act = async (action: 'rollout' | 'restart') => {
+  const stopped = d.status === 'Stopped' || d.status === 'Stopping';
+  const act = async (action: 'rollout' | 'restart' | 'stop' | 'start') => {
     setBusy(action);
     setError(await post(`${path}/${action}`));
     setBusy(null);
@@ -334,9 +339,20 @@ function Detail({ deployment, onClose }: { deployment: Deployment; onClose: () =
               Roll out {d.available.slice(0, 7)}
             </Button>
           )}
-          <Button size="sm" variant="outline" disabled={busy != null} onClick={() => void act('restart')}>
-            <RotateCcw />
-            Restart
+          {!stopped && (
+            <Button size="sm" variant="outline" disabled={busy != null} onClick={() => void act('restart')}>
+              <RotateCcw />
+              Restart
+            </Button>
+          )}
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={busy != null}
+            onClick={() => void act(stopped ? 'start' : 'stop')}
+          >
+            {stopped ? <Play /> : <Square />}
+            {stopped ? 'Start' : 'Stop'}
           </Button>
           <Button variant="ghost" size="icon-sm" onClick={onClose} aria-label="Close">
             <X />

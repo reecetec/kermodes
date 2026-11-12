@@ -310,6 +310,16 @@ impl Kube {
             .map_or(Rollout::Absent, rollout_of))
     }
 
+    /// How many runs a Deployment asks for; `None` when it does not exist.
+    pub async fn replicas(&self, name: &str) -> Result<Option<i32>, String> {
+        Ok(self
+            .deployments
+            .get_opt(name)
+            .await
+            .map_err(|e| format!("cannot read {name}: {e}"))?
+            .map(|d| d.spec.and_then(|s| s.replicas).unwrap_or(1)))
+    }
+
     /// The nodes marked unschedulable: cordoned, usually to be drained.
     pub async fn cordoned(&self) -> Result<BTreeSet<String>, String> {
         Ok(self

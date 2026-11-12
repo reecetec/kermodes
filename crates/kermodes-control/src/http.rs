@@ -31,6 +31,8 @@ pub async fn serve(controller: Arc<Controller>, listener: tokio::net::TcpListene
             "/api/deployments/{project}/{resource}/restart",
             post(restart),
         )
+        .route("/api/deployments/{project}/{resource}/stop", post(stop))
+        .route("/api/deployments/{project}/{resource}/start", post(start))
         .with_state(controller);
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("kermodes control: the HTTP server stopped: {e}");
@@ -81,6 +83,45 @@ async fn logs(
     match controller.kube.logs(&name, tail).await {
         Ok(text) => text.into_response(),
         Err(e) => (StatusCode::NOT_FOUND, e).into_response(),
+    }
+}
+
+/// Stops a deployment: no run until it is started, its template still following commits.
+async fn stop(
+    State(controller): State<Arc<Controller>>,
+    Path((project, resource)): Path<(String, String)>,
+) -> Response {
+    set_stopped(&controller, &project, &resource, true).await
+}
+
+/// Starts a stopped deployment, at the commit its template follows.
+async fn start(
+    State(controller): State<Arc<Controller>>,
+    Path((project, resource)): Path<(String, String)>,
+) -> Response {
+    set_stopped(&controller, &project, &resource, false).await
+}
+
+/// Records the desired state, then has the leader apply it (whichever replica took this).
+async fn set_stopped(
+    controller: &Controller,
+    project: &str,
+    resource: &str,
+    stopped: bool,
+) -> Response {
+    if let Err(refused) = deployment(controller, project, resource) {
+        return refused.into_response();
+    }
+    let mut state = controller.state.lock().await;
+    if let Err(e) = state.set_stopped(project, resource, stopped).await {
+        return (StatusCode::NOT_FOUND, e).into_response();
+    }
+    match state.request_sync().await {
+        Ok(()) => {
+            let verb = if stopped { "stopping" } else { "starting" };
+            (StatusCode::ACCEPTED, format!("{resource} {verb}")).into_response()
+        }
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
     }
 }
 

@@ -1120,7 +1120,7 @@ namespaces).
   `deployments`, and the app lists them live. Each row shows the deployment and its project,
   status, revision (and any update), CPU and memory as shares of its size with their recent
   history, restarts, uptime, node, and newest Warning event. A row opens its overview, events,
-  and log, with Roll out and Restart. A commit that failed discovery shows above the list.
+  and log, with Roll out, Restart, Stop, and Start. A commit that failed discovery shows above the list.
   With `kermodes ui --control URL` (the chart sets it with the controller), the server passes
   the controller's project, event, log, rollout, and restart routes through, by name only.
   Without a controller the tab is absent.
@@ -1211,7 +1211,10 @@ host it: Kubernetes (§16.1–16.5) and local (§16.6).
   kept in the catalog's Postgres, each commit discovered in a Job, each resource's Deployment
   reconciled by its update policy, and served on port 8732: snapshots, the sync webhook,
   projects (`GET /api/projects`), and each deployment's events, log, rollout, and restart
-  (`/api/deployments/{project}/{resource}/{events,logs,rollout,restart}`).
+  (`/api/deployments/{project}/{resource}/{events,logs,rollout,restart,stop,start}`). A
+  stopped deployment keeps following commits by its update policy with no run (zero replicas,
+  the same template), so Start runs the right commit without another rollout; the stop is
+  recorded in Postgres and applied by the leader.
 - Desired state is git (resource definitions, by commit) and Postgres (what is deployed where,
   runs, audit). Kubernetes holds only native objects the controller derives from it, labelled
   `kermodes.io/project`, `kermodes.io/resource`, and `kermodes.io/commit`; there is no custom
