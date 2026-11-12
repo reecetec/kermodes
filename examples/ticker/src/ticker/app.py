@@ -14,7 +14,8 @@ COLUMNS = {
 }
 
 
-@km.deployment()
+# The feed and its connector use about 35m CPU and 40Mi at 1,500 ticks a second.
+@km.deployment(cpu=0.25, memory="256Mi")
 def ticks(db):
     db.create_table("md.ticks", COLUMNS)
     feed = km.demo.ticker(rate=1_500, symbols=100)
