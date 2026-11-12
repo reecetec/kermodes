@@ -303,20 +303,42 @@ def run_weir(
 
 
 def run_ui(server: str | None, host: str, port: int, control: str | None) -> None:
-    session = km.connect(server)
-    ui = session.serve(port=port, host=host, control=control)
-    print(f"kermodes ui: {ui.url}", flush=True)
-
-    def publish(name: str, table: km.Table) -> None:
-        ui.publish(name, table)
-        if name == "sys.deployments":
-            # The Deployments tab: each deployment's newest row.
-            ui.publish("deployments", table.last_by("project", "name"))
-
+    """Serves the web UI over a store server until stopped, down only while the store is: it
+    waits for the store, and when it loses it, stops serving, waits, and serves again on the
+    same port, where browsers reconnect by themselves."""
     try:
-        follow(session, publish)
+        while True:
+            session = connect_when_up(server)
+            ui = session.serve(port=port, host=host, control=control)
+            print(f"kermodes ui: {ui.url}", flush=True)
+
+            def publish(name: str, table: km.Table, ui: _native.Server = ui) -> None:
+                ui.publish(name, table)
+                if name == "sys.deployments":
+                    # The Deployments tab's view: each deployment's newest row.
+                    ui.publish_view("deployments", table.last_by("project", "name"))
+
+            try:
+                follow(session, publish)
+            except km.KermodesError as e:
+                print(f"kermodes ui: lost the store ({e}); waiting for it", flush=True)
+                ui.stop()
+                session.stop()
     except KeyboardInterrupt:
         pass
+
+
+def connect_when_up(server: str | None) -> km.Session:
+    """Connects to the store server, waiting while it is down (a restart, an upgrade)."""
+    said = False
+    while True:
+        try:
+            return km.connect(server)
+        except km.KermodesError as e:
+            if not said:
+                print(f"kermodes ui: waiting for the store: {e}", flush=True)
+                said = True
+            time.sleep(1)
 
 
 def follow(
@@ -324,10 +346,10 @@ def follow(
     publish: Callable[[str, km.Table], None],
     every_second: Callable[[], None] | None = None,
 ) -> None:
-    """Publishes every stored table, including those created later, until one fails.
+    """Publishes every stored table, including those created later, until the store goes.
 
-    A live table fails when it loses the store it follows; the KermodesError that `len` raises
-    then ends the process.
+    A live table fails when it loses the store it follows; listing tables or reading a live
+    table then raises KermodesError, which ends this.
     """
     live: dict[str, km.Table] = {}
     while True:

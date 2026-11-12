@@ -121,3 +121,51 @@ def test_a_live_table_fails_when_its_store_goes(tmp_path):
         time.sleep(0.01)
     with pytest.raises(km.KermodesError):
         len(derived)
+
+
+def test_kermodes_ui_waits_out_its_store_and_serves_again(tmp_path):
+    store = km.local(tmp_path / "store")
+    store.create_table("md.t", {"n": km.int64()})
+    flight, port = free_port(), free_port()
+    server = store.serve_store(port=flight)
+    ui = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "kermodes",
+            "ui",
+            "--server",
+            server.url,
+            "--port",
+            str(port),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    def say(what: str) -> None:
+        assert ui.stdout is not None
+        while what not in (line := ui.stdout.readline()):
+            assert line, f"kermodes ui ended before saying {what!r}"
+
+    def serving() -> bool:
+        with socket.socket() as s:
+            return s.connect_ex(("127.0.0.1", port)) == 0
+
+    try:
+        say("kermodes ui: http")
+        assert serving()
+        # The store goes (a restart, an upgrade): the UI waits for it rather than exiting.
+        server.stop()
+        say("lost the store")
+        time.sleep(1.5)
+        assert ui.poll() is None
+        # It comes back on the same address: the UI serves again on its port.
+        server = store.serve_store(port=flight)
+        say("kermodes ui: http")
+        assert serving() and ui.poll() is None
+    finally:
+        ui.terminate()
+        print(ui.communicate(timeout=30)[0])
+        server.stop()

@@ -49,7 +49,7 @@ type StateMessage = {
 };
 
 type TextMessage =
-  | { type: 'tables'; tables: TableInfo[] }
+  | { type: 'tables'; tables: TableInfo[]; views?: string[] }
   | StateMessage
   | { type: 'error'; view: number | null; message: string };
 
@@ -153,6 +153,9 @@ export class KermodesConnection {
   status: ConnectionStatus = 'connecting';
 
   tables: readonly TableInfo[] = [];
+
+  /** Views published for pages of the app's own, not listed among tables (`deployments`) */
+  pages: readonly string[] = [];
 
   // The last error not tied to one view
   lastError: string | null = null;
@@ -295,6 +298,7 @@ export class KermodesConnection {
     switch (message.type) {
       case 'tables': {
         this.tables = message.tables;
+        this.pages = message.views ?? [];
         this.views.forEach(view => {
           const info = message.tables.find(table => table.name === view.table);
           if (

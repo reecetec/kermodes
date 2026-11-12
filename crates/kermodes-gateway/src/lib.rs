@@ -6,7 +6,8 @@
 //! Messages from the app are JSON text: `{"type": "tables"}`, `{"type": "open", "view": id,
 //! "table": name}`, `{"type": "close", "view": id}`, and the viewer's own messages (`viewport`,
 //! `sort`, `filter`, `fetch`, as in `kermodes_core::viewer`) with a `"view"` field. The server
-//! answers with JSON text (`tables`, `state` for a view before each of its windows, `error`)
+//! answers with JSON text (`tables`, which lists the published tables and names the views
+//! published for pages of their own; `state` for a view before each of its windows; `error`)
 //! and binary frames: a little-endian u32 header length, the header (JSON: `view`, `type`
 //! "rows" or "fetched", `id` for fetches, `start`, `total`, `cycle`), a u32 rows length, the
 //! rows (Arrow IPC stream), then the rows' keys (little-endian u64 each). After every engine
@@ -55,6 +56,9 @@ pub struct Server {
 struct Shared {
     /// Published tables by name, held until unpublished or the server stops.
     tables: Mutex<BTreeMap<String, Table>>,
+    /// Views the app opens by name for a page of its own (the Deployments tab), not listed
+    /// among the published tables.
+    views: Mutex<BTreeMap<String, Table>>,
     /// Bumped when the published set changes, so connections resend the list.
     catalog: watch::Sender<u64>,
     /// The last finished engine cycle.
@@ -76,6 +80,12 @@ impl Shared {
             .lock()
             .expect("kermodes gateway tables poisoned by an earlier panic")
     }
+
+    fn views(&self) -> MutexGuard<'_, BTreeMap<String, Table>> {
+        self.views
+            .lock()
+            .expect("kermodes gateway views poisoned by an earlier panic")
+    }
 }
 
 /// Serves `session` on `addr` (port 0 picks a free one), with the web app in `app` and the
@@ -91,6 +101,7 @@ pub fn serve(
     let addr = listener.local_addr()?;
     let shared = Arc::new(Shared {
         tables: Mutex::new(BTreeMap::new()),
+        views: Mutex::new(BTreeMap::new()),
         catalog: watch::Sender::new(0),
         cycles: watch::Sender::new(0),
         app,
@@ -175,6 +186,14 @@ impl Server {
 
     pub fn published(&self) -> Vec<String> {
         self.shared.tables().keys().cloned().collect()
+    }
+
+    /// Serves `table` as the view `name`, which the app opens by name for a page of its own,
+    /// without listing it among the published tables. The `tables` message names the views
+    /// there are, so the app shows their pages.
+    pub fn publish_view(&self, name: &str, table: &Table) {
+        self.shared.views().insert(name.to_owned(), table.clone());
+        self.shared.catalog.send_modify(|v| *v += 1);
     }
 
     /// Stops serving: open connections close, and published tables are let go.
@@ -395,7 +414,8 @@ async fn handle(shared: &Shared, views: &mut HashMap<u64, Open>, text: &str) -> 
         ("tables", _) => vec![tables(shared)],
         ("open", Some(id)) => {
             let name = message["table"].as_str().unwrap_or_default();
-            let Some(table) = shared.tables().get(name).cloned() else {
+            let table = shared.tables().get(name).cloned();
+            let Some(table) = table.or_else(|| shared.views().get(name).cloned()) else {
                 return vec![error(Some(id), &format!("no published table `{name}`"))];
             };
             let viewer = Arc::new(Mutex::new(blocking(move || Viewer::new(&table)).await));
@@ -558,8 +578,9 @@ fn tables(shared: &Shared) -> Message {
             json!({"name": name, "columns": columns, "refreshing": table.is_refreshing()})
         })
         .collect();
+    let views: Vec<String> = shared.views().keys().cloned().collect();
     Message::Text(
-        json!({"type": "tables", "tables": tables})
+        json!({"type": "tables", "tables": tables, "views": views})
             .to_string()
             .into(),
     )

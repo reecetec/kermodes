@@ -103,14 +103,18 @@ async fn the_app_lists_opens_filters_and_follows_published_tables() {
         kermodes_gateway::serve(session.clone(), "127.0.0.1:0".parse().unwrap(), None, None)
             .unwrap();
     server.publish("book", &book);
+    // A page's view (the Deployments tab): named for the app, not listed among tables.
+    server.publish_view("page", &book);
 
     let url = format!("ws://{}/ws", server.addr());
     let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     let tables = text(&mut socket).await;
     assert_eq!(tables["type"], "tables");
+    assert_eq!(tables["tables"].as_array().unwrap().len(), 1);
     assert_eq!(tables["tables"][0]["name"], "book");
     assert_eq!(tables["tables"][0]["refreshing"], true);
     assert_eq!(tables["tables"][0]["columns"][1]["type"], "float64");
+    assert_eq!(tables["views"], json!(["page"]));
 
     send(
         &mut socket,
@@ -177,6 +181,16 @@ async fn the_app_lists_opens_filters_and_follows_published_tables() {
         (missing["type"].clone(), missing["view"].clone()),
         (json!("error"), json!(2))
     );
+
+    // A page's view opens by name like a table.
+    send(
+        &mut socket,
+        json!({"type": "open", "view": 3, "table": "page"}),
+    )
+    .await;
+    let (state, _, rows, _) = window(&mut socket).await;
+    assert_eq!((state["view"].clone(), syms(&rows).len()), (json!(3), 3));
+    send(&mut socket, json!({"type": "close", "view": 3})).await;
 
     assert!(server.unpublish("book"));
     let tables = text(&mut socket).await;

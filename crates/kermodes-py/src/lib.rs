@@ -694,6 +694,13 @@ impl Server {
         py.detach(|| self.lock().publish(name, table));
     }
 
+    /// Serves `table` as the view `name` for a page of the app's own (the Deployments tab),
+    /// without listing it among the published tables.
+    fn publish_view(&self, py: Python<'_>, name: &str, table: PyRef<'_, Table>) {
+        let table = &table.0;
+        py.detach(|| self.lock().publish_view(name, table));
+    }
+
     /// Removes `name` from the web UI; whether it was published.
     fn unpublish(&self, py: Python<'_>, name: &str) -> bool {
         py.detach(|| self.lock().unpublish(name))

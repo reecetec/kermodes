@@ -18,8 +18,8 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { cn } from '@/lib/utils';
 
-/** The published view of `sys.deployments`: each deployment's newest row */
-export const DEPLOYMENTS_TABLE = 'deployments';
+/** The view of `sys.deployments` the UI's server publishes for this page: each deployment's newest row */
+export const DEPLOYMENTS_VIEW = 'deployments';
 
 /** A row of `sys.deployments`, as `kermodes control` reports it every few seconds */
 export type Deployment = {
@@ -65,7 +65,7 @@ function useDeployments(connection: KermodesConnection, published: boolean) {
     if (!published) {
       return;
     }
-    const view = connection.open(DEPLOYMENTS_TABLE);
+    const view = connection.open(DEPLOYMENTS_VIEW);
     view.send({
       type: 'sort',
       by: [
@@ -409,7 +409,7 @@ function Detail({ deployment, onClose }: { deployment: Deployment; onClose: () =
 }
 
 export function DeploymentsPage({ connection }: { connection: KermodesConnection }) {
-  const published = connection.tables.some(t => t.name === DEPLOYMENTS_TABLE);
+  const published = connection.pages.includes(DEPLOYMENTS_VIEW);
   const { rows, history } = useDeployments(connection, published);
   const failed = useFailedProjects();
   const [selected, setSelected] = useState<string | null>(null);

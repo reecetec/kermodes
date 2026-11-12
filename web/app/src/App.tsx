@@ -15,7 +15,7 @@ import {
   type KermodesConnection,
 } from '@kermodes/client';
 import { TableViewer, gridThemes, type GridThemeName } from '@kermodes/grid';
-import { DEPLOYMENTS_TABLE, DeploymentsPage } from '@/Deployments';
+import { DEPLOYMENTS_VIEW, DeploymentsPage } from '@/Deployments';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -258,7 +258,7 @@ export default function App({ connection }: { connection: KermodesConnection }) 
   const [active, setActive] = useState<string | null>(null);
   const theme = gridThemes[themeName];
   // Deployments is the main tab wherever a controller reports them, until someone picks a tab.
-  const hasDeployments = connection.tables.some(t => t.name === DEPLOYMENTS_TABLE);
+  const hasDeployments = connection.pages.includes(DEPLOYMENTS_VIEW);
   const [picked, setPicked] = useState<Page | null>(null);
   const page: Page = hasDeployments ? (picked ?? 'deployments') : 'tables';
 

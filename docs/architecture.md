@@ -1115,9 +1115,12 @@ namespaces).
   or the server stops). It listens on 127.0.0.1 and has no authentication; the WebSocket
   protocol is in `kermodes-gateway`'s module doc. `kermodes dev` and `kermodes ui` start the same
   server.
+  `kermodes ui` is down only while its store is: it waits for weir to come up, and when it loses
+  it (a restart, an upgrade) it stops serving, waits, and serves again on the same port, where
+  browsers reconnect by themselves.
 - Deployments, the main tab wherever a controller runs, as Deephaven's query monitor lists
-  persistent queries: `kermodes ui` publishes `sys.deployments`' newest row per deployment as
-  `deployments`, and the app lists them live. Each row shows the deployment and its project,
+  persistent queries: `kermodes ui` serves `sys.deployments`' newest row per deployment as the
+  view `deployments`, which the app opens for this tab and does not list among Tables. Each row shows the deployment and its project,
   status, revision (and any update), CPU and memory as shares of its size with their recent
   history, restarts, uptime, node, and newest Warning event. A row opens its overview, events,
   and log, with Roll out, Restart, Stop, and Start. A commit that failed discovery shows above the list.
