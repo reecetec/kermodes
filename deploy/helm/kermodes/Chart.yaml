@@ -4,5 +4,5 @@ description: Live and historical tables on Arrow. weir (the ingest store) and an
 type: application
 # Released together with the image: CI packages the chart with the release's version as both
 # `version` and `appVersion`, and the image tag defaults to `appVersion`.
-version: 0.3.4
-appVersion: "0.3.4"
+version: 0.3.5
+appVersion: "0.3.5"
