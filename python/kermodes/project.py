@@ -13,7 +13,7 @@ Declarations::
         columns={"sym": km.string(), "price": km.float64()},
     )
 
-    @km.deployment()
+    @km.deployment(cpu=1, memory="2Gi")  # defaults: 0.5 CPU, 512Mi
     def poller(db):
         writer = db.writer("md.quotes", source="poller", wait=True)
         ...
@@ -40,6 +40,12 @@ Update = Literal["auto", "manual", "on_start"]
 Rollout = Literal["rolling", "recreate"]
 
 _NAME = re.compile(r"[a-z][a-z0-9_-]{0,62}")
+# Kubernetes quantities: cores or millicores; bytes, or with a binary or decimal suffix.
+_CPU = re.compile(r"(\d+(\.\d+)?|\d+m)")
+_MEMORY = re.compile(r"\d+(Ki|Mi|Gi|Ti|k|M|G|T)?")
+# What a resource gets when it does not say: its requests and limits both.
+DEFAULT_CPU = "500m"
+DEFAULT_MEMORY = "512Mi"
 
 
 @dataclass(frozen=True)
@@ -72,6 +78,8 @@ class Ingester:
     columns: dict[str, str] | None = None
     update: Update = "auto"
     rollout: Rollout = "rolling"
+    cpu: str = DEFAULT_CPU
+    memory: str = DEFAULT_MEMORY
 
 
 @dataclass(frozen=True)
@@ -85,6 +93,8 @@ class Deployment:
     function_name: str
     update: Update = "auto"
     rollout: Rollout = "rolling"
+    cpu: str = DEFAULT_CPU
+    memory: str = DEFAULT_MEMORY
 
 
 Resource = Ingester | Deployment
@@ -101,30 +111,51 @@ def ingester(
     columns: dict[str, str] | None = None,
     update: Update = "auto",
     rollout: Rollout = "rolling",
+    cpu: float | str = DEFAULT_CPU,
+    memory: int | str = DEFAULT_MEMORY,
 ) -> Ingester:
     """Declares a built-in connector reading `source` into `target` (created with `columns`
-    if it does not exist)."""
-    resource = Ingester(name, target, source, columns, update, rollout)
+    if it does not exist), with `cpu` and `memory` as its requests and limits."""
+    resource = Ingester(
+        name,
+        target,
+        source,
+        columns,
+        update,
+        rollout,
+        _cpu(name, cpu),
+        _memory(name, memory),
+    )
     _check_policy(resource)
     _declared.append(resource)
     return resource
 
 
 def deployment(
-    name: str | None = None, *, update: Update = "auto", rollout: Rollout = "rolling"
+    name: str | None = None,
+    *,
+    update: Update = "auto",
+    rollout: Rollout = "rolling",
+    cpu: float | str = DEFAULT_CPU,
+    memory: int | str = DEFAULT_MEMORY,
 ) -> Callable[[Callable[[Session], object]], Callable[[Session], object]]:
-    """Declares the decorated `function(db)` as a deployment, named after it unless `name`."""
+    """Declares the decorated `function(db)` as a deployment, named after it unless `name`, with
+    `cpu` (cores, or a quantity such as "500m") and `memory` (bytes, or a quantity such as
+    "2Gi") as its requests and limits."""
 
     def declare(function: Callable[[Session], object]) -> Callable[[Session], object]:
         function_name = getattr(function, "__name__", None)
         if function_name is None:
             raise KermodesError("@km.deployment() decorates a function")
+        resource_name = name or function_name.replace("_", "-")
         resource = Deployment(
-            name or function_name.replace("_", "-"),
+            resource_name,
             function,
             function_name,
             update,
             rollout,
+            _cpu(resource_name, cpu),
+            _memory(resource_name, memory),
         )
         _check_policy(resource)
         _declared.append(resource)
@@ -268,11 +299,35 @@ def _check_policy(resource: Resource) -> None:
         raise KermodesError(f"`{resource.name}`: rollout must be one of {ROLLOUTS}")
 
 
+def _cpu(name: str, cpu: float | str) -> str:
+    """CPU as a Kubernetes quantity: cores as millicores, or a quantity as written."""
+    if isinstance(cpu, int | float) and not isinstance(cpu, bool) and cpu > 0:
+        return f"{round(cpu * 1000)}m"
+    if isinstance(cpu, str) and _CPU.fullmatch(cpu):
+        return cpu
+    raise KermodesError(
+        f'`{name}`: cpu must be cores (0.5) or a quantity ("500m"), not {cpu!r}'
+    )
+
+
+def _memory(name: str, memory: int | str) -> str:
+    """Memory as a Kubernetes quantity: bytes as written, or a quantity such as "2Gi"."""
+    if isinstance(memory, int) and not isinstance(memory, bool) and memory > 0:
+        return str(memory)
+    if isinstance(memory, str) and _MEMORY.fullmatch(memory):
+        return memory
+    raise KermodesError(
+        f'`{name}`: memory must be bytes or a quantity ("512Mi", "2Gi"), not {memory!r}'
+    )
+
+
 def _spec(resource: Resource, entry: str) -> dict:
     spec: dict = {
         "name": resource.name,
         "update": resource.update,
         "rollout": resource.rollout,
+        "cpu": resource.cpu,
+        "memory": resource.memory,
     }
     if isinstance(resource, Ingester):
         spec |= {

@@ -38,7 +38,7 @@ def test_a_project_declares_ingesters_and_deployments(tmp_path):
             columns={"sym": km.string(), "price": km.float64()},
         )
 
-        @km.deployment(update="manual")
+        @km.deployment(update="manual", cpu=1, memory="2Gi")
         def quote_poller(db):
             pass
         """,
@@ -50,6 +50,9 @@ def test_a_project_declares_ingesters_and_deployments(tmp_path):
             "name": "ticks",
             "update": "auto",
             "rollout": "rolling",
+            # Unsized: the defaults.
+            "cpu": "500m",
+            "memory": "512Mi",
             "kind": "ingester",
             "target": "md.ticks",
             "columns": {"sym": "utf8", "price": "float64"},
@@ -64,6 +67,8 @@ def test_a_project_declares_ingesters_and_deployments(tmp_path):
             "name": "quote-poller",
             "update": "manual",
             "rollout": "rolling",
+            "cpu": "1000m",
+            "memory": "2Gi",
             "kind": "deployment",
             "function": "ticker.app:quote_poller",
         },
@@ -79,6 +84,10 @@ def test_a_project_declares_ingesters_and_deployments(tmp_path):
         "@km.deployment()\ndef a(db): pass\n@km.deployment(name='a')\ndef b(db): pass",
         # A policy that does not exist.
         "@km.deployment(update='sometimes')\ndef a(db): pass",
+        # Sizes Kubernetes would refuse.
+        "@km.deployment(cpu='fast')\ndef a(db): pass",
+        "@km.deployment(cpu=0)\ndef a(db): pass",
+        'km.ingester("t", target="md.t", source=km.websocket("ws://x/"), memory="2GB")',
     ],
 )
 def test_declarations_the_platform_cannot_run_are_refused(tmp_path, app):

@@ -1218,7 +1218,7 @@ host it: Kubernetes (§16.1–16.5) and local (§16.6).
 
 | Kubernetes object | Created for | Notes |
 |---|---|---|
-| `apps/v1` Deployment | deployment, ingester | One replica, two for a hot standby. `RollingUpdate` (`maxSurge: 1`, `maxUnavailable: 0`) or `Recreate` (§11.4); the controller changes the template only to roll out an artifact. An init container fetches the commit's snapshot from the controller. A PodDisruptionBudget per resource; the controller moves runs off cordoned nodes (§17.1). |
+| `apps/v1` Deployment | deployment, ingester | One replica, two for a hot standby. `RollingUpdate` (`maxSurge: 1`, `maxUnavailable: 0`) or `Recreate` (§11.4); the controller changes the template only to roll out an artifact. An init container fetches the commit's snapshot from the controller. Requests and limits both from the resource's `cpu` and `memory` (`@km.deployment(cpu=1, memory="2Gi")`; 0.5 CPU and 512Mi when it does not say). A PodDisruptionBudget per resource; the controller moves runs off cordoned nodes (§17.1). |
 | Pod | session | `restartPolicy: Never`, reaped after the idle timeout |
 | `batch/v1` Job | scheduled task attempt, pipeline stage, discovery, environment build | Created by the scheduler or pipeline; history in Postgres |
 

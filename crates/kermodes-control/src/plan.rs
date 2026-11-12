@@ -120,6 +120,12 @@ pub fn deployment(target: &Target, resource: &Resource, name: &str) -> Deploymen
             "--ready-file", "/run/kermodes/ready",
         ],
         "env": [{"name": "PYTHONDONTWRITEBYTECODE", "value": "1"}],
+        // Requests equal to limits: the scheduler places the run where it fits, it never takes
+        // more than it asked for, and its use reads as a share of one number.
+        "resources": {
+            "requests": {"cpu": resource.cpu, "memory": resource.memory},
+            "limits": {"cpu": resource.cpu, "memory": resource.memory},
+        },
         // Ready once it can take over from the run it replaces (§11.4): connected, holding its
         // sources' leases or waiting for them.
         "readinessProbe": {
@@ -307,6 +313,8 @@ mod tests {
             name: name.into(),
             update,
             rollout,
+            cpu: "250m".into(),
+            memory: "1Gi".into(),
         }
     }
 
@@ -398,6 +406,19 @@ mod tests {
             ["run", "ticks", "--project", "/code/examples/ticker"]
         );
         assert!(run.readiness_probe.is_some());
+        // It gets exactly what it asked for, no more and no less.
+        let sizes = run.resources.clone().unwrap();
+        let quantity = |q: &std::collections::BTreeMap<
+            String,
+            k8s_openapi::apimachinery::pkg::api::resource::Quantity,
+        >,
+                        k: &str| q[k].0.clone();
+        for side in [sizes.requests.unwrap(), sizes.limits.unwrap()] {
+            assert_eq!(
+                (quantity(&side, "cpu"), quantity(&side, "memory")),
+                ("250m".into(), "1Gi".into())
+            );
+        }
         let fetch = pod.init_containers.unwrap()[0].args.clone().unwrap();
         assert_eq!(fetch[1], "http://kermodes-control:8732/snapshots/ticker/a");
     }
