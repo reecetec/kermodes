@@ -138,11 +138,13 @@ function Status({ status }: { status: string }) {
   return <Badge variant={STATUS_VARIANT[status] ?? 'destructive'}>{status}</Badge>;
 }
 
+/** A short commit, inline with the text around it: the surrounding size, on its baseline */
 function Commit({ commit }: { commit: string | null }) {
+  if (commit == null) return <span className="text-muted-foreground">—</span>;
   return (
-    <span className="inline-flex items-center gap-1 font-mono text-[13px]">
-      {commit != null && <GitCommitHorizontal className="size-3.5 text-muted-foreground" />}
-      {commit == null ? '—' : commit.slice(0, 7)}
+    <span className="font-mono whitespace-nowrap">
+      <GitCommitHorizontal className="mr-1 inline size-[1.1em] align-[-0.2em] text-muted-foreground" />
+      {commit.slice(0, 7)}
     </span>
   );
 }
@@ -291,7 +293,11 @@ function Events({ path }: { path: string }) {
 function Logs({ path }: { path: string }) {
   const { value, error } = usePolled(`${path}/logs?tail=500`, 3000, parseText);
   const end = useRef<HTMLDivElement>(null);
-  useEffect(() => end.current?.scrollIntoView({ block: 'end' }), [value]);
+  // A block body: scrollIntoView returns a Promise in newer browsers, and an effect may only
+  // return its cleanup.
+  useEffect(() => {
+    end.current?.scrollIntoView({ block: 'end' });
+  }, [value]);
   if (error != null) return <p className="p-4 text-sm text-destructive">{error}</p>;
   return (
     <pre className="p-4 font-mono text-xs leading-relaxed whitespace-pre-wrap">
@@ -361,10 +367,16 @@ function Detail({ deployment, onClose }: { deployment: Deployment; onClose: () =
       </header>
       {error != null && <p className="border-b px-4 py-2 text-sm text-destructive">{error}</p>}
       <Tabs defaultValue="overview" className="min-h-0 flex-1 gap-0">
-        <TabsList className="h-10 w-full justify-start rounded-none border-b bg-transparent px-2">
-          <TabsTrigger value="overview">Overview</TabsTrigger>
-          <TabsTrigger value="events">Events</TabsTrigger>
-          <TabsTrigger value="logs">Logs</TabsTrigger>
+        <TabsList className="h-10 w-full justify-start gap-1 rounded-none border-b bg-transparent px-2">
+          {(['overview', 'events', 'logs'] as const).map(name => (
+            <TabsTrigger
+              key={name}
+              value={name}
+              className="h-full border-b-2 border-transparent px-3 capitalize hover:text-foreground data-[state=active]:border-primary data-[state=active]:text-foreground"
+            >
+              {name}
+            </TabsTrigger>
+          ))}
         </TabsList>
         <TabsContent value="overview" className="min-h-0">
           <ScrollArea className="h-full">
