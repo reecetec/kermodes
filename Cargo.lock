@@ -1270,7 +1270,7 @@ dependencies = [
 
 [[package]]
 name = "kermodes-bench"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "arrow",
  "kermodes-core",
@@ -1278,7 +1278,7 @@ dependencies = [
 
 [[package]]
 name = "kermodes-control"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1293,7 +1293,7 @@ dependencies = [
 
 [[package]]
 name = "kermodes-core"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "ahash",
  "arrow",
@@ -1303,7 +1303,7 @@ dependencies = [
 
 [[package]]
 name = "kermodes-flight"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -1317,7 +1317,7 @@ dependencies = [
 
 [[package]]
 name = "kermodes-gateway"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "arrow",
  "axum",
@@ -1332,7 +1332,7 @@ dependencies = [
 
 [[package]]
 name = "kermodes-ingest"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "arrow",
  "axum",
@@ -1345,7 +1345,7 @@ dependencies = [
 
 [[package]]
 name = "kermodes-py"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "arrow",
  "kermodes-control",
@@ -1362,7 +1362,7 @@ dependencies = [
 
 [[package]]
 name = "kermodes-weir"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "arrow",
  "crc32fast",
