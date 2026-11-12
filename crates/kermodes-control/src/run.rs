@@ -19,7 +19,7 @@ use crate::leader::{Leadership, Wake};
 use crate::manifest::{Manifest, Update};
 use crate::plan::{self, Decision, Target};
 use crate::report;
-use crate::state::State;
+use crate::state::{Commit, State};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -340,21 +340,47 @@ async fn discover(
     Ok(output)
 }
 
-/// A manifest is what one platform reads of a commit. After an upgrade, the commit a project
-/// runs is read again, so what the new platform knows of it (sizes, say) reaches its runs; if the
-/// new platform cannot read it, the old manifest stays and the failure is logged, once.
+/// A manifest is what one platform reads of a commit. After an upgrade:
+/// - the mainline's newest commit, if discovery failed under another platform, is tried again:
+///   it may use what the new platform adds (a commit declaring sizes, read by a platform without
+///   them), and if it now reads, it is what the project runs;
+/// - the commit a project runs is read again, so what the new platform knows of it reaches its
+///   runs; if the new platform cannot read it, the old manifest stays and the failure is logged.
+///
+/// Either way each commit is read once per platform.
 async fn rediscover_if_stale(
     controller: &Controller,
     project: &ProjectConfig,
 ) -> Result<(), String> {
     let image = &controller.config.image;
+    let stale = |c: &Commit| c.discovered_by.as_deref() != Some(image.as_str());
+    let head = controller.state.lock().await.latest(&project.name).await?;
+    if let Some(head) = head.filter(|c| c.error.is_some() && stale(c)) {
+        let result = discover(controller, project, &head.commit).await;
+        match &result {
+            Ok(_) => eprintln!(
+                "kermodes control: {}: {} reads under {image}",
+                project.name, head.commit
+            ),
+            Err(e) => eprintln!(
+                "kermodes control: {}: {} still not deployable under {image}: {e}",
+                project.name, head.commit
+            ),
+        }
+        controller
+            .state
+            .lock()
+            .await
+            .discovered(&project.name, &head.commit, image, &result)
+            .await?;
+    }
     let latest = controller
         .state
         .lock()
         .await
         .latest_discovered(&project.name)
         .await?;
-    let Some(latest) = latest.filter(|c| c.discovered_by.as_deref() != Some(image.as_str())) else {
+    let Some(latest) = latest.filter(stale) else {
         return Ok(());
     };
     let result = discover(controller, project, &latest.commit).await;

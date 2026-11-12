@@ -146,9 +146,11 @@ pub fn deployment(target: &Target, resource: &Resource, name: &str, stopped: boo
         "metadata": {"name": name, "labels": labels},
         "spec": {
             "replicas": i32::from(!stopped),
-            // Rollbacks are rollouts of an earlier commit, never `kubectl rollout undo`, so old
-            // ReplicaSets have no use once a rollout is done.
-            "revisionHistoryLimit": 0,
+            // Rollbacks are rollouts of an earlier commit, never `kubectl rollout undo`. One old
+            // ReplicaSet is still kept: deleted the moment a rollout ends, its pod is still
+            // shutting down, and the disruption budget's controller warns about a pod without
+            // a controller on every rollout.
+            "revisionHistoryLimit": 1,
             "selector": {"matchLabels": selector},
             "strategy": strategy,
             // A new run that never becomes ready fails its rollout; the old one keeps serving.
