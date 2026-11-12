@@ -116,7 +116,8 @@ def test_kermodes_run_runs_a_deployment_on_a_servers_tables(tmp_path):
         """,
     )
     owner = km.local(tmp_path / "store", manual=True)
-    server = owner.serve_store()
+    # The run starts first, as after a restart while weir is away: it waits for its store.
+    flight = free_port()
     run = subprocess.Popen(
         [
             sys.executable,
@@ -127,12 +128,15 @@ def test_kermodes_run_runs_a_deployment_on_a_servers_tables(tmp_path):
             "--project",
             str(tmp_path / "proj"),
             "--server",
-            server.url,
+            f"grpc://127.0.0.1:{flight}",
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
+    time.sleep(1.5)
+    assert run.poll() is None, run.stderr
+    server = owner.serve_store(port=flight)
     try:
         reader = km.connect(server.url, manual=True)
         deadline = time.monotonic() + 30

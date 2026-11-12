@@ -177,11 +177,12 @@ impl Server {
         self.shared.catalog.send_modify(|v| *v += 1);
     }
 
-    /// Whether a table of that name was published.
+    /// Removes the table or view `name`; whether there was one.
     pub fn unpublish(&self, name: &str) -> bool {
-        let removed = self.shared.tables().remove(name).is_some();
+        let table = self.shared.tables().remove(name).is_some();
+        let view = self.shared.views().remove(name).is_some();
         self.shared.catalog.send_modify(|v| *v += 1);
-        removed
+        table || view
     }
 
     pub fn published(&self) -> Vec<String> {

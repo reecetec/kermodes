@@ -252,7 +252,9 @@ def run_resource(
     ready: Path | None,
 ) -> None:
     resource = projects.discover(project).resource(name)
-    db = km.local(data_dir) if data_dir else km.connect(server)
+    # A run started while its store is away (weir restarting) waits for it rather than exiting,
+    # so a restart does not become a crash loop; it is not ready until then.
+    db = km.local(data_dir) if data_dir else connect_when_up(server, "kermodes run")
     print(f"running {name}; Ctrl-C to stop", flush=True)
     try:
         projects.run(resource, db, ready)
@@ -303,32 +305,54 @@ def run_weir(
 
 
 def run_ui(server: str | None, host: str, port: int, control: str | None) -> None:
-    """Serves the web UI over a store server until stopped, down only while the store is: it
-    waits for the store, and when it loses it, stops serving, waits, and serves again on the
-    same port, where browsers reconnect by themselves."""
+    """Serves the web UI over a store server until stopped. It waits for the store to start;
+    after that it serves throughout, so a page never fails to load: while the store is away (a
+    restart, an upgrade) its tables go from the UI, and they come back with it."""
+    session = connect_when_up(server, "kermodes ui")
+    ui = session.serve(port=port, host=host, control=control)
+    print(f"kermodes ui: {ui.url}", flush=True)
+    live: dict[str, km.Table] = {}
+    away = False
+
+    def drop(name: str) -> None:
+        ui.unpublish(name)
+        if name == "sys.deployments":
+            ui.unpublish("deployments")
+        del live[name]
+
     try:
         while True:
-            session = connect_when_up(server)
-            ui = session.serve(port=port, host=host, control=control)
-            print(f"kermodes ui: {ui.url}", flush=True)
-
-            def publish(name: str, table: km.Table, ui: _native.Server = ui) -> None:
-                ui.publish(name, table)
-                if name == "sys.deployments":
-                    # The Deployments tab's view: each deployment's newest row.
-                    ui.publish_view("deployments", table.last_by("project", "name"))
-
             try:
-                follow(session, publish)
+                names = session.tables
+                for name in names:
+                    if name not in live:
+                        live[name] = session.live_table(name)
+                        ui.publish(name, live[name])
+                        if name == "sys.deployments":
+                            # The Deployments tab's view: each deployment's newest row.
+                            newest = live[name].last_by("project", "name")
+                            ui.publish_view("deployments", newest)
+                if away:
+                    print("kermodes ui: the store is back", flush=True)
+                    away = False
             except km.KermodesError as e:
-                print(f"kermodes ui: lost the store ({e}); waiting for it", flush=True)
-                ui.stop()
-                session.stop()
+                if not away:
+                    print(
+                        f"kermodes ui: the store is away ({e}); serving on", flush=True
+                    )
+                    away = True
+            # A live table fails when it loses its store; it opens again when the store is back.
+            for name, table in list(live.items()):
+                try:
+                    len(table)
+                except km.KermodesError:
+                    drop(name)
+            time.sleep(1)
     except KeyboardInterrupt:
         pass
 
 
-def connect_when_up(server: str | None) -> km.Session:
+def connect_when_up(server: str | None, who: str) -> km.Session:
     """Connects to the store server, waiting while it is down (a restart, an upgrade)."""
     said = False
     while True:
@@ -336,7 +360,7 @@ def connect_when_up(server: str | None) -> km.Session:
             return km.connect(server)
         except km.KermodesError as e:
             if not said:
-                print(f"kermodes ui: waiting for the store: {e}", flush=True)
+                print(f"{who}: waiting for the store: {e}", flush=True)
                 said = True
             time.sleep(1)
 

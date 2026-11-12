@@ -123,7 +123,7 @@ def test_a_live_table_fails_when_its_store_goes(tmp_path):
         len(derived)
 
 
-def test_kermodes_ui_waits_out_its_store_and_serves_again(tmp_path):
+def test_kermodes_ui_serves_on_while_its_store_is_away(tmp_path):
     store = km.local(tmp_path / "store")
     store.create_table("md.t", {"n": km.int64()})
     flight, port = free_port(), free_port()
@@ -156,14 +156,14 @@ def test_kermodes_ui_waits_out_its_store_and_serves_again(tmp_path):
     try:
         say("kermodes ui: http")
         assert serving()
-        # The store goes (a restart, an upgrade): the UI waits for it rather than exiting.
+        # The store goes (a restart, an upgrade): the page still loads.
         server.stop()
-        say("lost the store")
+        say("the store is away")
         time.sleep(1.5)
-        assert ui.poll() is None
-        # It comes back on the same address: the UI serves again on its port.
+        assert serving() and ui.poll() is None
+        # It comes back on the same address, and so do its tables.
         server = store.serve_store(port=flight)
-        say("kermodes ui: http")
+        say("the store is back")
         assert serving() and ui.poll() is None
     finally:
         ui.terminate()
