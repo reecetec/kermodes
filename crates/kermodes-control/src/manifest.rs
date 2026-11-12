@@ -13,6 +13,9 @@ pub struct Manifest {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct Resource {
     pub name: String,
+    /// `deployment` or `ingester`, as the run reads it; the controller only reports it.
+    #[serde(default = "default_kind")]
+    pub kind: String,
     pub update: Update,
     pub rollout: Rollout,
     /// Kubernetes quantities, as both requests and limits; manifests from before sizes have the
@@ -21,6 +24,10 @@ pub struct Resource {
     pub cpu: String,
     #[serde(default = "default_memory")]
     pub memory: String,
+}
+
+fn default_kind() -> String {
+    "deployment".into()
 }
 
 fn default_cpu() -> String {

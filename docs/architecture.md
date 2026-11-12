@@ -1212,8 +1212,14 @@ host it: Kubernetes (§16.1–16.5) and local (§16.6).
   runs, audit). Kubernetes holds only native objects the controller derives from it, labelled
   `kermodes.io/project`, `kermodes.io/resource`, and `kermodes.io/commit`; there is no custom
   resource. `kubectl get deploy -l kermodes.io/project=sportsflow` shows what runs.
-- Status flows back: the controller watches Deployments, Pods, and Jobs and writes
-  `sys.deployments`, `sys.task_runs`, and `sys.pipeline_runs`.
+- Status flows back as tables: the controller writes `sys.deployments`, `sys.task_runs`, and
+  `sys.pipeline_runs`. Built: every 5 s the leader appends one row per deployment to
+  `sys.deployments` (its source `control`): project, name, kind, status, update policy, the
+  commit it runs and any newer deployable one, node, start time, restarts, CPU and memory used
+  (metrics-server) against its size and as a percentage, and its newest Warning event. Status
+  says the most pressing thing: crash looping, image pull failing, unschedulable, rollout
+  failed, rolling out, starting, running, or not running. `last_by("project", "name")` is the
+  current state; the rows are its history.
 - Owner references garbage-collect what each resource's Deployment or Job created.
 
 | Kubernetes object | Created for | Notes |

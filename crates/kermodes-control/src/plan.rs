@@ -311,6 +311,7 @@ mod tests {
     fn resource(name: &str, update: Update, rollout: Rollout) -> Resource {
         Resource {
             name: name.into(),
+            kind: "deployment".into(),
             update,
             rollout,
             cpu: "250m".into(),

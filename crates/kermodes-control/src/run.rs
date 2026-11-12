@@ -5,7 +5,9 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use arrow::record_batch::RecordBatch;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -16,6 +18,7 @@ use crate::k8s::{Kube, Rollout};
 use crate::leader::{Leadership, Wake};
 use crate::manifest::{Manifest, Update};
 use crate::plan::{self, Decision, Target};
+use crate::report;
 use crate::state::State;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -121,8 +124,8 @@ pub async fn run(config: Config) -> Result<(), String> {
     Ok(())
 }
 
-/// Waits for the leader lock, then syncs, reconciles, and moves runs off cordoned nodes until it
-/// is lost; returns why.
+/// Waits for the leader lock, then syncs, reconciles, moves runs off cordoned nodes, and reports
+/// to `sys.deployments` until it is lost; returns why.
 async fn lead(controller: &Controller) -> String {
     let (mut leadership, mut wake) = match Leadership::acquire(&controller.config.database).await {
         Ok(won) => won,
@@ -133,7 +136,57 @@ async fn lead(controller: &Controller) -> String {
         reason = leadership.lost() => reason,
         () = sync_forever(controller, &mut wake) => unreachable!("syncs until stopped"),
         () = move_off_cordoned(controller) => unreachable!("moves until stopped"),
+        () = report_forever(controller) => unreachable!("reports until stopped"),
     }
+}
+
+/// How often each deployment's row goes to `sys.deployments`.
+const REPORT_EVERY: Duration = Duration::from_secs(5);
+
+/// Appends a row per deployment to `sys.deployments` every few seconds. The writer goes with
+/// this future, so the table's source passes to the next leader.
+async fn report_forever(controller: &Controller) {
+    let rows = report::writer(controller.config.weir.clone());
+    loop {
+        match report_once(controller).await {
+            Ok(batch) => {
+                let _ = rows.try_send(batch);
+            }
+            Err(e) => eprintln!("kermodes control: reporting: {e}"),
+        }
+        tokio::time::sleep(REPORT_EVERY).await;
+    }
+}
+
+async fn report_once(controller: &Controller) -> Result<RecordBatch, String> {
+    let observed = controller.kube.observe().await?;
+    let mut rows = Vec::new();
+    for project in &controller.config.projects {
+        let (latest, deployed) = {
+            let mut state = controller.state.lock().await;
+            (
+                state.latest_discovered(&project.name).await?,
+                state.deployed(&project.name).await?,
+            )
+        };
+        let Some(latest) = latest else { continue };
+        let manifest = Manifest::parse(latest.manifest.as_deref().unwrap_or_default())?;
+        for resource in &manifest.resources {
+            let name = plan::object_name(&project.name, &resource.name)?;
+            rows.push(report::Row::new(
+                &project.name,
+                resource,
+                deployed.get(&resource.name).map(String::as_str),
+                &latest.commit,
+                observed.get(&name),
+            ));
+        }
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?;
+    let now = i64::try_from(now.as_nanos()).map_err(|e| e.to_string())?;
+    Ok(report::batch(now, &rows))
 }
 
 /// Syncs every project now, then at each poll or sync request.

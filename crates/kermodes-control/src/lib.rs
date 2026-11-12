@@ -11,6 +11,7 @@ mod k8s;
 mod leader;
 pub mod manifest;
 pub mod plan;
+mod report;
 mod run;
 mod state;
 

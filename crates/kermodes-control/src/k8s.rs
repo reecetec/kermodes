@@ -7,12 +7,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{Node, Pod};
+use k8s_openapi::api::core::v1::{Event, Node, Pod};
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::Api;
-use kube::api::{DeleteParams, ListParams, LogParams, Patch, PatchParams, PostParams};
+use kube::api::{
+    ApiResource, DeleteParams, DynamicObject, GroupVersionKind, ListParams, LogParams, Patch,
+    PatchParams, PostParams,
+};
 
 use crate::plan::Placement;
+use crate::report::{self, Observed};
 
 const MANAGER: &str = "kermodes-control";
 /// How long discovery may take: fetching the snapshot and importing the project.
@@ -25,6 +29,9 @@ pub struct Kube {
     jobs: Api<Job>,
     pods: Api<Pod>,
     nodes: Api<Node>,
+    events: Api<Event>,
+    /// metrics-server's pod usage (`metrics.k8s.io`).
+    metrics: Api<DynamicObject>,
 }
 
 /// Where a resource's rollout stands, as Kubernetes reports it.
@@ -50,8 +57,130 @@ impl Kube {
             budgets: Api::namespaced(client.clone(), namespace),
             jobs: Api::namespaced(client.clone(), namespace),
             pods: Api::namespaced(client.clone(), namespace),
-            nodes: Api::all(client),
+            nodes: Api::all(client.clone()),
+            events: Api::namespaced(client.clone(), namespace),
+            metrics: Api::namespaced_with(
+                client,
+                namespace,
+                &ApiResource::from_gvk_with_plural(
+                    &GroupVersionKind::gvk("metrics.k8s.io", "v1beta1", "PodMetrics"),
+                    "pods",
+                ),
+            ),
         })
+    }
+
+    /// What Kubernetes shows of each of the controller's Deployments, by name: rollout, pods,
+    /// usage, and newest Warning event. Usage is missing (zero) while metrics-server is not
+    /// answering; the rest does not depend on it.
+    pub async fn observe(&self) -> Result<BTreeMap<String, Observed>, String> {
+        let managed =
+            ListParams::default().labels(&format!("app.kubernetes.io/managed-by={MANAGER}"));
+        let mut observed: BTreeMap<String, Observed> = self
+            .deployments
+            .list(&managed)
+            .await
+            .map_err(|e| format!("cannot list deployments: {e}"))?
+            .items
+            .iter()
+            .filter_map(|d| {
+                let observed = Observed {
+                    rollout: rollout_of(d),
+                    pods: Vec::new(),
+                    cpu: 0.0,
+                    memory: 0,
+                    warning: None,
+                };
+                Some((d.metadata.name.clone()?, observed))
+            })
+            .collect();
+        // Each pod's Deployment, for its usage and events.
+        let mut owner: BTreeMap<String, String> = BTreeMap::new();
+        for pod in self
+            .pods
+            .list(&managed)
+            .await
+            .map_err(|e| format!("cannot list pods: {e}"))?
+            .items
+        {
+            if pod.metadata.deletion_timestamp.is_some() {
+                continue;
+            }
+            let (Some(name), Some(deployment)) = (
+                pod.metadata.name.clone(),
+                pod.metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|l| l.get("app.kubernetes.io/name").cloned()),
+            ) else {
+                continue;
+            };
+            if let Some(seen) = observed.get_mut(&deployment) {
+                seen.pods.push(pod_state(&pod));
+                owner.insert(name, deployment);
+            }
+        }
+        if let Ok(usage) = self.metrics.list(&managed).await {
+            for pod in usage.items {
+                let Some(seen) = pod
+                    .metadata
+                    .name
+                    .as_ref()
+                    .and_then(|name| owner.get(name))
+                    .and_then(|deployment| observed.get_mut(deployment))
+                else {
+                    continue;
+                };
+                for container in pod.data["containers"].as_array().into_iter().flatten() {
+                    let usage = &container["usage"];
+                    seen.cpu += usage["cpu"].as_str().and_then(report::cores).unwrap_or(0.0);
+                    seen.memory += usage["memory"]
+                        .as_str()
+                        .and_then(report::bytes)
+                        .unwrap_or(0);
+                }
+            }
+        }
+        for event in self
+            .events
+            .list(&ListParams::default())
+            .await
+            .map_err(|e| format!("cannot list events: {e}"))?
+            .items
+        {
+            if event.type_.as_deref() != Some("Warning") {
+                continue;
+            }
+            let object = &event.involved_object;
+            let name = object.name.as_deref().unwrap_or_default();
+            // A Deployment's own events, its ReplicaSets' (`{deployment}-{hash}`), its pods'.
+            let deployment = match object.kind.as_deref() {
+                Some("Pod") => owner.get(name).cloned(),
+                Some("ReplicaSet") => name.rsplit_once('-').map(|(d, _)| d.to_owned()),
+                _ => Some(name.to_owned()),
+            };
+            let Some(seen) = deployment.and_then(|d| observed.get_mut(&d)) else {
+                continue;
+            };
+            let at = event
+                .last_timestamp
+                .as_ref()
+                .map(|t| t.0)
+                .or_else(|| event.event_time.as_ref().map(|t| t.0))
+                .or_else(|| event.first_timestamp.as_ref().map(|t| t.0));
+            let Some(at) = at.and_then(|t| i64::try_from(t.as_nanosecond()).ok()) else {
+                continue;
+            };
+            if seen.warning.as_ref().is_none_or(|(_, newest)| at > *newest) {
+                let text = format!(
+                    "{}: {}",
+                    event.reason.as_deref().unwrap_or("Warning"),
+                    event.message.as_deref().unwrap_or_default().trim()
+                );
+                seen.warning = Some((text, at));
+            }
+        }
+        Ok(observed)
     }
 
     pub async fn apply(&self, deployment: &Deployment) -> Result<(), String> {
@@ -280,5 +409,36 @@ fn rollout_of(deployment: &Deployment) -> Rollout {
         Rollout::Ready
     } else {
         Rollout::Rolling
+    }
+}
+
+/// A pod as the report reads it: where it runs, whether it serves, and why it cannot.
+fn pod_state(pod: &Pod) -> report::Pod {
+    let status = pod.status.clone().unwrap_or_default();
+    let containers = status.container_statuses.clone().unwrap_or_default();
+    let run = containers.iter().find(|c| c.name == "run");
+    let condition = |kind: &str| {
+        status
+            .conditions
+            .iter()
+            .flatten()
+            .find(|c| c.type_ == kind)
+            .cloned()
+    };
+    report::Pod {
+        node: pod.spec.as_ref().and_then(|s| s.node_name.clone()),
+        ready: condition("Ready").is_some_and(|c| c.status == "True"),
+        started_ns: status
+            .start_time
+            .and_then(|t| i64::try_from(t.0.as_nanosecond()).ok()),
+        restarts: containers.iter().map(|c| i64::from(c.restart_count)).sum(),
+        // The run's container, or an init container stuck before it (the snapshot fetch).
+        waiting: run
+            .into_iter()
+            .chain(status.init_container_statuses.iter().flatten())
+            .find_map(|c| c.state.as_ref()?.waiting.as_ref()?.reason.clone())
+            .filter(|reason| reason != "ContainerCreating" && reason != "PodInitializing"),
+        unschedulable: condition("PodScheduled")
+            .is_some_and(|c| c.status == "False" && c.reason.as_deref() == Some("Unschedulable")),
     }
 }

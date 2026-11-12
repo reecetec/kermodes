@@ -1280,9 +1280,12 @@ dependencies = [
 name = "kermodes-control"
 version = "0.3.5"
 dependencies = [
+ "arrow",
  "axum",
  "base64 0.22.1",
  "k8s-openapi",
+ "kermodes-flight",
+ "kermodes-weir",
  "kube",
  "ring",
  "serde",
