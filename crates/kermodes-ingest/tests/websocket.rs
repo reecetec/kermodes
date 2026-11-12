@@ -65,9 +65,9 @@ fn wait_for(what: &str, done: impl Fn() -> bool) {
 
 /// A writer that is open at once.
 fn opened(
-    write: impl FnMut(&RecordBatch) -> Result<bool, kermodes_weir::Error> + Send + 'static,
+    write: impl FnMut(&RecordBatch, Option<u64>) -> Result<bool, kermodes_weir::Error> + Send + 'static,
 ) -> Open {
-    Box::new(move || Ok(Box::new(write) as Write))
+    Box::new(move || Ok((Box::new(write) as Write, None)))
 }
 
 #[test]
@@ -96,7 +96,8 @@ fn feeds_are_read_tolerantly_and_reconnected() {
         &url,
         schema(),
         options,
-        opened(move |batch| {
+        None,
+        opened(move |batch, _| {
             sink.lock().unwrap().push(batch.clone());
             Ok(true)
         }),
@@ -161,7 +162,8 @@ fn a_ticker_feed_lands_in_a_store() {
         &format!("ws://{}/", feed.addr()),
         schema(),
         Options::default(),
-        opened(move |batch| writer.write(batch, None)),
+        None,
+        opened(move |batch, seq| writer.write(batch, seq)),
     )
     .unwrap();
     wait_for("1,000 rows", || ingest.stats().rows >= 1_000);
@@ -210,9 +212,10 @@ fn a_failed_write_stops_the_connector() {
         &format!("ws://{}/", feed.addr()),
         schema(),
         options,
+        None,
         // The store goes on the second batch and is back for the third: rows after a failure
         // must not be written as if nothing happened.
-        opened(move |batch| {
+        opened(move |batch, _| {
             if count.fetch_add(1, Ordering::Relaxed) == 1 {
                 return Err(kermodes_weir::Error::Io("the store went".into()));
             }
@@ -249,9 +252,12 @@ fn a_connector_is_ready_before_it_holds_its_source() {
             &format!("ws://{}/", feed.addr()),
             schema(),
             Options::default(),
+            None,
             Box::new(move || {
                 let writer = store.writer(&name, &source, true)?;
-                Ok(Box::new(move |batch: &RecordBatch| writer.write(batch, None)) as Write)
+                let last = writer.last_seq();
+                let write = move |batch: &RecordBatch, seq| writer.write(batch, seq);
+                Ok((Box::new(write) as Write, last))
             }),
         )
         .unwrap()
@@ -270,4 +276,78 @@ fn a_connector_is_ready_before_it_holds_its_source() {
     });
     ingest.stop();
     assert!(!ingest.stats().failed);
+}
+
+/// A rolling handover of a numbered feed: the new connector reads the same ticks as the old one
+/// while waiting for the source, and once it holds it writes only what the old one did not.
+#[test]
+fn a_numbered_feed_is_written_exactly_once_across_a_handover() {
+    let dir =
+        TempDir(std::env::temp_dir().join(format!("kermodes-ingest-once-{}", std::process::id())));
+    let store = Arc::new(Store::open(&dir.0).unwrap());
+    let name = TableName::parse("md.ticks").unwrap();
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("seq", DataType::Int64, true),
+        Field::new("sym", DataType::Utf8, true),
+    ]));
+    store.create_table(&name, &schema).unwrap();
+    let source = SourceId::parse("ticker").unwrap();
+    let feed = ticker("127.0.0.1:0".parse().unwrap(), 5_000, 10).unwrap();
+    let options = Options {
+        flush: Duration::from_millis(20),
+        max_rows: 1_000,
+    };
+    let connector = || {
+        let (store, name, source) = (store.clone(), name.clone(), source.clone());
+        websocket(
+            &format!("ws://{}/", feed.addr()),
+            schema.clone(),
+            options,
+            Some("seq"),
+            Box::new(move || {
+                let writer = store.writer(&name, &source, true)?;
+                let last = writer.last_seq();
+                let write = move |batch: &RecordBatch, seq| writer.write(batch, seq);
+                Ok((Box::new(write) as Write, last))
+            }),
+        )
+        .unwrap()
+    };
+
+    let mut old = connector();
+    wait_for("the old run's rows", || old.stats().rows >= 500);
+    let mut new = connector();
+    wait_for("the new run reading", || new.stats().messages >= 20);
+    old.stop();
+    wait_for("the new run writing", || new.stats().rows >= 500);
+    new.stop();
+
+    let stats = new.stats();
+    assert!(stats.duplicates > 0, "the runs overlapped: {stats:?}");
+    assert_eq!((stats.missed, stats.failed), (0, false), "{stats:?}");
+
+    let numbers = Arc::new(Mutex::new(Vec::<u64>::new()));
+    let sink = numbers.clone();
+    store
+        .subscribe(
+            &name,
+            Box::new(move |batch| {
+                let seq = batch
+                    .column(0)
+                    .as_primitive::<arrow::datatypes::Int64Type>();
+                sink.lock()
+                    .unwrap()
+                    .extend(seq.values().iter().map(|&n| n as u64));
+                true
+            }),
+        )
+        .unwrap();
+    let numbers = numbers.lock().unwrap();
+    let (first, last) = (numbers[0], *numbers.last().unwrap());
+    // Every tick between the first and the last written, once each and in order.
+    assert!(
+        numbers.iter().copied().eq(first..=last),
+        "{} rows for {first}..={last}",
+        numbers.len()
+    );
 }

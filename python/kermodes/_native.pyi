@@ -42,6 +42,7 @@ class Session:
         flush: str = "100ms",
         max_rows: int = 10_000,
         wait: bool = False,
+        seq: str | None = None,
     ) -> Ingest: ...
 
 class Ingest:
@@ -53,6 +54,8 @@ class IngestStats:
     messages: int
     rows: int
     skipped: int
+    duplicates: int
+    missed: int
     batches: int
     reconnects: int
     connected: bool

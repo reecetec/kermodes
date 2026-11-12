@@ -1,6 +1,7 @@
-//! A synthetic market-data feed over WebSocket, for demos and the M1 acceptance test: random-walk
-//! prices for a set of symbols, as JSON arrays of `{"sym", "price", "size", "ts"}` (`ts` an
-//! RFC 3339 UTC time), sent every 10 ms to each client.
+//! A synthetic market-data feed over WebSocket, for demos and tests: random-walk prices for a set
+//! of symbols, as JSON arrays of `{"seq", "sym", "price", "size", "ts"}` (`ts` an RFC 3339 UTC
+//! time) every 10 ms. Every client gets the same ticks, numbered by `seq` in the order sent, as
+//! from a real feed, so two runs reading it during a handover see the same records.
 
 use std::net::{SocketAddr, TcpListener};
 use std::thread::{self, JoinHandle};
@@ -8,11 +9,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::extract::State;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
 use axum::routing::get;
 use serde_json::json;
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, oneshot};
 
 /// A running ticker feed; stops when dropped.
 pub struct Ticker {
@@ -42,10 +43,10 @@ impl Drop for Ticker {
     }
 }
 
-#[derive(Clone, Copy)]
+/// The feed's messages, as they are made.
+#[derive(Clone)]
 struct Feed {
-    rate: u32,
-    symbols: u32,
+    ticks: broadcast::Sender<Utf8Bytes>,
 }
 
 /// Serves a feed of about `rate` ticks a second over `symbols` symbols on `addr`.
@@ -58,14 +59,16 @@ pub fn ticker(addr: SocketAddr, rate: u32, symbols: u32) -> std::io::Result<Tick
         .enable_all()
         .build()?;
     let (shutdown, stopped) = oneshot::channel::<()>();
+    // About 10 s of messages: a client further behind than that has lost its place.
+    let (ticks, _) = broadcast::channel(1024);
     let router = Router::new().route("/", get(upgrade)).with_state(Feed {
-        rate,
-        symbols: symbols.max(1),
+        ticks: ticks.clone(),
     });
     let thread = thread::Builder::new()
         .name("kermodes-ticker".into())
         .spawn(move || {
             runtime.block_on(async move {
+                let generator = tokio::spawn(generate(ticks, rate, symbols.max(1)));
                 let listener =
                     tokio::net::TcpListener::from_std(listener).expect("a bound listener converts");
                 let _ = axum::serve(listener, router)
@@ -73,6 +76,7 @@ pub fn ticker(addr: SocketAddr, rate: u32, symbols: u32) -> std::io::Result<Tick
                         let _ = stopped.await;
                     })
                     .await;
+                generator.abort();
             });
         })?;
     Ok(Ticker {
@@ -86,25 +90,27 @@ async fn upgrade(ws: WebSocketUpgrade, State(feed): State<Feed>) -> Response {
     ws.on_upgrade(move |socket| stream(socket, feed))
 }
 
-async fn stream(mut socket: WebSocket, feed: Feed) {
-    let mut random = Random(0x9E37_79B9_7F4A_7C15 ^ u64::from(feed.rate));
-    let mut prices: Vec<f64> = (0..feed.symbols)
-        .map(|i| 50.0 + f64::from(i % 200))
-        .collect();
-    let per_tick = (feed.rate / 100).max(1);
-    let mut ticks = tokio::time::interval(Duration::from_millis(10));
+/// Makes the ticks every 10 ms, whether or not anyone is connected, as a market moves on.
+async fn generate(ticks: broadcast::Sender<Utf8Bytes>, rate: u32, symbols: u32) {
+    let mut random = Random(0x9E37_79B9_7F4A_7C15 ^ u64::from(rate));
+    let mut prices: Vec<f64> = (0..symbols).map(|i| 50.0 + f64::from(i % 200)).collect();
+    let per_tick = (rate / 100).max(1);
+    let mut interval = tokio::time::interval(Duration::from_millis(10));
+    let mut seq = 0u64;
     loop {
-        ticks.tick().await;
+        interval.tick().await;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
         let ts = rfc3339(now);
         let rows: Vec<serde_json::Value> = (0..per_tick)
             .map(|_| {
-                let i = (random.next() % u64::from(feed.symbols)) as usize;
+                seq += 1;
+                let i = (random.next() % u64::from(symbols)) as usize;
                 let step = (random.next() % 2001) as f64 / 1000.0 - 1.0;
                 prices[i] = (prices[i] * (1.0 + step / 1000.0)).max(0.01);
                 json!({
+                    "seq": seq,
                     "sym": format!("S{i:04}"),
                     "price": (prices[i] * 100.0).round() / 100.0,
                     "size": 1 + random.next() % 1000,
@@ -112,9 +118,23 @@ async fn stream(mut socket: WebSocket, feed: Feed) {
                 })
             })
             .collect();
-        let text = serde_json::Value::Array(rows).to_string();
-        if socket.send(Message::Text(text.into())).await.is_err() {
-            return;
+        // Sending fails only while nobody is connected; those ticks go unheard.
+        let _ = ticks.send(serde_json::Value::Array(rows).to_string().into());
+    }
+}
+
+async fn stream(mut socket: WebSocket, feed: Feed) {
+    let mut ticks = feed.ticks.subscribe();
+    loop {
+        match ticks.recv().await {
+            Ok(text) => {
+                if socket.send(Message::Text(text)).await.is_err() {
+                    return;
+                }
+            }
+            // Too slow for the feed: closing tells the client it lost its place; it reconnects
+            // and finds the hole in `seq`.
+            Err(_) => return,
         }
     }
 }

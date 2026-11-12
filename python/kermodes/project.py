@@ -49,11 +49,16 @@ class WebSocket:
     url: str
     flush: str = "100ms"
     max_rows: int = 10_000
+    # The integer column the feed numbers its records by: each is written once across handovers.
+    seq: str | None = None
 
 
-def websocket(url: str, *, flush: str = "100ms", max_rows: int = 10_000) -> WebSocket:
-    """A WebSocket feed of JSON, for `ingester(source=...)`."""
-    return WebSocket(url, flush, max_rows)
+def websocket(
+    url: str, *, flush: str = "100ms", max_rows: int = 10_000, seq: str | None = None
+) -> WebSocket:
+    """A WebSocket feed of JSON, for `ingester(source=...)`. With `seq`, the column the feed
+    numbers its records by, a rolling update writes each record exactly once."""
+    return WebSocket(url, flush, max_rows, seq)
 
 
 @dataclass(frozen=True)
@@ -236,6 +241,7 @@ def run(resource: Resource, db: Session, ready: Path | None = None) -> None:
             flush=source.flush,
             max_rows=source.max_rows,
             wait=True,
+            seq=source.seq,
         )
         while True:
             stats = connector.stats

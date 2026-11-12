@@ -335,7 +335,14 @@ A source that needs code (parsing, joining reference data) is a deployment holdi
   message), flushed every `flush` or `max_rows`, reconnecting with backoff:
   `session.ingest_websocket(url, "md.ticks")` or `kermodes ingest websocket URL --table md.ticks`.
   A raw WebSocket feed is not replayable, so a restarted connector resumes from the feed's
-  present. `kermodes demo ticker` (`km.demo.ticker()`) serves a synthetic feed.
+  present. `kermodes demo ticker` (`km.demo.ticker()`) serves a synthetic feed, the same ticks to
+  every client, each numbered by `seq`.
+- A feed that numbers its records is written exactly once across a rolling handover with
+  `seq="seq"` (`km.websocket(url, seq="seq")`, `--seq`): the new run reads the feed while the old
+  one still writes, and once it holds the source's lease it writes only records numbered above
+  the source's last batch, each batch under its highest number (§7.4). `stats.duplicates` counts
+  what it dropped, `stats.missed` the numbers no run received (a crash, a lost reconnect), which
+  only a replayable source can fill.
 - Python connectors use a session's `writer(table, source=...)`, the SDK equivalent of a
   Deephaven logger.
 - Batch imports (CSV, API backfills) are ordinary jobs that write either through weir (live) or

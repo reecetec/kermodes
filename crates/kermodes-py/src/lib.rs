@@ -362,8 +362,10 @@ impl Session {
     /// (others ignored, missing ones NULL, an unreadable record skipped and counted). Rows are
     /// written every `flush` or `max_rows`, whichever comes first. Reading starts at once; with
     /// `wait`, the writer waits for the source's current writer to go (a handover), and the
-    /// connector is `connected` meanwhile.
-    #[pyo3(signature = (url, table, source="websocket", flush="100ms", max_rows=10_000, wait=false))]
+    /// connector is `connected` meanwhile. With `seq`, the integer column the feed numbers its
+    /// records by, a handover writes each record once: the new connector writes only records
+    /// numbered above what the source last wrote.
+    #[pyo3(signature = (url, table, source="websocket", flush="100ms", max_rows=10_000, wait=false, seq=None))]
     // Each parameter is a Python keyword argument; grouping them would change the Python API.
     #[allow(clippy::too_many_arguments)]
     fn ingest_websocket(
@@ -375,6 +377,7 @@ impl Session {
         flush: &str,
         max_rows: usize,
         wait: bool,
+        seq: Option<&str>,
     ) -> PyResult<Ingest> {
         let tables = self.stored()?.clone();
         let name = kermodes_weir::TableName::parse(table).map_err(store_error)?;
@@ -389,12 +392,12 @@ impl Session {
                 url,
                 schema,
                 options,
+                seq,
                 Box::new(move || {
                     let writer = tables.writer(&name, &source, wait)?;
-                    Ok(
-                        Box::new(move |batch: &RecordBatch| writer.write(batch, None))
-                            as kermodes_ingest::Write,
-                    )
+                    let last = writer.last_seq();
+                    let write = move |batch: &RecordBatch, seq| writer.write(batch, seq);
+                    Ok((Box::new(write) as kermodes_ingest::Write, last))
                 }),
             )
             .map_err(|e| KermodesError::new_err(format!("cannot start the connector: {e}")))
@@ -485,10 +488,7 @@ impl Writer {
     /// The last sequence number this source wrote (in its newest partition), or `None`.
     #[getter]
     fn last_seq(&self, py: Python<'_>) -> Option<u64> {
-        py.detach(|| match &self.0 {
-            SourceWriter::Local(writer) => writer.last_seq(),
-            SourceWriter::Remote(writer) => writer.last_seq(),
-        })
+        py.detach(|| self.0.last_seq())
     }
 
     /// This writer's lease epoch: above every earlier writer's of the source. `None` from a
@@ -509,6 +509,13 @@ impl SourceWriter {
             SourceWriter::Remote(writer) => writer.write(batch, seq),
         }
     }
+
+    fn last_seq(&self) -> Option<u64> {
+        match self {
+            SourceWriter::Local(writer) => writer.last_seq(),
+            SourceWriter::Remote(writer) => writer.last_seq(),
+        }
+    }
 }
 
 /// A running connector (`Session.ingest_websocket`); stops when this object goes, or with
@@ -526,6 +533,8 @@ impl Ingest {
             messages: stats.messages,
             rows: stats.rows,
             skipped: stats.skipped,
+            duplicates: stats.duplicates,
+            missed: stats.missed,
             batches: stats.batches,
             reconnects: stats.reconnects,
             connected: stats.connected,
@@ -556,8 +565,13 @@ pub struct IngestStats {
     messages: u64,
     /// Rows written to the table.
     rows: u64,
-    /// Records skipped because they could not be read as the table's columns.
+    /// Records skipped because they could not be read as the table's columns, or had no `seq`.
     skipped: u64,
+    /// Records dropped as already written by the run this one took over from (`seq` only).
+    duplicates: u64,
+    /// Numbers the feed skipped between written records: sent while no run read it, or lost in
+    /// a reconnect (`seq` only).
+    missed: u64,
     batches: u64,
     /// Times the feed was reconnected after it dropped.
     reconnects: u64,
@@ -574,10 +588,12 @@ pub struct IngestStats {
 impl IngestStats {
     fn __repr__(&self) -> String {
         format!(
-            "<IngestStats {} rows from {} messages, {} skipped, {} reconnects{}>",
+            "<IngestStats {} rows from {} messages, {} skipped, {} duplicates, {} missed, {} reconnects{}>",
             self.rows,
             self.messages,
             self.skipped,
+            self.duplicates,
+            self.missed,
             self.reconnects,
             if self.failed {
                 ", stopped: a write failed"

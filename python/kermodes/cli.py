@@ -106,6 +106,9 @@ def main(argv: list[str] | None = None) -> None:
         "--server", help="the store server (default: $KERMODES_URL, else kermodes dev)"
     )
     websocket.add_argument("--flush", default="100ms")
+    websocket.add_argument(
+        "--seq", help="the integer column the feed numbers records by (exactly once)"
+    )
 
     demo = commands.add_parser("demo", help="demo data sources")
     feeds = demo.add_subparsers(dest="feed", required=True)
@@ -191,7 +194,13 @@ def main(argv: list[str] | None = None) -> None:
         run_ui(args.server, args.host, args.port, args.control)
     elif args.command == "ingest":
         run_websocket(
-            args.url, args.table, args.source, args.columns, args.server, args.flush
+            args.url,
+            args.table,
+            args.source,
+            args.columns,
+            args.server,
+            args.flush,
+            args.seq,
         )
     elif args.command == "demo":
         run_ticker(args.host, args.port, args.rate, args.symbols)
@@ -333,11 +342,12 @@ def run_websocket(
     columns: str | None,
     server: str | None,
     flush: str,
+    seq: str | None,
 ) -> None:
     session = km.connect(server)
     if columns:
         session.create_table(table, parse_columns(columns))
-    ingest = session.ingest_websocket(url, table, source=source, flush=flush)
+    ingest = session.ingest_websocket(url, table, source=source, flush=flush, seq=seq)
     print(f"reading {url} into {table} (source {source}); Ctrl-C to stop", flush=True)
     try:
         for second in itertools.count(1):
