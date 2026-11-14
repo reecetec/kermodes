@@ -50,11 +50,15 @@ fn lost(error: &Error) -> bool {
     matches!(error, Error::Io(_) | Error::Catalog(_))
 }
 
-/// When buffered rows are written: after `flush` since the first of them, or at `max_rows`.
+/// When buffered rows are written: after `flush` since the first of them, or at `max_rows`, or
+/// once their records reach `max_bytes` of JSON.
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
     pub flush: Duration,
     pub max_rows: usize,
+    /// JSON is larger than the Arrow it decodes to, so batches stay well under the most one
+    /// write may take (64 MiB over Flight), however wide the rows.
+    pub max_bytes: usize,
 }
 
 impl Default for Options {
@@ -62,6 +66,7 @@ impl Default for Options {
         Self {
             flush: Duration::from_millis(100),
             max_rows: 10_000,
+            max_bytes: 16 << 20,
         }
     }
 }
@@ -457,6 +462,8 @@ struct Buffer {
     decoder: Decoder,
     pieces: Vec<RecordBatch>,
     rows: usize,
+    /// The JSON the buffered rows came from.
+    bytes: usize,
     since: Option<tokio::time::Instant>,
 }
 
@@ -468,6 +475,7 @@ impl Buffer {
             options,
             pieces: Vec::new(),
             rows: 0,
+            bytes: 0,
             since: None,
         }
     }
@@ -500,6 +508,7 @@ impl Buffer {
         match decoded {
             Ok(Some(batch)) if batch.num_rows() > 0 => {
                 self.rows += batch.num_rows();
+                self.bytes += record.len();
                 self.since.get_or_insert_with(tokio::time::Instant::now);
                 self.pieces.push(batch);
             }
@@ -515,6 +524,7 @@ impl Buffer {
 
     fn take_if_due(&mut self, counters: &Counters) -> Option<RecordBatch> {
         let due = self.rows >= self.options.max_rows
+            || self.bytes >= self.options.max_bytes
             || self
                 .since
                 .is_some_and(|since| since.elapsed() >= self.options.flush);
@@ -527,6 +537,7 @@ impl Buffer {
         }
         let pieces = std::mem::take(&mut self.pieces);
         self.rows = 0;
+        self.bytes = 0;
         self.since = None;
         match concat_batches(&self.schema, &pieces) {
             Ok(batch) => Some(batch),

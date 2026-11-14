@@ -51,7 +51,10 @@ pub fn serve(store: Arc<Store>, addr: SocketAddr) -> std::io::Result<Server> {
         .enable_all()
         .build()?;
     let (shutdown, stopped) = oneshot::channel::<()>();
-    let service = FlightServiceServer::new(Service { store });
+    // A write's batch is one message; the rest of the message (its descriptor, sequence number,
+    // and protobuf framing) takes far less than the headroom.
+    let service = FlightServiceServer::new(Service { store })
+        .max_decoding_message_size(crate::MAX_WRITE_BYTES + (64 << 10));
     let thread = thread::Builder::new()
         .name("kermodes-flight".into())
         .spawn(move || {
@@ -189,7 +192,13 @@ impl FlightService for Service {
                 let message = match message {
                     Ok(message) => message,
                     Err(e) => {
-                        let _ = acks.send(Err(Status::invalid_argument(e.to_string())));
+                        // A message over the size limit keeps tonic's status (out of range), which
+                        // the client reads as too large rather than as a bad batch.
+                        let status = match e {
+                            FlightError::Tonic(status) => *status,
+                            e => Status::invalid_argument(e.to_string()),
+                        };
+                        let _ = acks.send(Err(status));
                         return;
                     }
                 };

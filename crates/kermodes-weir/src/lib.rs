@@ -32,6 +32,8 @@ pub enum Error {
     Io(String),
     Arrow(String),
     Catalog(String),
+    /// A write over the limit for one batch: split it, it cannot succeed as it is.
+    TooLarge(String),
 }
 
 impl Error {
@@ -50,7 +52,8 @@ impl fmt::Display for Error {
             | Error::Corrupt(m)
             | Error::Io(m)
             | Error::Arrow(m)
-            | Error::Catalog(m) => f.write_str(m),
+            | Error::Catalog(m)
+            | Error::TooLarge(m) => f.write_str(m),
         }
     }
 }

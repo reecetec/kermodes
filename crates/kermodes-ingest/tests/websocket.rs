@@ -105,6 +105,7 @@ fn feeds_are_read_tolerantly_and_reconnected() {
     let options = Options {
         flush: Duration::from_millis(20),
         max_rows: 1_000,
+        ..Options::default()
     };
     let mut ingest = websocket(
         &url,
@@ -145,6 +146,37 @@ fn feeds_are_read_tolerantly_and_reconnected() {
         "2026-11-11T09:30:00Z"
     );
     assert!(ts.is_null(1));
+}
+
+/// Wide records are written once their JSON reaches `max_bytes`, however few they are, so a
+/// batch stays far below the most one write may take.
+#[test]
+fn wide_records_are_written_in_batches_bounded_by_bytes() {
+    let record = format!(r#"{{"sym":"{}","price":1.0,"size":1}}"#, "x".repeat(280));
+    let (url, _feed) = scripted_feed(vec![vec![Message::Text(record.into()); 12]]);
+    let sizes = Arc::new(Mutex::new(Vec::new()));
+    let sink = sizes.clone();
+    // Neither time nor rows would write anything during the test.
+    let options = Options {
+        flush: Duration::from_secs(3600),
+        max_rows: 1_000,
+        max_bytes: 1_000,
+    };
+    let mut ingest = websocket(
+        &url,
+        schema(),
+        options,
+        None,
+        opened(move |batch, _| {
+            sink.lock().unwrap().push(batch.num_rows());
+            Ok(true)
+        }),
+    )
+    .unwrap();
+    wait_for("twelve rows", || ingest.stats().rows == 12);
+    ingest.stop();
+    // About 310 bytes a record: the fourth reaches 1,000.
+    assert_eq!(*sizes.lock().unwrap(), [4, 4, 4]);
 }
 
 struct TempDir(PathBuf);
@@ -226,6 +258,7 @@ fn a_lost_store_is_reopened_and_the_interrupted_batch_written() {
     let options = Options {
         flush: Duration::from_millis(10),
         max_rows: 1_000,
+        ..Options::default()
     };
     let mut ingest = websocket(
         &format!("ws://{}/", feed.addr()),
@@ -266,6 +299,7 @@ fn a_write_that_cannot_succeed_stops_the_connector() {
     let options = Options {
         flush: Duration::from_millis(10),
         max_rows: 1_000,
+        ..Options::default()
     };
     let mut ingest = websocket(
         &format!("ws://{}/", feed.addr()),
@@ -354,6 +388,7 @@ fn a_numbered_feed_is_written_exactly_once_across_a_handover() {
     let options = Options {
         flush: Duration::from_millis(20),
         max_rows: 1_000,
+        ..Options::default()
     };
     let connector = || {
         let (store, name, source) = (store.clone(), name.clone(), source.clone());

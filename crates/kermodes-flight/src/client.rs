@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tonic::Streaming;
 use tonic::transport::Channel;
 
-use crate::{columns_json, error_from_status, schema_from_json};
+use crate::{MAX_WRITE_BYTES, columns_json, error_from_status, schema_from_json};
 
 /// Connected to a store's Flight server. Calls block until the server answers. Clones share the
 /// connection.
@@ -144,6 +144,7 @@ impl Client {
         )?;
         Ok(RemoteWriter {
             runtime: self.runtime.clone(),
+            table: name.clone(),
             schema,
             sender,
             epoch: state["epoch"].as_u64(),
@@ -213,6 +214,7 @@ impl Client {
 /// Writes one source's rows of a served table (`Client::writer`).
 pub struct RemoteWriter {
     runtime: Arc<Runtime>,
+    table: TableName,
     schema: SchemaRef,
     sender: mpsc::UnboundedSender<FlightData>,
     epoch: Option<u64>,
@@ -251,6 +253,16 @@ impl RemoteWriter {
             .pop()
             .expect("a batch message");
         data.app_metadata = seq.to_le_bytes().to_vec().into();
+        let bytes = data.data_header.len() + data.data_body.len();
+        if bytes > MAX_WRITE_BYTES {
+            return Err(Error::TooLarge(format!(
+                "a write to {} of {:.1} MiB is over the {} MiB limit for one batch; write it as \
+                 smaller batches",
+                self.table,
+                bytes as f64 / (1 << 20) as f64,
+                MAX_WRITE_BYTES >> 20
+            )));
+        }
         self.sender
             .send(data)
             .map_err(|_| Error::Io("the write stream closed".into()))?;

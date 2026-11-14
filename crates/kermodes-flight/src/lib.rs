@@ -7,7 +7,8 @@
 //!   true`, when the current writer goes; without, a taken source fails with `Busy`. Each record
 //!   batch's `app_metadata` is its sequence number (u64, little-endian). Each batch is
 //!   acknowledged once durable (or dropped as a resend) with a `PutResult` whose `app_metadata` is
-//!   the source's last sequence number (u64) and whether the batch was written (one byte).
+//!   the source's last sequence number (u64) and whether the batch was written (one byte). A
+//!   batch's message is at most `MAX_WRITE_BYTES`: the client refuses a larger one as `TooLarge`.
 //! - `DoGet` reads: the ticket `{"table"}` streams every committed batch, then each new one.
 //! - Actions, JSON in and out: `create_table` `{"table", "columns": [[name, type]]}`; `tables`;
 //!   `last_seq` `{"table", "source"}` → `{"last_seq", "epoch"}`. A writer asks for it once its
@@ -28,6 +29,11 @@ use tonic::{Code, Status};
 
 pub use client::{Client, RemoteWriter};
 pub use server::{Server, serve};
+
+/// The most one write's batch may take over Flight, encoded. A write is one atomic batch (one
+/// sequence number), so it is never split; at weir's segment size, one fits under a live
+/// reader's queue (128 MiB), and the server holds at most this per writer while decoding.
+pub const MAX_WRITE_BYTES: usize = 64 << 20;
 
 fn columns_json(schema: &Schema) -> Value {
     Value::Array(
@@ -62,6 +68,7 @@ fn status(error: Error) -> Status {
         Error::NotFound(_) => Code::NotFound,
         Error::Busy(_) => Code::AlreadyExists,
         Error::Corrupt(_) => Code::DataLoss,
+        Error::TooLarge(_) => Code::OutOfRange,
         Error::Io(_) | Error::Arrow(_) | Error::Catalog(_) => Code::Internal,
     };
     Status::new(code, error.to_string())
@@ -74,6 +81,8 @@ fn error_from_status(status: &Status) -> Error {
         Code::NotFound => Error::NotFound(message),
         Code::AlreadyExists => Error::Busy(message),
         Code::DataLoss => Error::Corrupt(message),
+        // Also how tonic refuses a message over the server's limit.
+        Code::OutOfRange => Error::TooLarge(message),
         _ => Error::Io(format!("kermodes server: {message}")),
     }
 }

@@ -393,6 +393,10 @@ catalog as live tables.
   never read; a segment with no committed batch is deleted.
 - A segment takes batches until its stream reaches 64 MiB. Later: sealing rewrites a full
   segment as an Arrow IPC file with its footer, so it can be memory-mapped and copied to S3.
+- One write is one batch under one `seq`, never split, so it is atomic. Over Flight it is at most
+  64 MiB encoded (the client refuses a larger one as too large, not as a lost connection, so a
+  connector does not retry it); connectors also write once buffered records reach 16 MiB of JSON,
+  far below that. One maximal batch fits a live reader's queue (§7.2).
 - Row positions within an internal partition are stable (append-only), which maps onto add-only
   tables in the engine.
 - Per-batch metadata (`seq`, ingest time) lives in the index, not in user columns. An

@@ -385,6 +385,7 @@ impl Session {
         let options = kermodes_ingest::Options {
             flush: parse_period(flush)?,
             max_rows,
+            ..kermodes_ingest::Options::default()
         };
         let ingest = py.detach(|| {
             let schema = tables.schema(&name).map_err(store_error)?;

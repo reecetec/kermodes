@@ -194,6 +194,41 @@ fn a_waiting_writer_resumes_after_the_last_writers_final_batch() {
     assert_eq!(waiting.join().unwrap(), (Some(2), Some(3)));
 }
 
+/// A write is one atomic batch over Flight up to 64 MiB, far past gRPC's 4 MiB default; a larger
+/// one is refused before it is sent, as too large rather than as a lost connection a connector
+/// would retry, and the writer goes on.
+#[test]
+fn a_write_up_to_the_batch_limit_lands_whole_and_a_larger_one_is_refused() {
+    let dir = TempDir::new();
+    let store = Arc::new(Store::open(&dir.0).unwrap());
+    let server = serve(store.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+    let client = Client::connect(&format!("grpc://{}", server.addr())).unwrap();
+    client.create_table(&ticks(), &schema()).unwrap();
+    let writer = client
+        .writer(&ticks(), &SourceId::parse("feed").unwrap(), false)
+        .unwrap();
+
+    // About 40 MiB, then about 80.
+    assert!(writer.write(&batch(0..2_000_000), None).unwrap());
+    let refused = writer.write(&batch(0..4_000_000), None).unwrap_err();
+    assert!(matches!(refused, Error::TooLarge(_)), "{refused}");
+    assert!(writer.write(&batch(2_000_000..2_000_010), None).unwrap());
+    assert_eq!(writer.last_seq(), Some(2));
+
+    let batches = Arc::new(Mutex::new(Vec::new()));
+    let seen = batches.clone();
+    store
+        .subscribe(
+            &ticks(),
+            Box::new(move |batch, _| {
+                seen.lock().unwrap().push(batch.num_rows());
+                true
+            }),
+        )
+        .unwrap();
+    assert_eq!(*batches.lock().unwrap(), [2_000_000, 10]);
+}
+
 /// A reader whose history is far larger than the server's queue (about 150 MiB, against 16 MiB)
 /// gets all of it, in order and once, while a writer goes on: the server's replay waits for the
 /// reader instead of holding the day.
