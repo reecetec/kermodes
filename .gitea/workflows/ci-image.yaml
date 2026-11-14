@@ -1,0 +1,45 @@
+name: CI image
+
+# Builds the image CI jobs run in (ci/Dockerfile) when it changes, under the tag that names its
+# contents. ci.yaml uses that tag, so a change lands in two steps: this image, then ci.yaml.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - ci/Dockerfile
+      - .gitea/workflows/ci-image.yaml
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: arc
+    container:
+      image: git.rcolclough.com/rcolclough/buildah-ci:stable-node20
+    env:
+      REGISTRY: git.rcolclough.com
+      REGISTRY_USER: reecec
+      CI_IMAGE: git.rcolclough.com/rcolclough/kermodes-ci:rust1.98.1-bun1.4.2-sccache0.19.0
+      BUILDAH_ISOLATION: chroot
+      STORAGE_DRIVER: vfs
+      XDG_RUNTIME_DIR: /tmp/containers-run
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          set-safe-directory: true
+
+      - name: Log in to the registry
+        run: |
+          mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+          echo "${{ secrets.REGISTRY_TOKEN }}" | buildah login "$REGISTRY" --username "$REGISTRY_USER" --password-stdin
+
+      - name: Build and push the image
+        run: |
+          buildah build --arch amd64 --tag "$CI_IMAGE" ci
+          buildah push "$CI_IMAGE"
