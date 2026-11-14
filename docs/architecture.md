@@ -1255,6 +1255,9 @@ proven parts.
 - Sort and filter run in the engine, on tables the viewer derives and releases with the view
   (`where` for filters; `sort` for static tables and an incremental sort for ticking ones).
   Fetching rows by position needs a rank index for keyed tables.
+- A sort or filter of a big table takes seconds. The grid numbers each one it sends and the
+  engine reports the highest it has applied; until that catches up, the grid dims its rows and
+  says "updating…", so nobody reads the old rows as the answer.
 - Targets: 60 fps scrolling over a billion rows; a change reaches the screen within one cycle
   and one frame; no work while nothing changes.
 

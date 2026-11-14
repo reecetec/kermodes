@@ -1443,8 +1443,9 @@ fn py_frame(py: Python<'_>, frame: kermodes_core::viewer::Frame) -> PyResult<PyF
 }
 
 /// A grid message: {"type": "viewport", "top", "bottom"}, {"type": "sort", "by": [{"column",
-/// "descending"}]}, {"type": "filter", "filters": {column: text}}, or {"type": "fetch", "id",
-/// "start", "count"}. `None` for other types.
+/// "descending"}], "request"}, {"type": "filter", "filters": {column: text}, "request"}, or
+/// {"type": "fetch", "id", "start", "count"}. A sort's or filter's `request` number is what
+/// `applied` reports back (0 if absent). `None` for other types.
 fn request(message: &Bound<'_, PyDict>) -> PyResult<Option<kermodes_core::viewer::Request>> {
     use kermodes_core::viewer::{Request, SortKey};
     let item = |name: &str| -> PyResult<Bound<'_, PyAny>> {
@@ -1452,14 +1453,18 @@ fn request(message: &Bound<'_, PyDict>) -> PyResult<Option<kermodes_core::viewer
             .get_item(name)?
             .ok_or_else(|| PyValueError::new_err(format!("viewer message without `{name}`")))
     };
+    let number: u64 = match message.get_item("request")? {
+        Some(number) => number.extract()?,
+        None => 0,
+    };
     let kind: String = item("type")?.extract()?;
     Ok(Some(match kind.as_str() {
         "viewport" => Request::Viewport {
             top: item("top")?.extract()?,
             bottom: item("bottom")?.extract()?,
         },
-        "sort" => Request::Sort(
-            item("by")?
+        "sort" => Request::Sort {
+            by: item("by")?
                 .try_iter()?
                 .map(|key| {
                     let key = key?;
@@ -1469,8 +1474,12 @@ fn request(message: &Bound<'_, PyDict>) -> PyResult<Option<kermodes_core::viewer
                     })
                 })
                 .collect::<PyResult<_>>()?,
-        ),
-        "filter" => Request::Filter(item("filters")?.extract()?),
+            number,
+        },
+        "filter" => Request::Filter {
+            filters: item("filters")?.extract()?,
+            number,
+        },
         "fetch" => Request::Fetch {
             id: item("id")?.extract()?,
             start: item("start")?.extract()?,
@@ -1542,6 +1551,12 @@ impl Viewer {
     #[getter]
     fn filter_errors(&self) -> std::collections::BTreeMap<String, String> {
         self.lock().filter_errors().clone()
+    }
+
+    /// The number of the last sort or filter applied: the rows reflect it.
+    #[getter]
+    fn applied(&self) -> u64 {
+        self.lock().applied()
     }
 
     /// "static", or "ticking · updated in cycle N".

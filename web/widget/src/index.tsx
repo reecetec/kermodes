@@ -25,6 +25,7 @@ const TRAITS: readonly (keyof ViewerState)[] = [
   'sort',
   'filters',
   'filter_errors',
+  'applied',
 ];
 
 const MAX_GRID_HEIGHT = 420;
@@ -46,6 +47,7 @@ export function widgetChannel(model: WidgetModel): ViewerChannel {
       sort: model.get('sort') ?? [],
       filters: model.get('filters') ?? {},
       filter_errors: model.get('filter_errors') ?? {},
+      applied: model.get('applied') ?? 0,
     }),
     onState(handler) {
       const events = TRAITS.map(name => `change:${name}`);

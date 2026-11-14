@@ -118,6 +118,7 @@ const traits: ViewerState = {
   sort: [],
   filters: {},
   filter_errors: {},
+  applied: 0,
 };
 const listeners = new Map<string, Set<(...args: never[]) => void>>();
 let cycle = 1;
@@ -193,6 +194,7 @@ function receive(message: ViewerRequest): void {
   } else if (message.type === 'sort') {
     setTrait('sort', message.by.map(({ column, descending }): SortKey => ({ column, descending })));
     derive();
+    setTrait('applied', Math.max(traits.applied, message.request ?? 0));
   } else if (message.type === 'filter') {
     const filters = Object.fromEntries(
       Object.entries(message.filters).filter(([, text]) => text.trim() !== '')
@@ -214,6 +216,7 @@ function receive(message: ViewerRequest): void {
     setTrait('filters', filters);
     setTrait('filter_errors', errors);
     derive();
+    setTrait('applied', Math.max(traits.applied, message.request ?? 0));
   } else if (message.type === 'fetch') {
     emit(
       'msg:custom',

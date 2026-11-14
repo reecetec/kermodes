@@ -29,14 +29,18 @@ pub struct SortKey {
     pub descending: bool,
 }
 
-/// A message from the grid.
+/// A message from the grid. A sort or filter carries the grid's number for it: `applied` then
+/// says which the rows reflect, so the grid can show the old ones as such until they do.
 pub enum Request {
     /// The first and last rows on screen.
     Viewport { top: usize, bottom: usize },
     /// Sort keys, most significant first; empty for the table's own order.
-    Sort(Vec<SortKey>),
+    Sort { by: Vec<SortKey>, number: u64 },
     /// Quick-filter entries by column; empty entries are dropped.
-    Filter(BTreeMap<String, String>),
+    Filter {
+        filters: BTreeMap<String, String>,
+        number: u64,
+    },
     /// Exactly these rows, for copying a selection; answered as `Frame::fetched`.
     Fetch { id: u64, start: usize, count: usize },
 }
@@ -64,6 +68,9 @@ pub struct Viewer {
     sort: Vec<SortKey>,
     filters: BTreeMap<String, String>,
     filter_errors: BTreeMap<String, String>,
+    /// The highest sort or filter number applied (`Request`); 0 before any. Highest, not last:
+    /// a reconnecting grid replays its last sort and filter, in either order.
+    applied: u64,
 }
 
 impl Viewer {
@@ -82,6 +89,7 @@ impl Viewer {
             sort: Vec::new(),
             filters: BTreeMap::new(),
             filter_errors: BTreeMap::new(),
+            applied: 0,
         }
     }
 
@@ -93,13 +101,17 @@ impl Viewer {
                 let start = top.saturating_sub(MARGIN);
                 self.window = (start, bottom.saturating_sub(top) + 1 + 2 * MARGIN);
             }
-            Request::Sort(sort) => self.derive(sort, self.filters.clone()),
-            Request::Filter(filters) => {
+            Request::Sort { by, number } => {
+                self.derive(by, self.filters.clone());
+                self.applied = self.applied.max(number);
+            }
+            Request::Filter { filters, number } => {
                 let filters = filters
                     .into_iter()
                     .filter(|(_, text)| !text.trim().is_empty())
                     .collect();
                 self.derive(self.sort.clone(), filters);
+                self.applied = self.applied.max(number);
             }
             Request::Fetch { id, start, count } => {
                 return self.frame(Some(id), start, count.min(FETCH_LIMIT));
@@ -124,6 +136,10 @@ impl Viewer {
         self.shown = None;
     }
 
+    /// The highest sort or filter number applied: the rows reflect it and every one before.
+    pub fn applied(&self) -> u64 {
+        self.applied
+    }
     pub fn sort(&self) -> &[SortKey] {
         &self.sort
     }

@@ -29,6 +29,8 @@ class TableView(anywidget.AnyWidget):
     sort = traitlets.List().tag(sync=True)
     filters = traitlets.Dict().tag(sync=True)
     filter_errors = traitlets.Dict().tag(sync=True)
+    # The number of the last sort or filter the rows reflect (the grid's `request`).
+    applied = traitlets.Int(0).tag(sync=True)
 
     def __init__(self, table: Table) -> None:
         super().__init__(columns=[{"name": n, "type": t} for n, t in table.columns])
@@ -62,6 +64,7 @@ class TableView(anywidget.AnyWidget):
             self.sort = [{"column": c, "descending": d} for c, d in self._viewer.sort]
             self.filters = self._viewer.filters
             self.filter_errors = self._viewer.filter_errors
+            self.applied = self._viewer.applied
         self.send(header, [rows, keys])
 
 

@@ -463,13 +463,15 @@ fn request(kind: &str, message: &Value) -> Result<Option<Request>, String> {
             .map(|n| n as usize)
             .ok_or_else(|| format!("`{kind}` needs a number `{name}`"))
     };
+    // A client before applied numbers sends none: 0, which never reads as pending.
+    let request = message["request"].as_u64().unwrap_or(0);
     Ok(Some(match kind {
         "viewport" => Request::Viewport {
             top: number("top")?,
             bottom: number("bottom")?,
         },
-        "sort" => Request::Sort(
-            message["by"]
+        "sort" => Request::Sort {
+            by: message["by"]
                 .as_array()
                 .ok_or("`sort` needs a list `by`")?
                 .iter()
@@ -483,9 +485,10 @@ fn request(kind: &str, message: &Value) -> Result<Option<Request>, String> {
                     })
                 })
                 .collect::<Result<_, &str>>()?,
-        ),
-        "filter" => Request::Filter(
-            message["filters"]
+            number: request,
+        },
+        "filter" => Request::Filter {
+            filters: message["filters"]
                 .as_object()
                 .ok_or("`filter` needs an object `filters`")?
                 .iter()
@@ -493,7 +496,8 @@ fn request(kind: &str, message: &Value) -> Result<Option<Request>, String> {
                     (column.clone(), text.as_str().unwrap_or_default().to_owned())
                 })
                 .collect(),
-        ),
+            number: request,
+        },
         "fetch" => Request::Fetch {
             id: number("id")? as u64,
             start: number("start")?,
@@ -538,6 +542,7 @@ fn state(id: u64, viewer: &Viewer, frame: &Frame) -> Message {
             "sort": sort,
             "filters": viewer.filters(),
             "filter_errors": viewer.filter_errors(),
+            "applied": viewer.applied(),
         })
         .to_string()
         .into(),

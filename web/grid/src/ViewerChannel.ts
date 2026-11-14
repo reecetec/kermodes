@@ -11,16 +11,19 @@ export type ViewerState = {
   filters: Record<string, string>;
   // Why a column's quick filter was not applied, by column name
   filter_errors: Record<string, string>;
+  // The highest sort or filter `request` number the rows reflect
+  applied: number;
 };
 
 /** Messages from the viewer to the engine side */
 export type ViewerRequest =
   // First and last row on screen (inclusive)
   | { type: 'viewport'; top: number; bottom: number }
-  // Sort keys in priority order; empty for unsorted
-  | { type: 'sort'; by: SortKey[] }
+  // Sort keys in priority order; empty for unsorted. `request` numbers a change to show
+  // pending until `applied` reaches it; without one the change is never shown pending.
+  | { type: 'sort'; by: SortKey[]; request?: number }
   // Every column's filter text; empty text for no filter on that column
-  | { type: 'filter'; filters: Record<string, string> }
+  | { type: 'filter'; filters: Record<string, string>; request?: number }
   // Rows start..start+count, eg. for copying beyond the window; answered by "fetched"
   | { type: 'fetch'; id: number; start: number; count: number };
 

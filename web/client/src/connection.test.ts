@@ -163,6 +163,7 @@ describe('KermodesConnection', () => {
         sort: [{ column: 'px', descending: true }],
         filters: {},
         filter_errors: {},
+        applied: 0,
       })
     );
     expect(tradesStates).toBe(1);

@@ -31,27 +31,18 @@ export function nextSort(
 }
 
 /**
- * The sort a header shows, given the sort `asked` for and not yet seen applied
- * (or `null`), and the one the engine `reported`; and what is still asked. A
- * sort of a big table takes a while, and the engine's reports until it lands
- * carry the old sort: showing those would flip the header back. The engine
- * always ends up reporting the sort asked for, even one it could not apply.
+ * What the viewer shows on an engine report. `sent` is the number of the last
+ * sort or filter sent, `applied` the highest the engine reports done: until it
+ * catches up the rows predate a change, which can take seconds on a big table,
+ * so they are `pending` and the header keeps the sort `asked` for (`null` if
+ * none was) rather than flip back to the old one the reports still carry.
  */
-export function shownSort(
+export function shownView(
+  sent: number,
+  applied: number,
   asked: readonly SortKey[] | null,
   reported: readonly SortKey[]
-): { shown: readonly SortKey[]; asked: readonly SortKey[] | null } {
-  if (asked == null || sameSort(asked, reported)) {
-    return { shown: reported, asked: null };
-  }
-  return { shown: asked, asked };
-}
-
-function sameSort(a: readonly SortKey[], b: readonly SortKey[]): boolean {
-  return (
-    a.length === b.length &&
-    a.every(
-      (key, i) => key.column === b[i].column && key.descending === b[i].descending
-    )
-  );
+): { pending: boolean; sort: readonly SortKey[] } {
+  const pending = applied < sent;
+  return { pending, sort: pending && asked != null ? asked : reported };
 }

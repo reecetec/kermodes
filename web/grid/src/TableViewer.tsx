@@ -26,7 +26,7 @@ import {
   filterCells,
   type FilterCell,
 } from './FilterBar';
-import { nextSort, shownSort } from './sorting';
+import { nextSort, shownView } from './sorting';
 import {
   COPY_ROW_LIMIT,
   copyText,
@@ -234,8 +234,12 @@ export function TableViewer({
   );
   const draftRef = useRef(draft);
   const filterTimer = useRef<number | null>(null);
-  // A sort clicked and not yet applied by the engine (`shownSort`)
+  // The number of the last sort or filter sent; until the engine reports it applied
+  // (`shownView`), the rows shown predate it, so the table says it is updating and dims them.
+  const sent = useRef(0);
+  // The sort last asked for, shown in the header while it is pending
   const askedSort = useRef<readonly SortKey[] | null>(null);
+  const [isUpdating, setIsUpdating] = useState(false);
   const [cells, setCells] = useState<readonly FilterCell[]>([]);
   const cellsKey = useRef('');
 
@@ -262,11 +266,14 @@ export function TableViewer({
         viewport.reset();
       }
       model.setRowCount(next.row_count);
-      const sorted = shownSort(askedSort.current, next.sort);
-      askedSort.current = sorted.asked;
-      model.setSort(sorted.shown);
-      // Typing wins over the engine's echo of an older entry
-      if (filterTimer.current == null) {
+      const shown = shownView(sent.current, next.applied, askedSort.current, next.sort);
+      if (!shown.pending) {
+        askedSort.current = null;
+      }
+      setIsUpdating(shown.pending);
+      model.setSort(shown.sort);
+      // Typing, and entries sent and not yet applied, win over the engine's echo of older ones
+      if (filterTimer.current == null && !shown.pending) {
         draftRef.current = next.filters;
         setDraft(next.filters);
       }
@@ -336,7 +343,9 @@ export function TableViewer({
       clearTimeout(filterTimer.current ?? undefined);
       filterTimer.current = window.setTimeout(() => {
         filterTimer.current = null;
-        channel.send({ type: 'filter', filters: draftRef.current });
+        sent.current += 1;
+        setIsUpdating(true);
+        channel.send({ type: 'filter', filters: draftRef.current, request: sent.current });
       }, FILTER_DEBOUNCE_MS);
     },
     [channel]
@@ -423,9 +432,11 @@ export function TableViewer({
         }
         const modelColumn = GridUtils.getModelIndex(column, grid.state.movedColumns);
         const by = nextSort(model.sortKeys, model.columns[modelColumn].name, additive);
+        sent.current += 1;
         askedSort.current = by;
+        setIsUpdating(true);
         model.setSort(by);
-        channel.send({ type: 'sort', by });
+        channel.send({ type: 'sort', by, request: sent.current });
       }),
       new CopyCellMouseHandler(copyCell),
     ],
@@ -575,6 +586,21 @@ export function TableViewer({
             {toast.text}
           </div>
         )}
+        {isUpdating && (
+          <div
+            data-testid="updating"
+            style={{
+              position: 'absolute',
+              left: 0,
+              right: 0,
+              top: theme.columnHeaderHeight + filterBarHeight,
+              bottom: 0,
+              background: theme.backgroundColor,
+              opacity: 0.6,
+              pointerEvents: 'none',
+            }}
+          />
+        )}
       </div>
       <div
         style={{
@@ -591,7 +617,9 @@ export function TableViewer({
         <span>
           {rowCount.toLocaleString('en-US')} {rowCount === 1 ? 'row' : 'rows'}
         </span>
-        <span style={{ marginLeft: 'auto' }}>{state.status}</span>
+        <span style={{ marginLeft: 'auto' }}>
+          {isUpdating ? 'updating…' : state.status}
+        </span>
       </div>
     </div>
   );

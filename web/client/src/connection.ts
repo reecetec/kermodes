@@ -46,6 +46,7 @@ type StateMessage = {
   sort: ViewerState['sort'];
   filters: ViewerState['filters'];
   filter_errors: ViewerState['filter_errors'];
+  applied: ViewerState['applied'];
 };
 
 type TextMessage =
@@ -85,6 +86,7 @@ export class SocketView implements ViewerChannel {
       sort: [],
       filters: {},
       filter_errors: {},
+      applied: 0,
     };
   }
 
@@ -312,10 +314,10 @@ export class KermodesConnection {
         break;
       }
       case 'state': {
-        const { row_count, status, sort, filters, filter_errors } = message;
+        const { row_count, status, sort, filters, filter_errors, applied } = message;
         this.views
           .get(message.view)
-          ?.update({ row_count, status, sort, filters, filter_errors });
+          ?.update({ row_count, status, sort, filters, filter_errors, applied });
         break;
       }
       case 'error': {

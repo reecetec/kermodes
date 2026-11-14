@@ -37,7 +37,15 @@ fn filter(viewer: &mut Viewer, entries: &[(&str, &str)]) -> RecordBatch {
         .iter()
         .map(|(c, t)| ((*c).to_owned(), (*t).to_owned()))
         .collect();
-    rows(&viewer.receive(Request::Filter(entries)).unwrap().unwrap())
+    rows(
+        &viewer
+            .receive(Request::Filter {
+                filters: entries,
+                number: 1,
+            })
+            .unwrap()
+            .unwrap(),
+    )
 }
 
 /// One row per kind of value, and a row of NULLs.
@@ -173,10 +181,13 @@ fn sorted_filtered_windows_follow_the_table_and_keep_their_keys() {
 
     filter(&mut viewer, &[("sym", "a")]);
     let sorted = viewer
-        .receive(Request::Sort(vec![SortKey {
-            column: "price".into(),
-            descending: true,
-        }]))
+        .receive(Request::Sort {
+            by: vec![SortKey {
+                column: "price".into(),
+                descending: true,
+            }],
+            number: 7,
+        })
         .unwrap()
         .unwrap();
     let names = ["aa", "ca", "AB"];
@@ -198,9 +209,18 @@ fn sorted_filtered_windows_follow_the_table_and_keep_their_keys() {
     assert_eq!(prices.values().to_vec(), vec![9.0, 3.0, 2.0]);
 
     // No sort and no filters show the table as it is.
-    viewer.receive(Request::Sort(Vec::new())).unwrap();
+    viewer
+        .receive(Request::Sort {
+            by: Vec::new(),
+            number: 8,
+        })
+        .unwrap();
+    assert_eq!(viewer.applied(), 8, "the rows reflect the last change sent");
     let all = filter(&mut viewer, &[("sym", " ")]);
     assert_eq!(all.num_rows(), 4);
+    // A reconnecting grid replays its sort and filter in either order: an older number (1)
+    // after a newer one leaves the rows reported as reflecting both.
+    assert_eq!(viewer.applied(), 8);
     assert!(viewer.filters().is_empty() && viewer.sort().is_empty());
 }
 

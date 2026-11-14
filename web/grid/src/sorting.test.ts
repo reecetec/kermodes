@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { nextSort, shownSort } from './sorting';
+import { nextSort, shownView } from './sorting';
 
 const asc = (column: string) => ({ column, descending: false });
 const desc = (column: string) => ({ column, descending: true });
@@ -34,22 +34,36 @@ describe('nextSort', () => {
   });
 });
 
-describe('shownSort', () => {
-  it('shows the sort asked for until the engine reports it', () => {
+describe('shownView', () => {
+  it('is pending, showing the sort asked for, until the engine applies it', () => {
     // Reports of the old sort while the engine sorts
-    expect(shownSort([desc('px')], [asc('px')])).toEqual({
-      shown: [desc('px')],
-      asked: [desc('px')],
+    expect(shownView(4, 3, [desc('px')], [asc('px')])).toEqual({
+      pending: true,
+      sort: [desc('px')],
     });
-    expect(shownSort([desc('px')], [desc('px')])).toEqual({
-      shown: [desc('px')],
-      asked: null,
+    expect(shownView(4, 4, [desc('px')], [desc('px')])).toEqual({
+      pending: false,
+      sort: [desc('px')],
     });
   });
 
-  it('shows what the engine reports when nothing is asked', () => {
-    expect(shownSort(null, [asc('sym')])).toEqual({ shown: [asc('sym')], asked: null });
-    // Cleared: asked for no sort, and the engine reports none
-    expect(shownSort([], [])).toEqual({ shown: [], asked: null });
+  it('is pending on a filter, keeping the reported sort', () => {
+    expect(shownView(5, 4, null, [asc('sym')])).toEqual({
+      pending: true,
+      sort: [asc('sym')],
+    });
+  });
+
+  it('shows what the engine reports once caught up, even unlike what was asked', () => {
+    expect(shownView(4, 4, [desc('px')], [asc('sym')])).toEqual({
+      pending: false,
+      sort: [asc('sym')],
+    });
+    // A grid that never sent anything, or reopened on a viewer ahead of it
+    expect(shownView(0, 0, null, [])).toEqual({ pending: false, sort: [] });
+    expect(shownView(0, 6, null, [asc('px')])).toEqual({
+      pending: false,
+      sort: [asc('px')],
+    });
   });
 });
