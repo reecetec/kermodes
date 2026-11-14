@@ -23,8 +23,8 @@ use crate::{Error, SourceId, TableName};
 /// The branch a local store's tables live on (architecture.md §10.1).
 pub const BRANCH: &str = "local";
 
-/// Receives a table's batches in order: every committed batch when it subscribes, then each new
-/// one as it commits. Returning `false` unsubscribes it (its table is gone).
+/// Receives a table's batches in order: every batch committed today (UTC) when it subscribes,
+/// then each new one as it commits. Returning `false` unsubscribes it (its table is gone).
 pub type Subscriber = Box<dyn FnMut(&RecordBatch) -> bool + Send>;
 
 pub struct Store {
@@ -152,16 +152,25 @@ impl Store {
         Ok((last_seq, epoch))
     }
 
-    /// Feeds `subscriber` every committed batch of `name`, then each new one as it commits;
-    /// returns the table's schema.
+    /// Feeds `subscriber` every batch of `name` committed today (UTC), then each new one as it
+    /// commits; returns the table's schema. A live table is intraday (§7.3): earlier days are
+    /// history, read from the lake once merged, not replayed into every reader.
     pub fn subscribe(
         &self,
         name: &TableName,
         mut subscriber: Subscriber,
     ) -> Result<SchemaRef, Error> {
+        let today = utc_date(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos() as i64),
+        );
         let log = self.log(name)?;
         let mut log = lock(&log.state);
-        for partition in log.partitions.values() {
+        for ((date, _), partition) in &log.partitions {
+            if *date < today {
+                continue;
+            }
             for batch in partition.batches()? {
                 if !subscriber(&batch) {
                     return Ok(log.entry.schema.clone());

@@ -399,9 +399,11 @@ catalog as live tables.
 ### 7.2 Serving
 
 - Subscribers are engine workers, not end users.
-- Subscribe = snapshot (every committed batch) then tail (each new batch as it commits), in one
-  Flight `DoGet` stream per subscriber. A slow subscriber's batches queue on the server rather
-  than holding up writers.
+- Subscribe = snapshot (every batch committed today, UTC) then tail (each new batch as it
+  commits), in one Flight `DoGet` stream per subscriber. Live tables are intraday: earlier days
+  stay in weir until merged and are read as history (§8), never replayed into every reader, whose
+  memory would otherwise grow with every day kept. A slow subscriber's batches queue on the
+  server rather than holding up writers.
 - Later: sealed segments over `DoGet` with the engine caching them locally, the tail over
   `DoExchange` resumed by row position (§17).
 - Co-located workers may memory-map sealed segments directly; this is an optimization only.

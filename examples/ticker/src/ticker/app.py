@@ -14,11 +14,12 @@ COLUMNS = {
 }
 
 
-# The feed and its connector use about 35m CPU and 40Mi at 1,500 ticks a second.
+# About 100 ticks a second, some 100 MB a day in weir: a demo that runs for weeks until the merge
+# job moves days to the lake. It uses well under its size (35m CPU and 40Mi at 1,500 a second).
 @km.deployment(cpu=0.25, memory="256Mi")
 def ticks(db):
     db.create_table("md.ticks", COLUMNS)
-    feed = km.demo.ticker(rate=1_500, symbols=100)
+    feed = km.demo.ticker(rate=100, symbols=100)
     # Waits for the run it replaces to hand over md.ticks (a rolling update).
     ingest = db.ingest_websocket(feed.url, "md.ticks", source="ticks", wait=True)
     # The feed and its connector run as long as this function holds them.

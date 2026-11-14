@@ -129,6 +129,32 @@ fn rows_survive_reopening_and_resends_are_dropped() {
     assert_eq!(values(&store), (0..7).collect::<Vec<_>>());
 }
 
+/// A live table is intraday: a subscriber gets today's batches and not earlier days', which stay
+/// on disk, and the source's sequence goes on across the day.
+#[test]
+fn subscribers_start_at_today() {
+    let dir = TempDir::new();
+    {
+        let store = Store::open(&dir.0).unwrap();
+        store.create_table(&ticks(), &schema()).unwrap();
+        let writer = store.writer(&ticks(), &source("feed"), false).unwrap();
+        writer.write(&batch(0..3), None).unwrap();
+    }
+    // What was written becomes an earlier day's partition.
+    let (index, _) = segments(&dir.0).remove(0);
+    let today = index.parent().unwrap().parent().unwrap().to_path_buf();
+    fs::rename(&today, today.with_file_name("2000-01-01")).unwrap();
+
+    let store = Store::open(&dir.0).unwrap();
+    assert_eq!(values(&store), Vec::<i64>::new());
+    let writer = store.writer(&ticks(), &source("feed"), false).unwrap();
+    assert_eq!(writer.last_seq(), Some(1));
+    writer.write(&batch(3..5), None).unwrap();
+    assert_eq!(writer.last_seq(), Some(2));
+    assert_eq!(values(&store), vec![3, 4]);
+    assert!(today.with_file_name("2000-01-01").exists());
+}
+
 #[test]
 fn recovery_keeps_committed_batches_and_drops_what_a_crash_cut_short() {
     let dir = TempDir::new();
