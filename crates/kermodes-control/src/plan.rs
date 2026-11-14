@@ -468,6 +468,7 @@ mod tests {
             rollout,
             cpu: "250m".into(),
             memory: "1Gi".into(),
+            defined_at: None,
         }
     }
 

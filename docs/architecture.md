@@ -1208,15 +1208,29 @@ namespaces).
   an upgrade) its tables go from the UI and come back with it, and pages keep loading. A
   `kermodes run` started while weir is away waits for it too, so a program that lost weir
   restarts once rather than crash-looping.
-- Deployments, the main tab wherever a controller runs, as Deephaven's query monitor lists
+- Deployments, the home page wherever a controller runs, as Deephaven's query monitor lists
   persistent queries: `kermodes ui` serves `sys.deployments`' newest row per deployment as the
   view `deployments`, which the app opens for this tab and does not list among Tables. Each row shows the deployment and its project,
   status, revision (and any update), CPU and memory as shares of its size with their recent
-  history, restarts, uptime, node, and newest Warning event. A row opens its overview, events,
-  and log, with Roll out, Restart, Stop, and Start. A commit that failed discovery shows above the list.
+  history, restarts, uptime, node, and newest Warning event. A search above the list keeps rows
+  where every word appears in some field (`/` focuses it). A row opens its overview, events,
+  and log in a panel docked below the list, as tall as it was last dragged; the list keeps its
+  width and its columns their places. Roll out, Restart, Stop, and Start are there. A commit that
+  failed discovery shows above the list.
+- A deployment's revision links, in a new tab, to where its project declares it at the commit it
+  runs, on the project's git host (GitHub's, GitLab's, or Gitea's page form): discovery records
+  each resource's file and line (`defined_at` in the manifest) and the controller builds the
+  link (`/api/projects`). Commits from before `defined_at` link to the project's directory.
+- Above the list, the platform's own components (weir, Postgres, the controller, the web UI)
+  as Kubernetes shows their pods: readiness, version, node, restarts, CPU and memory, and the
+  newest Warning event, each opening its pods, events, and logs. The controller reads them
+  (`/api/components`) rather than a `sys.*` table, so the page can say weir is down while it is.
   With `kermodes ui --control URL` (the chart sets it with the controller), the server passes
-  the controller's project, event, log, rollout, and restart routes through, by name only.
-  Without a controller the tab is absent.
+  the controller's project, component, event, log, rollout, and restart routes through, by name
+  only. Without a controller the tab is absent.
+- Later: a batch job's progress live on its row (a tqdm-style hook in the job's code), and its
+  DAG drawn when the row is opened, as Argo Workflows shows a workflow. Times shown in each
+  user's time zone, a user setting, instead of UTC.
 - v1 surfaces: catalog (schemas, versions, lineage), live and historical table viewer, console
   (SQL and table-API editor on CodeMirror 6, `EXPLAIN` view), pipelines (commit → build → test →
   plan → roll out), deployments (running commit, available update, rollout state, Restart and Roll

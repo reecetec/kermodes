@@ -135,6 +135,8 @@ pub fn serve(
     let router = Router::new()
         .route("/ws", get(upgrade))
         .route("/api/projects", get(projects))
+        .route("/api/components", get(components))
+        .route("/api/components/{component}/{action}", get(component_get))
         .route(
             "/api/deployments/{project}/{resource}/{action}",
             get(deployment_get).post(deployment_post),
@@ -228,6 +230,52 @@ async fn projects(State(shared): State<Arc<Shared>>) -> Response {
     to_control(&shared, Method::GET, "/api/projects").await
 }
 
+/// The platform's components (weir, Postgres, the controller, the web UI), as Kubernetes shows
+/// them: read from the controller, so the page can say weir is down while it is.
+async fn components(State(shared): State<Arc<Shared>>) -> Response {
+    to_control(&shared, Method::GET, "/api/components").await
+}
+
+/// A component's `events`, or `logs` (`?pod=` one of its pods, `?tail=` lines).
+async fn component_get(
+    State(shared): State<Arc<Shared>>,
+    UrlPath((component, action)): UrlPath<(String, String)>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    if !plain(&component) {
+        return control_error(StatusCode::BAD_REQUEST, "not a component name");
+    }
+    // Only these parameters, re-encoded from their parsed values.
+    let mut params = Vec::new();
+    for (key, value) in query
+        .as_deref()
+        .unwrap_or_default()
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+    {
+        match key {
+            "tail" if value.parse::<u32>().is_ok() => params.push(format!("tail={value}")),
+            "pod" if plain(value) => params.push(format!("pod={value}")),
+            _ => {}
+        }
+    }
+    let path = match action.as_str() {
+        "events" => format!("/api/components/{component}/events"),
+        "logs" if params.is_empty() => format!("/api/components/{component}/logs"),
+        "logs" => format!("/api/components/{component}/logs?{}", params.join("&")),
+        _ => return control_error(StatusCode::NOT_FOUND, "no such component page"),
+    };
+    to_control(&shared, Method::GET, &path).await
+}
+
+/// A name, never a path: letters, digits, `-`, and `_`.
+fn plain(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 /// A deployment's `events` or `logs` (`?tail=` lines).
 async fn deployment_get(
     State(shared): State<Arc<Shared>>,
@@ -271,11 +319,6 @@ async fn to_deployment(
     action: &str,
 ) -> Response {
     // Names, never paths: nothing else of the controller's API is reachable from here.
-    let plain = |s: &str| {
-        !s.is_empty()
-            && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    };
     if !plain(project) || !plain(resource) {
         return control_error(StatusCode::BAD_REQUEST, "not a project and resource name");
     }

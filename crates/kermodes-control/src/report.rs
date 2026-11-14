@@ -358,6 +358,7 @@ mod tests {
             rollout: Replacement::Rolling,
             cpu: "250m".into(),
             memory: "256Mi".into(),
+            defined_at: None,
         };
         let observed = Observed {
             rollout: Rollout::Rolling,

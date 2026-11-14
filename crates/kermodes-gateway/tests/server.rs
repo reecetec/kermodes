@@ -240,3 +240,75 @@ async fn the_app_is_served_from_its_directory_only() {
     );
     std::fs::remove_dir_all(app).unwrap();
 }
+
+/// The controller's API is reachable only through the routes the app uses, with names checked
+/// and parameters re-encoded: a component's logs keep `pod` and `tail`, and nothing else.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_the_apps_controller_routes_reach_the_controller() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // A controller that answers everything and records what it was asked.
+    let controller = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", controller.local_addr().unwrap());
+    let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let record = asked.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = controller.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let n = stream.read(&mut request).await.unwrap();
+            let line = String::from_utf8_lossy(&request[..n]).into_owned();
+            let path = line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_owned();
+            record.lock().unwrap().push(path);
+            let answer = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok";
+            stream.write_all(answer).await.unwrap();
+        }
+    });
+    let server = kermodes_gateway::serve(
+        Session::new(),
+        "127.0.0.1:0".parse().unwrap(),
+        None,
+        Some(url),
+    )
+    .unwrap();
+    let status = |path: &str| {
+        let addr = server.addr();
+        let path = path.to_owned();
+        async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let request = format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            response
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_owned()
+        }
+    };
+    assert_eq!(status("/api/components").await, "200");
+    assert_eq!(
+        status("/api/components/weir/logs?pod=kermodes-weir-0&tail=50&follow=1").await,
+        "200"
+    );
+    assert_eq!(
+        status("/api/components/weir/logs?pod=..%2F..%2Fsnapshots&tail=all").await,
+        "200"
+    );
+    assert_eq!(status("/api/components/weir/events").await, "200");
+    assert_eq!(status("/api/components/weir/restart").await, "404");
+    assert_eq!(status("/api/components/..%2Fsnapshots/events").await, "400");
+    assert_eq!(
+        *asked.lock().unwrap(),
+        [
+            "/api/components",
+            "/api/components/weir/logs?pod=kermodes-weir-0&tail=50",
+            "/api/components/weir/logs",
+            "/api/components/weir/events",
+        ]
+    );
+}

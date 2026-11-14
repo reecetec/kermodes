@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
+use crate::browse;
 use crate::git::{self, Credentials, Repository};
 use crate::k8s::Kube;
 use crate::leader::{Leadership, Wake};
@@ -595,12 +596,17 @@ pub async fn status(controller: &Controller) -> Result<Value, String> {
                 let running = deployed.get(&resource.name);
                 let name = plan::object_name(&project.name, &resource.name)?;
                 let rollout = controller.kube.rollout(&name).await?;
+                let source = match running {
+                    Some(commit) => source(controller, project, commit, &resource.name).await?,
+                    None => None,
+                };
                 resources.push(json!({
                     "name": resource.name,
                     "update": format!("{:?}", resource.update).to_lowercase(),
                     "commit": running,
                     "available": (running != Some(&latest.commit)).then_some(&latest.commit),
                     "rollout": format!("{rollout:?}").to_lowercase(),
+                    "source": source,
                 }));
             }
         }
@@ -615,6 +621,43 @@ pub async fn status(controller: &Controller) -> Result<Value, String> {
         }));
     }
     Ok(json!({ "projects": projects }))
+}
+
+/// The page showing where `resource` is declared at `commit` on the project's git host, or the
+/// project's directory there when that commit's manifest does not say.
+async fn source(
+    controller: &Controller,
+    project: &ProjectConfig,
+    commit: &str,
+    resource: &str,
+) -> Result<Option<String>, String> {
+    let stored = controller
+        .state
+        .lock()
+        .await
+        .commit(&project.name, commit)
+        .await?;
+    let defined_at = stored
+        .and_then(|c| c.manifest)
+        .and_then(|manifest| Manifest::parse(&manifest).ok())
+        .and_then(|manifest| {
+            let resource = manifest
+                .resources
+                .into_iter()
+                .find(|r| r.name == resource)?;
+            resource.defined_at
+        });
+    let directory = project.path.trim_matches('/');
+    Ok(match defined_at {
+        Some(at) => {
+            let file = match directory {
+                "" => at.file,
+                directory => format!("{directory}/{}", at.file),
+            };
+            browse::source_url(&project.url, commit, &file, Some(at.line))
+        }
+        None => browse::source_url(&project.url, commit, directory, None),
+    })
 }
 
 fn target(controller: &Controller, project: &ProjectConfig, commit: &str) -> Target {

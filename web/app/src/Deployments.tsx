@@ -1,492 +1,295 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import {
-  AlertTriangle,
-  GitCommitHorizontal,
-  Play,
-  RotateCcw,
-  Rocket,
-  ServerCog,
-  Square,
-  X,
-} from 'lucide-react';
-import { tableFromIPC } from 'apache-arrow';
+import { AlertTriangle, Search, X } from 'lucide-react';
 import type { KermodesConnection } from '@kermodes/client';
-import { toBytes } from '@kermodes/grid';
-import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
-import { ScrollArea } from '@/components/ui/scroll-area';
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { Input } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
+import { DEPLOYMENTS_VIEW, useComponents, useDeployments, useProjects } from '@/deployments/data';
+import { ComponentDetail, DeploymentDetail } from '@/deployments/Details';
+import {
+  ago,
+  bytes,
+  clampPanel,
+  cores,
+  deploymentFields,
+  key,
+  matchesSearch,
+} from '@/deployments/model';
+import { Commit, Status, Usage } from '@/deployments/parts';
+import { SystemStrip } from '@/deployments/SystemStrip';
 
-/** The view of `sys.deployments` the UI's server publishes for this page: each deployment's newest row */
-export const DEPLOYMENTS_VIEW = 'deployments';
+export { DEPLOYMENTS_VIEW };
 
-/** A row of `sys.deployments`, as `kermodes control` reports it every few seconds */
-export type Deployment = {
-  ts: number;
-  project: string;
-  name: string;
-  kind: string;
-  status: string;
-  update: string;
-  commit: string | null;
-  available: string | null;
-  node: string | null;
-  started: number | null;
-  restarts: number;
-  cpu: number;
-  cpu_limit: number;
-  cpu_pct: number;
-  memory: number;
-  memory_limit: number;
-  memory_pct: number;
-  event: string | null;
-  event_at: number | null;
-};
+type Selected = { kind: 'deployment'; key: string } | { kind: 'component'; name: string };
 
-type Project = {
-  name: string;
-  failed: { commit: string; error: string } | null;
-};
+const PANEL_STORAGE = 'kermodes.deployments.panel-height';
+const PANEL_DEFAULT = 380;
 
-const key = (d: { project: string; name: string }) => `${d.project}/${d.name}`;
-
-// Arrow gives int64 as bigint and timestamps as milliseconds
-const num = (value: unknown) => (value == null ? null : Number(value));
-
-/** Samples of CPU and memory kept per deployment for the sparklines: about 5 minutes */
-const HISTORY = 60;
-
-/** The deployments' newest rows, live, and a short history of their usage */
-function useDeployments(connection: KermodesConnection, published: boolean) {
-  const [rows, setRows] = useState<Deployment[]>([]);
-  const history = useRef(new Map<string, { ts: number; cpu: number; memory: number }[]>());
-  useEffect(() => {
-    if (!published) {
-      return;
-    }
-    const view = connection.open(DEPLOYMENTS_VIEW);
-    view.send({
-      type: 'sort',
-      by: [
-        { column: 'project', descending: false },
-        { column: 'name', descending: false },
-      ],
-    });
-    view.send({ type: 'viewport', top: 0, bottom: 9_999 });
-    const stop = view.onMessage((header, buffers) => {
-      if (header.type !== 'rows') {
-        return;
-      }
-      const table = tableFromIPC(toBytes(buffers[0]));
-      const next = table.toArray().map(row => {
-        const r = row.toJSON() as Record<string, unknown>;
-        return {
-          ...(r as Omit<Deployment, 'ts' | 'started' | 'event_at' | 'restarts' | 'memory'>),
-          ts: num(r.ts) ?? 0,
-          started: num(r.started),
-          event_at: num(r.event_at),
-          restarts: num(r.restarts) ?? 0,
-          memory: num(r.memory) ?? 0,
-          memory_limit: num(r.memory_limit) ?? 0,
-        } as Deployment;
-      });
-      for (const d of next) {
-        const samples = history.current.get(key(d)) ?? [];
-        if (samples.at(-1)?.ts !== d.ts) {
-          samples.push({ ts: d.ts, cpu: d.cpu_pct, memory: d.memory_pct });
-          history.current.set(key(d), samples.slice(-HISTORY));
-        }
-      }
-      setRows(next);
-    });
-    return () => {
-      stop();
-      view.close();
-    };
-  }, [connection, published]);
-  return { rows, history: history.current };
-}
-
-/** Projects with a commit that failed discovery, polled from the controller */
-function useFailedProjects(): Project[] {
-  const [projects, setProjects] = useState<Project[]>([]);
-  useEffect(() => {
-    const load = async () => {
-      const response = await fetch('/api/projects').catch(() => null);
-      if (response?.ok) {
-        setProjects((await response.json()).projects);
-      }
-    };
-    void load();
-    const timer = setInterval(() => void load(), 10_000);
-    return () => clearInterval(timer);
+/** The details panel's height as the user last left it */
+function useStoredHeight() {
+  const [height, setHeight] = useState(
+    () => Number(localStorage.getItem(PANEL_STORAGE)) || PANEL_DEFAULT
+  );
+  const store = useCallback((next: number) => {
+    setHeight(next);
+    localStorage.setItem(PANEL_STORAGE, String(next));
   }, []);
-  return projects.filter(p => p.failed != null);
+  return [height, store] as const;
 }
 
-const STATUS_VARIANT: Record<string, 'success' | 'warning' | 'destructive' | 'outline'> = {
-  Running: 'success',
-  'Rolling out': 'warning',
-  Starting: 'warning',
-  'Not running': 'outline',
-  Stopped: 'outline',
-  Stopping: 'warning',
-};
-
-function Status({ status }: { status: string }) {
-  return <Badge variant={STATUS_VARIANT[status] ?? 'destructive'}>{status}</Badge>;
+/** An element's height, kept current as it resizes */
+function useHeight(ref: React.RefObject<HTMLElement | null>) {
+  const [height, setHeight] = useState(0);
+  useEffect(() => {
+    const element = ref.current;
+    if (element == null) return;
+    const observer = new ResizeObserver(([entry]) => setHeight(entry.contentRect.height));
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [ref]);
+  return height;
 }
 
-/** A short commit, inline with the text around it: the surrounding size, on its baseline */
-function Commit({ commit }: { commit: string | null }) {
-  if (commit == null) return <span className="text-muted-foreground">—</span>;
-  return (
-    <span className="font-mono whitespace-nowrap">
-      <GitCommitHorizontal className="mr-1 inline size-[1.1em] align-[-0.2em] text-muted-foreground" />
-      {commit.slice(0, 7)}
-    </span>
-  );
-}
-
-function bytes(n: number): string {
-  if (n >= 1 << 30) return `${(n / (1 << 30)).toFixed(1)} GiB`;
-  if (n >= 1 << 20) return `${Math.round(n / (1 << 20))} MiB`;
-  return `${Math.round(n / 1024)} KiB`;
-}
-
-function cores(n: number): string {
-  return n >= 1 ? `${n.toFixed(2)} cores` : `${Math.round(n * 1000)}m`;
-}
-
-function ago(ms: number | null): string {
-  if (ms == null) return '—';
-  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
-  if (s < 60) return `${s}s`;
-  if (s < 3600) return `${Math.floor(s / 60)}m`;
-  if (s < 86_400) return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
-  return `${Math.floor(s / 86_400)}d ${Math.floor((s % 86_400) / 3600)}h`;
-}
-
-/** A share of a deployment's size, as a bar with its history behind it */
-function Usage({
-  pct,
-  samples,
-  label,
+/** A handle between the page and the panel below it: drag, arrow keys, or double-click to reset */
+function Splitter({
+  height,
+  onResize,
 }: {
-  pct: number;
-  samples: number[];
-  label: string;
+  height: number;
+  onResize: (height: number) => void;
 }) {
-  const width = 96;
-  const height = 22;
-  const points = samples
-    .map((v, i) => {
-      const x = samples.length < 2 ? width : (i / (samples.length - 1)) * width;
-      const y = height - (Math.min(v, 100) / 100) * height;
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    })
-    .join(' ');
-  const tone = pct >= 90 ? 'text-destructive' : pct >= 70 ? 'text-warning' : 'text-success';
+  const [dragging, setDragging] = useState(false);
+  const start = useRef({ y: 0, height: 0 });
   return (
-    <div className="flex items-center gap-2" title={label}>
-      <svg width={width} height={height} className={cn('shrink-0', tone)} aria-hidden>
-        <rect x={0} y={0} width={width} height={height} className="fill-muted/40" rx={3} />
-        <rect
-          x={0}
-          y={height - 3}
-          width={(Math.min(pct, 100) / 100) * width}
-          height={3}
-          className="fill-current opacity-60"
-          rx={1.5}
-        />
-        {samples.length > 1 && (
-          <polyline points={points} fill="none" stroke="currentColor" strokeWidth={1.25} />
-        )}
-      </svg>
-      <span className="w-11 text-right font-mono text-xs tabular-nums">{pct.toFixed(0)}%</span>
+    <div
+      role="separator"
+      aria-orientation="horizontal"
+      aria-label="Resize details"
+      aria-valuenow={height}
+      tabIndex={0}
+      data-dragging={dragging}
+      title="Drag to resize · double-click to reset"
+      onPointerDown={event => {
+        event.preventDefault();
+        event.currentTarget.setPointerCapture(event.pointerId);
+        start.current = { y: event.clientY, height };
+        setDragging(true);
+      }}
+      onPointerMove={event => {
+        if (dragging) {
+          onResize(start.current.height + start.current.y - event.clientY);
+        }
+      }}
+      onPointerUp={() => setDragging(false)}
+      onPointerCancel={() => setDragging(false)}
+      onDoubleClick={() => onResize(PANEL_DEFAULT)}
+      onKeyDown={event => {
+        if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+          event.preventDefault();
+          onResize(height + (event.key === 'ArrowUp' ? 32 : -32));
+        }
+      }}
+      className={cn(
+        'group relative h-1.5 shrink-0 cursor-row-resize border-t bg-muted/40 outline-none',
+        'hover:bg-primary/30 focus-visible:bg-primary/40 data-[dragging=true]:bg-primary/50'
+      )}
+    >
+      <span className="absolute top-1/2 left-1/2 h-0.5 w-10 -translate-x-1/2 -translate-y-1/2 rounded-full bg-muted-foreground/40 group-hover:bg-primary" />
     </div>
   );
 }
 
-async function post(url: string): Promise<string | null> {
-  const response = await fetch(url, { method: 'POST' }).catch(e => e as Error);
-  if (response instanceof Error) return String(response);
-  if (response.ok) return null;
-  const text = await response.text();
-  try {
-    return JSON.parse(text).error ?? text;
-  } catch {
-    return text || `${response.status} ${response.statusText}`;
-  }
-}
-
-type Event = {
-  type: string;
-  reason: string | null;
-  message: string | null;
-  count: number | null;
-  at_ns: number;
-  object: string;
-};
-
-function usePolled<T>(url: string, every: number, parse: (r: Response) => Promise<T>) {
-  const [value, setValue] = useState<T | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  useEffect(() => {
-    let live = true;
-    const load = async () => {
-      const response = await fetch(url).catch(e => e as Error);
-      if (!live) return;
-      if (response instanceof Error) {
-        setError(String(response));
-      } else if (!response.ok) {
-        setError((await response.text()) || `${response.status}`);
-      } else {
-        setError(null);
-        setValue(await parse(response));
-      }
-    };
-    void load();
-    const timer = setInterval(() => void load(), every);
-    return () => {
-      live = false;
-      clearInterval(timer);
-    };
-  }, [url, every, parse]);
-  return { value, error };
-}
-
-const parseJson = (r: Response) => r.json() as Promise<Event[]>;
-const parseText = (r: Response) => r.text();
-
-function Events({ path }: { path: string }) {
-  const { value, error } = usePolled(`${path}/events`, 5000, parseJson);
-  if (error != null) return <p className="p-4 text-sm text-destructive">{error}</p>;
-  if (value == null) return <p className="p-4 text-sm text-muted-foreground">Loading…</p>;
-  if (value.length === 0) return <p className="p-4 text-sm text-muted-foreground">No events.</p>;
-  return (
-    <table className="w-full text-sm">
-      <tbody>
-        {value.map((e, i) => (
-          <tr key={i} className="border-b align-top">
-            <td className="py-2 pr-3 pl-4 whitespace-nowrap text-muted-foreground">
-              {ago(e.at_ns / 1e6)} ago
-            </td>
-            <td className="py-2 pr-3">
-              <span className={cn('font-medium', e.type === 'Warning' && 'text-destructive')}>
-                {e.reason}
-              </span>
-              {(e.count ?? 1) > 1 && (
-                <span className="text-muted-foreground"> ×{e.count}</span>
-              )}
-              <div className="font-mono text-xs text-muted-foreground">{e.object}</div>
-            </td>
-            <td className="py-2 pr-4">{e.message}</td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
-  );
-}
-
-function Logs({ path }: { path: string }) {
-  const { value, error } = usePolled(`${path}/logs?tail=500`, 3000, parseText);
-  const end = useRef<HTMLDivElement>(null);
-  // A block body: scrollIntoView returns a Promise in newer browsers, and an effect may only
-  // return its cleanup.
-  useEffect(() => {
-    end.current?.scrollIntoView({ block: 'end' });
-  }, [value]);
-  if (error != null) return <p className="p-4 text-sm text-destructive">{error}</p>;
-  return (
-    <pre className="p-4 font-mono text-xs leading-relaxed whitespace-pre-wrap">
-      {value ?? 'Loading…'}
-      <div ref={end} />
-    </pre>
-  );
-}
-
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div className="grid grid-cols-[9rem_1fr] gap-2 border-b py-2 text-sm">
-      <span className="text-muted-foreground">{label}</span>
-      <span className="min-w-0 break-words">{children}</span>
-    </div>
-  );
-}
-
-function Detail({ deployment, onClose }: { deployment: Deployment; onClose: () => void }) {
-  const d = deployment;
-  const path = `/api/deployments/${encodeURIComponent(d.project)}/${encodeURIComponent(d.name)}`;
-  const [busy, setBusy] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const stopped = d.status === 'Stopped' || d.status === 'Stopping';
-  const act = async (action: 'rollout' | 'restart' | 'stop' | 'start') => {
-    setBusy(action);
-    setError(await post(`${path}/${action}`));
-    setBusy(null);
-  };
-  return (
-    <aside className="flex w-[min(44rem,55vw)] shrink-0 flex-col border-l bg-background">
-      <header className="flex items-center gap-3 border-b px-4 py-3">
-        <ServerCog className="size-4 text-muted-foreground" />
-        <div className="min-w-0">
-          <div className="font-mono text-[15px] font-semibold">{d.name}</div>
-          <div className="text-xs text-muted-foreground">
-            {d.project} · {d.kind}
-          </div>
-        </div>
-        <Status status={d.status} />
-        <div className="ml-auto flex items-center gap-2">
-          {d.available != null && d.update === 'manual' && (
-            <Button size="sm" variant="outline" disabled={busy != null} onClick={() => void act('rollout')}>
-              <Rocket />
-              Roll out {d.available.slice(0, 7)}
-            </Button>
-          )}
-          {!stopped && (
-            <Button size="sm" variant="outline" disabled={busy != null} onClick={() => void act('restart')}>
-              <RotateCcw />
-              Restart
-            </Button>
-          )}
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={busy != null}
-            onClick={() => void act(stopped ? 'start' : 'stop')}
-          >
-            {stopped ? <Play /> : <Square />}
-            {stopped ? 'Start' : 'Stop'}
-          </Button>
-          <Button variant="ghost" size="icon-sm" onClick={onClose} aria-label="Close">
-            <X />
-          </Button>
-        </div>
-      </header>
-      {error != null && <p className="border-b px-4 py-2 text-sm text-destructive">{error}</p>}
-      <Tabs defaultValue="overview" className="min-h-0 flex-1 gap-0">
-        <TabsList className="h-10 w-full justify-start gap-1 rounded-none border-b bg-transparent px-2">
-          {(['overview', 'events', 'logs'] as const).map(name => (
-            <TabsTrigger
-              key={name}
-              value={name}
-              className="h-full border-b-2 border-transparent px-3 capitalize hover:text-foreground data-[state=active]:border-primary data-[state=active]:text-foreground"
-            >
-              {name}
-            </TabsTrigger>
-          ))}
-        </TabsList>
-        <TabsContent value="overview" className="min-h-0">
-          <ScrollArea className="h-full">
-            <div className="px-4 py-2">
-              <Field label="Status">{d.status}</Field>
-              <Field label="Commit">
-                <span className="font-mono text-[13px]">{d.commit ?? '—'}</span>
-              </Field>
-              <Field label="Update available">
-                {d.available == null ? 'Up to date' : <span className="font-mono text-[13px]">{d.available}</span>}
-              </Field>
-              <Field label="Update policy">{d.update}</Field>
-              <Field label="Node">{d.node ?? '—'}</Field>
-              <Field label="Up for">{ago(d.started)}</Field>
-              <Field label="Restarts">{d.restarts}</Field>
-              <Field label="CPU">
-                {cores(d.cpu)} of {cores(d.cpu_limit)} ({d.cpu_pct.toFixed(0)}%)
-              </Field>
-              <Field label="Memory">
-                {bytes(d.memory)} of {bytes(d.memory_limit)} ({d.memory_pct.toFixed(0)}%)
-              </Field>
-              <Field label="Last warning">
-                {d.event == null ? '—' : `${d.event} (${ago(d.event_at)} ago)`}
-              </Field>
-              <Field label="Reported">{ago(d.ts)} ago</Field>
-            </div>
-          </ScrollArea>
-        </TabsContent>
-        <TabsContent value="events" className="min-h-0">
-          <ScrollArea className="h-full">
-            <Events path={path} />
-          </ScrollArea>
-        </TabsContent>
-        <TabsContent value="logs" className="min-h-0">
-          <ScrollArea className="h-full">
-            <Logs path={path} />
-          </ScrollArea>
-        </TabsContent>
-      </Tabs>
-    </aside>
-  );
-}
+/** Widths fixed so that values changing, or the panel opening, never move a column */
+const COLUMNS: { label: string; width: string }[] = [
+  { label: 'Deployment', width: 'w-[18rem]' },
+  { label: 'Project', width: 'w-[9rem]' },
+  { label: 'Status', width: 'w-[8.5rem]' },
+  { label: 'Revision', width: 'w-[10rem]' },
+  { label: 'CPU', width: 'w-[10.5rem]' },
+  { label: 'Memory', width: 'w-[10.5rem]' },
+  { label: 'Restarts', width: 'w-[5.5rem]' },
+  { label: 'Up', width: 'w-[6.5rem]' },
+  { label: 'Node', width: 'w-[9rem]' },
+  { label: 'Last warning', width: '' },
+];
 
 export function DeploymentsPage({ connection }: { connection: KermodesConnection }) {
   const published = connection.pages.includes(DEPLOYMENTS_VIEW);
   const { rows, history } = useDeployments(connection, published);
-  const failed = useFailedProjects();
-  const [selected, setSelected] = useState<string | null>(null);
-  const open = useMemo(() => rows.find(d => key(d) === selected) ?? null, [rows, selected]);
+  const projects = useProjects();
+  const system = useComponents();
+  const [selected, setSelected] = useState<Selected | null>(null);
+  const [query, setQuery] = useState('');
+  const search = useRef<HTMLInputElement>(null);
+  const page = useRef<HTMLDivElement>(null);
+  const table = useRef<HTMLDivElement>(null);
+  const available = useHeight(page);
+  const [height, setHeight] = useStoredHeight();
   const close = useCallback(() => setSelected(null), []);
+
+  const sources = useMemo(() => {
+    const links = new Map<string, string | null>();
+    for (const project of projects) {
+      for (const resource of project.resources ?? []) {
+        links.set(`${project.name}/${resource.name}`, resource.source);
+      }
+    }
+    return links;
+  }, [projects]);
+  const failed = projects.filter(p => p.failed != null);
+  const shown = useMemo(
+    () => rows.filter(d => matchesSearch(deploymentFields(d), query)),
+    [rows, query]
+  );
+
+  const deployment =
+    selected?.kind === 'deployment' ? (rows.find(d => key(d) === selected.key) ?? null) : null;
+  const component =
+    selected?.kind === 'component'
+      ? (system.components?.find(c => c.name === selected.name) ?? null)
+      : null;
+  const open = deployment != null || component != null;
+
+  // `/` searches; Escape leaves the search, else closes the details.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      const typing =
+        event.target instanceof HTMLElement &&
+        event.target.closest('input, textarea, select, [contenteditable="true"]') != null;
+      if (event.key === '/' && !typing && !event.metaKey && !event.ctrlKey) {
+        event.preventDefault();
+        search.current?.focus();
+      } else if (event.key === 'Escape' && !typing && open) {
+        close();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open, close]);
+
+  // The chosen row stays in sight as the panel opens beneath it.
+  const selectedKey = selected?.kind === 'deployment' ? selected.key : null;
+  useEffect(() => {
+    if (selectedKey == null) return;
+    const frame = requestAnimationFrame(() =>
+      table.current
+        ?.querySelector('[aria-selected="true"]')
+        ?.scrollIntoView({ block: 'nearest' })
+    );
+    return () => cancelAnimationFrame(frame);
+  }, [selectedKey]);
+
+  const panelHeight = clampPanel(height, available);
   return (
-    <div className="flex min-h-0 flex-1">
-      <ScrollArea className="min-h-0 min-w-0 flex-1">
-        <div className="flex flex-col gap-3 p-4">
-          {failed.map(p => (
-            <div
-              key={p.name}
-              className="flex gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm"
-            >
-              <AlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive" />
-              <div className="min-w-0">
-                <div>
-                  <span className="font-medium">{p.name}</span>: commit{' '}
-                  <Commit commit={p.failed!.commit} /> failed discovery, so it is not rolled out.
-                </div>
-                <pre className="mt-1 overflow-x-auto font-mono text-xs whitespace-pre-wrap text-muted-foreground">
-                  {p.failed!.error}
-                </pre>
+    <div ref={page} className="flex min-h-0 flex-1 flex-col">
+      <div className="flex min-h-0 flex-1 flex-col gap-3 px-4 pt-4">
+        <SystemStrip
+          components={system.components}
+          error={system.error}
+          history={system.history}
+          selected={selected?.kind === 'component' ? selected.name : null}
+          onSelect={name => setSelected({ kind: 'component', name })}
+        />
+        {failed.map(p => (
+          <div
+            key={p.name}
+            className="flex gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm"
+          >
+            <AlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive" />
+            <div className="min-w-0">
+              <div>
+                <span className="font-medium">{p.name}</span>: commit{' '}
+                <Commit commit={p.failed!.commit} /> failed discovery, so it is not rolled out.
               </div>
+              <pre className="mt-1 overflow-x-auto font-mono text-xs whitespace-pre-wrap text-muted-foreground">
+                {p.failed!.error}
+              </pre>
             </div>
-          ))}
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b text-left text-xs text-muted-foreground">
-                <th className="py-2 pr-4 pl-3 font-medium">Deployment</th>
-                <th className="py-2 pr-4 font-medium">Project</th>
-                <th className="py-2 pr-4 font-medium">Status</th>
-                <th className="py-2 pr-4 font-medium">Revision</th>
-                <th className="py-2 pr-4 font-medium">CPU</th>
-                <th className="py-2 pr-4 font-medium">Memory</th>
-                <th className="py-2 pr-4 font-medium">Restarts</th>
-                <th className="py-2 pr-4 font-medium">Up</th>
-                <th className="py-2 pr-4 font-medium">Node</th>
-                <th className="py-2 pr-3 font-medium">Last warning</th>
+          </div>
+        ))}
+        <div className="flex items-center gap-3">
+          <div className="relative w-full max-w-sm">
+            <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              ref={search}
+              value={query}
+              onChange={event => setQuery(event.target.value)}
+              onKeyDown={event => {
+                if (event.key === 'Escape') {
+                  setQuery('');
+                  event.currentTarget.blur();
+                }
+              }}
+              placeholder="Search deployments"
+              aria-label="Search deployments"
+              className="h-8 pr-8 pl-8"
+            />
+            {query === '' ? (
+              <kbd className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 rounded border px-1.5 font-mono text-[11px] text-muted-foreground">
+                /
+              </kbd>
+            ) : (
+              <button
+                type="button"
+                aria-label="Clear search"
+                onClick={() => setQuery('')}
+                className="absolute top-1/2 right-2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+              >
+                <X className="size-4" />
+              </button>
+            )}
+          </div>
+          <span className="text-xs text-muted-foreground tabular-nums">
+            {shown.length === rows.length
+              ? `${rows.length} ${rows.length === 1 ? 'deployment' : 'deployments'}`
+              : `${shown.length} of ${rows.length}`}
+          </span>
+        </div>
+        <div ref={table} className="min-h-0 flex-1 overflow-auto rounded-md border">
+          <table className="w-full min-w-[96rem] table-fixed text-sm">
+            <colgroup>
+              {COLUMNS.map(c => (
+                <col key={c.label} className={c.width} />
+              ))}
+            </colgroup>
+            <thead className="sticky top-0 z-10 bg-background">
+              <tr className="text-left text-xs text-muted-foreground shadow-[inset_0_-1px_0_var(--border)]">
+                {COLUMNS.map(c => (
+                  <th key={c.label} className="py-2 pr-4 font-medium first:pl-3">
+                    {c.label}
+                  </th>
+                ))}
               </tr>
             </thead>
             <tbody>
-              {rows.map(d => {
+              {shown.map(d => {
                 const samples = history.get(key(d)) ?? [];
+                const isSelected = selected?.kind === 'deployment' && selected.key === key(d);
                 return (
                   <tr
                     key={key(d)}
-                    onClick={() => setSelected(key(d))}
+                    aria-selected={isSelected}
+                    onClick={() => setSelected({ kind: 'deployment', key: key(d) })}
                     className={cn(
-                      'cursor-pointer border-b hover:bg-accent/50',
-                      selected === key(d) && 'bg-accent'
+                      'cursor-pointer border-b last:border-b-0 hover:bg-accent/50',
+                      isSelected && 'bg-accent'
                     )}
                   >
-                    <td className="py-2 pr-4 pl-3">
-                      <div className="font-mono text-[13px] font-medium">{d.name}</div>
+                    <td className="truncate py-2 pr-4 pl-3">
+                      <div className="truncate font-mono text-[13px] font-medium" title={d.name}>
+                        {d.name}
+                      </div>
                       <div className="text-xs text-muted-foreground">{d.kind}</div>
                     </td>
-                    <td className="py-2 pr-4">{d.project}</td>
+                    <td className="truncate py-2 pr-4" title={d.project}>
+                      {d.project}
+                    </td>
                     <td className="py-2 pr-4">
                       <Status status={d.status} />
                     </td>
                     <td className="py-2 pr-4">
-                      <Commit commit={d.commit} />
+                      <Commit commit={d.commit} href={sources.get(key(d))} />
                       {d.available != null && (
-                        <div className="text-xs text-warning">
+                        <div className="truncate text-xs text-warning">
                           {d.update === 'manual' ? 'update available' : 'rolling to'}{' '}
                           {d.available.slice(0, 7)}
                         </div>
@@ -494,24 +297,28 @@ export function DeploymentsPage({ connection }: { connection: KermodesConnection
                     </td>
                     <td className="py-2 pr-4">
                       <Usage
-                        pct={d.cpu_pct}
+                        value={d.cpu}
+                        limit={d.cpu_limit}
                         samples={samples.map(s => s.cpu)}
-                        label={`${cores(d.cpu)} of ${cores(d.cpu_limit)}`}
+                        format={cores}
                       />
                     </td>
                     <td className="py-2 pr-4">
                       <Usage
-                        pct={d.memory_pct}
+                        value={d.memory}
+                        limit={d.memory_limit}
                         samples={samples.map(s => s.memory)}
-                        label={`${bytes(d.memory)} of ${bytes(d.memory_limit)}`}
+                        format={bytes}
                       />
                     </td>
                     <td className={cn('py-2 pr-4 tabular-nums', d.restarts > 0 && 'text-warning')}>
                       {d.restarts}
                     </td>
                     <td className="py-2 pr-4 tabular-nums">{ago(d.started)}</td>
-                    <td className="py-2 pr-4 text-xs text-muted-foreground">{d.node ?? '—'}</td>
-                    <td className="max-w-80 truncate py-2 pr-3 text-xs" title={d.event ?? undefined}>
+                    <td className="truncate py-2 pr-4 text-xs text-muted-foreground" title={d.node ?? undefined}>
+                      {d.node ?? '—'}
+                    </td>
+                    <td className="truncate py-2 pr-3 text-xs" title={d.event ?? undefined}>
                       {d.event == null ? (
                         <span className="text-muted-foreground">—</span>
                       ) : (
@@ -523,14 +330,37 @@ export function DeploymentsPage({ connection }: { connection: KermodesConnection
               })}
             </tbody>
           </table>
-          {rows.length === 0 && (
-            <p className="px-3 text-sm text-muted-foreground">
-              {published ? 'No deployments yet.' : 'Waiting for sys.deployments…'}
+          {shown.length === 0 && (
+            <p className="px-3 py-4 text-sm text-muted-foreground">
+              {rows.length > 0
+                ? `No deployment matches “${query}”.`
+                : published
+                  ? 'No deployments yet.'
+                  : 'Waiting for sys.deployments…'}
             </p>
           )}
         </div>
-      </ScrollArea>
-      {open != null && <Detail deployment={open} onClose={close} />}
+      </div>
+      {open ? (
+        <>
+          <Splitter height={panelHeight} onResize={next => setHeight(clampPanel(next, available))} />
+          <div style={{ height: panelHeight }} className="shrink-0">
+            {deployment != null && (
+              <DeploymentDetail
+                key={key(deployment)}
+                deployment={deployment}
+                source={sources.get(key(deployment)) ?? null}
+                onClose={close}
+              />
+            )}
+            {component != null && (
+              <ComponentDetail key={component.name} component={component} onClose={close} />
+            )}
+          </div>
+        </>
+      ) : (
+        <div className="h-4 shrink-0" />
+      )}
     </div>
   );
 }

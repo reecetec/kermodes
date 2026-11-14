@@ -53,6 +53,9 @@ def test_a_project_declares_ingesters_and_deployments(tmp_path):
             # Unsized: the defaults.
             "cpu": "500m",
             "memory": "512Mi",
+            # Where it is declared, relative to the project (the app's lines start after a
+            # blank one): the `km.ingester(` call.
+            "defined_at": {"file": "src/ticker/app.py", "line": 4},
             "kind": "ingester",
             "target": "md.ticks",
             "columns": {"sym": "utf8", "price": "float64"},
@@ -69,6 +72,8 @@ def test_a_project_declares_ingesters_and_deployments(tmp_path):
             "rollout": "rolling",
             "cpu": "1000m",
             "memory": "2Gi",
+            # The function's first line: its decorator.
+            "defined_at": {"file": "src/ticker/app.py", "line": 11},
             "kind": "deployment",
             "function": "ticker.app:quote_poller",
         },

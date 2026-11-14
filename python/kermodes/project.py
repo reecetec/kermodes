@@ -80,6 +80,8 @@ class Ingester:
     rollout: Rollout = "rolling"
     cpu: str = DEFAULT_CPU
     memory: str = DEFAULT_MEMORY
+    # Where it is declared: the file and line of the `ingester(...)` call.
+    defined_at: tuple[str, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +97,8 @@ class Deployment:
     rollout: Rollout = "rolling"
     cpu: str = DEFAULT_CPU
     memory: str = DEFAULT_MEMORY
+    # Where it is declared: the file and first line (its first decorator) of the function.
+    defined_at: tuple[str, int] | None = None
 
 
 Resource = Ingester | Deployment
@@ -116,6 +120,7 @@ def ingester(
 ) -> Ingester:
     """Declares a built-in connector reading `source` into `target` (created with `columns`
     if it does not exist), with `cpu` and `memory` as its requests and limits."""
+    caller = sys._getframe(1)
     resource = Ingester(
         name,
         target,
@@ -125,6 +130,7 @@ def ingester(
         rollout,
         _cpu(name, cpu),
         _memory(name, memory),
+        (caller.f_code.co_filename, caller.f_lineno),
     )
     _check_policy(resource)
     _declared.append(resource)
@@ -148,6 +154,7 @@ def deployment(
         if function_name is None:
             raise KermodesError("@km.deployment() decorates a function")
         resource_name = name or function_name.replace("_", "-")
+        code = getattr(function, "__code__", None)
         resource = Deployment(
             resource_name,
             function,
@@ -156,6 +163,7 @@ def deployment(
             rollout,
             _cpu(resource_name, cpu),
             _memory(resource_name, memory),
+            None if code is None else (code.co_filename, code.co_firstlineno),
         )
         _check_policy(resource)
         _declared.append(resource)
@@ -189,7 +197,9 @@ class Project:
             "entry": self.entry,
             "namespaces": list(self.namespaces),
             "mainline": self.mainline,
-            "resources": [_spec(r, self.entry) for r in self.resources.values()],
+            "resources": [
+                _spec(r, self.entry, self.root) for r in self.resources.values()
+            ],
         }
 
 
@@ -321,7 +331,7 @@ def _memory(name: str, memory: int | str) -> str:
     )
 
 
-def _spec(resource: Resource, entry: str) -> dict:
+def _spec(resource: Resource, entry: str, root: Path) -> dict:
     spec: dict = {
         "name": resource.name,
         "update": resource.update,
@@ -329,6 +339,15 @@ def _spec(resource: Resource, entry: str) -> dict:
         "cpu": resource.cpu,
         "memory": resource.memory,
     }
+    # Relative to the project, so the platform can link to it at any commit (§15.2).
+    if resource.defined_at is not None:
+        file, line = resource.defined_at
+        path = Path(file).resolve()
+        if path.is_relative_to(root):
+            spec["defined_at"] = {
+                "file": path.relative_to(root).as_posix(),
+                "line": line,
+            }
     if isinstance(resource, Ingester):
         spec |= {
             "kind": "ingester",

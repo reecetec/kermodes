@@ -15,12 +15,16 @@ use axum::routing::{get, post};
 
 use crate::plan;
 use crate::run::{self, Controller};
+use crate::system;
 
 pub async fn serve(controller: Arc<Controller>, listener: tokio::net::TcpListener) {
     let app = Router::new()
         .route("/snapshots/{project}/{commit}", get(snapshot))
         .route("/hooks/sync", post(sync))
         .route("/api/projects", get(projects))
+        .route("/api/components", get(components))
+        .route("/api/components/{component}/events", get(component_events))
+        .route("/api/components/{component}/logs", get(component_logs))
         .route("/api/deployments/{project}/{resource}/events", get(events))
         .route("/api/deployments/{project}/{resource}/logs", get(logs))
         .route(
@@ -81,6 +85,56 @@ async fn logs(
         .unwrap_or(300)
         .clamp(1, 5_000);
     match controller.kube.logs(&name, tail).await {
+        Ok(text) => text.into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, e).into_response(),
+    }
+}
+
+/// The platform's own components: weir, Postgres, the controller, and the web UI.
+async fn components(State(controller): State<Arc<Controller>>) -> Response {
+    match controller.kube.components().await {
+        Ok(components) => axum::Json(components).into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+    }
+}
+
+fn known_component(component: &str) -> Result<(), (StatusCode, String)> {
+    if system::COMPONENTS.contains(&component) {
+        Ok(())
+    } else {
+        Err((StatusCode::NOT_FOUND, format!("no component `{component}`")))
+    }
+}
+
+async fn component_events(
+    State(controller): State<Arc<Controller>>,
+    Path(component): Path<String>,
+) -> Response {
+    if let Err(refused) = known_component(&component) {
+        return refused.into_response();
+    }
+    match controller.kube.component_events(&component).await {
+        Ok(events) => axum::Json(events).into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+    }
+}
+
+/// A component pod's last `tail` lines (default 300, at most 5,000): `pod`, else a ready one.
+async fn component_logs(
+    State(controller): State<Arc<Controller>>,
+    Path(component): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    if let Err(refused) = known_component(&component) {
+        return refused.into_response();
+    }
+    let tail = query
+        .get("tail")
+        .and_then(|t| t.parse::<i64>().ok())
+        .unwrap_or(300)
+        .clamp(1, 5_000);
+    let pod = query.get("pod").map(String::as_str);
+    match controller.kube.component_logs(&component, pod, tail).await {
         Ok(text) => text.into_response(),
         Err(e) => (StatusCode::NOT_FOUND, e).into_response(),
     }

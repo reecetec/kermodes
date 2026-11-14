@@ -17,8 +17,11 @@ use kube::api::{
 
 use crate::plan::{MergeJob, Placement};
 use crate::report::{self, Observed};
+use crate::system;
 
 const MANAGER: &str = "kermodes-control";
+/// The platform's own pods, by their chart's (and the Postgres operator's) component label.
+const COMPONENTS_SELECTOR: &str = "app.kubernetes.io/component in (weir,database,control,ui)";
 /// How long discovery may take: fetching the snapshot and importing the project.
 const DISCOVERY_DEADLINE: Duration = Duration::from_secs(360);
 
@@ -176,33 +179,195 @@ impl Kube {
             .into_iter()
             .filter_map(|p| Some((p.metadata.name?, name.to_owned())))
             .collect();
-        let mut events: Vec<(i64, serde_json::Value)> = self
+        let events = self
             .events
             .list(&ListParams::default())
             .await
             .map_err(|e| format!("cannot list events: {e}"))?
             .items
             .into_iter()
-            .filter(|e| deployment_of(e, &owner).as_deref() == Some(name))
-            .filter_map(|e| {
-                let at = event_ns(&e)?;
-                let json = serde_json::json!({
-                    "type": e.type_,
-                    "reason": e.reason,
-                    "message": e.message.as_deref().map(str::trim),
-                    "count": e.count,
-                    "at_ns": at,
-                    "object": format!(
-                        "{}/{}",
-                        e.involved_object.kind.as_deref().unwrap_or_default(),
-                        e.involved_object.name.as_deref().unwrap_or_default()
-                    ),
-                });
-                Some((at, json))
+            .filter(|e| deployment_of(e, &owner).as_deref() == Some(name));
+        Ok(newest_first(events))
+    }
+
+    /// The platform's components as their pods show them, in `system::COMPONENTS` order; one
+    /// without pods is left out. Usage is zero while metrics-server is not answering.
+    pub async fn components(&self) -> Result<Vec<system::Component>, String> {
+        let selector = ListParams::default().labels(COMPONENTS_SELECTOR);
+        let pods = self
+            .pods
+            .list(&selector)
+            .await
+            .map_err(|e| format!("cannot list pods: {e}"))?
+            .items;
+        let mut usage: BTreeMap<String, (f64, i64)> = BTreeMap::new();
+        if let Ok(metrics) = self.metrics.list(&selector).await {
+            for pod in metrics.items {
+                let Some(name) = pod.metadata.name.clone() else {
+                    continue;
+                };
+                let used = usage.entry(name).or_default();
+                for container in pod.data["containers"].as_array().into_iter().flatten() {
+                    let measured = &container["usage"];
+                    used.0 += measured["cpu"]
+                        .as_str()
+                        .and_then(report::cores)
+                        .unwrap_or(0.0);
+                    used.1 += measured["memory"]
+                        .as_str()
+                        .and_then(report::bytes)
+                        .unwrap_or(0);
+                }
+            }
+        }
+        // Each component's pods, and every object its events can be about.
+        let mut instances: BTreeMap<String, Vec<system::Instance>> = BTreeMap::new();
+        let mut about: BTreeMap<String, String> = BTreeMap::new();
+        for pod in pods
+            .iter()
+            .filter(|p| p.metadata.deletion_timestamp.is_none())
+        {
+            let (Some(name), Some(component)) = (
+                pod.metadata.name.clone(),
+                label(pod, "app.kubernetes.io/component"),
+            ) else {
+                continue;
+            };
+            for object in objects_of(pod) {
+                about.insert(object, component.clone());
+            }
+            let (cpu, memory) = usage.get(&name).copied().unwrap_or_default();
+            instances
+                .entry(component)
+                .or_default()
+                .push(instance(pod, name, cpu, memory));
+        }
+        let mut warnings: BTreeMap<String, (String, i64)> = BTreeMap::new();
+        for event in self
+            .events
+            .list(&ListParams::default())
+            .await
+            .map_err(|e| format!("cannot list events: {e}"))?
+            .items
+        {
+            if event.type_.as_deref() != Some("Warning") {
+                continue;
+            }
+            let (Some(component), Some(at)) = (
+                event
+                    .involved_object
+                    .name
+                    .as_ref()
+                    .and_then(|name| about.get(name)),
+                event_ns(&event),
+            ) else {
+                continue;
+            };
+            if warnings
+                .get(component)
+                .is_none_or(|(_, newest)| at > *newest)
+            {
+                let text = format!(
+                    "{}: {}",
+                    event.reason.as_deref().unwrap_or("Warning"),
+                    event.message.as_deref().unwrap_or_default().trim()
+                );
+                warnings.insert(component.clone(), (text, at));
+            }
+        }
+        Ok(system::COMPONENTS
+            .iter()
+            .filter_map(|name| {
+                let instances = instances.remove(*name)?;
+                let warning = warnings.remove(*name);
+                Some(system::Component {
+                    name: (*name).to_owned(),
+                    status: system::status(&instances),
+                    instances,
+                    warning_ns: warning.as_ref().map(|(_, at)| *at),
+                    warning: warning.map(|(text, _)| text),
+                })
             })
+            .collect())
+    }
+
+    /// A component's events, newest first: its pods' and their owners'.
+    pub async fn component_events(
+        &self,
+        component: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let objects: BTreeSet<String> = self
+            .component_pods(component)
+            .await?
+            .iter()
+            .flat_map(objects_of)
             .collect();
-        events.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
-        Ok(events.into_iter().take(100).map(|(_, e)| e).collect())
+        let events = self
+            .events
+            .list(&ListParams::default())
+            .await
+            .map_err(|e| format!("cannot list events: {e}"))?
+            .items
+            .into_iter()
+            .filter(|e| {
+                e.involved_object
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| objects.contains(name))
+            });
+        Ok(newest_first(events))
+    }
+
+    /// The last `tail` lines of a component's pod: `pod` if it is one of the component's, else
+    /// a ready one, else the newest.
+    pub async fn component_logs(
+        &self,
+        component: &str,
+        pod: Option<&str>,
+        tail: i64,
+    ) -> Result<String, String> {
+        let mut pods = self.component_pods(component).await?;
+        pods.sort_by_key(|p| p.metadata.creation_timestamp.as_ref().map(|t| t.0));
+        let chosen = match pod {
+            Some(wanted) => pods
+                .iter()
+                .find(|p| p.metadata.name.as_deref() == Some(wanted))
+                .ok_or_else(|| format!("{wanted} is not a {component} pod"))?,
+            None => pods
+                .iter()
+                .find(|p| pod_state(p).ready)
+                .or_else(|| pods.last())
+                .ok_or_else(|| format!("no {component} pod runs"))?,
+        };
+        let name = chosen.metadata.name.clone().unwrap_or_default();
+        let params = LogParams {
+            container: chosen
+                .spec
+                .as_ref()
+                .and_then(|s| s.containers.first())
+                .map(|c| c.name.clone()),
+            tail_lines: Some(tail),
+            timestamps: true,
+            ..LogParams::default()
+        };
+        self.pods
+            .logs(&name, &params)
+            .await
+            .map_err(|e| format!("cannot read {name}'s log: {e}"))
+    }
+
+    async fn component_pods(&self, component: &str) -> Result<Vec<Pod>, String> {
+        Ok(self
+            .pods
+            .list(
+                &ListParams::default().labels(&format!("app.kubernetes.io/component={component}")),
+            )
+            .await
+            .map_err(|e| format!("cannot list {component}'s pods: {e}"))?
+            .items
+            .into_iter()
+            .filter(|p| p.metadata.deletion_timestamp.is_none())
+            .collect())
     }
 
     /// The last `tail` lines of the serving run's log: its ready pod's, else its newest's.
@@ -567,4 +732,104 @@ fn event_ns(event: &Event) -> Option<i64> {
         .or_else(|| event.event_time.as_ref().map(|t| t.0))
         .or_else(|| event.first_timestamp.as_ref().map(|t| t.0))?;
     i64::try_from(at.as_nanosecond()).ok()
+}
+
+/// `events` as the API shows them, newest first, at most 100.
+fn newest_first(events: impl Iterator<Item = Event>) -> Vec<serde_json::Value> {
+    let mut events: Vec<(i64, serde_json::Value)> = events
+        .filter_map(|e| {
+            let at = event_ns(&e)?;
+            let json = serde_json::json!({
+                "type": e.type_,
+                "reason": e.reason,
+                "message": e.message.as_deref().map(str::trim),
+                "count": e.count,
+                "at_ns": at,
+                "object": format!(
+                    "{}/{}",
+                    e.involved_object.kind.as_deref().unwrap_or_default(),
+                    e.involved_object.name.as_deref().unwrap_or_default()
+                ),
+            });
+            Some((at, json))
+        })
+        .collect();
+    events.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    events.into_iter().take(100).map(|(_, e)| e).collect()
+}
+
+fn label(pod: &Pod, key: &str) -> Option<String> {
+    pod.metadata.labels.as_ref()?.get(key).cloned()
+}
+
+/// The objects a pod's events can be about: the pod, its owners (a StatefulSet, the Postgres
+/// operator's Cluster, a ReplicaSet), and a ReplicaSet's Deployment (`{deployment}-{hash}`).
+fn objects_of(pod: &Pod) -> Vec<String> {
+    let mut objects: Vec<String> = pod.metadata.name.iter().cloned().collect();
+    for owner in pod.metadata.owner_references.iter().flatten() {
+        objects.push(owner.name.clone());
+        if owner.kind == "ReplicaSet"
+            && let Some((deployment, _)) = owner.name.rsplit_once('-')
+        {
+            objects.push(deployment.to_owned());
+        }
+    }
+    objects
+}
+
+/// One pod of a component, using `cpu` cores and `memory` bytes.
+fn instance(pod: &Pod, name: String, cpu: f64, memory: i64) -> system::Instance {
+    let state = pod_state(pod);
+    let containers = pod
+        .spec
+        .as_ref()
+        .map_or(&[][..], |s| s.containers.as_slice());
+    // Each container's limit, else its request: what it was sized at.
+    let sized = |resource: &str| -> Vec<String> {
+        containers
+            .iter()
+            .filter_map(|c| {
+                let r = c.resources.as_ref()?;
+                r.limits
+                    .as_ref()
+                    .and_then(|l| l.get(resource))
+                    .or_else(|| r.requests.as_ref()?.get(resource))
+                    .map(|q| q.0.clone())
+            })
+            .collect()
+    };
+    let (cpus, memories) = (sized("cpu"), sized("memory"));
+    let status = pod.status.clone().unwrap_or_default();
+    system::Instance {
+        pod: name,
+        role: label(pod, "cnpg.io/instanceRole"),
+        version: containers
+            .first()
+            .and_then(|c| c.image.as_deref())
+            .and_then(system::image_tag),
+        ready: state.ready,
+        node: state.node,
+        started_ns: state.started_ns,
+        restarts: state.restarts,
+        waiting: status
+            .container_statuses
+            .iter()
+            .flatten()
+            .chain(status.init_container_statuses.iter().flatten())
+            .find_map(|c| c.state.as_ref()?.waiting.as_ref()?.reason.clone())
+            .filter(|reason| reason != "ContainerCreating" && reason != "PodInitializing"),
+        cpu,
+        cpu_limit: (!cpus.is_empty())
+            .then(|| cpus.iter().map(|q| report::cores(q)).sum::<Option<f64>>())
+            .flatten(),
+        memory,
+        memory_limit: (!memories.is_empty())
+            .then(|| {
+                memories
+                    .iter()
+                    .map(|q| report::bytes(q))
+                    .sum::<Option<i64>>()
+            })
+            .flatten(),
+    }
 }

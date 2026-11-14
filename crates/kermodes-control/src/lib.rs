@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+mod browse;
 mod git;
 mod http;
 mod k8s;
@@ -14,5 +15,6 @@ pub mod plan;
 mod report;
 mod run;
 mod state;
+mod system;
 
 pub use run::{Config, run, run_blocking};

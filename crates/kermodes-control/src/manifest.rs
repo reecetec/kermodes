@@ -24,6 +24,16 @@ pub struct Resource {
     pub cpu: String,
     #[serde(default = "default_memory")]
     pub memory: String,
+    /// Where the project declares it; manifests from before this have none.
+    #[serde(default)]
+    pub defined_at: Option<DefinedAt>,
+}
+
+/// A file within the project's directory, and a line in it.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct DefinedAt {
+    pub file: String,
+    pub line: u32,
 }
 
 fn default_kind() -> String {
@@ -103,7 +113,7 @@ fn memory_quantity(memory: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::Manifest;
+    use super::{DefinedAt, Manifest};
 
     fn manifest(sizes: &str) -> Result<Manifest, String> {
         Manifest::parse(&format!(
@@ -136,5 +146,18 @@ mod tests {
         ] {
             assert!(sized(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_resource_says_where_it_is_declared_when_its_manifest_does() {
+        let at = |extra: &str| manifest(extra).map(|m| m.resources[0].defined_at.clone());
+        assert_eq!(at(""), Ok(None));
+        assert_eq!(
+            at(r#", "defined_at": {"file": "src/ticker/app.py", "line": 12}"#),
+            Ok(Some(DefinedAt {
+                file: "src/ticker/app.py".into(),
+                line: 12,
+            }))
+        );
     }
 }
