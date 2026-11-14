@@ -1349,6 +1349,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kermodes-lake"
+version = "0.0.0"
+dependencies = [
+ "kermodes-weir",
+]
+
+[[package]]
 name = "kermodes-py"
 version = "0.0.0"
 dependencies = [

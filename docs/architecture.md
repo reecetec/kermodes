@@ -458,23 +458,33 @@ outlive what Kubernetes believes.
 
 ## 8. Historical store
 
+Correctness first, then storage and speed; no time travel. Each `(table, date)` is served from
+exactly one place: weir until the date is merged, the lake once the catalog says so. Moving a
+date is one catalog transaction, and weir deletes its copy only after that commit.
+
 ### 8.1 Layout
 
 Parquet files written by Kermodes to object storage (rustfs in the cluster, a local directory in
 local mode) through `object_store`.
 
 ```
-{lake}/{location}/Date={date}/part-{n}.parquet
+{lake}/{location}/{first_date}_{last_date}-{file_id}.parquet
 ```
 
-Per-table layout config, applied by the merge writer:
-
-- Sort by `(key columns..., ts_column)` within the date — the analogue of kdb+'s `p#`.
-- Dictionary-encode key columns — the analogue of kdb+'s `sym` enumeration.
-- Row groups sized to align with key ranges; write column statistics and the page index so readers
-  skip by key and time.
-- Parquet `field_id` set from column IDs.
-- Compression: ZSTD.
+- **A date is the logical unit, not the physical one.** Every write replaces whole dates. A file
+  holds whole dates only: a big date has its own file (or several, split by key range), and
+  consecutive small dates share a pack. No file holds part of one date and part of another.
+- **Small dates are packed as part of the write.** Writing date `D` decides, by a pure planning
+  function over the dates' sizes and the current files, what to write and what to delete: a
+  small `D` joins the neighbouring pack while the result stays under the target file size
+  (256 MiB); replacing a packed date rewrites its pack. A write rewrites at most one pack, so a
+  sparse table never accumulates tiny files and there is no compaction service.
+- Sort by `(Date, key columns..., ts_column)`, the analogue of kdb+'s `p#` within a date. Row
+  groups never straddle dates (a new one starts at every date boundary) and are at most about
+  128 MiB.
+- `Date` is stored in every file (run-length encoded, nearly free); key columns are
+  dictionary-encoded (kdb+'s `sym`); column statistics and the page index are written so readers
+  skip by date, key, and time. Parquet `field_id` is set from column IDs. Compression: ZSTD.
 
 ### 8.2 Catalog
 
@@ -484,45 +494,56 @@ the only record of what history exists.
 - Tables: ID, branch, namespace, name, location, owning project, current schema version, layout
   config.
 - Schema versions: columns by ID with name, type, default, and the version that introduced them.
-- Data files: path, `Date`, row count, byte size, schema version, per-column min/max for key and
-  `ts` columns, merge run ID.
-- Snapshots: every commit (merge, rewrite, purge) creates a snapshot ID; a read pins a snapshot
-  and sees a consistent file set. Snapshots older than the retention window are expired and their
-  unreferenced files deleted.
-- Commits are single database transactions; a merge or rewrite is atomic per date.
+- Data files: path, first and last date, row count, byte size, schema version, per-column
+  min/max for key and `ts` columns.
+- Merged dates: which dates of a table the lake serves (the routing flip).
+- A commit is one database transaction: the new files go in, the files they replace go out, and
+  the dates written become merged. Replaced files are deleted after a grace period that covers
+  reads already in flight; nothing older is kept.
 
-### 8.3 Merge job
+### 8.3 Merge
 
-Daily, scheduled through the Kermodes scheduler.
+1. At UTC midnight plus a grace window, weir seals date `D` (§7.3).
+2. The controller finds sealed dates not yet merged and starts one merge Job per `(table, D)`: a
+   Kubernetes Job on the same image, its memory sized to the day, so a large sort cannot take
+   weir down. Locally the same merge runs on a thread; `kermodes merge ns.table DATE` runs one by
+   hand.
+3. The Job reads `D` from weir over Flight, projects every schema version present onto the
+   table's current one by column ID (§5.4), sorts, and writes per the plan (§8.1).
+4. It commits, replacing `D` (a re-run after a crash is the same commit), after checking that
+   row counts per source match weir's indexes.
+5. Weir then deletes its partitions for `D`.
 
-1. Wait until all internal partitions for `D` are sealed.
-2. Read sealed segments, project every schema version present in `D` onto the table's current
-   version by column ID (§5.4), sort per layout config, write Parquet.
-3. Commit the files to the catalog in one transaction, **replacing** partition `D` (idempotent
-   re-runs).
-4. Validate: row counts per source match weir indexes.
-5. Mark `D` merged (flips `db.table` routing) and schedule intraday deletion.
+Batch jobs (end-of-day files, vendor data, backfills, corrections) write history directly, never
+through weir: `write_history(table, date, data)` goes through the same planner, writer, and
+commit. Weir is only for live, sequenced, exactly-once ingestion.
 
 ### 8.4 Reading history
 
-The engine reads history itself.
+The engine reads history itself, on its static operator path (§9.1).
 
-- Partition pruning by `Date` from the catalog; file pruning by catalog min/max statistics.
-- Row-group and page pruning from Parquet statistics and the page index; projection to the
-  requested columns; filter predicates evaluated during decode where the `parquet` reader supports
-  it (row filters, row selections).
-- Static queries run on the engine's static operator path (§9.1), streaming record batches per
-  file; results return as Arrow over Flight.
-- Workers keep a local NVMe cache of fetched Parquet files and sealed weir segments.
+- `db.historical_table(...)` is static. Date predicates in its `where` are pushed down: the
+  catalog returns only files whose date range overlaps them, the reader skips row groups by their
+  statistics (a packed small date costs its own row groups, not its pack), and key predicates
+  skip further by statistics and the page index. `EXPLAIN` shows files and row groups considered
+  and read. A date sealed but not yet merged is read from weir, so history has no gap.
+- `db.live_table(...)` is today. At midnight it rolls: yesterday's rows leave as one removal
+  delta (a contiguous range, weir partitions being append-only), so operators drop them
+  incrementally and memory stays bounded.
+- `db.table(..., days=N)` is the last `N` days of history plus today, ticking. The cut is fixed
+  when it starts: history before the start date, read once; weir from it on. At midnight the
+  oldest day leaves and the day that ended stays, its rows already in memory, so nothing is
+  re-read, missing, or doubled; a later merge of that day changes nothing a running engine sees.
+- Later: a date replaced while an engine runs reaches it on restart only; catalog notifications
+  could swap it as a remove-then-add delta. Workers may cache fetched files on local NVMe.
 
 ### 8.5 External access
 
-Files use a plain Hive-style layout with standard Parquet, so external tools (DuckDB, Polars,
-pyarrow, Spark) can read them directly with read access to the bucket. The catalog is the source
-of truth for which files are current; an export of catalog snapshots to an open table format
-(DuckLake or Iceberg metadata) is a later addition if external tools need snapshot consistency.
-Locations are fixed at creation, so a renamed table's files keep their first path; the catalog
-(`kermodes data locate ns.table`) gives the current one.
+Files are standard Parquet with `Date` stored in them, so external tools (DuckDB, Polars, pyarrow,
+Spark) can read a table's directory directly with read access to the bucket. The catalog is the
+source of truth for which files are current: a file being replaced is visible beside its
+replacement until the grace period ends. Locations are fixed at creation, so a renamed table's
+files keep their first path; the catalog (`kermodes data locate ns.table`) gives the current one.
 
 ## 9. Engine
 
