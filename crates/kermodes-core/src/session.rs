@@ -644,18 +644,45 @@ impl WeakTable {
     }
 }
 
-/// Delivers rows to a fed table (`Session::fed_table`). It holds the table weakly: once nothing
-/// else does, `append` reports the table gone and the store can stop feeding it.
+/// Delivers rows to a fed table (`Session::fed_table`). It does not keep the table: once the
+/// table is released (no handle holds it and no table is computed from it), its methods report
+/// it gone and the store can stop feeding it. A table built from a live table keeps the feed
+/// open, though the code that made it let the live table itself go.
 #[derive(Clone)]
 pub struct Feed {
-    table: WeakTable,
+    session: std::sync::Weak<Inner>,
+    id: usize,
+    schema: SchemaRef,
+}
+
+impl Feed {
+    fn of(table: &Table) -> Self {
+        Self {
+            session: Arc::downgrade(&table.session.inner),
+            id: table.id,
+            schema: table.schema.clone(),
+        }
+    }
+
+    /// Where to queue the table's writes, while it is still in use.
+    fn target(&self) -> Option<Target> {
+        let session = Session {
+            inner: self.session.upgrade()?,
+        };
+        let released = session.read().tables[self.id].released;
+        (!released).then(|| Target {
+            session,
+            id: self.id,
+            schema: self.schema.clone(),
+        })
+    }
 }
 
 impl Feed {
     /// Queues rows for the table's next cycle, as `Table::append` does; `false` once the table is
     /// gone.
     pub fn append(&self, batches: &[RecordBatch]) -> Result<bool, Error> {
-        let Some(table) = self.table.upgrade() else {
+        let Some(table) = self.target() else {
             return Ok(false);
         };
         table.expect_source("append", |s| matches!(s, Source::Fed))?;
@@ -667,7 +694,7 @@ impl Feed {
     /// Queues upserts to a fed keyed table, as `Table::upsert` does for a keyed input table;
     /// `false` once the table is gone.
     pub fn upsert(&self, batches: &[RecordBatch]) -> Result<bool, Error> {
-        let Some(table) = self.table.upgrade() else {
+        let Some(table) = self.target() else {
             return Ok(false);
         };
         table.expect_source("upsert", |s| matches!(s, Source::Keyed(k) if k.fed))?;
@@ -678,7 +705,7 @@ impl Feed {
     /// Replaces a fed keyed table's rows with `batches`: every key not in them is gone. Empty
     /// `batches` clear the table.
     pub fn replace(&self, batches: &[RecordBatch]) -> Result<bool, Error> {
-        let Some(table) = self.table.upgrade() else {
+        let Some(table) = self.target() else {
             return Ok(false);
         };
         table.expect_source("replace", |s| matches!(s, Source::Keyed(k) if k.fed))?;
@@ -698,7 +725,7 @@ impl Feed {
     /// Queues deletes of keys. A store's deletes hold every column (the key's, and nulls), so
     /// only the key columns are taken.
     pub fn delete(&self, batches: &[RecordBatch]) -> Result<bool, Error> {
-        let Some(table) = self.table.upgrade() else {
+        let Some(table) = self.target() else {
             return Ok(false);
         };
         table.expect_source("delete", |s| matches!(s, Source::Keyed(k) if k.fed))?;
@@ -723,7 +750,7 @@ impl Feed {
     /// broke): rather than look current while it no longer updates, it fails, and so do the
     /// tables built from it. `false` once the table is gone.
     pub fn fail(&self, message: String) -> bool {
-        let Some(table) = self.table.upgrade() else {
+        let Some(table) = self.target() else {
             return false;
         };
         table.queue(std::iter::once(Write::Fail(message)));
@@ -770,9 +797,7 @@ impl Session {
             Growth::AppendOnly,
             Source::Fed,
         ));
-        let feed = Feed {
-            table: table.downgrade(),
-        };
+        let feed = Feed::of(&table);
         Ok((table, feed))
     }
 
@@ -796,9 +821,7 @@ impl Session {
         description: &str,
     ) -> Result<(Table, Feed), Error> {
         let table = self.keyed(schema, key, description.to_owned(), true)?;
-        let feed = Feed {
-            table: table.downgrade(),
-        };
+        let feed = Feed::of(&table);
         Ok((table, feed))
     }
 
@@ -1376,43 +1399,33 @@ impl Table {
     /// Queues rows for the next cycle. Columns are matched by name; all batches are checked
     /// before any is queued.
     pub fn append(&self, batches: &[RecordBatch]) -> Result<(), Error> {
-        self.expect_source("append", |s| matches!(s, Source::Append))?;
+        let target = self.target();
+        target.expect_source("append", |s| matches!(s, Source::Append))?;
         let batches = conform_all(&self.schema, batches)?;
-        self.queue(batches.into_iter().map(Write::Append));
+        target.queue(batches.into_iter().map(Write::Append));
         Ok(())
     }
 
     /// Queues rows that replace the current row with the same key, or add one.
     pub fn upsert(&self, batches: &[RecordBatch]) -> Result<(), Error> {
-        self.expect_source("upsert", |s| matches!(s, Source::Keyed(k) if !k.fed))?;
-        self.queue_upserts(batches)
+        let target = self.target();
+        target.expect_source("upsert", |s| matches!(s, Source::Keyed(k) if !k.fed))?;
+        target.queue_upserts(batches)
     }
 
     /// Queues the removal of the rows with these keys; `batches` hold only the key columns.
     pub fn delete(&self, batches: &[RecordBatch]) -> Result<(), Error> {
-        self.expect_source("delete", |s| matches!(s, Source::Keyed(k) if !k.fed))?;
-        self.queue_deletes(batches)
+        let target = self.target();
+        target.expect_source("delete", |s| matches!(s, Source::Keyed(k) if !k.fed))?;
+        target.queue_deletes(batches)
     }
 
-    fn queue_upserts(&self, batches: &[RecordBatch]) -> Result<(), Error> {
-        let batches = conform_all(&self.schema, batches)?;
-        self.queue(batches.into_iter().map(Write::Upsert));
-        Ok(())
-    }
-
-    /// A keyed table's key columns.
-    fn key_schema(&self) -> SchemaRef {
-        match &self.session.read().tables[self.id].source {
-            Source::Keyed(keyed) => keyed.key_schema.clone(),
-            _ => unreachable!("callers check the table is keyed"),
+    fn target(&self) -> Target {
+        Target {
+            session: self.session.clone(),
+            id: self.id,
+            schema: self.schema.clone(),
         }
-    }
-
-    fn queue_deletes(&self, batches: &[RecordBatch]) -> Result<(), Error> {
-        let key_schema = self.key_schema();
-        let batches = conform_all(&key_schema, batches)?;
-        self.queue(batches.into_iter().map(Write::Delete));
-        Ok(())
     }
 
     /// Rows for which `predicate` is true. NULL counts as false.
@@ -2209,23 +2222,6 @@ impl Table {
         self.growth() >= Growth::AddOnly
     }
 
-    fn expect_source(&self, action: &str, accepts: fn(&Source) -> bool) -> Result<(), Error> {
-        let graph = self.session.read();
-        let table = &graph.tables[self.id];
-        if accepts(&table.source) {
-            return Ok(());
-        }
-        Err(Error::Unsupported(format!(
-            "`{}` does not accept {action}",
-            table.description
-        )))
-    }
-
-    fn queue(&self, writes: impl Iterator<Item = Write>) {
-        self.session.pending().extend(writes.map(|w| (self.id, w)));
-        self.session.inner.arrived.notify_all();
-    }
-
     /// Builds a table from this one, computed from this table's current rows. Building on a
     /// static table finishes here; building on a refreshing one also updates it every cycle.
     fn derive(
@@ -2270,6 +2266,53 @@ impl Table {
         drop(graph);
         idle();
         Ok(Table::new(&self.session, id, schema))
+    }
+}
+
+/// A table to queue writes for, as `Table` and `Feed` both do: its session, id, and columns.
+struct Target {
+    session: Session,
+    id: usize,
+    schema: SchemaRef,
+}
+
+impl Target {
+    fn expect_source(&self, action: &str, accepts: fn(&Source) -> bool) -> Result<(), Error> {
+        let graph = self.session.read();
+        let table = &graph.tables[self.id];
+        if accepts(&table.source) {
+            return Ok(());
+        }
+        Err(Error::Unsupported(format!(
+            "`{}` does not accept {action}",
+            table.description
+        )))
+    }
+
+    fn queue(&self, writes: impl Iterator<Item = Write>) {
+        self.session.pending().extend(writes.map(|w| (self.id, w)));
+        self.session.inner.arrived.notify_all();
+    }
+
+    fn queue_upserts(&self, batches: &[RecordBatch]) -> Result<(), Error> {
+        let batches = conform_all(&self.schema, batches)?;
+        self.queue(batches.into_iter().map(Write::Upsert));
+        Ok(())
+    }
+
+    /// A keyed table's key columns.
+    fn key_schema(&self) -> SchemaRef {
+        match &self.session.read().tables[self.id].source {
+            Source::Keyed(keyed) => keyed.key_schema.clone(),
+            _ => unreachable!("callers check the table is keyed"),
+        }
+    }
+
+    fn queue_deletes(&self, batches: &[RecordBatch]) -> Result<(), Error> {
+        let key_schema = self.key_schema();
+        let batches = conform_all(&key_schema, batches)?;
+        self.queue(batches.into_iter().map(Write::Delete));
+        Ok(())
     }
 }
 

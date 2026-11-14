@@ -335,3 +335,24 @@ fn rows_at_positions_match_the_snapshot() {
         }
     }
 }
+
+/// A table built on a fed table keeps it fed after the code that made the fed table let it go
+/// (`live_table(...).where(...)`); once nothing uses it, the feed says it is gone.
+#[test]
+fn a_fed_table_is_fed_while_a_table_is_built_on_it() {
+    let session = Session::new();
+    let (fed, feed) = session.fed_table(&schema(), "live md.ticks").unwrap();
+    let downstream = fed.filter("size > 0").unwrap();
+    drop(fed);
+    assert!(feed.append(&[rows(&["a"], &[1])]).unwrap());
+    session.step();
+    assert!(feed.append(&[rows(&["b"], &[2])]).unwrap());
+    session.step();
+    assert_eq!(sizes(&downstream), [1, 2]);
+
+    drop(downstream);
+    assert!(
+        !feed.append(&[rows(&["c"], &[3])]).unwrap(),
+        "nothing uses it"
+    );
+}
