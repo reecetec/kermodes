@@ -223,6 +223,7 @@ impl Kube {
         // Each component's pods, and every object its events can be about.
         let mut instances: BTreeMap<String, Vec<system::Instance>> = BTreeMap::new();
         let mut about: BTreeMap<String, String> = BTreeMap::new();
+        let mut ready_since: BTreeMap<String, i64> = BTreeMap::new();
         for pod in pods
             .iter()
             .filter(|p| p.metadata.deletion_timestamp.is_none())
@@ -235,6 +236,9 @@ impl Kube {
             };
             for object in objects_of(pod) {
                 about.insert(object, component.clone());
+            }
+            if let Some(since) = ready_since_ns(pod) {
+                ready_since.insert(name.clone(), since);
             }
             let (cpu, memory) = usage.get(&name).copied().unwrap_or_default();
             instances
@@ -253,23 +257,23 @@ impl Kube {
             if event.type_.as_deref() != Some("Warning") {
                 continue;
             }
-            let (Some(component), Some(at)) = (
-                event
-                    .involved_object
-                    .name
-                    .as_ref()
-                    .and_then(|name| about.get(name)),
-                event_ns(&event),
-            ) else {
+            let (Some(object), Some(at)) = (event.involved_object.name.as_ref(), event_ns(&event))
+            else {
                 continue;
             };
+            let Some(component) = about.get(object) else {
+                continue;
+            };
+            let reason = event.reason.as_deref().unwrap_or("Warning");
+            if system::recovered(reason, at, ready_since.get(object).copied()) {
+                continue;
+            }
             if warnings
                 .get(component)
                 .is_none_or(|(_, newest)| at > *newest)
             {
                 let text = format!(
-                    "{}: {}",
-                    event.reason.as_deref().unwrap_or("Warning"),
+                    "{reason}: {}",
                     event.message.as_deref().unwrap_or_default().trim()
                 );
                 warnings.insert(component.clone(), (text, at));
@@ -832,4 +836,16 @@ fn instance(pod: &Pod, name: String, cpu: f64, memory: i64) -> system::Instance 
             })
             .flatten(),
     }
+}
+
+/// When a pod became ready, if it is ready now.
+fn ready_since_ns(pod: &Pod) -> Option<i64> {
+    let ready = pod
+        .status
+        .as_ref()?
+        .conditions
+        .as_ref()?
+        .iter()
+        .find(|c| c.type_ == "Ready" && c.status == "True")?;
+    i64::try_from(ready.last_transition_time.as_ref()?.0.as_nanosecond()).ok()
 }

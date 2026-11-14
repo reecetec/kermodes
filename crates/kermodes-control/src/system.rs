@@ -63,9 +63,16 @@ pub fn image_tag(image: &str) -> Option<String> {
     (!tag.contains('/') && !tag.is_empty()).then(|| tag.to_owned())
 }
 
+/// Whether a Warning event is a failed probe (`Unhealthy`) its pod has recovered from: the pod
+/// is ready, and became so after the failure, as every pod does once it has started. A card
+/// shows what is wrong now; the component's events keep every one.
+pub fn recovered(reason: &str, at_ns: i64, ready_since_ns: Option<i64>) -> bool {
+    reason == "Unhealthy" && ready_since_ns.is_some_and(|since| since >= at_ns)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Instance, image_tag, status};
+    use super::{Instance, image_tag, recovered, status};
 
     #[test]
     fn a_component_is_running_degraded_or_says_why_it_is_not() {
@@ -108,5 +115,16 @@ mod tests {
         for (image, tag) in cases {
             assert_eq!(image_tag(image).as_deref(), tag, "{image}");
         }
+    }
+
+    #[test]
+    fn a_probe_failure_the_pod_has_recovered_from_is_not_a_warning() {
+        // Failed while starting, ready since.
+        assert!(recovered("Unhealthy", 10, Some(12)));
+        // Failing now, or after it became ready, or not ready at all.
+        assert!(!recovered("Unhealthy", 15, Some(12)));
+        assert!(!recovered("Unhealthy", 10, None));
+        // Not a probe failure.
+        assert!(!recovered("BackOff", 10, Some(12)));
     }
 }
