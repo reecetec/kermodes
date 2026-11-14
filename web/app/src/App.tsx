@@ -118,6 +118,7 @@ function TopBar({
   page,
   onPage,
   pages,
+  home,
 }: {
   connection: KermodesConnection;
   themeName: GridThemeName;
@@ -125,13 +126,31 @@ function TopBar({
   page: Page;
   onPage: (page: Page) => void;
   pages: readonly Page[];
+  /** Whether the brand opens Deployments, the home page wherever a controller runs */
+  home: boolean;
 }) {
   return (
     <header className="flex h-12 shrink-0 items-center gap-3 border-b bg-sidebar px-4">
-      <div className="flex items-center gap-2">
-        <Logo className="size-6" />
-        <span className="text-[15px] font-semibold tracking-tight">Kermodes</span>
-      </div>
+      {home ? (
+        <button
+          type="button"
+          onClick={() => onPage('deployments')}
+          aria-current={page === 'deployments' ? 'page' : undefined}
+          title="Deployments"
+          className={cn(
+            '-ml-2 flex h-8 items-center gap-2 rounded-md px-2 hover:bg-accent',
+            page === 'deployments' && 'bg-secondary'
+          )}
+        >
+          <Logo className="size-6" />
+          <span className="text-[15px] font-semibold tracking-tight">Kermodes</span>
+        </button>
+      ) : (
+        <div className="flex items-center gap-2">
+          <Logo className="size-6" />
+          <span className="text-[15px] font-semibold tracking-tight">Kermodes</span>
+        </div>
+      )}
       <nav className="flex items-center gap-1">
         {pages.map(name => (
           <Button
@@ -278,11 +297,7 @@ export default function App({ connection }: { connection: KermodesConnection }) 
   // Deployments is the main tab wherever a controller reports them, until someone picks a tab.
   const hasDeployments = connection.pages.includes(DEPLOYMENTS_VIEW);
   const hasCatalog = useHasCatalog();
-  const pages: Page[] = [
-    ...(hasDeployments ? (['deployments'] as const) : []),
-    ...(hasCatalog ? (['catalog'] as const) : []),
-    'tables',
-  ];
+  const pages: Page[] = [...(hasCatalog ? (['catalog'] as const) : []), 'tables'];
   const [picked, setPicked] = useState<Page | null>(null);
   const page: Page = picked ?? (hasDeployments ? 'deployments' : 'tables');
 
@@ -344,6 +359,7 @@ export default function App({ connection }: { connection: KermodesConnection }) 
           page={page}
           onPage={setPicked}
           pages={pages}
+          home={hasDeployments}
         />
         {page === 'deployments' && <DeploymentsPage connection={connection} />}
         {page === 'catalog' && (

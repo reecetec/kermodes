@@ -1,130 +1,166 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertTriangle, Search, X } from 'lucide-react';
+import { AlertTriangle, Play, RotateCcw, Rocket, Search, Square, X } from 'lucide-react';
 import type { KermodesConnection } from '@kermodes/client';
+import { SidePanel } from '@/components/SidePanel';
+import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
-import { DEPLOYMENTS_VIEW, useComponents, useDeployments, useProjects } from '@/deployments/data';
-import { ComponentDetail, DeploymentDetail } from '@/deployments/Details';
+import type { Catalog } from '@/catalog/model';
 import {
-  ago,
-  bytes,
-  clampPanel,
-  cores,
-  deploymentFields,
-  key,
-  matchesSearch,
-} from '@/deployments/model';
-import { Commit, Status, Usage } from '@/deployments/parts';
-import { SystemStrip } from '@/deployments/SystemStrip';
+  DEPLOYMENTS_VIEW,
+  usePolled,
+  useComponents,
+  useDeployments,
+  useProjects,
+} from '@/deployments/data';
+import { RowDetail } from '@/deployments/Details';
+import { type Disk, ago, bytes, cores } from '@/deployments/model';
+import { Commit, DiskUse, TONE_FILL, Usage } from '@/deployments/parts';
+import {
+  type Filters,
+  type Row,
+  type Tone,
+  NO_FILTERS,
+  SYSTEM,
+  choices,
+  counts,
+  matches,
+  tableRows,
+  toneOf,
+} from '@/deployments/rows';
 
 export { DEPLOYMENTS_VIEW };
 
-type Selected = { kind: 'deployment'; key: string } | { kind: 'component'; name: string };
+const parseCatalog = (r: Response) => r.json() as Promise<Catalog>;
 
-const PANEL_STORAGE = 'kermodes.deployments.panel-height';
-const PANEL_DEFAULT = 380;
+/** Widths fixed so that values changing, or the panel resizing, never move a column */
+const COLUMNS: { label: string; width: string }[] = [
+  { label: 'Name', width: 'w-[15rem]' },
+  { label: 'Project', width: 'w-[8rem]' },
+  { label: 'Kind', width: 'w-[7rem]' },
+  { label: 'Status', width: 'w-[8.5rem]' },
+  { label: 'Revision', width: 'w-[8.5rem]' },
+  { label: 'CPU', width: 'w-[8.5rem]' },
+  { label: 'Memory', width: 'w-[8.5rem]' },
+  { label: 'Disk', width: 'w-[12rem]' },
+  { label: 'Restarts', width: 'w-[4.5rem]' },
+  { label: 'Up', width: 'w-[5.5rem]' },
+  { label: 'Node', width: 'w-[8rem]' },
+  { label: 'Last warning', width: 'w-[18rem]' },
+];
 
-/** The details panel's height as the user last left it */
-function useStoredHeight() {
-  const [height, setHeight] = useState(
-    () => Number(localStorage.getItem(PANEL_STORAGE)) || PANEL_DEFAULT
-  );
-  const store = useCallback((next: number) => {
-    setHeight(next);
-    localStorage.setItem(PANEL_STORAGE, String(next));
-  }, []);
-  return [height, store] as const;
+const TONE_LABEL: Record<Tone, string> = {
+  ok: 'running',
+  busy: 'changing',
+  bad: 'failing',
+  idle: 'stopped',
+};
+
+async function post(url: string): Promise<string | null> {
+  const response = await fetch(url, { method: 'POST' }).catch(e => e as Error);
+  if (response instanceof Error) return String(response);
+  if (response.ok) return null;
+  const text = await response.text();
+  try {
+    return JSON.parse(text).error ?? text;
+  } catch {
+    return text || `${response.status} ${response.statusText}`;
+  }
 }
 
-/** An element's height, kept current as it resizes */
-function useHeight(ref: React.RefObject<HTMLElement | null>) {
-  const [height, setHeight] = useState(0);
-  useEffect(() => {
-    const element = ref.current;
-    if (element == null) return;
-    const observer = new ResizeObserver(([entry]) => setHeight(entry.contentRect.height));
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [ref]);
-  return height;
+/** The disk nearest full, which the table shows; every disk is in its title */
+function fullest(disks: readonly Disk[]): Disk | null {
+  const share = (d: Disk) => (d.size ? d.used / d.size : 0);
+  return disks.reduce<Disk | null>((a, d) => (a == null || share(d) > share(a) ? d : a), null);
 }
 
-/** A handle between the page and the panel below it: drag, arrow keys, or double-click to reset */
-function Splitter({
-  height,
-  onResize,
-}: {
-  height: number;
-  onResize: (height: number) => void;
-}) {
-  const [dragging, setDragging] = useState(false);
-  const start = useRef({ y: 0, height: 0 });
+/** Roll out, Restart, Stop or Start for the selected deployment; the platform's own rows are the Helm release's */
+function Actions({ row, onDone }: { row: Row | null; onDone: (error: string | null) => void }) {
+  const [busy, setBusy] = useState<string | null>(null);
+  const d = row?.source.type === 'deployment' ? row.source.deployment : null;
+  const managed = row != null && row.project === SYSTEM;
+  const stopped = d != null && (d.status === 'Stopped' || d.status === 'Stopping');
+  const act = async (action: 'rollout' | 'restart' | 'stop' | 'start') => {
+    if (d == null) return;
+    setBusy(action);
+    const path = `/api/deployments/${encodeURIComponent(d.project)}/${encodeURIComponent(d.name)}`;
+    onDone(await post(`${path}/${action}`));
+    setBusy(null);
+  };
+  const off = d == null || busy != null;
+  const why = managed
+    ? 'Managed by the Helm release'
+    : d == null
+      ? 'Select a deployment'
+      : undefined;
   return (
-    <div
-      role="separator"
-      aria-orientation="horizontal"
-      aria-label="Resize details"
-      aria-valuenow={height}
-      tabIndex={0}
-      data-dragging={dragging}
-      title="Drag to resize · double-click to reset"
-      onPointerDown={event => {
-        event.preventDefault();
-        event.currentTarget.setPointerCapture(event.pointerId);
-        start.current = { y: event.clientY, height };
-        setDragging(true);
-      }}
-      onPointerMove={event => {
-        if (dragging) {
-          onResize(start.current.height + start.current.y - event.clientY);
-        }
-      }}
-      onPointerUp={() => setDragging(false)}
-      onPointerCancel={() => setDragging(false)}
-      onDoubleClick={() => onResize(PANEL_DEFAULT)}
-      onKeyDown={event => {
-        if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
-          event.preventDefault();
-          onResize(height + (event.key === 'ArrowUp' ? 32 : -32));
-        }
-      }}
-      className={cn(
-        'group relative h-1.5 shrink-0 cursor-row-resize border-t bg-muted/40 outline-none',
-        'hover:bg-primary/30 focus-visible:bg-primary/40 data-[dragging=true]:bg-primary/50'
+    <div className="flex items-center gap-1.5" title={why}>
+      {d?.available != null && d.update === 'manual' && (
+        <Button size="sm" variant="outline" disabled={off} onClick={() => void act('rollout')}>
+          <Rocket />
+          Roll out {d.available.slice(0, 7)}
+        </Button>
       )}
-    >
-      <span className="absolute top-1/2 left-1/2 h-0.5 w-10 -translate-x-1/2 -translate-y-1/2 rounded-full bg-muted-foreground/40 group-hover:bg-primary" />
+      <Button size="sm" variant="outline" disabled={off || stopped} onClick={() => void act('restart')}>
+        <RotateCcw />
+        Restart
+      </Button>
+      <Button
+        size="sm"
+        variant="outline"
+        disabled={off}
+        onClick={() => void act(stopped ? 'start' : 'stop')}
+      >
+        {stopped ? <Play /> : <Square />}
+        {stopped ? 'Start' : 'Stop'}
+      </Button>
     </div>
   );
 }
 
-/** Widths fixed so that values changing, or the panel opening, never move a column */
-const COLUMNS: { label: string; width: string }[] = [
-  { label: 'Deployment', width: 'w-[18rem]' },
-  { label: 'Project', width: 'w-[9rem]' },
-  { label: 'Status', width: 'w-[8.5rem]' },
-  { label: 'Revision', width: 'w-[10rem]' },
-  { label: 'CPU', width: 'w-[10.5rem]' },
-  { label: 'Memory', width: 'w-[10.5rem]' },
-  { label: 'Restarts', width: 'w-[5.5rem]' },
-  { label: 'Up', width: 'w-[6.5rem]' },
-  { label: 'Node', width: 'w-[9rem]' },
-  { label: 'Last warning', width: '' },
-];
+function Choice({
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  options: string[];
+  onChange: (value: string) => void;
+}) {
+  return (
+    <select
+      aria-label={label}
+      value={value}
+      onChange={event => onChange(event.target.value)}
+      className={cn(
+        'h-8 rounded-md border bg-background px-2 text-xs',
+        value === '' ? 'text-muted-foreground' : 'text-foreground'
+      )}
+    >
+      <option value="">{label}: any</option>
+      {options.map(o => (
+        <option key={o} value={o}>
+          {o}
+        </option>
+      ))}
+    </select>
+  );
+}
 
 export function DeploymentsPage({ connection }: { connection: KermodesConnection }) {
   const published = connection.pages.includes(DEPLOYMENTS_VIEW);
-  const { rows, history } = useDeployments(connection, published);
+  const { rows: deployments, history } = useDeployments(connection, published);
   const projects = useProjects();
   const system = useComponents();
-  const [selected, setSelected] = useState<Selected | null>(null);
-  const [query, setQuery] = useState('');
+  const catalog = usePolled('/api/catalog', 30_000, parseCatalog).value;
+  const [selected, setSelected] = useState<string | null>(null);
+  const [filters, setFilters] = useState<Filters>(NO_FILTERS);
+  const [error, setError] = useState<string | null>(null);
   const search = useRef<HTMLInputElement>(null);
-  const page = useRef<HTMLDivElement>(null);
-  const table = useRef<HTMLDivElement>(null);
-  const available = useHeight(page);
-  const [height, setHeight] = useStoredHeight();
   const close = useCallback(() => setSelected(null), []);
+  const set = (change: Partial<Filters>) => setFilters(current => ({ ...current, ...change }));
 
   const sources = useMemo(() => {
     const links = new Map<string, string | null>();
@@ -136,18 +172,14 @@ export function DeploymentsPage({ connection }: { connection: KermodesConnection
     return links;
   }, [projects]);
   const failed = projects.filter(p => p.failed != null);
-  const shown = useMemo(
-    () => rows.filter(d => matchesSearch(deploymentFields(d), query)),
-    [rows, query]
+  const rows = useMemo(
+    () => tableRows(deployments, system.components, catalog),
+    [deployments, system.components, catalog]
   );
-
-  const deployment =
-    selected?.kind === 'deployment' ? (rows.find(d => key(d) === selected.key) ?? null) : null;
-  const component =
-    selected?.kind === 'component'
-      ? (system.components?.find(c => c.name === selected.name) ?? null)
-      : null;
-  const open = deployment != null || component != null;
+  const shown = useMemo(() => rows.filter(r => matches(r, filters)), [rows, filters]);
+  const tally = counts(rows);
+  const row = rows.find(r => r.key === selected) ?? null;
+  const filtered = JSON.stringify(filters) !== JSON.stringify(NO_FILTERS);
 
   // `/` searches; Escape leaves the search, else closes the details.
   useEffect(() => {
@@ -158,72 +190,67 @@ export function DeploymentsPage({ connection }: { connection: KermodesConnection
       if (event.key === '/' && !typing && !event.metaKey && !event.ctrlKey) {
         event.preventDefault();
         search.current?.focus();
-      } else if (event.key === 'Escape' && !typing && open) {
+      } else if (event.key === 'Escape' && !typing && row != null) {
         close();
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [open, close]);
+  }, [row, close]);
 
-  // The chosen row stays in sight as the panel opens beneath it.
-  const selectedKey = selected?.kind === 'deployment' ? selected.key : null;
-  useEffect(() => {
-    if (selectedKey == null) return;
-    const frame = requestAnimationFrame(() =>
-      table.current
-        ?.querySelector('[aria-selected="true"]')
-        ?.scrollIntoView({ block: 'nearest' })
-    );
-    return () => cancelAnimationFrame(frame);
-  }, [selectedKey]);
+  const samplesOf = (r: Row) =>
+    (r.source.type === 'component'
+      ? system.history.get(r.source.component.name)
+      : history.get(r.key)) ?? [];
 
-  const panelHeight = clampPanel(height, available);
   return (
-    <div ref={page} className="flex min-h-0 flex-1 flex-col">
-      <div className="flex min-h-0 flex-1 flex-col gap-3 px-4 pt-4">
-        <SystemStrip
-          components={system.components}
-          error={system.error}
-          history={system.history}
-          selected={selected?.kind === 'component' ? selected.name : null}
-          onSelect={name => setSelected({ kind: 'component', name })}
-        />
-        {failed.map(p => (
-          <div
-            key={p.name}
-            className="flex gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm"
-          >
-            <AlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive" />
-            <div className="min-w-0">
-              <div>
-                <span className="font-medium">{p.name}</span>: commit{' '}
-                <Commit commit={p.failed!.commit} /> failed discovery, so it is not rolled out.
-              </div>
-              <pre className="mt-1 overflow-x-auto font-mono text-xs whitespace-pre-wrap text-muted-foreground">
-                {p.failed!.error}
-              </pre>
-            </div>
+    <div className="flex min-h-0 flex-1">
+      <div className="flex min-w-0 flex-1 flex-col gap-2 p-3">
+        <div className="flex flex-wrap items-center gap-2">
+          {(['ok', 'busy', 'bad', 'idle'] as const).map(tone => (
+            <span
+              key={tone}
+              className={cn(
+                'rounded px-2 py-0.5 text-xs font-medium tabular-nums',
+                tally[tone] > 0 ? TONE_FILL[tone] : 'bg-muted/50 text-muted-foreground'
+              )}
+            >
+              {tally[tone]} {TONE_LABEL[tone]}
+            </span>
+          ))}
+          {system.error != null && (
+            <span className="text-xs text-destructive">Platform: {system.error}</span>
+          )}
+          <div className="ml-auto">
+            <Actions row={row} onDone={setError} />
           </div>
-        ))}
-        <div className="flex items-center gap-3">
-          <div className="relative w-full max-w-sm">
+        </div>
+        {error != null && (
+          <p className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-sm">
+            {error}
+            <button type="button" className="ml-auto" aria-label="Dismiss" onClick={() => setError(null)}>
+              <X className="size-4" />
+            </button>
+          </p>
+        )}
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="relative w-72">
             <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
             <Input
               ref={search}
-              value={query}
-              onChange={event => setQuery(event.target.value)}
+              value={filters.query}
+              onChange={event => set({ query: event.target.value })}
               onKeyDown={event => {
                 if (event.key === 'Escape') {
-                  setQuery('');
+                  set({ query: '' });
                   event.currentTarget.blur();
                 }
               }}
-              placeholder="Search deployments"
+              placeholder="Search"
               aria-label="Search deployments"
               className="h-8 pr-8 pl-8"
             />
-            {query === '' ? (
+            {filters.query === '' ? (
               <kbd className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 rounded border px-1.5 font-mono text-[11px] text-muted-foreground">
                 /
               </kbd>
@@ -231,21 +258,51 @@ export function DeploymentsPage({ connection }: { connection: KermodesConnection
               <button
                 type="button"
                 aria-label="Clear search"
-                onClick={() => setQuery('')}
+                onClick={() => set({ query: '' })}
                 className="absolute top-1/2 right-2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
               >
                 <X className="size-4" />
               </button>
             )}
           </div>
-          <span className="text-xs text-muted-foreground tabular-nums">
-            {shown.length === rows.length
-              ? `${rows.length} ${rows.length === 1 ? 'deployment' : 'deployments'}`
-              : `${shown.length} of ${rows.length}`}
+          <Choice label="Project" value={filters.project} options={choices(rows, 'project')} onChange={project => set({ project })} />
+          <Choice label="Status" value={filters.status} options={choices(rows, 'status')} onChange={status => set({ status })} />
+          <Choice label="Kind" value={filters.kind} options={choices(rows, 'kind')} onChange={kind => set({ kind })} />
+          <Choice label="Node" value={filters.node} options={choices(rows, 'node')} onChange={node => set({ node })} />
+          <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+            <input
+              type="checkbox"
+              checked={filters.hideStopped}
+              onChange={event => set({ hideStopped: event.target.checked })}
+            />
+            Hide stopped
+          </label>
+          {filtered && (
+            <Button size="sm" variant="ghost" onClick={() => setFilters(NO_FILTERS)}>
+              Clear
+            </Button>
+          )}
+          <span className="ml-auto text-xs text-muted-foreground tabular-nums">
+            {shown.length === rows.length ? `${rows.length} rows` : `${shown.length} of ${rows.length}`}
           </span>
         </div>
-        <div ref={table} className="min-h-0 flex-1 overflow-auto rounded-md border">
-          <table className="w-full min-w-[96rem] table-fixed text-sm">
+        {failed.map(p => (
+          <div
+            key={p.name}
+            className="flex gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm"
+          >
+            <AlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive" />
+            <div className="min-w-0">
+              <span className="font-medium">{p.name}</span>: commit <Commit commit={p.failed!.commit} />{' '}
+              failed discovery, so it is not rolled out.
+              <pre className="mt-1 overflow-x-auto font-mono text-xs whitespace-pre-wrap text-muted-foreground">
+                {p.failed!.error}
+              </pre>
+            </div>
+          </div>
+        ))}
+        <div className="min-h-0 flex-1 overflow-auto rounded-md border">
+          <table className="w-full min-w-[112rem] table-fixed text-[13px]">
             <colgroup>
               {COLUMNS.map(c => (
                 <col key={c.label} className={c.width} />
@@ -254,75 +311,84 @@ export function DeploymentsPage({ connection }: { connection: KermodesConnection
             <thead className="sticky top-0 z-10 bg-background">
               <tr className="text-left text-xs text-muted-foreground shadow-[inset_0_-1px_0_var(--border)]">
                 {COLUMNS.map(c => (
-                  <th key={c.label} className="py-2 pr-4 font-medium first:pl-3">
+                  <th key={c.label} className="h-7 pr-3 font-medium first:pl-2">
                     {c.label}
                   </th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {shown.map(d => {
-                const samples = history.get(key(d)) ?? [];
-                const isSelected = selected?.kind === 'deployment' && selected.key === key(d);
+              {shown.map(r => {
+                const isSelected = r.key === selected;
+                const samples = samplesOf(r);
+                const disk = fullest(r.disks);
                 return (
                   <tr
-                    key={key(d)}
+                    key={r.key}
                     aria-selected={isSelected}
-                    onClick={() => setSelected({ kind: 'deployment', key: key(d) })}
+                    onClick={() => setSelected(r.key)}
                     className={cn(
-                      'cursor-pointer border-b last:border-b-0 hover:bg-accent/50',
-                      isSelected && 'bg-accent'
+                      'h-6 cursor-pointer border-b hover:bg-accent/50',
+                      isSelected && 'bg-accent',
+                      r.project === SYSTEM && 'bg-muted/25'
                     )}
                   >
-                    <td className="truncate py-2 pr-4 pl-3">
-                      <div className="truncate font-mono text-[13px] font-medium" title={d.name}>
-                        {d.name}
-                      </div>
-                      <div className="text-xs text-muted-foreground">{d.kind}</div>
+                    <td className="truncate pr-3 pl-2 font-mono font-medium" title={r.name}>
+                      {r.name}
                     </td>
-                    <td className="truncate py-2 pr-4" title={d.project}>
-                      {d.project}
+                    <td className="truncate pr-3 text-muted-foreground">{r.project}</td>
+                    <td className="truncate pr-3 text-muted-foreground">{r.kind}</td>
+                    <td className={cn('truncate px-2 font-medium', TONE_FILL[toneOf(r.status)])} title={r.status}>
+                      {r.status}
                     </td>
-                    <td className="py-2 pr-4">
-                      <Status status={d.status} />
-                    </td>
-                    <td className="py-2 pr-4">
-                      <Commit commit={d.commit} href={sources.get(key(d))} />
-                      {d.available != null && (
-                        <div className="truncate text-xs text-warning">
-                          {d.update === 'manual' ? 'update available' : 'rolling to'}{' '}
-                          {d.available.slice(0, 7)}
-                        </div>
+                    <td className="truncate pr-3 pl-2">
+                      {r.source.type === 'deployment' ? (
+                        <>
+                          <Commit commit={r.revision} href={sources.get(r.key)} />
+                          {r.source.deployment.available != null && (
+                            <span className="ml-1 text-xs text-warning" title={`update ${r.source.deployment.available}`}>
+                              ↑
+                            </span>
+                          )}
+                        </>
+                      ) : (
+                        <span className="font-mono text-xs">{r.revision ?? '—'}</span>
                       )}
                     </td>
-                    <td className="py-2 pr-4">
-                      <Usage
-                        value={d.cpu}
-                        limit={d.cpu_limit}
-                        samples={samples.map(s => s.cpu)}
-                        format={cores}
-                      />
-                    </td>
-                    <td className="py-2 pr-4">
-                      <Usage
-                        value={d.memory}
-                        limit={d.memory_limit}
-                        samples={samples.map(s => s.memory)}
-                        format={bytes}
-                      />
-                    </td>
-                    <td className={cn('py-2 pr-4 tabular-nums', d.restarts > 0 && 'text-warning')}>
-                      {d.restarts}
-                    </td>
-                    <td className="py-2 pr-4 tabular-nums">{ago(d.started)}</td>
-                    <td className="truncate py-2 pr-4 text-xs text-muted-foreground" title={d.node ?? undefined}>
-                      {d.node ?? '—'}
-                    </td>
-                    <td className="truncate py-2 pr-3 text-xs" title={d.event ?? undefined}>
-                      {d.event == null ? (
+                    <td className="pr-3">
+                      {r.cpu == null ? (
                         <span className="text-muted-foreground">—</span>
                       ) : (
-                        <span className="text-destructive">{d.event}</span>
+                        <Usage value={r.cpu} limit={r.cpuLimit} samples={samples.map(s => s.cpu)} format={cores} width={52} />
+                      )}
+                    </td>
+                    <td className="pr-3">
+                      {r.memory == null ? (
+                        <span className="text-muted-foreground">—</span>
+                      ) : (
+                        <Usage value={r.memory} limit={r.memoryLimit} samples={samples.map(s => s.memory)} format={bytes} width={52} />
+                      )}
+                    </td>
+                    <td
+                      className="truncate pr-3"
+                      title={r.disks.map(d => `${d.name} ${bytes(d.used)}${d.size ? ` of ${bytes(d.size)}` : ''}`).join(' · ')}
+                    >
+                      {disk == null ? (
+                        <span className="text-muted-foreground">—</span>
+                      ) : (
+                        <DiskUse name={disk.name} used={disk.used} size={disk.size} compact />
+                      )}
+                    </td>
+                    <td className={cn('pr-3 tabular-nums', r.restarts > 0 && 'text-warning')}>{r.restarts}</td>
+                    <td className="pr-3 tabular-nums">{ago(r.started)}</td>
+                    <td className="truncate pr-3 text-xs text-muted-foreground" title={r.node ?? undefined}>
+                      {r.node ?? '—'}
+                    </td>
+                    <td className="truncate pr-2 text-xs" title={r.warning ?? undefined}>
+                      {r.warning == null ? (
+                        <span className="text-muted-foreground">—</span>
+                      ) : (
+                        <span className="text-destructive">{r.warning}</span>
                       )}
                     </td>
                   </tr>
@@ -333,7 +399,7 @@ export function DeploymentsPage({ connection }: { connection: KermodesConnection
           {shown.length === 0 && (
             <p className="px-3 py-4 text-sm text-muted-foreground">
               {rows.length > 0
-                ? `No deployment matches “${query}”.`
+                ? 'Nothing matches these filters.'
                 : published
                   ? 'No deployments yet.'
                   : 'Waiting for sys.deployments…'}
@@ -341,26 +407,20 @@ export function DeploymentsPage({ connection }: { connection: KermodesConnection
           )}
         </div>
       </div>
-      {open ? (
-        <>
-          <Splitter height={panelHeight} onResize={next => setHeight(clampPanel(next, available))} />
-          <div style={{ height: panelHeight }} className="shrink-0">
-            {deployment != null && (
-              <DeploymentDetail
-                key={key(deployment)}
-                deployment={deployment}
-                source={sources.get(key(deployment)) ?? null}
-                onClose={close}
-              />
-            )}
-            {component != null && (
-              <ComponentDetail key={component.name} component={component} onClose={close} />
-            )}
-          </div>
-        </>
-      ) : (
-        <div className="h-4 shrink-0" />
-      )}
+      <SidePanel name="deployments">
+        {fold =>
+          row == null ? (
+            <div className="flex h-full flex-col">
+              <div className="flex h-11 shrink-0 items-center justify-end border-b px-3">{fold}</div>
+              <p className="p-4 text-sm text-muted-foreground">
+                Select a row to see its summary, logs, events, and settings.
+              </p>
+            </div>
+          ) : (
+            <RowDetail row={row} source={sources.get(row.key) ?? null} fold={fold} onClose={close} />
+          )
+        }
+      </SidePanel>
     </div>
   );
 }

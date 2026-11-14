@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown, ChevronRight, Search, Table2, X } from 'lucide-react';
+import { SidePanel } from '@/components/SidePanel';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -20,11 +21,6 @@ import { bytes, matchesSearch } from '@/deployments/model';
 import { DiskUse, Field } from '@/deployments/parts';
 
 const parseCatalog = (r: Response) => r.json() as Promise<Catalog>;
-
-const PANEL_STORAGE = 'kermodes.catalog.panel-width';
-const PANEL_DEFAULT = 440;
-const PANEL_MIN = 300;
-const PAGE_MIN = 480;
 
 const count = (n: number) => n.toLocaleString();
 const size = (n: number) => (n === 0 ? '—' : bytes(n));
@@ -62,53 +58,16 @@ function TotalsCells({ t }: { t: Totals }) {
   );
 }
 
-/** A handle between the table and the panel to its right: drag, arrow keys, or double-click */
-function Splitter({ width, onResize }: { width: number; onResize: (width: number) => void }) {
-  const [dragging, setDragging] = useState(false);
-  const start = useRef({ x: 0, width: 0 });
-  return (
-    <div
-      role="separator"
-      aria-orientation="vertical"
-      aria-label="Resize details"
-      aria-valuenow={width}
-      tabIndex={0}
-      data-dragging={dragging}
-      title="Drag to resize · double-click to reset"
-      onPointerDown={event => {
-        event.preventDefault();
-        event.currentTarget.setPointerCapture(event.pointerId);
-        start.current = { x: event.clientX, width };
-        setDragging(true);
-      }}
-      onPointerMove={event => {
-        if (dragging) onResize(start.current.width + start.current.x - event.clientX);
-      }}
-      onPointerUp={() => setDragging(false)}
-      onPointerCancel={() => setDragging(false)}
-      onDoubleClick={() => onResize(PANEL_DEFAULT)}
-      onKeyDown={event => {
-        if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
-          event.preventDefault();
-          onResize(width + (event.key === 'ArrowLeft' ? 32 : -32));
-        }
-      }}
-      className={cn(
-        'w-1.5 shrink-0 cursor-col-resize border-l bg-muted/40 outline-none',
-        'hover:bg-primary/30 focus-visible:bg-primary/40 data-[dragging=true]:bg-primary/50'
-      )}
-    />
-  );
-}
-
 function TableDetail({
   table,
   onOpen,
   onClose,
+  fold,
 }: {
   table: CatalogTable;
   onOpen: (table: string) => void;
   onClose: () => void;
+  fold: React.ReactNode;
 }) {
   const dates = tableDates(table);
   return (
@@ -125,6 +84,7 @@ function TableDetail({
         <Button size="icon-sm" variant="ghost" aria-label="Close details" onClick={onClose}>
           <X />
         </Button>
+        {fold}
       </div>
       <div className="min-h-0 flex-1 overflow-auto px-3 pb-3">
         {table.key.length > 0 && <Field label="Key">{table.key.join(', ')}</Field>}
@@ -189,19 +149,8 @@ export function CatalogPage({ onOpen }: { onOpen: (table: string) => void }) {
   const [query, setQuery] = useState('');
   const [selected, setSelected] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
-  const [width, setWidth] = useState(
-    () => Number(localStorage.getItem(PANEL_STORAGE)) || PANEL_DEFAULT
-  );
-  const page = useRef<HTMLDivElement>(null);
   const search = useRef<HTMLInputElement>(null);
   const close = useCallback(() => setSelected(null), []);
-
-  const resize = useCallback((next: number) => {
-    const available = page.current?.clientWidth ?? window.innerWidth;
-    const clamped = Math.round(Math.max(PANEL_MIN, Math.min(next, available - PAGE_MIN)));
-    setWidth(clamped);
-    localStorage.setItem(PANEL_STORAGE, String(clamped));
-  }, []);
 
   const today = utcDate(new Date());
   const tables = catalog?.tables ?? [];
@@ -241,7 +190,7 @@ export function CatalogPage({ onOpen }: { onOpen: (table: string) => void }) {
   const spaces = new Set(tables.map(t => namespaceOf(t.table))).size;
   const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
   return (
-    <div ref={page} className="flex min-h-0 flex-1">
+    <div className="flex min-h-0 flex-1">
       <div className="flex min-w-0 flex-1 flex-col gap-3 p-4">
         <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
           <div className="relative w-full max-w-sm">
@@ -381,14 +330,26 @@ export function CatalogPage({ onOpen }: { onOpen: (table: string) => void }) {
           )}
         </div>
       </div>
-      {detail != null && (
-        <>
-          <Splitter width={width} onResize={resize} />
-          <aside style={{ width }} className="shrink-0 bg-sidebar">
-            <TableDetail key={detail.table} table={detail} onOpen={onOpen} onClose={close} />
-          </aside>
-        </>
-      )}
+      <SidePanel name="catalog">
+        {fold =>
+          detail == null ? (
+            <div className="flex h-full flex-col">
+              <div className="flex h-11 shrink-0 items-center justify-end border-b px-3">{fold}</div>
+              <p className="p-4 text-sm text-muted-foreground">
+                Select a table to see its columns and dates.
+              </p>
+            </div>
+          ) : (
+            <TableDetail
+              key={detail.table}
+              table={detail}
+              onOpen={onOpen}
+              onClose={close}
+              fold={fold}
+            />
+          )
+        }
+      </SidePanel>
     </div>
   );
 }

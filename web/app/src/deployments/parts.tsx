@@ -1,38 +1,29 @@
 import { useEffect, useRef } from 'react';
 import { ExternalLink, GitCommitHorizontal } from 'lucide-react';
-import { Badge } from '@/components/ui/badge';
+import { type Tone, toneOf } from './rows';
 import { cn } from '@/lib/utils';
 import { usePolled } from './data';
 import { ago, bytes } from './model';
 
-const STATUS_VARIANT: Record<string, 'success' | 'warning' | 'destructive' | 'outline'> = {
-  Running: 'success',
-  'Rolling out': 'warning',
-  Starting: 'warning',
-  Degraded: 'warning',
-  'Not running': 'outline',
-  Stopped: 'outline',
-  Stopping: 'warning',
+/** A status's fill, by how it reads: as Deephaven's Query Monitor colours its cells */
+export const TONE_FILL: Record<Tone, string> = {
+  ok: 'bg-success text-background',
+  busy: 'bg-warning text-background',
+  bad: 'bg-destructive text-background',
+  idle: 'bg-muted text-muted-foreground',
 };
 
-export function Status({ status }: { status: string }) {
-  return <Badge variant={STATUS_VARIANT[status] ?? 'destructive'}>{status}</Badge>;
-}
-
-/** A status as a coloured dot, for dense places */
-export function StatusDot({ status }: { status: string }) {
-  const variant = STATUS_VARIANT[status] ?? 'destructive';
+/** A status as a small solid label, for headers */
+export function StatusFill({ status }: { status: string }) {
   return (
     <span
-      title={status}
       className={cn(
-        'inline-block size-2 shrink-0 rounded-full',
-        variant === 'success' && 'bg-success',
-        variant === 'warning' && 'bg-warning',
-        variant === 'destructive' && 'bg-destructive',
-        variant === 'outline' && 'bg-muted-foreground/50'
+        'shrink-0 rounded px-2 py-0.5 text-xs font-medium whitespace-nowrap',
+        TONE_FILL[toneOf(status)]
       )}
-    />
+    >
+      {status}
+    </span>
   );
 }
 
@@ -121,18 +112,34 @@ export function Usage({
           <polyline points={points} fill="none" stroke="currentColor" strokeWidth={1.25} />
         )}
       </svg>
-      <span className="min-w-11 text-right font-mono text-xs tabular-nums">
+      <span className="min-w-11 text-right font-mono text-xs whitespace-nowrap tabular-nums">
         {pct == null ? format(value) : `${pct.toFixed(0)}%`}
       </span>
     </div>
   );
 }
 
-/** A disk's use: its name, a bar of its size when known (red past 85%), and used of size */
-export function DiskUse({ name, used, size }: { name: string; used: number; size: number | null }) {
+/**
+ * A disk's use: its name, a bar of its size when known (red past 85%), and used of size;
+ * `compact` leaves the size to the bar and the title, for table cells.
+ */
+export function DiskUse({
+  name,
+  used,
+  size,
+  compact = false,
+}: {
+  name: string;
+  used: number;
+  size: number | null;
+  compact?: boolean;
+}) {
   const share = size != null && size > 0 ? used / size : null;
   return (
-    <span className="flex items-center gap-2 text-xs text-muted-foreground tabular-nums">
+    <span
+      className="flex items-center gap-2 text-xs whitespace-nowrap text-muted-foreground tabular-nums"
+      title={size != null ? `${bytes(used)} of ${bytes(size)}` : undefined}
+    >
       {name}
       {share != null && (
         <span className="h-1.5 w-16 shrink-0 overflow-hidden rounded-full bg-muted">
@@ -143,7 +150,7 @@ export function DiskUse({ name, used, size }: { name: string; used: number; size
         </span>
       )}
       <span className="text-foreground">{bytes(used)}</span>
-      {size != null && <span>of {bytes(size)}</span>}
+      {size != null && !compact && <span>of {bytes(size)}</span>}
     </span>
   );
 }
@@ -176,25 +183,23 @@ export function Events({ url }: { url: string }) {
   if (value == null) return <p className="p-4 text-sm text-muted-foreground">Loading…</p>;
   if (value.length === 0) return <p className="p-4 text-sm text-muted-foreground">No events.</p>;
   return (
-    <table className="w-full text-sm">
-      <tbody>
-        {value.map((e, i) => (
-          <tr key={i} className="border-b align-top">
-            <td className="w-24 py-2 pr-3 pl-4 whitespace-nowrap text-muted-foreground">
+    <div>
+      {value.map((e, i) => (
+        <div key={i} className="border-b px-3 py-2 text-sm">
+          <div className="flex items-baseline gap-2">
+            <span className={cn('font-medium', e.type === 'Warning' && 'text-destructive')}>
+              {e.reason}
+            </span>
+            {(e.count ?? 1) > 1 && <span className="text-muted-foreground">×{e.count}</span>}
+            <span className="ml-auto text-xs whitespace-nowrap text-muted-foreground">
               {ago(e.at_ns / 1e6)} ago
-            </td>
-            <td className="w-72 py-2 pr-3">
-              <span className={cn('font-medium', e.type === 'Warning' && 'text-destructive')}>
-                {e.reason}
-              </span>
-              {(e.count ?? 1) > 1 && <span className="text-muted-foreground"> ×{e.count}</span>}
-              <div className="font-mono text-xs text-muted-foreground">{e.object}</div>
-            </td>
-            <td className="py-2 pr-4">{e.message}</td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
+            </span>
+          </div>
+          <div className="truncate font-mono text-xs text-muted-foreground">{e.object}</div>
+          <div className="mt-0.5 break-words">{e.message}</div>
+        </div>
+      ))}
+    </div>
   );
 }
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { type Instance, clampPanel, componentUsage, matchesSearch } from './model';
+import { type Instance, componentUsage, matchesSearch } from './model';
 
 describe('matchesSearch', () => {
   const fields = ['ticker-ticks', 'ticker', 'Running', 'talos-4oh-emk', null];
@@ -48,15 +48,5 @@ describe('componentUsage', () => {
       memoryLimit: null,
     });
     expect(componentUsage([]).cpuLimit).toBeNull();
-  });
-});
-
-describe('clampPanel', () => {
-  it('keeps the panel at its minimum and the page above it at its own', () => {
-    expect(clampPanel(300, 900)).toBe(300);
-    expect(clampPanel(50, 900)).toBe(160);
-    expect(clampPanel(850, 900)).toBe(720);
-    // A short window: the panel's minimum wins.
-    expect(clampPanel(300, 250)).toBe(160);
   });
 });

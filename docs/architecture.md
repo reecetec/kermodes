@@ -1215,22 +1215,26 @@ namespaces).
   retries, backing off, until weir is back and the table opens afresh. A `kermodes run` started
   while weir is away waits for it too, so a program that lost weir restarts once rather than
   crash-looping.
-- Deployments, the home page wherever a controller runs, as Deephaven's query monitor lists
-  persistent queries: `kermodes ui` serves `sys.deployments`' newest row per deployment as the
-  view `deployments`, which the app opens for this tab and does not list among Tables. Each row shows the deployment and its project,
-  status, revision (and any update), CPU and memory as shares of its size with their recent
-  history, restarts, uptime, node, and newest Warning event. A search above the list keeps rows
-  where every word appears in some field (`/` focuses it). A row opens its overview, events,
-  and log in a panel docked below the list, as tall as it was last dragged; the list keeps its
-  width and its columns their places. Roll out, Restart, Stop, and Start are there. A commit that
-  failed discovery shows above the list.
+- Deployments, the home page wherever a controller runs (the Kermodes brand opens it), as
+  Deephaven's query monitor lists persistent queries: `kermodes ui` serves `sys.deployments`'
+  newest row per deployment as the view `deployments`, which the app opens for this tab and does
+  not list among Tables. One dense table: name, project, kind, status as a filled cell coloured
+  by how it reads (running, changing, failing, stopped), revision (and any update), CPU and
+  memory as shares of their size with their recent history, disk, restarts, uptime, node, and
+  newest Warning event. Counts by status and Roll out, Restart, Stop, and Start for the
+  selected row sit above it, then a search (`/` focuses it; every word must appear in some
+  field), choices of project, status, kind, and node, and Hide stopped. A row opens its summary,
+  logs, events, and settings in a panel docked to the right, as wide as it was last dragged or
+  folded away; the table's columns keep their places. A commit that failed discovery shows
+  above the table.
 - A deployment's revision links, in a new tab, to where its project declares it at the commit it
   runs, on the project's git host (GitHub's, GitLab's, or Gitea's page form): discovery records
   each resource's file and line (`defined_at` in the manifest) and the controller builds the
   link (`/api/projects`). Commits from before `defined_at` link to the project's directory.
-- Above the list, the platform's own components (weir, Postgres, the controller, the web UI)
-  as Kubernetes shows their pods: readiness, version, node, restarts, CPU and memory, and the
-  newest Warning event, each opening its pods, events, and logs. The controller reads them
+- The platform's own parts lead the table as the project `system`: weir, Postgres, the
+  controller, the web UI, and the lake's history (its size from `/api/catalog`). Their rows sum
+  their pods (a Postgres row shows its primary's disks) and open each pod in the panel. The Helm
+  release runs them, so their actions are disabled. The controller reads them
   (`/api/components`) rather than a `sys.*` table, so the page can say weir is down while it is.
   Each pod's disks come from the component itself, not the node (no kubelet access): weir's
   volume from its `stats` action; each Postgres instance's databases and WAL from its CNPG

@@ -1,37 +1,52 @@
 import { useState } from 'react';
-import { Play, RotateCcw, Rocket, ServerCog, Square, X } from 'lucide-react';
+import { X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { cn } from '@/lib/utils';
-import { type Component, type Deployment, ago, bytes, cores } from './model';
-import { Commit, DiskUse, Events, Field, Logs, Status } from './parts';
-import { componentMeta, versionOf } from './SystemStrip';
+import { totals, utcDate } from '@/catalog/model';
+import { type Component, type Deployment, type Instance, ago, bytes, cores } from './model';
+import { Commit, DiskUse, Events, Field, Logs, StatusFill } from './parts';
+import type { Row } from './rows';
 
-async function post(url: string): Promise<string | null> {
-  const response = await fetch(url, { method: 'POST' }).catch(e => e as Error);
-  if (response instanceof Error) return String(response);
-  if (response.ok) return null;
-  const text = await response.text();
-  try {
-    return JSON.parse(text).error ?? text;
-  } catch {
-    return text || `${response.status} ${response.statusText}`;
-  }
-}
-
-/** A details panel: its header, then tabs filling the rest */
-function Panel({
-  header,
-  tabs,
+/** A row's details, docked to the right of the table: a header, then tabs filling the rest */
+export function RowDetail({
+  row,
+  source,
+  fold,
+  onClose,
 }: {
-  header: React.ReactNode;
-  tabs: { name: string; content: React.ReactNode }[];
+  row: Row;
+  /** Where a deployment is declared at the commit it runs, on its git host */
+  source: string | null;
+  fold: React.ReactNode;
+  onClose: () => void;
 }) {
+  const tabs = tabsOf(row, source);
   return (
-    <section className="flex h-full min-h-0 flex-col bg-background">
-      {header}
-      <Tabs defaultValue={tabs[0].name} className="min-h-0 flex-1 gap-0">
+    <section className="flex h-full min-h-0 flex-col">
+      <header className="flex shrink-0 items-start gap-2 border-b px-3 py-2">
+        <div className="min-w-0 flex-1">
+          <div className="truncate font-mono text-[14px] font-semibold" title={row.name}>
+            {row.name}
+          </div>
+          <div className="truncate text-xs text-muted-foreground">
+            {row.project} · {row.kind}
+          </div>
+        </div>
+        <StatusFill status={row.status} />
+        {fold}
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          onClick={onClose}
+          aria-label="Close details"
+          title="Close (Esc)"
+        >
+          <X />
+        </Button>
+      </header>
+      <Tabs key={row.key} defaultValue={tabs[0].name} className="min-h-0 flex-1 gap-0">
         <TabsList className="h-9 w-full shrink-0 justify-start gap-1 rounded-none border-b bg-transparent px-2">
           {tabs.map(({ name }) => (
             <TabsTrigger
@@ -53,77 +68,46 @@ function Panel({
   );
 }
 
-function Close({ onClose }: { onClose: () => void }) {
-  return (
-    <Button variant="ghost" size="icon-sm" onClick={onClose} aria-label="Close details" title="Close (Esc)">
-      <X />
-    </Button>
-  );
+function tabsOf(row: Row, source: string | null): { name: string; content: React.ReactNode }[] {
+  switch (row.source.type) {
+    case 'deployment': {
+      const d = row.source.deployment;
+      const path = `/api/deployments/${encodeURIComponent(d.project)}/${encodeURIComponent(d.name)}`;
+      return [
+        { name: 'summary', content: <DeploymentSummary d={d} source={source} /> },
+        { name: 'logs', content: <Logs url={`${path}/logs?tail=500`} /> },
+        { name: 'events', content: <Events url={`${path}/events`} /> },
+        { name: 'settings', content: <DeploymentSettings d={d} source={source} /> },
+      ];
+    }
+    case 'component': {
+      const c = row.source.component;
+      const path = `/api/components/${encodeURIComponent(c.name)}`;
+      return [
+        { name: 'summary', content: <ComponentSummary c={c} /> },
+        { name: 'logs', content: <ComponentLogs c={c} path={path} /> },
+        { name: 'events', content: <Events url={`${path}/events`} /> },
+        { name: 'settings', content: <ComponentSettings c={c} /> },
+      ];
+    }
+    case 'history':
+      return [{ name: 'summary', content: <HistorySummary row={row} /> }];
+  }
 }
 
-export function DeploymentDetail({
-  deployment,
-  source,
-  onClose,
-}: {
-  deployment: Deployment;
-  source: string | null;
-  onClose: () => void;
-}) {
-  const d = deployment;
-  const path = `/api/deployments/${encodeURIComponent(d.project)}/${encodeURIComponent(d.name)}`;
-  const [busy, setBusy] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const stopped = d.status === 'Stopped' || d.status === 'Stopping';
-  const act = async (action: 'rollout' | 'restart' | 'stop' | 'start') => {
-    setBusy(action);
-    setError(await post(`${path}/${action}`));
-    setBusy(null);
-  };
-  const header = (
-    <>
-      <header className="flex shrink-0 items-center gap-3 border-b px-4 py-2.5">
-        <ServerCog className="size-4 text-muted-foreground" />
-        <div className="min-w-0">
-          <div className="font-mono text-[15px] font-semibold">{d.name}</div>
-          <div className="text-xs text-muted-foreground">
-            {d.project} · {d.kind}
-          </div>
-        </div>
-        <Status status={d.status} />
-        <div className="ml-auto flex items-center gap-2">
-          {d.available != null && d.update === 'manual' && (
-            <Button size="sm" variant="outline" disabled={busy != null} onClick={() => void act('rollout')}>
-              <Rocket />
-              Roll out {d.available.slice(0, 7)}
-            </Button>
-          )}
-          {!stopped && (
-            <Button size="sm" variant="outline" disabled={busy != null} onClick={() => void act('restart')}>
-              <RotateCcw />
-              Restart
-            </Button>
-          )}
-          <Button size="sm" variant="outline" disabled={busy != null} onClick={() => void act(stopped ? 'start' : 'stop')}>
-            {stopped ? <Play /> : <Square />}
-            {stopped ? 'Start' : 'Stop'}
-          </Button>
-          <Close onClose={onClose} />
-        </div>
-      </header>
-      {error != null && <p className="shrink-0 border-b px-4 py-2 text-sm text-destructive">{error}</p>}
-    </>
-  );
-  const overview = (
-    <div className="grid gap-x-8 px-4 py-2 md:grid-cols-2 xl:grid-cols-3">
-      <Field label="Status">{d.status}</Field>
+function DeploymentSummary({ d, source }: { d: Deployment; source: string | null }) {
+  return (
+    <div className="px-3 py-1">
       <Field label="Commit">
         <Commit commit={d.commit} href={source} />
       </Field>
       <Field label="Update available">
-        {d.available == null ? 'Up to date' : <span className="font-mono text-[13px]">{d.available.slice(0, 12)}</span>}
+        {d.available == null ? (
+          'Up to date'
+        ) : (
+          <span className="font-mono text-[13px] text-warning">{d.available.slice(0, 12)}</span>
+        )}
       </Field>
-      <Field label="Update policy">{d.update}</Field>
       <Field label="Node">{d.node ?? '—'}</Field>
       <Field label="Up for">{ago(d.started)}</Field>
       <Field label="Restarts">{d.restarts}</Field>
@@ -133,93 +117,105 @@ export function DeploymentDetail({
       <Field label="Memory">
         {bytes(d.memory)} of {bytes(d.memory_limit)} ({d.memory_pct.toFixed(0)}%)
       </Field>
-      <Field label="Last warning">{d.event == null ? '—' : `${d.event} (${ago(d.event_at)} ago)`}</Field>
+      <Field label="Last warning">
+        {d.event == null ? '—' : <span className="text-destructive">{d.event}</span>}
+        {d.event_at != null && (
+          <span className="text-muted-foreground"> ({ago(d.event_at)} ago)</span>
+        )}
+      </Field>
       <Field label="Reported">{ago(d.ts)} ago</Field>
     </div>
   );
+}
+
+function DeploymentSettings({ d, source }: { d: Deployment; source: string | null }) {
   return (
-    <Panel
-      header={header}
-      tabs={[
-        { name: 'overview', content: overview },
-        { name: 'events', content: <Events url={`${path}/events`} /> },
-        { name: 'logs', content: <Logs url={`${path}/logs?tail=500`} /> },
-      ]}
-    />
+    <div className="px-3 py-1">
+      <Field label="Kind">{d.kind}</Field>
+      <Field label="Update policy">
+        {d.update}
+        <div className="text-xs text-muted-foreground">
+          {d.update === 'manual'
+            ? 'A new commit waits for Roll out.'
+            : 'Each new commit rolls out by itself.'}
+        </div>
+      </Field>
+      <Field label="CPU">{cores(d.cpu_limit)}</Field>
+      <Field label="Memory">{bytes(d.memory_limit)}</Field>
+      <Field label="Declared in">
+        {source == null ? (
+          '—'
+        ) : (
+          <a href={source} target="_blank" rel="noreferrer" className="break-all underline">
+            {source}
+          </a>
+        )}
+      </Field>
+      <p className="py-2 text-xs text-muted-foreground">
+        Settings come from the project's code; change them there and the next commit rolls out.
+      </p>
+    </div>
   );
 }
 
-export function ComponentDetail({ component, onClose }: { component: Component; onClose: () => void }) {
-  const meta = componentMeta(component.name);
-  const Icon = meta.icon;
-  const path = `/api/components/${encodeURIComponent(component.name)}`;
-  const [pod, setPod] = useState<string>('');
-  const header = (
-    <header className="flex shrink-0 items-center gap-3 border-b px-4 py-2.5">
-      <Icon className="size-4 text-muted-foreground" />
-      <div className="min-w-0">
-        <div className="text-[15px] font-semibold">{meta.label}</div>
-        <div className="text-xs text-muted-foreground">
-          {meta.about} · <span className="font-mono">{versionOf(component)}</span>
-        </div>
+function InstanceBlock({ i }: { i: Instance }) {
+  return (
+    <div className="border-b px-3 py-2 text-sm">
+      <div className="flex items-center gap-2">
+        <span className="truncate font-mono text-[13px] font-medium">{i.pod}</span>
+        {i.role != null && <span className="text-xs text-muted-foreground">{i.role}</span>}
+        <span
+          className={cn('ml-auto text-xs', i.ready ? 'text-success' : 'text-destructive')}
+        >
+          {i.ready ? 'ready' : (i.waiting ?? 'not ready')}
+        </span>
       </div>
-      <Status status={component.status} />
-      <div className="ml-auto">
-        <Close onClose={onClose} />
+      <div className="mt-1 grid grid-cols-2 gap-x-3 gap-y-0.5 text-xs text-muted-foreground tabular-nums">
+        <span>
+          version <span className="font-mono text-foreground">{i.version ?? '—'}</span>
+        </span>
+        <span className="truncate">node {i.node ?? '—'}</span>
+        <span>up {ago(i.started_ns == null ? null : i.started_ns / 1e6)}</span>
+        <span className={cn(i.restarts > 0 && 'text-warning')}>{i.restarts} restarts</span>
+        <span>
+          cpu <span className="text-foreground">{cores(i.cpu)}</span>
+          {i.cpu_limit != null && ` of ${cores(i.cpu_limit)}`}
+        </span>
+        <span>
+          mem <span className="text-foreground">{bytes(i.memory)}</span>
+          {i.memory_limit != null && ` of ${bytes(i.memory_limit)}`}
+        </span>
       </div>
-    </header>
-  );
-  const instances = (
-    <table className="w-full text-sm">
-      <thead>
-        <tr className="border-b text-left text-xs text-muted-foreground">
-          {['Pod', 'Role', 'Ready', 'Version', 'Node', 'Up', 'Restarts', 'CPU', 'Memory', 'Disks'].map(h => (
-            <th key={h} className="py-2 pr-4 font-medium first:pl-4">
-              {h}
-            </th>
+      {i.disks.length > 0 && (
+        <div className="mt-1 flex flex-col gap-0.5">
+          {i.disks.map(d => (
+            <DiskUse key={d.name} name={d.name} used={d.used} size={d.size} />
           ))}
-        </tr>
-      </thead>
-      <tbody>
-        {component.instances.map(i => (
-          <tr key={i.pod} className="border-b">
-            <td className="py-2 pr-4 pl-4 font-mono text-[13px]">{i.pod}</td>
-            <td className="py-2 pr-4">{i.role ?? '—'}</td>
-            <td className={cn('py-2 pr-4', !i.ready && 'text-destructive')}>
-              {i.ready ? 'yes' : (i.waiting ?? 'no')}
-            </td>
-            <td className="py-2 pr-4 font-mono text-xs">{i.version ?? '—'}</td>
-            <td className="py-2 pr-4 text-xs text-muted-foreground">{i.node ?? '—'}</td>
-            <td className="py-2 pr-4 tabular-nums">{ago(i.started_ns == null ? null : i.started_ns / 1e6)}</td>
-            <td className={cn('py-2 pr-4 tabular-nums', i.restarts > 0 && 'text-warning')}>{i.restarts}</td>
-            <td className="py-2 pr-4 tabular-nums">
-              {cores(i.cpu)}
-              {i.cpu_limit != null && <span className="text-muted-foreground"> of {cores(i.cpu_limit)}</span>}
-            </td>
-            <td className="py-2 pr-4 tabular-nums">
-              {bytes(i.memory)}
-              {i.memory_limit != null && <span className="text-muted-foreground"> of {bytes(i.memory_limit)}</span>}
-            </td>
-            <td className="py-2 pr-4">
-              {i.disks.length === 0 ? (
-                <span className="text-muted-foreground">—</span>
-              ) : (
-                <div className="flex flex-col gap-1">
-                  {i.disks.map(d => (
-                    <DiskUse key={d.name} name={d.name} used={d.used} size={d.size} />
-                  ))}
-                </div>
-              )}
-            </td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
+        </div>
+      )}
+    </div>
   );
-  const logs = (
+}
+
+function ComponentSummary({ c }: { c: Component }) {
+  return (
     <div>
-      {component.instances.length > 1 && (
-        <div className="flex items-center gap-2 border-b px-4 py-2 text-xs text-muted-foreground">
+      {c.warning != null && (
+        <p className="border-b px-3 py-2 text-sm text-destructive">{c.warning}</p>
+      )}
+      {c.instances.map(i => (
+        <InstanceBlock key={i.pod} i={i} />
+      ))}
+    </div>
+  );
+}
+
+function ComponentLogs({ c, path }: { c: Component; path: string }) {
+  const [pod, setPod] = useState('');
+  return (
+    <div>
+      {c.instances.length > 1 && (
+        <div className="flex items-center gap-2 border-b px-3 py-2 text-xs text-muted-foreground">
           Pod
           <select
             value={pod}
@@ -227,7 +223,7 @@ export function ComponentDetail({ component, onClose }: { component: Component; 
             className="rounded-md border bg-background px-2 py-1 font-mono text-xs text-foreground"
           >
             <option value="">a ready one</option>
-            {component.instances.map(i => (
+            {c.instances.map(i => (
               <option key={i.pod} value={i.pod}>
                 {i.pod}
                 {i.role != null ? ` (${i.role})` : ''}
@@ -236,17 +232,53 @@ export function ComponentDetail({ component, onClose }: { component: Component; 
           </select>
         </div>
       )}
-      <Logs key={pod} url={`${path}/logs?tail=500${pod ? `&pod=${encodeURIComponent(pod)}` : ''}`} />
+      <Logs
+        key={pod}
+        url={`${path}/logs?tail=500${pod ? `&pod=${encodeURIComponent(pod)}` : ''}`}
+      />
     </div>
   );
+}
+
+function ComponentSettings({ c }: { c: Component }) {
   return (
-    <Panel
-      header={header}
-      tabs={[
-        { name: 'overview', content: instances },
-        { name: 'events', content: <Events url={`${path}/events`} /> },
-        { name: 'logs', content: logs },
-      ]}
-    />
+    <div className="px-3 py-1">
+      <Field label="Pods">{c.instances.length}</Field>
+      <Field label="Images">
+        {[...new Set(c.instances.map(i => i.version ?? '?'))].join(', ')}
+      </Field>
+      <p className="py-2 text-xs text-muted-foreground">
+        The Helm release runs this part of the platform: change it in the chart's values, and
+        roll it out with the release, not from here.
+      </p>
+    </div>
+  );
+}
+
+function HistorySummary({ row }: { row: Row }) {
+  if (row.source.type !== 'history') return null;
+  const tables = row.source.catalog.tables;
+  const all = totals(tables, utcDate(new Date()));
+  const largest = tables
+    .map(t => ({ table: t.table, bytes: t.history.reduce((s, d) => s + d.bytes, 0) }))
+    .filter(t => t.bytes > 0)
+    .sort((a, b) => b.bytes - a.bytes)
+    .slice(0, 8);
+  return (
+    <div className="px-3 py-1">
+      <Field label="Size">{bytes(all.historyBytes)}</Field>
+      <Field label="Rows">{all.historyRows.toLocaleString()}</Field>
+      <Field label="Tables">{tables.filter(t => t.history.length > 0).length}</Field>
+      <h3 className="mt-3 mb-1 text-xs font-medium text-muted-foreground">Largest</h3>
+      {largest.map(t => (
+        <div key={t.table} className="flex justify-between border-b py-1 text-sm">
+          <span className="font-mono text-[13px]">{t.table}</span>
+          <span className="tabular-nums">{bytes(t.bytes)}</span>
+        </div>
+      ))}
+      <p className="py-2 text-xs text-muted-foreground">
+        Merged from weir each night by the controller; the Catalog tab has every date.
+      </p>
+    </div>
   );
 }

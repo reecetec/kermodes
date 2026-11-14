@@ -75,11 +75,6 @@ export function matchesSearch(fields: readonly (string | null | undefined)[], qu
   return words.every(word => text.some(field => field.includes(word)));
 }
 
-/** What a deployment is searched by */
-export function deploymentFields(d: Deployment): (string | null)[] {
-  return [d.name, d.project, d.kind, d.status, d.update, d.commit, d.available, d.node, d.event];
-}
-
 /**
  * A component's use and size across its pods: cores and bytes, and their limits (`null`
  * unless every pod declares one, since a share of part of the size would mislead).
@@ -98,15 +93,6 @@ export function componentUsage(instances: readonly Instance[]): {
     memory: instances.reduce((a, i) => a + i.memory, 0),
     memoryLimit: instances.length === 0 ? null : sum(instances.map(i => i.memory_limit)),
   };
-}
-
-/** The shortest the details panel gets, and the least of the page it leaves above it */
-export const PANEL_MIN = 160;
-export const PAGE_MIN = 180;
-
-/** The details panel's height, kept between its minimum and what leaves the page its own */
-export function clampPanel(height: number, available: number): number {
-  return Math.round(Math.max(PANEL_MIN, Math.min(height, available - PAGE_MIN)));
 }
 
 export function bytes(n: number): string {
