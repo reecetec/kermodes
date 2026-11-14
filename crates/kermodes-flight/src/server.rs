@@ -3,6 +3,7 @@
 use std::net::{SocketAddr, TcpListener};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 
 use arrow::record_batch::RecordBatch;
@@ -15,7 +16,7 @@ use arrow_flight::{
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
 use futures::stream::{self, StreamExt, TryStreamExt};
-use kermodes_weir::{Error, SourceId, Store, TableName};
+use kermodes_weir::{Error, Pace, SourceId, Store, TableName};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -23,6 +24,14 @@ use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::{columns_json, schema_from_json, status};
+
+/// Bytes queued for one reader while it catches up: the replay waits for the reader past this,
+/// so a day of any size costs about this much of the server's memory per reader.
+const CATCH_UP_BYTES: usize = 16 << 20;
+/// Bytes a reader may fall behind live writes before it is dropped (its stream ends, and it
+/// subscribes again) rather than held in the server's memory. Above `CATCH_UP_BYTES`, so the
+/// last batches of a replay and the first live ones always fit.
+const LIVE_BYTES: usize = 128 << 20;
 
 /// A running Flight server; stops when dropped.
 pub struct Server {
@@ -216,19 +225,56 @@ impl FlightService for Service {
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let ticket = command(&request.into_inner().ticket)?;
         let name = table_name(&ticket)?;
-        let (batches, receiver) = mpsc::unbounded_channel::<RecordBatch>();
+        let schema = {
+            let (store, name) = (self.store.clone(), name.clone());
+            blocking(move || store.table(&name).map(|entry| entry.schema)).await?
+        };
+        // Batches sent to the reader's stream, and the bytes of them it has not taken yet.
+        let (batches, receiver) =
+            mpsc::unbounded_channel::<(Result<RecordBatch, FlightError>, usize)>();
+        let queued = Arc::new(AtomicUsize::new(0));
         let store = self.store.clone();
-        // A slow reader buffers here rather than holding up writers; a reader that has gone is
-        // dropped at the next batch.
-        let schema = blocking(move || {
-            store.subscribe(
+        let sent = queued.clone();
+        // The replay runs beside the stream: it waits for the reader while catching up, which
+        // would never end if the stream started only after it.
+        tokio::task::spawn_blocking(move || {
+            let subscriber = batches.clone();
+            let subscribed = store.subscribe(
                 &name,
-                Box::new(move |batch| batches.send(batch.clone()).is_ok()),
-            )
-        })
-        .await?;
-        let rows = futures::stream::unfold(receiver, |mut receiver| async move {
-            receiver.recv().await.map(|batch| (Ok(batch), receiver))
+                Box::new(move |batch, pace| {
+                    let size = batch.get_array_memory_size();
+                    match pace {
+                        Pace::MayWait => {
+                            while sent.load(Ordering::Acquire) > CATCH_UP_BYTES {
+                                if subscriber.is_closed() {
+                                    return false;
+                                }
+                                thread::sleep(Duration::from_millis(2));
+                            }
+                        }
+                        // Too far behind to keep up.
+                        Pace::MustNotWait => {
+                            if sent.load(Ordering::Acquire) + size > LIVE_BYTES {
+                                return false;
+                            }
+                        }
+                    }
+                    sent.fetch_add(size, Ordering::AcqRel);
+                    // Fails once the reader went.
+                    subscriber.send((Ok(batch.clone()), size)).is_ok()
+                }),
+            );
+            if let Err(e) = subscribed {
+                let _ = batches.send((Err(FlightError::Tonic(Box::new(status(e)))), 0));
+            }
+        });
+        let rows = futures::stream::unfold(receiver, move |mut receiver| {
+            let queued = queued.clone();
+            async move {
+                let (batch, size) = receiver.recv().await?;
+                queued.fetch_sub(size, Ordering::AcqRel);
+                Some((batch, receiver))
+            }
         });
         let data = FlightDataEncoderBuilder::new()
             .with_schema(schema)

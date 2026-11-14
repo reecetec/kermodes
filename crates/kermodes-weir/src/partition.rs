@@ -175,39 +175,52 @@ impl Partition {
         Ok(true)
     }
 
-    /// Every committed batch, in order.
-    pub(crate) fn batches(&self) -> Result<Vec<RecordBatch>, Error> {
-        let segments = self
-            .closed
-            .iter()
-            .chain(self.open.as_ref().map(|open| &open.segment));
-        let mut batches = Vec::new();
-        for segment in segments {
-            let Some(last) = segment.entries.last() else {
+    /// How many batches are committed.
+    pub(crate) fn committed(&self) -> usize {
+        self.segments().map(|s| s.entries.len()).sum()
+    }
+
+    /// The committed batches from the `from`th on (counting from 0), to read without the
+    /// partition: a committed batch's bytes never change, so the cursor reads them while writers
+    /// go on appending.
+    pub(crate) fn cursor(&self, from: usize) -> Cursor {
+        // Batches to pass over before the first one to deliver.
+        let mut before = from;
+        let mut first_skip = 0;
+        let mut segments = Vec::new();
+        let mut bytes = 0;
+        for segment in self.segments() {
+            let count = segment.entries.len();
+            if before >= count {
+                before -= count;
                 continue;
-            };
-            let path = data_path(&self.dir, segment.number);
-            let file = File::open(&path).map_err(|e| Error::io(&path, e))?;
-            let reader = StreamReader::try_new(file.take(last.end), None)
-                .map_err(|e| Error::Arrow(format!("{}: {e}", path.display())))?;
-            let read: Vec<RecordBatch> = reader
-                .collect::<Result<_, _>>()
-                .map_err(|e| Error::Arrow(format!("{}: {e}", path.display())))?;
-            let matches = read.len() == segment.entries.len()
-                && read
-                    .iter()
-                    .zip(&segment.entries)
-                    .all(|(batch, entry)| batch.num_rows() as u64 == entry.rows);
-            if !matches {
-                return Err(Error::Corrupt(format!(
-                    "{}: the stream does not hold the {} batches its index commits",
-                    path.display(),
-                    segment.entries.len()
-                )));
             }
-            batches.extend(read);
+            if segments.is_empty() {
+                first_skip = before;
+            }
+            let last = segment.entries.last().expect("a segment with batches");
+            // Stream bytes from the end of the last batch delivered to the end of the segment.
+            let start = before.checked_sub(1).map_or(0, |i| segment.entries[i].end);
+            bytes += last.end - start;
+            before = 0;
+            segments.push(Committed {
+                path: data_path(&self.dir, segment.number),
+                end: last.end,
+                rows: segment.entries.iter().map(|e| e.rows).collect(),
+            });
         }
-        Ok(batches)
+        Cursor {
+            segments,
+            skip: first_skip,
+            bytes,
+        }
+    }
+
+    fn segments(&self) -> impl Iterator<Item = &Segment> {
+        self.closed
+            .iter()
+            .chain(self.open.as_ref().map(|open| &open.segment))
+            .filter(|segment| !segment.entries.is_empty())
     }
 
     fn start(&self) -> Result<Open, Error> {
@@ -244,6 +257,64 @@ impl Partition {
             stream,
             index: index_file,
         })
+    }
+}
+
+/// A segment's committed batches: its stream up to the last committed byte, and each batch's row
+/// count, to check what the stream holds against what the index commits.
+struct Committed {
+    path: PathBuf,
+    end: u64,
+    rows: Vec<u64>,
+}
+
+/// Committed batches of a partition, read one at a time (`Partition::cursor`).
+pub(crate) struct Cursor {
+    segments: Vec<Committed>,
+    /// Batches of the first segment already delivered.
+    skip: usize,
+    /// Bytes of the stream the batches to deliver take on disk.
+    bytes: u64,
+}
+
+impl Cursor {
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+    /// Feeds `receive` each batch in order, decoding one at a time, until it returns `false`;
+    /// whether every batch was taken.
+    pub(crate) fn read(self, mut receive: impl FnMut(RecordBatch) -> bool) -> Result<bool, Error> {
+        let mut skip = self.skip;
+        for segment in self.segments {
+            let path = &segment.path;
+            let corrupt = || {
+                Error::Corrupt(format!(
+                    "{}: the stream does not hold the {} batches its index commits",
+                    path.display(),
+                    segment.rows.len()
+                ))
+            };
+            let file = File::open(path).map_err(|e| Error::io(path, e))?;
+            let mut batches = StreamReader::try_new(file.take(segment.end), None)
+                .map_err(|e| Error::Arrow(format!("{}: {e}", path.display())))?;
+            for (i, rows) in segment.rows.iter().enumerate() {
+                let batch = batches
+                    .next()
+                    .ok_or_else(corrupt)?
+                    .map_err(|e| Error::Arrow(format!("{}: {e}", path.display())))?;
+                if batch.num_rows() as u64 != *rows {
+                    return Err(corrupt());
+                }
+                if i >= skip && !receive(batch) {
+                    return Ok(false);
+                }
+            }
+            if batches.next().is_some() {
+                return Err(corrupt());
+            }
+            skip = 0;
+        }
+        Ok(true)
     }
 }
 
@@ -301,4 +372,55 @@ fn recover(dir: &Path, number: u32) -> Result<Option<Segment>, Error> {
         )));
     }
     Ok(Some(Segment { number, entries }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{AsArray, Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Int64Type, Schema};
+
+    use super::Partition;
+
+    /// A cursor from any batch delivers exactly the batches from there on, across segments,
+    /// and counts their bytes.
+    #[test]
+    fn a_cursor_reads_on_from_any_batch_across_segments() {
+        let dir = std::env::temp_dir().join(format!("kermodes-cursor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let mut partition = Partition::open(&dir, schema.clone()).unwrap();
+        // About 24 MiB a batch: three to a 64 MiB segment, so ten batches span four segments of
+        // three, three, three, and one.
+        let rows = 3 << 20;
+        for v in 0..10_i64 {
+            let n = Int64Array::from(vec![v; rows]);
+            let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(n)]).unwrap();
+            assert!(partition.append(&batch, v as u64 + 1, 0, 1).unwrap());
+        }
+        assert!(
+            partition.segments().count() >= 3,
+            "the batches span segments"
+        );
+        assert_eq!(partition.committed(), 10);
+        let mut last_bytes = u64::MAX;
+        for from in 0..=10 {
+            let cursor = partition.cursor(from);
+            assert!(cursor.bytes() < last_bytes || from == 10, "from {from}");
+            last_bytes = cursor.bytes();
+            let mut read = Vec::new();
+            assert!(
+                cursor
+                    .read(|batch| {
+                        read.push(batch.column(0).as_primitive::<Int64Type>().value(0));
+                        true
+                    })
+                    .unwrap()
+            );
+            assert_eq!(read, (from as i64..10).collect::<Vec<_>>(), "from {from}");
+        }
+        assert_eq!(partition.cursor(10).bytes(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

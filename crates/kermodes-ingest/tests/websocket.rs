@@ -67,7 +67,21 @@ fn wait_for(what: &str, done: impl Fn() -> bool) {
 fn opened(
     write: impl FnMut(&RecordBatch, Option<u64>) -> Result<bool, kermodes_weir::Error> + Send + 'static,
 ) -> Open {
-    Box::new(move || Ok((Box::new(write) as Write, None)))
+    counting_opens(write, Arc::new(AtomicU64::new(0)))
+}
+
+/// A writer that is open at once, every time it is opened, counting the opens.
+fn counting_opens(
+    write: impl FnMut(&RecordBatch, Option<u64>) -> Result<bool, kermodes_weir::Error> + Send + 'static,
+    opens: Arc<AtomicU64>,
+) -> Open {
+    let write = Arc::new(Mutex::new(write));
+    Box::new(move || {
+        opens.fetch_add(1, Ordering::Relaxed);
+        let write = write.clone();
+        let forward = move |batch: &RecordBatch, seq| (write.lock().unwrap())(batch, seq);
+        Ok((Box::new(forward) as Write, None))
+    })
 }
 
 #[test]
@@ -182,7 +196,7 @@ fn a_ticker_feed_lands_in_a_store() {
     store
         .subscribe(
             &name,
-            Box::new(move |batch| {
+            Box::new(move |batch, _| {
                 count.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
                 let null_count: usize = batch.columns().iter().map(|c| c.null_count()).sum();
                 missing.fetch_add(null_count as u64, Ordering::Relaxed);
@@ -198,11 +212,16 @@ fn a_ticker_feed_lands_in_a_store() {
     );
 }
 
+/// The store goes on the second write (weir restarting) and is back at once: the connector
+/// opens its writer again and writes that batch again, not losing it.
 #[test]
-fn a_failed_write_stops_the_connector() {
+fn a_lost_store_is_reopened_and_the_interrupted_batch_written() {
     let feed = ticker("127.0.0.1:0".parse().unwrap(), 5_000, 10).unwrap();
-    let calls = Arc::new(AtomicU64::new(0));
-    let written = Arc::new(AtomicU64::new(0));
+    let (calls, written, opens) = (
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+    );
     let (count, rows) = (calls.clone(), written.clone());
     let options = Options {
         flush: Duration::from_millis(10),
@@ -213,13 +232,50 @@ fn a_failed_write_stops_the_connector() {
         schema(),
         options,
         None,
-        // The store goes on the second batch and is back for the third: rows after a failure
-        // must not be written as if nothing happened.
-        opened(move |batch, _| {
+        counting_opens(
+            move |batch, _| {
+                if count.fetch_add(1, Ordering::Relaxed) == 1 {
+                    return Err(kermodes_weir::Error::Io("the store went".into()));
+                }
+                rows.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+                Ok(true)
+            },
+            opens.clone(),
+        ),
+    )
+    .unwrap();
+    wait_for("writes after the loss", || ingest.stats().batches >= 3);
+    ingest.stop();
+    let stats = ingest.stats();
+    assert_eq!(
+        (opens.load(Ordering::Relaxed), stats.reopens, stats.failed),
+        (2, 1, false),
+        "{stats:?}"
+    );
+    // Every call wrote but the failed one, whose batch was written on the next.
+    assert_eq!(calls.load(Ordering::Relaxed), stats.batches + 1);
+    assert_eq!(stats.rows, written.load(Ordering::Relaxed));
+}
+
+/// Anything but a lost store stops the connector: waiting would not mend it.
+#[test]
+fn a_write_that_cannot_succeed_stops_the_connector() {
+    let feed = ticker("127.0.0.1:0".parse().unwrap(), 5_000, 10).unwrap();
+    let calls = Arc::new(AtomicU64::new(0));
+    let count = calls.clone();
+    let options = Options {
+        flush: Duration::from_millis(10),
+        max_rows: 1_000,
+    };
+    let mut ingest = websocket(
+        &format!("ws://{}/", feed.addr()),
+        schema(),
+        options,
+        None,
+        opened(move |_, _| {
             if count.fetch_add(1, Ordering::Relaxed) == 1 {
-                return Err(kermodes_weir::Error::Io("the store went".into()));
+                return Err(kermodes_weir::Error::Schema("a column went".into()));
             }
-            rows.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
             Ok(true)
         }),
     )
@@ -227,9 +283,11 @@ fn a_failed_write_stops_the_connector() {
     wait_for("the failure", || ingest.stats().failed);
     ingest.stop();
     let stats = ingest.stats();
-    assert_eq!(calls.load(Ordering::Relaxed), 2, "{stats:?}");
-    assert_eq!(stats.rows, written.load(Ordering::Relaxed));
-    assert_eq!(stats.batches, 1);
+    assert_eq!(
+        (calls.load(Ordering::Relaxed), stats.batches),
+        (2, 1),
+        "{stats:?}"
+    );
 }
 
 /// A rolling handover: the new connector is connected (ready) while the old writer still holds
@@ -331,7 +389,7 @@ fn a_numbered_feed_is_written_exactly_once_across_a_handover() {
     store
         .subscribe(
             &name,
-            Box::new(move |batch| {
+            Box::new(move |batch, _| {
                 let seq = batch
                     .column(0)
                     .as_primitive::<arrow::datatypes::Int64Type>();

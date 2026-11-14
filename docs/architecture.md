@@ -337,6 +337,10 @@ A source that needs code (parsing, joining reference data) is a deployment holdi
   A raw WebSocket feed is not replayable, so a restarted connector resumes from the feed's
   present. `kermodes demo ticker` (`km.demo.ticker()`) serves a synthetic feed, the same ticks to
   every client, each numbered by `seq`.
+- A connector that loses its store (weir restarting, a broken connection) opens its writer
+  again once the store is back and writes the batch it was on again; `stats.reopens` counts
+  it. With `seq`, a batch the store did commit is dropped as a duplicate; without, it may be
+  written twice. Other errors stop it (`stats.failed`).
 - A feed that numbers its records is written exactly once across a rolling handover with
   `seq="seq"` (`km.websocket(url, seq="seq")`, `--seq`): the new run reads the feed while the old
   one still writes, and once it holds the source's lease it writes only records numbered above
@@ -402,8 +406,13 @@ catalog as live tables.
 - Subscribe = snapshot (every batch committed today, UTC) then tail (each new batch as it
   commits), in one Flight `DoGet` stream per subscriber. Live tables are intraday: earlier days
   stay in weir until merged and are read as history (§8), never replayed into every reader, whose
-  memory would otherwise grow with every day kept. A slow subscriber's batches queue on the
-  server rather than holding up writers.
+  memory would otherwise grow with every day kept.
+- The replay reads one batch at a time from disk without the table's lock, in rounds, until
+  little is left (64 batches and 4 MiB); that it delivers under the lock and joins the writes,
+  so no batch comes between or twice and writers wait only for that remainder. Each reader has a
+  queue bounded in bytes: while it catches up, the replay waits for the reader past 16 MiB, so a
+  day of any size costs about that much of weir's memory per reader; a reader 128 MiB behind live
+  writes is dropped (its stream ends, and it subscribes again) rather than held in memory.
 - Later: sealed segments over `DoGet` with the engine caching them locally, the tail over
   `DoExchange` resumed by row position (§17).
 - Co-located workers may memory-map sealed segments directly; this is an optimization only.

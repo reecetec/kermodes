@@ -24,8 +24,27 @@ use crate::{Error, SourceId, TableName};
 pub const BRANCH: &str = "local";
 
 /// Receives a table's batches in order: every batch committed today (UTC) when it subscribes,
-/// then each new one as it commits. Returning `false` unsubscribes it (its table is gone).
-pub type Subscriber = Box<dyn FnMut(&RecordBatch) -> bool + Send>;
+/// then each new one as it commits. Returning `false` unsubscribes it (its reader is gone, or
+/// too far behind). `Pace` says whether it may wait for its reader before returning.
+pub type Subscriber = Box<dyn FnMut(&RecordBatch, Pace) -> bool + Send>;
+
+/// Whether a subscriber may wait before taking the next batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pace {
+    /// A batch read from disk while the subscriber catches up, with no lock held: waiting slows
+    /// only this subscriber, which is how a slow reader holds back its own replay.
+    MayWait,
+    /// A batch delivered under the table's lock, as writes commit: waiting would hold up every
+    /// writer, so a subscriber that cannot take it should return `false` instead.
+    MustNotWait,
+}
+
+/// While more than this is left to catch up on, a subscriber reads it without the table's lock;
+/// the rest it reads under the lock, then joins the writes, so none comes between and none
+/// twice. Bounded in batches and in bytes, so writers wait for little either way and a
+/// subscriber can take it all without waiting.
+const CATCH_UP_UNDER_LOCK: usize = 64;
+const CATCH_UP_UNDER_LOCK_BYTES: u64 = 4 << 20;
 
 pub struct Store {
     root: PathBuf,
@@ -155,6 +174,10 @@ impl Store {
     /// Feeds `subscriber` every batch of `name` committed today (UTC), then each new one as it
     /// commits; returns the table's schema. A live table is intraday (§7.3): earlier days are
     /// history, read from the lake once merged, not replayed into every reader.
+    ///
+    /// The replay reads one batch at a time from disk, without the table's lock, in rounds until
+    /// few are left; those it delivers under the lock before joining the writes. Memory is a
+    /// batch, however large the day, and writers wait at most for those last few.
     pub fn subscribe(
         &self,
         name: &TableName,
@@ -166,19 +189,40 @@ impl Store {
                 .map_or(0, |d| d.as_nanos() as i64),
         );
         let log = self.log(name)?;
-        let mut log = lock(&log.state);
-        for ((date, _), partition) in &log.partitions {
-            if *date < today {
-                continue;
-            }
-            for batch in partition.batches()? {
-                if !subscriber(&batch) {
-                    return Ok(log.entry.schema.clone());
+        // Batches delivered so far, by partition.
+        let mut delivered: BTreeMap<(String, SourceId), usize> = BTreeMap::new();
+        loop {
+            let mut state = lock(&log.state);
+            let mut behind = Vec::new();
+            let (mut left, mut left_bytes) = (0, 0);
+            for (key, partition) in &state.partitions {
+                let from = delivered.get(key).copied().unwrap_or(0);
+                let committed = partition.committed();
+                if key.0 >= today && committed > from {
+                    let cursor = partition.cursor(from);
+                    left += committed - from;
+                    left_bytes += cursor.bytes();
+                    behind.push((key.clone(), cursor, committed));
                 }
             }
+            let schema = state.entry.schema.clone();
+            if left <= CATCH_UP_UNDER_LOCK && left_bytes <= CATCH_UP_UNDER_LOCK_BYTES {
+                for (_, cursor, _) in behind {
+                    if !cursor.read(|batch| subscriber(&batch, Pace::MustNotWait))? {
+                        return Ok(schema);
+                    }
+                }
+                state.subscribers.push(subscriber);
+                return Ok(schema);
+            }
+            drop(state);
+            for (key, cursor, committed) in behind {
+                if !cursor.read(|batch| subscriber(&batch, Pace::MayWait))? {
+                    return Ok(schema);
+                }
+                delivered.insert(key, committed);
+            }
         }
-        log.subscribers.push(subscriber);
-        Ok(log.entry.schema.clone())
     }
 
     /// The table's log, opened (and its partitions recovered) on first use.
@@ -262,7 +306,8 @@ impl Writer {
         if !partition.append(&batch, seq, ingest_ns, self.epoch)? {
             return Ok(false);
         }
-        log.subscribers.retain_mut(|subscriber| subscriber(&batch));
+        log.subscribers
+            .retain_mut(|subscriber| subscriber(&batch, Pace::MustNotWait));
         Ok(true)
     }
 }

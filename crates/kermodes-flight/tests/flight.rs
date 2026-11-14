@@ -95,7 +95,7 @@ fn clients_share_a_served_store() {
     let schema = reader
         .subscribe(
             &ticks(),
-            Box::new(move |batch| {
+            Box::new(move |batch, _| {
                 let n = batch.column(0).as_primitive::<Int64Type>();
                 sink.lock().unwrap().extend(n.values().iter().copied());
                 true
@@ -192,4 +192,66 @@ fn a_waiting_writer_resumes_after_the_last_writers_final_batch() {
     assert!(writer.write(&batch(4..5), None).unwrap());
     drop(writer);
     assert_eq!(waiting.join().unwrap(), (Some(2), Some(3)));
+}
+
+/// A reader whose history is far larger than the server's queue (about 150 MiB, against 16 MiB)
+/// gets all of it, in order and once, while a writer goes on: the server's replay waits for the
+/// reader instead of holding the day.
+#[test]
+fn a_long_history_reaches_a_remote_reader_once_while_writes_go_on() {
+    const ROWS: i64 = 50_000;
+    let dir = TempDir::new();
+    let store = Arc::new(Store::open(&dir.0).unwrap());
+    store.create_table(&ticks(), &schema()).unwrap();
+    let writer = store
+        .writer(&ticks(), &SourceId::parse("feed").unwrap(), false)
+        .unwrap();
+    for v in 0..60 {
+        writer
+            .write(&batch(v * ROWS..(v + 1) * ROWS), None)
+            .unwrap();
+    }
+    let server = serve(store, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let reader = Client::connect(&format!("grpc://{}", server.addr())).unwrap();
+    // Whether each value came once and in order, and how many came.
+    let next = Arc::new(AtomicU64::new(0));
+    let in_order = Arc::new(AtomicU64::new(1));
+    let (expect, ordered) = (next.clone(), in_order.clone());
+    reader
+        .subscribe(
+            &ticks(),
+            Box::new(move |batch, _| {
+                // A reader slower than the disk, so the server's queue fills and its replay waits.
+                std::thread::sleep(Duration::from_millis(5));
+                for &n in batch.column(0).as_primitive::<Int64Type>().values() {
+                    if n as u64 != expect.fetch_add(1, Ordering::Relaxed) {
+                        ordered.store(0, Ordering::Relaxed);
+                    }
+                }
+                true
+            }),
+            Box::new(|why| panic!("lost the stream: {why}")),
+        )
+        .unwrap();
+    for v in 60..70 {
+        writer
+            .write(&batch(v * ROWS..(v + 1) * ROWS), None)
+            .unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while next.load(Ordering::Relaxed) < 70 * ROWS as u64 {
+        assert!(
+            Instant::now() < deadline,
+            "{} rows",
+            next.load(Ordering::Relaxed)
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(next.load(Ordering::Relaxed), 70 * ROWS as u64);
+    assert_eq!(
+        in_order.load(Ordering::Relaxed),
+        1,
+        "every value once, in order"
+    );
 }

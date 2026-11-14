@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch, StringArray, UInt8Array};
 use arrow::datatypes::{DataType, Field, Int64Type, Schema};
-use kermodes_weir::{Error, SourceId, Store, TableName};
+use kermodes_weir::{Error, Pace, SourceId, Store, TableName};
 
 /// A fresh directory under the system temp dir, removed when dropped.
 struct TempDir(PathBuf);
@@ -68,7 +68,7 @@ fn values(store: &Store) -> Vec<i64> {
     store
         .subscribe(
             &ticks(),
-            Box::new(move |batch| {
+            Box::new(move |batch, _| {
                 let Some(sink) = sink.upgrade() else {
                     return false;
                 };
@@ -226,7 +226,7 @@ fn subscribers_get_every_committed_batch_once_then_each_new_one() {
     store
         .subscribe(
             &ticks(),
-            Box::new(move |batch| {
+            Box::new(move |batch, _| {
                 let n = batch.column(0).as_primitive::<Int64Type>();
                 sink.lock().unwrap().extend(n.values().iter().copied());
                 true
@@ -239,7 +239,7 @@ fn subscribers_get_every_committed_batch_once_then_each_new_one() {
     store
         .subscribe(
             &ticks(),
-            Box::new(move |_| counter.fetch_add(1, Ordering::Relaxed) < 2),
+            Box::new(move |_, _| counter.fetch_add(1, Ordering::Relaxed) < 2),
         )
         .unwrap();
     west.write(&batch(4..5), None).unwrap();
@@ -252,6 +252,50 @@ fn subscribers_get_every_committed_batch_once_then_each_new_one() {
         3,
         "two existing batches, then one new"
     );
+}
+
+/// A subscriber that catches up slowly on a long history while a writer goes on: it reads the
+/// history without holding up the writer (it may wait), joins the writes without a gap or a
+/// repeat, and gets live batches under the rule that it must not wait.
+#[test]
+fn a_slow_subscriber_catches_up_without_holding_writers_and_misses_nothing() {
+    let dir = TempDir::new();
+    let store = Arc::new(Store::open(&dir.0).unwrap());
+    store.create_table(&ticks(), &schema()).unwrap();
+    let writer = store.writer(&ticks(), &source("feed"), false).unwrap();
+    for v in 0..300 {
+        writer.write(&batch(v..v + 1), None).unwrap();
+    }
+    let writing = std::thread::spawn(move || {
+        for v in 300..600 {
+            writer.write(&batch(v..v + 1), None).unwrap();
+        }
+    });
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let paces = Arc::new(Mutex::new(Vec::new()));
+    let (sink, pace_sink) = (seen.clone(), paces.clone());
+    store
+        .subscribe(
+            &ticks(),
+            Box::new(move |batch, pace| {
+                if pace == Pace::MayWait {
+                    std::thread::sleep(std::time::Duration::from_micros(300));
+                }
+                let n = batch.column(0).as_primitive::<Int64Type>();
+                sink.lock().unwrap().extend(n.values().iter().copied());
+                pace_sink.lock().unwrap().push(pace);
+                true
+            }),
+        )
+        .unwrap();
+    writing.join().unwrap();
+    assert_eq!(*seen.lock().unwrap(), (0..600).collect::<Vec<_>>());
+    let paces = paces.lock().unwrap();
+    let waited = paces.iter().filter(|p| **p == Pace::MayWait).count();
+    // Most of the history while it may wait; then no waiting once it holds up writers.
+    assert!(waited >= 236, "{waited} batches read while it could wait");
+    assert!(paces[waited..].iter().all(|p| *p == Pace::MustNotWait));
 }
 
 #[test]
@@ -423,7 +467,7 @@ fn full_segments_roll_over() {
         store
             .subscribe(
                 &name,
-                Box::new(move |batch| {
+                Box::new(move |batch, _| {
                     let Some(sink) = sink.upgrade() else {
                         return false;
                     };

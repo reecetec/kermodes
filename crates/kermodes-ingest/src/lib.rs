@@ -39,8 +39,16 @@ pub use ticker::{Ticker, ticker};
 pub type Write = Box<dyn FnMut(&RecordBatch, Option<u64>) -> Result<bool, Error> + Send>;
 
 /// Opens the writer, taking the source's lease (it may wait for another writer to let go), and
-/// returns it with the source's last written sequence number.
-pub type Open = Box<dyn FnOnce() -> Result<(Write, Option<u64>), Error> + Send>;
+/// returns it with the source's last written sequence number. Called again when the store is
+/// lost, to write on once it is back.
+pub type Open = Box<dyn FnMut() -> Result<(Write, Option<u64>), Error> + Send>;
+
+/// Whether an error means the store is out of reach for now (weir restarting, a lost connection,
+/// the catalog's database failing over), so writing can go on once it is back. Anything else
+/// (columns, names, a source another writer holds) will not mend by waiting.
+fn lost(error: &Error) -> bool {
+    matches!(error, Error::Io(_) | Error::Catalog(_))
+}
 
 /// When buffered rows are written: after `flush` since the first of them, or at `max_rows`.
 #[derive(Clone, Copy, Debug)]
@@ -77,12 +85,14 @@ pub struct Stats {
     pub batches: u64,
     /// Times the feed was reconnected after it dropped.
     pub reconnects: u64,
+    /// Times the writer was opened again after losing its store (weir restarting).
+    pub reopens: u64,
     /// The feed's connection is open: the connector is ready, holding the lease or not.
     pub connected: bool,
     /// The writer is open and holds the source's lease.
     pub writing: bool,
-    /// A write failed and the connector stopped: its store went. Rows it had not written are
-    /// lost (the feed cannot be replayed); whoever runs it restarts it against the store.
+    /// The connector stopped on an error waiting cannot mend (columns, names, a source another
+    /// writer holds). A lost store is not one: the writer is opened again once it is back.
     pub failed: bool,
     pub last_error: Option<String>,
 }
@@ -96,6 +106,7 @@ struct Counters {
     missed: AtomicU64,
     batches: AtomicU64,
     reconnects: AtomicU64,
+    reopens: AtomicU64,
     connected: AtomicBool,
     writing: AtomicBool,
     failed: AtomicBool,
@@ -129,6 +140,7 @@ impl Ingest {
             missed: c.missed.load(Ordering::Relaxed),
             batches: c.batches.load(Ordering::Relaxed),
             reconnects: c.reconnects.load(Ordering::Relaxed),
+            reopens: c.reopens.load(Ordering::Relaxed),
             connected: c.connected.load(Ordering::Relaxed),
             writing: c.writing.load(Ordering::Relaxed),
             failed: c.failed.load(Ordering::Relaxed),
@@ -172,7 +184,7 @@ pub fn websocket(
     schema: SchemaRef,
     options: Options,
     seq: Option<&str>,
-    open: Open,
+    mut open: Open,
 ) -> std::io::Result<Ingest> {
     let seq = match seq {
         None => None,
@@ -203,23 +215,50 @@ pub fn websocket(
         thread::Builder::new()
             .name("kermodes-ingest-write".into())
             .spawn(move || {
-                // A writer whose store went stays broken; reading on would only drop rows.
-                // Stopping lets a supervisor restart the connector.
+                // Anything but a lost store stops the connector, for whoever runs it to see.
                 let fail = |message: String| {
                     counters.error(message);
                     counters.failed.store(true, Ordering::Release);
                     stop.store(true, Ordering::Release);
                 };
-                let (mut write, mut last) = match open() {
-                    Ok(opened) => opened,
-                    Err(e) => return fail(format!("cannot open the writer: {e}")),
-                };
-                counters.writing.store(true, Ordering::Release);
-                while let Some(batch) = queue.blocking_recv() {
-                    let (batch, number) = match seq {
-                        None => (batch, None),
+                let mut opened: Option<(Write, Option<u64>)> = None;
+                let mut opened_before = false;
+                // A batch whose write the store's loss interrupted: written again once it is
+                // back. With `seq`, one the store did commit is dropped then as a duplicate.
+                let mut retry: Option<RecordBatch> = None;
+                let mut pause = Duration::from_millis(250);
+                loop {
+                    if opened.is_none() {
+                        match open() {
+                            Ok(writer) => {
+                                opened = Some(writer);
+                                counters.writing.store(true, Ordering::Release);
+                                if opened_before {
+                                    counters.reopens.fetch_add(1, Ordering::Relaxed);
+                                }
+                                opened_before = true;
+                                pause = Duration::from_millis(250);
+                            }
+                            Err(e) if lost(&e) => {
+                                counters.error(format!("cannot open the writer, retrying: {e}"));
+                                if stop.load(Ordering::Acquire) {
+                                    return;
+                                }
+                                thread::sleep(pause);
+                                pause = (pause * 2).min(Duration::from_secs(5));
+                                continue;
+                            }
+                            Err(e) => return fail(format!("cannot open the writer: {e}")),
+                        }
+                    }
+                    let Some(batch) = retry.take().or_else(|| queue.blocking_recv()) else {
+                        return;
+                    };
+                    let (write, last) = opened.as_mut().expect("opened above");
+                    let (rows, number) = match seq {
+                        None => (batch.clone(), None),
                         Some(column) => {
-                            let fresh = match fresh(&batch, column, last) {
+                            let fresh = match fresh(&batch, column, *last) {
                                 Ok(fresh) => fresh,
                                 Err(e) => return fail(format!("cannot read record numbers: {e}")),
                             };
@@ -236,13 +275,20 @@ pub fn websocket(
                             }
                         }
                     };
-                    match write(&batch, number) {
+                    match write(&rows, number) {
                         Ok(_) => {
-                            last = number.or(last);
+                            *last = number.or(*last);
                             counters.batches.fetch_add(1, Ordering::Relaxed);
                             counters
                                 .rows
-                                .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+                                .fetch_add(rows.num_rows() as u64, Ordering::Relaxed);
+                        }
+                        Err(e) if lost(&e) => {
+                            counters.error(format!("lost the store, reopening the writer: {e}"));
+                            counters.writing.store(false, Ordering::Release);
+                            // Dropping the writer lets its lease go.
+                            opened = None;
+                            retry = Some(batch);
                         }
                         Err(e) => return fail(format!("write failed: {e}")),
                     }

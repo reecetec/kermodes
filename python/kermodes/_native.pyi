@@ -58,6 +58,7 @@ class IngestStats:
     missed: int
     batches: int
     reconnects: int
+    reopens: int
     connected: bool
     writing: bool
     failed: bool

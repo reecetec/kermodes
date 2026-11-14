@@ -134,7 +134,7 @@ impl Tables {
     ) -> Result<(), kermodes_weir::Error> {
         let rows = feed.clone();
         let subscriber: kermodes_weir::Subscriber =
-            Box::new(move |batch| matches!(rows.append(std::slice::from_ref(batch)), Ok(true)));
+            Box::new(move |batch, _| matches!(rows.append(std::slice::from_ref(batch)), Ok(true)));
         match self {
             Tables::Local(store) => store.subscribe(name, subscriber).map(drop),
             Tables::Remote(client) => client
@@ -537,6 +537,7 @@ impl Ingest {
             missed: stats.missed,
             batches: stats.batches,
             reconnects: stats.reconnects,
+            reopens: stats.reopens,
             connected: stats.connected,
             writing: stats.writing,
             failed: stats.failed,
@@ -575,11 +576,13 @@ pub struct IngestStats {
     batches: u64,
     /// Times the feed was reconnected after it dropped.
     reconnects: u64,
+    /// Times the writer was opened again after losing its store (weir restarting).
+    reopens: u64,
     /// The feed's connection is open: the connector is ready, holding its source or not.
     connected: bool,
     /// The writer is open and holds the source's lease.
     writing: bool,
-    /// A write failed and the connector stopped: its store went.
+    /// The connector stopped on an error waiting cannot mend; a lost store is reopened instead.
     failed: bool,
     last_error: Option<String>,
 }

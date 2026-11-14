@@ -10,7 +10,7 @@ use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::utils::batches_to_flight_data;
 use arrow_flight::{Action, FlightData, FlightDescriptor, PutResult, Ticket};
 use futures::{StreamExt, TryStreamExt};
-use kermodes_weir::{Error, SourceId, Subscriber, TableName, conform};
+use kermodes_weir::{Error, Pace, SourceId, Subscriber, TableName, conform};
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
@@ -195,7 +195,7 @@ impl Client {
                 match decoded.next().await {
                     Some(Ok(message)) => {
                         if let DecodedPayload::RecordBatch(batch) = message.payload
-                            && !subscriber(&batch)
+                            && !subscriber(&batch, Pace::MayWait)
                         {
                             return;
                         }
