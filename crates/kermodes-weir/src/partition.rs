@@ -180,6 +180,14 @@ impl Partition {
         self.segments().map(|s| s.entries.len()).sum()
     }
 
+    /// How many rows the committed batches hold.
+    pub(crate) fn rows(&self) -> u64 {
+        self.segments()
+            .flat_map(|s| s.entries.iter())
+            .map(|e| e.rows)
+            .sum()
+    }
+
     /// The committed batches from the `from`th on (counting from 0), to read without the
     /// partition: a committed batch's bytes never change, so the cursor reads them while writers
     /// go on appending.

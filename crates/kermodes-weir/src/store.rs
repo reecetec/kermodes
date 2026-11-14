@@ -260,6 +260,88 @@ impl Store {
         }
     }
 
+    /// The rows and stream bytes weir holds of a past `date` of `name`, over every source.
+    pub fn date_rows(&self, name: &TableName, date: Date) -> Result<(u64, u64), Error> {
+        past(date)?;
+        let log = self.log(name)?;
+        let state = lock(&log.state);
+        let key = date.to_string();
+        Ok(state
+            .partitions
+            .iter()
+            .filter(|((day, _), _)| *day == key)
+            .fold((0, 0), |(rows, bytes), (_, partition)| {
+                (rows + partition.rows(), bytes + partition.cursor(0).bytes())
+            }))
+    }
+
+    /// Every batch of a past `date` of `name`, source by source in commit order, to `each`.
+    /// Nothing writes a past date, so this reads without holding up writers.
+    pub fn read_date(
+        &self,
+        name: &TableName,
+        date: Date,
+        each: &mut dyn FnMut(RecordBatch) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        past(date)?;
+        let log = self.log(name)?;
+        let key = date.to_string();
+        let cursors: Vec<_> = lock(&log.state)
+            .partitions
+            .iter()
+            .filter(|((day, _), _)| *day == key)
+            .map(|(_, partition)| partition.cursor(0))
+            .collect();
+        for cursor in cursors {
+            let mut failed = None;
+            cursor.read(|batch| match each(batch) {
+                Ok(()) => true,
+                Err(e) => {
+                    failed = Some(e);
+                    false
+                }
+            })?;
+            if let Some(e) = failed {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Deletes weir's partitions of a past `date` of `name`, once its history holds the date
+    /// whole (as many rows as weir has): weir never deletes rows its history does not hold.
+    pub fn drop_date(&self, name: &TableName, date: Date) -> Result<(), Error> {
+        past(date)?;
+        let in_history: u64 = self
+            .history(name)?
+            .iter()
+            .filter(|held| held.date == date)
+            .map(|held| held.rows)
+            .sum();
+        let log = self.log(name)?;
+        let mut state = lock(&log.state);
+        let key = date.to_string();
+        let rows: u64 = state
+            .partitions
+            .iter()
+            .filter(|((day, _), _)| *day == key)
+            .map(|(_, partition)| partition.rows())
+            .sum();
+        if rows != in_history {
+            return Err(Error::Catalog(format!(
+                "weir holds {rows} rows of {name} on {date} and its history {in_history}: \
+                 merge the date before dropping it"
+            )));
+        }
+        state.partitions.retain(|(day, _), _| *day != key);
+        let dir = state.dir.join(&key);
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Error::io(&dir, e)),
+        }
+    }
+
     /// The table's log, opened (and its partitions recovered) on first use.
     fn log(&self, name: &TableName) -> Result<Arc<Log>, Error> {
         let entry = self.table(name)?;
@@ -455,4 +537,19 @@ fn unix_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// Today's date is still being written: only a past one is read whole, merged, or dropped.
+fn past(date: Date) -> Result<(), Error> {
+    let today = Date::of_ns(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as i64),
+    );
+    if date >= today {
+        return Err(Error::Busy(format!(
+            "{date} is still being written: only past dates are merged"
+        )));
+    }
+    Ok(())
 }
