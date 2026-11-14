@@ -1,5 +1,6 @@
 import React from 'react';
 import type GridMetrics from './GridMetrics';
+import { type DraggingColumn } from './mouse-handlers/GridColumnMoveMouseHandler';
 import { type GridTheme } from './GridTheme';
 import { isNumericType, type ViewportColumn } from './ViewportGridModel';
 
@@ -37,21 +38,36 @@ export type FilterCell = {
   width: number;
 };
 
-/** The filter inputs' positions for the columns on screen, in display order */
+/**
+ * The filter inputs' positions for the columns on screen, in display order. Columns being
+ * dragged sit where the drag draws them, under the pointer, not at the slot they hold.
+ */
 export function filterCells(
-  metrics: GridMetrics,
-  columns: readonly ViewportColumn[]
+  metrics: Pick<
+    GridMetrics,
+    'columnsForRender' | 'allColumnXs' | 'allColumnWidths' | 'modelColumns' | 'gridX'
+  >,
+  columns: readonly ViewportColumn[],
+  dragging: DraggingColumn | null = null
 ): FilterCell[] {
   const { columnsForRender, allColumnXs, allColumnWidths, modelColumns, gridX } =
     metrics;
+  const dragStart = dragging == null ? undefined : allColumnXs.get(dragging.range[0]);
   const cells: FilterCell[] = [];
   for (const visible of columnsForRender) {
     const x = allColumnXs.get(visible);
     const width = allColumnWidths.get(visible);
     const modelColumn = modelColumns.get(visible);
-    if (x !== undefined && width !== undefined && modelColumn !== undefined) {
-      cells.push({ column: columns[modelColumn], left: gridX + x, width });
+    if (x === undefined || width === undefined || modelColumn === undefined) {
+      continue;
     }
+    const isDragged =
+      dragging != null &&
+      dragStart !== undefined &&
+      visible >= dragging.range[0] &&
+      visible <= dragging.range[1];
+    const left = isDragged ? dragging.left + (x - dragStart) : x;
+    cells.push({ column: columns[modelColumn], left: gridX + left, width });
   }
   return cells;
 }

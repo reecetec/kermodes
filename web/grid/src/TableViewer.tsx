@@ -370,7 +370,11 @@ export function TableViewer({
   const handleViewChanged = useCallback(
     (metrics: GridMetrics) => {
       viewport.onViewChanged(metrics);
-      const next = filterCells(metrics, model.columns);
+      const next = filterCells(
+        metrics,
+        model.columns,
+        gridRef.current?.state.draggingColumn ?? null
+      );
       const key = next
         .map(cell => `${cell.column.name}:${cell.left}:${cell.width}`)
         .join('|');
