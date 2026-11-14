@@ -59,6 +59,7 @@ pub fn merge(weir: &dyn Weir, lake: &Lake, name: &TableName, date: Date) -> Resu
             let part = lake.write(
                 &entry.location,
                 &columns,
+                &entry.sort,
                 dates,
                 |day, push| {
                     if day == date {

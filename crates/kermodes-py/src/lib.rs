@@ -110,13 +110,25 @@ impl Tables {
         name: &kermodes_weir::TableName,
         schema: &Schema,
         key: &[String],
+        sort: &[String],
     ) -> Result<(), kermodes_weir::Error> {
-        match (self, key.is_empty()) {
-            (Tables::Local(store), true) => store.create_table(name, schema).map(drop),
-            (Tables::Local(store), false) => store.create_keyed_table(name, schema, key).map(drop),
-            (Tables::Remote(client), true) => client.create_table(name, schema).map(drop),
-            (Tables::Remote(client), false) => {
+        match (self, key, sort) {
+            (_, [_, ..], [_, ..]) => Err(kermodes_weir::Error::Schema(format!(
+                "{name} is keyed: its history is its log, kept in commit order"
+            ))),
+            (Tables::Local(store), [], []) => store.create_table(name, schema).map(drop),
+            (Tables::Local(store), key, []) => {
+                store.create_keyed_table(name, schema, key).map(drop)
+            }
+            (Tables::Local(store), [], sort) => {
+                store.create_sorted_table(name, schema, sort).map(drop)
+            }
+            (Tables::Remote(client), [], []) => client.create_table(name, schema).map(drop),
+            (Tables::Remote(client), key, []) => {
                 client.create_keyed_table(name, schema, key).map(drop)
+            }
+            (Tables::Remote(client), [], sort) => {
+                client.create_sorted_table(name, schema, sort).map(drop)
             }
         }
     }
@@ -213,13 +225,13 @@ enum SourceWriter {
     Remote(Box<kermodes_flight::RemoteWriter>),
 }
 
-/// A stored table's key columns, from `key="sym"` or `key=["a", "b"]`.
-fn key_columns(key: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<String>> {
-    match key {
+/// A stored table's key or sort columns, from `"sym"` or `["a", "b"]`.
+fn column_names(names: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<String>> {
+    match names {
         None => Ok(Vec::new()),
-        Some(key) => match key.extract::<String>() {
+        Some(names) => match names.extract::<String>() {
             Ok(column) => Ok(vec![column]),
-            Err(_) => key.extract(),
+            Err(_) => names.extract(),
         },
     }
 }
@@ -361,21 +373,24 @@ impl Session {
     }
 
     /// Creates the stored table `name` ("namespace.table") with these column names and types,
-    /// or does nothing if it exists with the same columns (and key). With `key` (a column, or a
-    /// list of them), it is a keyed table: one row per key, written by upserts and deletes.
-    #[pyo3(signature = (name, columns, key=None))]
+    /// or does nothing if it exists with the same columns (and key or sort). With `key` (a
+    /// column, or a list of them), it is a keyed table: one row per key, written by upserts and
+    /// deletes, its history sorted by key. With `sort`, an append table's history is sorted by
+    /// those columns within each date, so reads filtering on them skip most of it.
+    #[pyo3(signature = (name, columns, key=None, sort=None))]
     fn create_table(
         &self,
         py: Python<'_>,
         name: &str,
         columns: &Bound<'_, PyDict>,
         key: Option<&Bound<'_, PyAny>>,
+        sort: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let tables = self.stored()?;
         let name = kermodes_weir::TableName::parse_user(name).map_err(store_error)?;
         let schema = schema_from(columns)?;
-        let key = key_columns(key)?;
-        py.detach(|| tables.create_table(&name, &schema, &key))
+        let (key, sort) = (column_names(key)?, column_names(sort)?);
+        py.detach(|| tables.create_table(&name, &schema, &key, &sort))
             .map_err(store_error)
     }
 
@@ -499,13 +514,13 @@ impl Session {
         let tables = self.stored()?;
         let name = kermodes_weir::TableName::parse_user(name).map_err(store_error)?;
         let source = kermodes_weir::SourceId::parse("publish").map_err(store_error)?;
-        let key = key_columns(Some(key))?;
+        let key = column_names(Some(key))?;
         if key.is_empty() {
             return Err(PyValueError::new_err("publish needs key columns"));
         }
         py.detach(|| {
             tables
-                .create_table(&name, table.0.schema(), &key)
+                .create_table(&name, table.0.schema(), &key, &[])
                 .map_err(store_error)?;
             let writer = tables.writer(&name, &source, false).map_err(store_error)?;
             publish::publish(&table.0, writer, &key).map_err(engine_error)

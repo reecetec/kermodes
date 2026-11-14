@@ -128,7 +128,7 @@ impl Store {
 
     /// Creates `name` with `schema`, or returns it if it exists with the same columns.
     pub fn create_table(&self, name: &TableName, schema: &Schema) -> Result<TableEntry, Error> {
-        lock(&self.catalog).create(&self.branch, name, schema, &[])
+        lock(&self.catalog).create(&self.branch, name, schema, &[], &[])
     }
 
     /// Creates `name` as a keyed table (§5.2): one row per value of the `key` columns, written as
@@ -144,7 +144,19 @@ impl Store {
                 "a keyed table needs key columns; {name} has none"
             )));
         }
-        lock(&self.catalog).create(&self.branch, name, schema, key)
+        lock(&self.catalog).create(&self.branch, name, schema, key, &[])
+    }
+
+    /// Creates `name` as an append table whose history sorts each date by the `sort` columns
+    /// (§8.1), so reads that filter on them skip most of a date. Returns it if it exists with
+    /// the same columns and sort.
+    pub fn create_sorted_table(
+        &self,
+        name: &TableName,
+        schema: &Schema,
+        sort: &[String],
+    ) -> Result<TableEntry, Error> {
+        lock(&self.catalog).create(&self.branch, name, schema, &[], sort)
     }
 
     /// Every table, by name.

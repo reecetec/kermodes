@@ -499,18 +499,21 @@ begin with their branch, so one bucket holds every branch's history.
 ```
 
 - **A date is the logical unit, not the physical one.** Every write replaces whole dates. A file
-  holds whole dates only: a big date is split over files of about the target size (by key range
-  once keys are declared, by arrival order until then), and consecutive small dates share a pack.
-  No file holds part of one date and part of another.
+  holds whole dates only: a big date is split over files of about the target size, in arrival
+  order, and consecutive small dates share a pack. No file holds part of one date and part of
+  another.
 - **Small dates are packed as part of the write.** Writing date `D` decides, by a pure planning
   function over the dates' sizes and the current files, what to write and what to delete: a
   small `D` joins the neighbouring pack if that pack is under half the target file size (256 MiB)
   and the result stays under the target; replacing a packed date rewrites its pack. A write
   rewrites at most one pack, never a nearly full one to add a little, so a sparse table never
   accumulates tiny files and there is no compaction service.
-- Sort by `(Date, key columns..., ts_column)`, the analogue of kdb+'s `p#` within a date. Row
-  groups never straddle dates (a new one starts at every date boundary) and are at most about
-  128 MiB.
+- An append table created with `sort=[...]` (`create_table(name, columns, sort=["sym", "ts"])`)
+  has each row group sorted by those columns, the analogue of kdb+'s `p#`: a read filtering on
+  them skips most pages by the page index. A row group is sorted, not a whole date, so a merge's
+  memory is a row group's however big the date; a symbol then lies in a narrow run of pages in
+  each row group, not in one run per date. Row groups never straddle dates (a new one starts at
+  every date boundary) and are at most about 128 MiB.
 - `Date` is stored in every file (run-length encoded, nearly free); key columns are
   dictionary-encoded (kdb+'s `sym`); column statistics and the page index are written so readers
   skip by date, key, and time. Parquet `field_id` is set from column IDs. Compression: ZSTD.

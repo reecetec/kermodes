@@ -88,6 +88,7 @@ fn dates_are_written_whole_and_read_back_by_date() {
         .write(
             "md/ticks.1",
             &schema(),
+            &[],
             &[d(1), d(2), d(3)],
             |date, push| rows(date).into_iter().try_for_each(push),
             1 << 30,
@@ -124,6 +125,7 @@ fn a_big_date_is_split_over_files_of_about_the_target() {
         .write(
             "md/ticks.1",
             &schema(),
+            &[],
             &[d(1)],
             |_, push| (0..40).try_for_each(|i| push(batch(i * 5_000..(i + 1) * 5_000))),
             target,
@@ -155,6 +157,64 @@ fn a_table_with_its_own_date_column_is_refused() {
     let dir = TempDir::new();
     let lake = Lake::open(dir.0.to_str().unwrap()).unwrap();
     let schema = Schema::new(vec![Field::new("Date", DataType::Utf8, true)]);
-    let refused = lake.write("md/x.1", &schema, &[d(1)], |_, _| Ok(()), 1 << 30);
+    let refused = lake.write("md/x.1", &schema, &[], &[d(1)], |_, _| Ok(()), 1 << 30);
+    assert!(matches!(refused, Err(Error::Schema(_))), "{refused:?}");
+}
+
+/// A sorted table's dates are written sorted by its sort columns, every row kept; a sort column
+/// that is not a column is refused.
+#[test]
+fn a_sorted_tables_dates_are_written_in_sort_order() {
+    let dir = TempDir::new();
+    let lake = Lake::open(dir.0.to_str().unwrap()).unwrap();
+    // Each date arrives as several batches, its syms in no order.
+    let shuffled = |date: u32, part: i64| {
+        let n: Vec<i64> = (0..50)
+            .map(|i| (i * 37 + part * 11 + i64::from(date)) % 50)
+            .collect();
+        let syms: Vec<String> = n
+            .iter()
+            .map(|v| format!("sym-{:08}", (v * 7919) % 50))
+            .collect();
+        RecordBatch::try_from_iter([
+            ("n", Arc::new(Int64Array::from(n)) as ArrayRef),
+            ("sym", Arc::new(StringArray::from(syms))),
+        ])
+        .unwrap()
+    };
+    let written = lake
+        .write(
+            "md/ticks.1",
+            &schema(),
+            &["sym".to_string()],
+            &[d(1), d(2), d(3)],
+            |date, push| {
+                for part in 0..4 {
+                    push(shuffled(date.days() as u32, part))?;
+                }
+                Ok(())
+            },
+            1 << 30,
+        )
+        .unwrap();
+    let file = &written.files[0].name;
+    for day in 1..=3 {
+        let mut syms = Vec::new();
+        for batch in lake.read("md/ticks.1", file, d(day), d(day)).unwrap() {
+            let batch = batch.unwrap();
+            let column = batch.column(2).as_string::<i32>();
+            syms.extend((0..batch.num_rows()).map(|i| column.value(i).to_string()));
+        }
+        assert_eq!(syms.len(), 200, "every row of 2026-11-{day:02}");
+        assert!(syms.is_sorted(), "2026-11-{day:02} is in sym order");
+    }
+    let refused = lake.write(
+        "md/x.1",
+        &schema(),
+        &["px".to_string()],
+        &[d(1)],
+        |_, _| Ok(()),
+        1 << 30,
+    );
     assert!(matches!(refused, Err(Error::Schema(_))), "{refused:?}");
 }

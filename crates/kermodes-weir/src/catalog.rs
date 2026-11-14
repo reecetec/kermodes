@@ -30,6 +30,9 @@ pub struct TableEntry {
     pub schema: SchemaRef,
     /// A keyed table's key columns (§5.2), fixed when it is created; empty for an append table.
     pub key: Vec<String>,
+    /// The columns history sorts an append table's dates by (§8.1), as it was created; empty
+    /// for none, and for a keyed table, whose history is its log in commit order.
+    pub sort: Vec<String>,
 }
 
 /// A file of a table's history: its name within the table's location, the dates it holds, and
@@ -79,11 +82,19 @@ pub(crate) enum Catalog {
     Postgres(Box<postgres::Postgres>),
 }
 
-/// A table's row: id, namespace, name, location, columns, and key columns as stored.
-type Row = (i64, String, String, String, String, Option<String>);
+/// A table's row: id, namespace, name, location, columns, and key and sort columns as stored.
+type Row = (
+    i64,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+);
 
-/// A table found by name: id, location, columns, and key columns as stored.
-type Found = (i64, String, String, Option<String>);
+/// A table found by name: id, location, columns, and key and sort columns as stored.
+type Found = (i64, String, String, Option<String>, Option<String>);
 
 impl Catalog {
     pub(crate) fn sqlite(path: &Path) -> Result<Self, Error> {
@@ -94,18 +105,25 @@ impl Catalog {
         Ok(Self::Postgres(Box::new(postgres::Postgres::open(url)?)))
     }
 
-    /// Creates `name` on `branch` with `schema`, keyed by `key` (empty for an append table), or
-    /// returns it if it exists with the same columns and key. A table with other columns or
-    /// another key is an error: schema changes are planned (§5.4).
+    /// Creates `name` on `branch` with `schema`, keyed by `key` (empty for an append table) or,
+    /// for an append table, sorted in history by `sort`; or returns it if it exists with the same
+    /// definition. One with other columns, key, or sort is an error: schema changes are planned
+    /// (§5.4).
     pub(crate) fn create(
         &mut self,
         branch: &str,
         name: &TableName,
         schema: &Schema,
         key: &[String],
+        sort: &[String],
     ) -> Result<TableEntry, Error> {
+        if !key.is_empty() && !sort.is_empty() {
+            return Err(Error::Schema(format!(
+                "{name} is keyed: its history is its log, kept in commit order"
+            )));
+        }
         if let Some(existing) = self.get(branch, name)? {
-            return same_definition(name, existing, schema, key);
+            return same_definition(name, existing, schema, key, sort);
         }
         for field in schema.fields() {
             let kind = type_name(field.data_type());
@@ -116,24 +134,27 @@ impl Catalog {
                 )));
             }
         }
-        for (i, column) in key.iter().enumerate() {
-            if schema.column_with_name(column).is_none() {
-                return Err(Error::Schema(format!(
-                    "{name}'s key column `{column}` is not one of its columns ({})",
-                    listed(schema)
-                )));
-            }
-            if key[..i].contains(column) {
-                return Err(Error::Schema(format!(
-                    "{name}'s key names `{column}` twice"
-                )));
-            }
-        }
+        named_columns(name, schema, "key", key)?;
+        named_columns(name, schema, "sort", sort)?;
         let columns = encode(schema).to_string();
-        let key_json = (!key.is_empty()).then(|| serde_json::json!(key).to_string());
+        let json =
+            |names: &[String]| (!names.is_empty()).then(|| serde_json::json!(names).to_string());
+        let (key_json, sort_json) = (json(key), json(sort));
         let inserted = match self {
-            Self::Sqlite(c) => c.insert(branch, name, &columns, key_json.as_deref())?,
-            Self::Postgres(c) => c.insert(branch, name, &columns, key_json.as_deref())?,
+            Self::Sqlite(c) => c.insert(
+                branch,
+                name,
+                &columns,
+                key_json.as_deref(),
+                sort_json.as_deref(),
+            )?,
+            Self::Postgres(c) => c.insert(
+                branch,
+                name,
+                &columns,
+                key_json.as_deref(),
+                sort_json.as_deref(),
+            )?,
         };
         match inserted {
             Some((id, location)) => Ok(TableEntry {
@@ -142,13 +163,14 @@ impl Catalog {
                 location,
                 schema: Arc::new(nullable(schema)),
                 key: key.to_vec(),
+                sort: sort.to_vec(),
             }),
             // Another catalog client created it first: it must agree.
             None => {
                 let existing = self.get(branch, name)?.ok_or_else(|| {
                     Error::Catalog(format!("{name} was created and then vanished"))
                 })?;
-                same_definition(name, existing, schema, key)
+                same_definition(name, existing, schema, key, sort)
             }
         }
     }
@@ -162,13 +184,14 @@ impl Catalog {
             Self::Sqlite(c) => c.get(branch, name)?,
             Self::Postgres(c) => c.get(branch, name)?,
         };
-        row.map(|(id, location, columns, key)| {
+        row.map(|(id, location, columns, key, sort)| {
             Ok(TableEntry {
                 id,
                 name: name.clone(),
                 location,
                 schema: Arc::new(decode(&columns)?),
-                key: decode_key(key.as_deref())?,
+                key: decode_names(key.as_deref())?,
+                sort: decode_names(sort.as_deref())?,
             })
         })
         .transpose()
@@ -181,13 +204,14 @@ impl Catalog {
             Self::Postgres(c) => c.list(branch)?,
         };
         rows.into_iter()
-            .map(|(id, namespace, table, location, columns, key)| {
+            .map(|(id, namespace, table, location, columns, key, sort)| {
                 Ok(TableEntry {
                     id,
                     name: TableName::parse(&format!("{namespace}.{table}"))?,
                     location,
                     schema: Arc::new(decode(&columns)?),
-                    key: decode_key(key.as_deref())?,
+                    key: decode_names(key.as_deref())?,
+                    sort: decode_names(sort.as_deref())?,
                 })
             })
             .collect()
@@ -323,6 +347,7 @@ fn same_definition(
     existing: TableEntry,
     schema: &Schema,
     key: &[String],
+    sort: &[String],
 ) -> Result<TableEntry, Error> {
     if columns(&existing.schema) != columns(schema) {
         return Err(Error::Schema(format!(
@@ -342,13 +367,47 @@ fn same_definition(
             keyed(key)
         )));
     }
+    if existing.sort != sort {
+        let sorted = |sort: &[String]| match sort {
+            [] => "unsorted".to_owned(),
+            sort => format!("sorted by ({})", sort.join(", ")),
+        };
+        return Err(Error::Schema(format!(
+            "{name} already exists {}, not {}",
+            sorted(&existing.sort),
+            sorted(sort)
+        )));
+    }
     Ok(existing)
 }
 
-fn decode_key(text: Option<&str>) -> Result<Vec<String>, Error> {
+/// Checks that `names` (a table's key or sort) are columns of `schema`, each once.
+fn named_columns(
+    name: &TableName,
+    schema: &Schema,
+    what: &str,
+    names: &[String],
+) -> Result<(), Error> {
+    for (i, column) in names.iter().enumerate() {
+        if schema.column_with_name(column).is_none() {
+            return Err(Error::Schema(format!(
+                "{name}'s {what} column `{column}` is not one of its columns ({})",
+                listed(schema)
+            )));
+        }
+        if names[..i].contains(column) {
+            return Err(Error::Schema(format!(
+                "{name}'s {what} names `{column}` twice"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn decode_names(text: Option<&str>) -> Result<Vec<String>, Error> {
     text.map_or(Ok(Vec::new()), |text| {
         serde_json::from_str(text)
-            .map_err(|_| Error::Corrupt(format!("catalog key columns `{text}` are unreadable")))
+            .map_err(|_| Error::Corrupt(format!("catalog column names `{text}` are unreadable")))
     })
 }
 

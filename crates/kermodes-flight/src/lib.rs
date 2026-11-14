@@ -96,8 +96,8 @@ fn list_from_json<T>(
         .collect()
 }
 
-/// A table's key columns; absent (an older peer, or an append table) is none.
-fn key_from_json(value: &Value) -> Result<Vec<String>, Error> {
+/// A table's key or sort columns; absent (an older peer, or a table without) is none.
+fn names_from_json(value: &Value) -> Result<Vec<String>, Error> {
     if value.is_null() {
         return Ok(Vec::new());
     }
@@ -105,7 +105,7 @@ fn key_from_json(value: &Value) -> Result<Vec<String>, Error> {
         column
             .as_str()
             .map(str::to_owned)
-            .ok_or_else(|| Error::Schema(format!("a key column is named, not {column}")))
+            .ok_or_else(|| Error::Schema(format!("a column is named, not {column}")))
     })
 }
 

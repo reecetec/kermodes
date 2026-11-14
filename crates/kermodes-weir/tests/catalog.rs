@@ -388,3 +388,52 @@ fn racing_history_commits_on_a_shared_catalog_one_wins() {
         assert_eq!(a.history(&name).unwrap().len(), 2);
     }
 }
+
+/// History sorts each date of an append table by its declared sort (a keyed table's log keeps
+/// commit order); both catalogs keep it, and a table asked for again with another sort is refused.
+#[test]
+fn both_catalogs_keep_a_tables_sort() {
+    let names = |columns: &[&str]| columns.iter().map(|c| c.to_string()).collect::<Vec<_>>();
+    let quotes = TableName::parse("md.quotes").unwrap();
+    for backend in backends() {
+        let dir = TempDir::new();
+        {
+            let store = open(&dir, &backend);
+            let sorted = store
+                .create_sorted_table(&ticks(), &schema(), &names(&["sym", "n"]))
+                .unwrap();
+            assert_eq!((sorted.key.len(), sorted.sort), (0, names(&["sym", "n"])));
+            let keyed = store
+                .create_keyed_table(&quotes, &schema(), &names(&["sym"]))
+                .unwrap();
+            assert!(
+                keyed.sort.is_empty(),
+                "a keyed table's log keeps commit order"
+            );
+        }
+        let store = open(&dir, &backend);
+        assert_eq!(store.table(&ticks()).unwrap().sort, ["sym", "n"]);
+        let listed: Vec<Vec<String>> = store
+            .tables()
+            .unwrap()
+            .into_iter()
+            .map(|t| t.sort)
+            .collect();
+        assert_eq!(listed, [names(&[]), names(&["sym", "n"])]);
+        store
+            .create_sorted_table(&ticks(), &schema(), &names(&["sym", "n"]))
+            .unwrap();
+        let refused = [
+            store.create_sorted_table(&ticks(), &schema(), &names(&["n"])),
+            store.create_table(&ticks(), &schema()),
+            store.create_sorted_table(
+                &TableName::parse("md.x").unwrap(),
+                &schema(),
+                &names(&["px"]),
+            ),
+        ];
+        for result in refused {
+            assert!(matches!(result, Err(Error::Schema(_))), "{result:?}");
+        }
+    }
+}

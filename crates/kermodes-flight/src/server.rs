@@ -25,7 +25,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::{
     columns_json, commit_from_json, garbage_from_json, garbage_json, history_date_json,
-    history_file_json, key_from_json, schema_from_json, status,
+    history_file_json, names_from_json, schema_from_json, status,
 };
 
 /// Bytes queued for one reader while it catches up: the replay waits for the reader past this,
@@ -388,19 +388,24 @@ impl FlightService for Service {
                 let command = command(&action.body)?;
                 let name = table_name(&command)?;
                 let schema = schema_from_json(&command["columns"]).map_err(status)?;
-                // Absent before keyed tables: an append table.
-                let key = key_from_json(&command["key"]).map_err(status)?;
-                let entry = blocking(move || match key.as_slice() {
-                    [] => store.create_table(&name, &schema),
-                    key => store.create_keyed_table(&name, &schema, key),
+                // Absent before keyed tables: an append table; `sort` absent before sorted ones.
+                let key = names_from_json(&command["key"]).map_err(status)?;
+                let sort = names_from_json(&command["sort"]).map_err(status)?;
+                let entry = blocking(move || match (key.as_slice(), sort.as_slice()) {
+                    ([], []) => store.create_table(&name, &schema),
+                    (key, []) => store.create_keyed_table(&name, &schema, key),
+                    ([], sort) => store.create_sorted_table(&name, &schema, sort),
+                    _ => Err(Error::Schema(format!(
+                        "{name} is keyed: its history is its log, kept in commit order"
+                    ))),
                 })
                 .await?;
                 json!({"table": entry.name.to_string(), "columns": columns_json(&entry.schema)})
             }
             "tables" => {
                 let tables = blocking(move || store.tables()).await?;
-                // `id` and `location` since history (a merge Job writes under the location), and
-                // `key` since keyed tables (empty for an append table).
+                // `id` and `location` since history (a merge Job writes under the location),
+                // `key` since keyed tables (empty for an append table), `sort` since sorted ones.
                 Value::Array(
                     tables
                         .iter()
@@ -411,6 +416,7 @@ impl FlightService for Service {
                                 "id": t.id,
                                 "location": t.location,
                                 "key": t.key,
+                                "sort": t.sort,
                             })
                         })
                         .collect(),

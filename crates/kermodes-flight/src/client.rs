@@ -23,8 +23,8 @@ use tonic::transport::Channel;
 
 use crate::{
     MAX_WRITE_BYTES, columns_json, commit_json, date_from_json, error_from_status,
-    garbage_from_json, garbage_json, history_date_from_json, history_file_from_json, key_from_json,
-    list_from_json, schema_from_json,
+    garbage_from_json, garbage_json, history_date_from_json, history_file_from_json,
+    list_from_json, names_from_json, schema_from_json,
 };
 
 /// Connected to a store's Flight server. Calls block until the server answers. Clones share the
@@ -107,6 +107,21 @@ impl Client {
         schema_from_json(&created["columns"])
     }
 
+    /// Creates `name` as an append table sorted in history by `sort`, or checks it exists with
+    /// the same columns and sort.
+    pub fn create_sorted_table(
+        &self,
+        name: &TableName,
+        schema: &Schema,
+        sort: &[String],
+    ) -> Result<SchemaRef, Error> {
+        let created = self.action(
+            "create_table",
+            json!({"table": name.to_string(), "columns": columns_json(schema), "sort": sort}),
+        )?;
+        schema_from_json(&created["columns"])
+    }
+
     /// Every table, by name, with its schema.
     pub fn tables(&self) -> Result<Vec<(TableName, SchemaRef)>, Error> {
         let tables = self.action("tables", json!({}))?;
@@ -144,12 +159,16 @@ impl Client {
                 "the server is older than history: {name} has no location"
             ))
         };
+        let key = names_from_json(&table["key"])?;
+        // Absent from a server older than sorted tables: unsorted.
+        let sort = names_from_json(&table["sort"])?;
         Ok(TableEntry {
             id: table["id"].as_i64().ok_or_else(older)?,
             name: name.clone(),
             location: table["location"].as_str().ok_or_else(older)?.to_owned(),
             schema: schema_from_json(&table["columns"])?,
-            key: key_from_json(&table["key"])?,
+            key,
+            sort,
         })
     }
 

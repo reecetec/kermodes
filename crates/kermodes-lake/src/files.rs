@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::{Array, ArrayRef, AsArray, Date32Array, RecordBatch, StringArray};
+use arrow::compute::{SortColumn, concat_batches, lexsort_to_indices, take_record_batch};
 use arrow::datatypes::{DataType, Date32Type, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -107,6 +108,7 @@ pub struct Written {
 /// A file being written.
 struct Open {
     writer: AsyncArrowWriter<BufWriter>,
+    schema: SchemaRef,
     name: String,
     first: Date,
     last: Date,
@@ -114,6 +116,9 @@ struct Open {
     /// Rows of the current date in this file, and the bytes written when it began here.
     date_rows: u64,
     date_start: usize,
+    /// A sorted table's rows held back until they make a row group, which is then sorted.
+    held: Vec<RecordBatch>,
+    held_bytes: usize,
 }
 
 impl Lake {
@@ -150,11 +155,14 @@ impl Lake {
     /// Writes `dates`, in order, as files under `location` (a table's), each date's rows from
     /// `rows`, which hands them to the function it is given. A date with no rows is in no file.
     /// One file holds the dates until it reaches `target`; it then ends with the row group, so a
-    /// big date continues in the next.
+    /// big date continues in the next. With `sort`, each row group (about 128 MiB) is sorted by
+    /// those columns, so a read filtering on them skips most pages by the page index; sorting a
+    /// row group rather than a whole date keeps a merge's memory bounded however big the date.
     pub fn write(
         &self,
         location: &str,
         schema: &Schema,
+        sort: &[String],
         dates: &[Date],
         mut rows: impl FnMut(
             Date,
@@ -168,6 +176,14 @@ impl Lake {
             )));
         }
         let file_schema = with_date_column(schema);
+        let order = sort
+            .iter()
+            .map(|column| {
+                file_schema.index_of(column).map_err(|_| {
+                    Error::Schema(format!("the sort column `{column}` is not a column"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut written = Written::default();
         let mut open: Option<Open> = None;
         for &date in dates {
@@ -185,20 +201,28 @@ impl Lake {
                     file.date_rows = 0;
                     file.date_start = file.writer.bytes_written();
                 }
-                self.runtime
-                    .block_on(file.writer.write(&batch))
-                    .map_err(parquet_error)?;
                 file.rows += batch.num_rows() as u64;
                 file.date_rows += batch.num_rows() as u64;
-                if file.writer.in_progress_size() >= ROW_GROUP_BYTES {
+                if order.is_empty() {
                     self.runtime
-                        .block_on(file.writer.flush())
+                        .block_on(file.writer.write(&batch))
                         .map_err(parquet_error)?;
+                    if file.writer.in_progress_size() >= ROW_GROUP_BYTES {
+                        self.runtime
+                            .block_on(file.writer.flush())
+                            .map_err(parquet_error)?;
+                    }
+                } else {
+                    file.held_bytes += batch.get_array_memory_size();
+                    file.held.push(batch);
+                    if file.held_bytes >= ROW_GROUP_BYTES {
+                        self.write_held(file, &order)?;
+                    }
                 }
                 let size = file.writer.bytes_written() + file.writer.in_progress_size();
                 if size as u64 >= target {
                     let full = open.take().expect("a file is open");
-                    self.finish(full, &mut written)?;
+                    self.finish(full, &order, &mut written)?;
                 }
                 Ok(())
             })?;
@@ -207,6 +231,7 @@ impl Lake {
                 && file.last == date
                 && file.date_rows > 0
             {
+                self.write_held(file, &order)?;
                 self.runtime
                     .block_on(file.writer.flush())
                     .map_err(parquet_error)?;
@@ -221,7 +246,7 @@ impl Lake {
             }
         }
         if let Some(file) = open {
-            self.finish(file, &mut written)?;
+            self.finish(file, &order, &mut written)?;
         }
         Ok(written)
     }
@@ -298,16 +323,45 @@ impl Lake {
         .map_err(parquet_error)?;
         Ok(Open {
             writer,
+            schema: schema.clone(),
             name,
             first,
             last: first,
             rows: 0,
             date_rows: 0,
             date_start: 0,
+            held: Vec::new(),
+            held_bytes: 0,
         })
     }
 
-    fn finish(&self, mut file: Open, written: &mut Written) -> Result<(), Error> {
+    /// Writes the rows held back for sorting, sorted by the `order` columns, as a row group.
+    fn write_held(&self, file: &mut Open, order: &[usize]) -> Result<(), Error> {
+        if file.held.is_empty() {
+            return Ok(());
+        }
+        let held = concat_batches(&file.schema, &file.held).map_err(arrow_error)?;
+        file.held.clear();
+        file.held_bytes = 0;
+        let columns: Vec<SortColumn> = order
+            .iter()
+            .map(|&column| SortColumn {
+                values: held.column(column).clone(),
+                options: None,
+            })
+            .collect();
+        let indices = lexsort_to_indices(&columns, None).map_err(arrow_error)?;
+        let sorted = take_record_batch(&held, &indices).map_err(arrow_error)?;
+        self.runtime
+            .block_on(file.writer.write(&sorted))
+            .map_err(parquet_error)?;
+        self.runtime
+            .block_on(file.writer.flush())
+            .map_err(parquet_error)
+    }
+
+    fn finish(&self, mut file: Open, order: &[usize], written: &mut Written) -> Result<(), Error> {
+        self.write_held(&mut file, order)?;
         self.runtime
             .block_on(file.writer.flush())
             .map_err(parquet_error)?;
@@ -391,6 +445,10 @@ fn file_name(first: Date) -> String {
 }
 
 fn parquet_error(error: parquet::errors::ParquetError) -> Error {
+    Error::Arrow(error.to_string())
+}
+
+fn arrow_error(error: arrow::error::ArrowError) -> Error {
     Error::Arrow(error.to_string())
 }
 

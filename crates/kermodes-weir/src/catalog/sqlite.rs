@@ -43,6 +43,11 @@ impl Sqlite {
                  table_id INTEGER PRIMARY KEY REFERENCES tables (id),
                  key TEXT NOT NULL
              );
+             -- An append table's sort columns (§8.1), added after format 1 shipped, like `sources`.
+             CREATE TABLE IF NOT EXISTS table_sort (
+                 table_id INTEGER PRIMARY KEY REFERENCES tables (id),
+                 sort TEXT NOT NULL
+             );
              -- History (§8), added after format 1 shipped, like `sources`: which files hold
              -- each table's history, which dates each holds, and files replaced but not yet
              -- deleted.
@@ -102,6 +107,7 @@ impl Sqlite {
         name: &TableName,
         columns: &str,
         key: Option<&str>,
+        sort: Option<&str>,
     ) -> Result<Option<(i64, String)>, Error> {
         let tx = self.conn.transaction().map_err(sql)?;
         tx.execute(
@@ -124,19 +130,35 @@ impl Sqlite {
             )
             .map_err(sql)?;
         }
+        if let Some(sort) = sort {
+            tx.execute(
+                "INSERT INTO table_sort (table_id, sort) VALUES (?1, ?2)",
+                params![id, sort],
+            )
+            .map_err(sql)?;
+        }
         tx.commit().map_err(sql)?;
         Ok(Some((id, location)))
     }
 
-    /// A table's id, location, columns, and key columns.
+    /// A table's id, location, columns, key columns, and sort columns.
     pub(crate) fn get(&mut self, branch: &str, name: &TableName) -> Result<Option<Found>, Error> {
         self.conn
             .query_row(
-                "SELECT t.id, t.location, t.columns, k.key FROM tables t
+                "SELECT t.id, t.location, t.columns, k.key, s.sort FROM tables t
                  LEFT JOIN table_keys k ON k.table_id = t.id
+                 LEFT JOIN table_sort s ON s.table_id = t.id
                  WHERE t.branch = ?1 AND t.namespace = ?2 AND t.name = ?3",
                 params![branch, name.namespace(), name.table()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()
             .map_err(sql)
@@ -146,8 +168,10 @@ impl Sqlite {
         let mut statement = self
             .conn
             .prepare(
-                "SELECT t.id, t.namespace, t.name, t.location, t.columns, k.key FROM tables t
+                "SELECT t.id, t.namespace, t.name, t.location, t.columns, k.key, s.sort
+                 FROM tables t
                  LEFT JOIN table_keys k ON k.table_id = t.id
+                 LEFT JOIN table_sort s ON s.table_id = t.id
                  WHERE t.branch = ?1 ORDER BY t.namespace, t.name",
             )
             .map_err(sql)?;
@@ -160,6 +184,7 @@ impl Sqlite {
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
                 ))
             })
             .map_err(sql)?

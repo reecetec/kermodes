@@ -27,7 +27,11 @@ class Session:
         self, port: int = 0, host: str = "127.0.0.1", control: str | None = None
     ) -> Server: ...
     def create_table(
-        self, name: str, columns: dict[str, str], key: str | list[str] | None = None
+        self,
+        name: str,
+        columns: dict[str, str],
+        key: str | list[str] | None = None,
+        sort: str | list[str] | None = None,
     ) -> None: ...
     @property
     def tables(self) -> list[str]: ...
