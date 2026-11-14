@@ -228,7 +228,7 @@ fn a_ticker_feed_lands_in_a_store() {
     store
         .subscribe(
             &name,
-            Box::new(move |batch, _| {
+            Box::new(move |batch, _, _| {
                 count.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
                 let null_count: usize = batch.columns().iter().map(|c| c.null_count()).sum();
                 missing.fetch_add(null_count as u64, Ordering::Relaxed);
@@ -424,7 +424,7 @@ fn a_numbered_feed_is_written_exactly_once_across_a_handover() {
     store
         .subscribe(
             &name,
-            Box::new(move |batch, _| {
+            Box::new(move |batch, _, _| {
                 let seq = batch
                     .column(0)
                     .as_primitive::<arrow::datatypes::Int64Type>();

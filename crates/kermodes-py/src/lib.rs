@@ -1,5 +1,7 @@
 //! `kermodes._native`: the engine exposed to Python. Engine work runs with the interpreter released.
 
+mod publish;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -107,10 +109,15 @@ impl Tables {
         &self,
         name: &kermodes_weir::TableName,
         schema: &Schema,
+        key: &[String],
     ) -> Result<(), kermodes_weir::Error> {
-        match self {
-            Tables::Local(store) => store.create_table(name, schema).map(drop),
-            Tables::Remote(client) => client.create_table(name, schema).map(drop),
+        match (self, key.is_empty()) {
+            (Tables::Local(store), true) => store.create_table(name, schema).map(drop),
+            (Tables::Local(store), false) => store.create_keyed_table(name, schema, key).map(drop),
+            (Tables::Remote(client), true) => client.create_table(name, schema).map(drop),
+            (Tables::Remote(client), false) => {
+                client.create_keyed_table(name, schema, key).map(drop)
+            }
         }
     }
 
@@ -125,26 +132,46 @@ impl Tables {
         })
     }
 
-    fn schema(
+    fn entry(
         &self,
         name: &kermodes_weir::TableName,
-    ) -> Result<arrow::datatypes::SchemaRef, kermodes_weir::Error> {
+    ) -> Result<kermodes_weir::TableEntry, kermodes_weir::Error> {
         match self {
-            Tables::Local(store) => Ok(store.table(name)?.schema),
-            Tables::Remote(client) => client.table(name),
+            Tables::Local(store) => store.table(name),
+            Tables::Remote(client) => client.entry(name),
         }
     }
 
-    /// Feeds `feed` the table's rows; a remote table whose stream ends fails the fed table. (A
-    /// local store delivers in-process and cannot lose a subscription.)
+    /// Feeds `feed` the table's changes, as `taking` says; a remote table whose stream ends
+    /// fails the fed table. (A local store delivers in-process and cannot lose a subscription.)
     fn feed(
         &self,
         name: &kermodes_weir::TableName,
         feed: kermodes_core::Feed,
+        taking: Fed,
     ) -> Result<(), kermodes_weir::Error> {
         let rows = feed.clone();
-        let subscriber: kermodes_weir::Subscriber =
-            Box::new(move |batch, _| matches!(rows.append(std::slice::from_ref(batch)), Ok(true)));
+        let subscriber: kermodes_weir::Subscriber = Box::new(move |batch, change, _| {
+            let fed = match &taking {
+                Fed::State => {
+                    let batch = std::slice::from_ref(batch);
+                    match change {
+                        kermodes_weir::Change::Rows => rows.append(batch),
+                        kermodes_weir::Change::Upsert => rows.upsert(batch),
+                        kermodes_weir::Change::Delete => rows.delete(batch),
+                        kermodes_weir::Change::Checkpoint => rows.replace(batch),
+                    }
+                    .map_err(|e| e.to_string())
+                }
+                Fed::Log(entry) => kermodes_lake::with_op(entry, batch.clone(), change)
+                    .map_err(|e| e.to_string())
+                    .and_then(|logged| rows.append(&[logged]).map_err(|e| e.to_string())),
+            };
+            fed.unwrap_or_else(|e| {
+                rows.fail(e);
+                false
+            })
+        });
         match self {
             Tables::Local(store) => store.subscribe(name, subscriber).map(drop),
             Tables::Remote(client) => client
@@ -174,9 +201,27 @@ impl Tables {
     }
 }
 
+/// How a fed table takes a stored table's changes: as the table they make (`live_table`), or as
+/// their log, each row with its kind as history keeps it (`changes`).
+enum Fed {
+    State,
+    Log(kermodes_weir::TableEntry),
+}
+
 enum SourceWriter {
     Local(kermodes_weir::Writer),
     Remote(Box<kermodes_flight::RemoteWriter>),
+}
+
+/// A stored table's key columns, from `key="sym"` or `key=["a", "b"]`.
+fn key_columns(key: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<String>> {
+    match key {
+        None => Ok(Vec::new()),
+        Some(key) => match key.extract::<String>() {
+            Ok(column) => Ok(vec![column]),
+            Err(_) => key.extract(),
+        },
+    }
 }
 
 #[pymethods]
@@ -316,17 +361,21 @@ impl Session {
     }
 
     /// Creates the stored table `name` ("namespace.table") with these column names and types,
-    /// or does nothing if it exists with the same columns.
+    /// or does nothing if it exists with the same columns (and key). With `key` (a column, or a
+    /// list of them), it is a keyed table: one row per key, written by upserts and deletes.
+    #[pyo3(signature = (name, columns, key=None))]
     fn create_table(
         &self,
         py: Python<'_>,
         name: &str,
         columns: &Bound<'_, PyDict>,
+        key: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let tables = self.stored()?;
         let name = kermodes_weir::TableName::parse_user(name).map_err(store_error)?;
         let schema = schema_from(columns)?;
-        py.detach(|| tables.create_table(&name, &schema))
+        let key = key_columns(key)?;
+        py.detach(|| tables.create_table(&name, &schema, &key))
             .map_err(store_error)
     }
 
@@ -356,7 +405,7 @@ impl Session {
     fn historical_table(&self, py: Python<'_>, name: &str) -> PyResult<HistoricalTable> {
         let tables = self.stored()?.clone();
         let name = kermodes_weir::TableName::parse(name).map_err(store_error)?;
-        py.detach(|| tables.schema(&name)).map_err(store_error)?;
+        py.detach(|| tables.entry(&name)).map_err(store_error)?;
         Ok(HistoricalTable {
             engine: self.engine.clone(),
             tables,
@@ -389,20 +438,78 @@ impl Session {
     }
 
     /// The stored table `name`, ticking: every row written so far, then each batch as it is
-    /// written. Its rows come only from its writers.
+    /// written. Its rows come only from its writers. A keyed table holds each key's latest row.
     fn live_table(&self, py: Python<'_>, name: &str) -> PyResult<Table> {
         let tables = self.stored()?;
         let name = kermodes_weir::TableName::parse(name).map_err(store_error)?;
         let table = py.detach(|| {
-            let schema = tables.schema(&name).map_err(store_error)?;
-            let (table, feed) = self
-                .engine
-                .fed_table(&schema, &format!("live {name}"))
-                .map_err(engine_error)?;
-            tables.feed(&name, feed).map_err(store_error)?;
+            let entry = tables.entry(&name).map_err(store_error)?;
+            let description = format!("live {name}");
+            let key: Vec<&str> = entry.key.iter().map(String::as_str).collect();
+            let (table, feed) = if key.is_empty() {
+                self.engine.fed_table(&entry.schema, &description)
+            } else {
+                self.engine
+                    .fed_keyed_table(&entry.schema, &key, &description)
+            }
+            .map_err(engine_error)?;
+            tables.feed(&name, feed, Fed::State).map_err(store_error)?;
             Ok::<_, PyErr>(table)
         })?;
         Ok(Table(table))
+    }
+
+    /// The stored keyed table `name`'s changes as they happen, ticking: its state as of its
+    /// latest checkpoint (`checkpoint` rows), then each upsert and delete. `Op` says which, as
+    /// in the table's history.
+    fn changes(&self, py: Python<'_>, name: &str) -> PyResult<Table> {
+        let tables = self.stored()?;
+        let name = kermodes_weir::TableName::parse(name).map_err(store_error)?;
+        let table = py.detach(|| {
+            let entry = tables.entry(&name).map_err(store_error)?;
+            if entry.key.is_empty() {
+                return Err(PyValueError::new_err(format!(
+                    "{name} is an append table: its rows are its changes (live_table)"
+                )));
+            }
+            let schema = kermodes_lake::history_columns(&entry).map_err(store_error)?;
+            let (table, feed) = self
+                .engine
+                .fed_table(&schema, &format!("changes {name}"))
+                .map_err(engine_error)?;
+            tables
+                .feed(&name, feed, Fed::Log(entry))
+                .map_err(store_error)?;
+            Ok(table)
+        })?;
+        Ok(Table(table))
+    }
+
+    /// Publishes `table` as the keyed stored table `name` (created if needed), one row per value
+    /// of `key` (a column, or a list of them): its rows now replace the stored table's, then each
+    /// cycle's changes follow, until the returned `Publication` goes or stops. `key` must name
+    /// one row of `table`. One publication per stored table at a time.
+    fn publish(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        table: &Table,
+        key: &Bound<'_, PyAny>,
+    ) -> PyResult<publish::Publication> {
+        let tables = self.stored()?;
+        let name = kermodes_weir::TableName::parse_user(name).map_err(store_error)?;
+        let source = kermodes_weir::SourceId::parse("publish").map_err(store_error)?;
+        let key = key_columns(Some(key))?;
+        if key.is_empty() {
+            return Err(PyValueError::new_err("publish needs key columns"));
+        }
+        py.detach(|| {
+            tables
+                .create_table(&name, table.0.schema(), &key)
+                .map_err(store_error)?;
+            let writer = tables.writer(&name, &source, false).map_err(store_error)?;
+            publish::publish(&table.0, writer, &key).map_err(engine_error)
+        })
     }
 
     /// Reads the WebSocket feed at `url` into `table` through a writer for `source`, until
@@ -436,7 +543,7 @@ impl Session {
             ..kermodes_ingest::Options::default()
         };
         let ingest = py.detach(|| {
-            let schema = tables.schema(&name).map_err(store_error)?;
+            let schema = tables.entry(&name).map_err(store_error)?.schema;
             kermodes_ingest::websocket(
                 url,
                 schema,
@@ -445,7 +552,9 @@ impl Session {
                 Box::new(move || {
                     let writer = tables.writer(&name, &source, wait)?;
                     let last = writer.last_seq();
-                    let write = move |batch: &RecordBatch, seq| writer.write(batch, seq);
+                    let write = move |batch: &RecordBatch, seq| {
+                        writer.write(batch, seq, kermodes_weir::Change::Rows)
+                    };
                     Ok((Box::new(write) as kermodes_ingest::Write, last))
                 }),
             )
@@ -619,11 +728,19 @@ impl Writer {
     /// when `seq` was already written, which writes nothing (a resend after a restart).
     #[pyo3(signature = (data, seq=None))]
     fn write(&self, py: Python<'_>, data: AnyRecordBatch, seq: Option<u64>) -> PyResult<bool> {
-        let (schema, batches) = read_batches(data)?;
-        py.detach(|| {
-            let batch = arrow::compute::concat_batches(&schema, &batches).map_err(arrow_error)?;
-            self.0.write(&batch, seq).map_err(store_error)
-        })
+        self.put(py, data, seq, kermodes_weir::Change::Rows)
+    }
+
+    /// Sets each row's key of a keyed table to that row, as `write` does for an append table.
+    #[pyo3(signature = (data, seq=None))]
+    fn upsert(&self, py: Python<'_>, data: AnyRecordBatch, seq: Option<u64>) -> PyResult<bool> {
+        self.put(py, data, seq, kermodes_weir::Change::Upsert)
+    }
+
+    /// Removes the keys of `data`'s rows from a keyed table; `data` needs only the key columns.
+    #[pyo3(signature = (data, seq=None))]
+    fn delete(&self, py: Python<'_>, data: AnyRecordBatch, seq: Option<u64>) -> PyResult<bool> {
+        self.put(py, data, seq, kermodes_weir::Change::Delete)
     }
 
     /// The last sequence number this source wrote (in its newest partition), or `None`.
@@ -643,11 +760,39 @@ impl Writer {
     }
 }
 
+impl Writer {
+    fn put(
+        &self,
+        py: Python<'_>,
+        data: AnyRecordBatch,
+        seq: Option<u64>,
+        change: kermodes_weir::Change,
+    ) -> PyResult<bool> {
+        let (schema, batches) = read_batches(data)?;
+        py.detach(|| {
+            let batch = arrow::compute::concat_batches(&schema, &batches).map_err(arrow_error)?;
+            self.0.write(&batch, seq, change).map_err(store_error)
+        })
+    }
+}
+
 impl SourceWriter {
-    fn write(&self, batch: &RecordBatch, seq: Option<u64>) -> Result<bool, kermodes_weir::Error> {
-        match self {
-            SourceWriter::Local(writer) => writer.write(batch, seq),
-            SourceWriter::Remote(writer) => writer.write(batch, seq),
+    fn write(
+        &self,
+        batch: &RecordBatch,
+        seq: Option<u64>,
+        change: kermodes_weir::Change,
+    ) -> Result<bool, kermodes_weir::Error> {
+        use kermodes_weir::Change::{Checkpoint, Delete, Rows, Upsert};
+        match (self, change) {
+            (SourceWriter::Local(writer), Rows) => writer.write(batch, seq),
+            (SourceWriter::Local(writer), Upsert) => writer.upsert(batch, seq),
+            (SourceWriter::Local(writer), Delete) => writer.delete(batch, seq),
+            (SourceWriter::Local(writer), Checkpoint) => writer.replace(batch, seq),
+            (SourceWriter::Remote(writer), Rows) => writer.write(batch, seq),
+            (SourceWriter::Remote(writer), Upsert) => writer.upsert(batch, seq),
+            (SourceWriter::Remote(writer), Delete) => writer.delete(batch, seq),
+            (SourceWriter::Remote(writer), Checkpoint) => writer.replace(batch, seq),
         }
     }
 
@@ -1349,7 +1494,7 @@ mod _native {
     #[pymodule_export]
     use super::{
         HistoricalTable, Ingest, IngestStats, Server, Session, StoreServer, Table, Ticker, Viewer,
-        Writer, control, merge, ticker,
+        Writer, control, merge, publish::Publication, ticker,
     };
 
     use pyo3::prelude::*;

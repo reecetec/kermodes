@@ -6,10 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch, StringArray};
+use arrow::array::{Array, ArrayRef, AsArray, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Int64Type, Schema};
 use kermodes_flight::{Client, serve};
-use kermodes_weir::{Error, SourceId, Store, TableName};
+use kermodes_weir::{Change, Error, SourceId, Store, TableName};
 
 struct TempDir(PathBuf);
 
@@ -95,7 +95,7 @@ fn clients_share_a_served_store() {
     let schema = reader
         .subscribe(
             &ticks(),
-            Box::new(move |batch, _| {
+            Box::new(move |batch, _, _| {
                 let n = batch.column(0).as_primitive::<Int64Type>();
                 sink.lock().unwrap().extend(n.values().iter().copied());
                 true
@@ -220,7 +220,7 @@ fn a_write_up_to_the_batch_limit_lands_whole_and_a_larger_one_is_refused() {
     store
         .subscribe(
             &ticks(),
-            Box::new(move |batch, _| {
+            Box::new(move |batch, _, _| {
                 seen.lock().unwrap().push(batch.num_rows());
                 true
             }),
@@ -255,7 +255,7 @@ fn a_long_history_reaches_a_remote_reader_once_while_writes_go_on() {
     reader
         .subscribe(
             &ticks(),
-            Box::new(move |batch, _| {
+            Box::new(move |batch, _, _| {
                 // A reader slower than the disk, so the server's queue fills and its replay waits.
                 std::thread::sleep(Duration::from_millis(5));
                 for &n in batch.column(0).as_primitive::<Int64Type>().values() {
@@ -289,4 +289,71 @@ fn a_long_history_reaches_a_remote_reader_once_while_writes_go_on() {
         1,
         "every value once, in order"
     );
+}
+
+/// A keyed table's upserts and deletes cross the wire with their kind: a remote reader gets the
+/// day's checkpoint, then each change tagged, a delete written as its key alone.
+#[test]
+fn keyed_changes_cross_the_wire_with_their_kind() {
+    let dir = TempDir::new();
+    let store = Arc::new(Store::open(&dir.0).unwrap());
+    let server = serve(store, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let url = format!("grpc://{}", server.addr());
+    let quotes = TableName::parse("md.quotes").unwrap();
+    let feed = SourceId::parse("feed").unwrap();
+
+    let producer = Client::connect(&url).unwrap();
+    producer
+        .create_keyed_table(&quotes, &schema(), &["sym".to_string()])
+        .unwrap();
+    let writer = producer.writer(&quotes, &feed, false).unwrap();
+    assert!(writer.upsert(&batch(0..3), None).unwrap());
+    let key =
+        RecordBatch::try_from_iter([("sym", Arc::new(StringArray::from(vec!["s1"])) as ArrayRef)])
+            .unwrap();
+    assert!(writer.delete(&key, None).unwrap());
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    // Kept: a client's subscriptions run on its runtime.
+    let reader = Client::connect(&url).unwrap();
+    reader
+        .subscribe(
+            &quotes,
+            Box::new(move |batch, change, _| {
+                let n = batch.column(0).as_primitive::<Int64Type>();
+                let syms = batch.column(1).as_string::<i32>();
+                let rows: Vec<(Option<i64>, String)> = (0..batch.num_rows())
+                    .map(|i| (n.is_valid(i).then(|| n.value(i)), syms.value(i).to_string()))
+                    .collect();
+                sink.lock().unwrap().push((change, rows));
+                true
+            }),
+            Box::new(|_| {}),
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while seen.lock().unwrap().len() < 3 {
+        assert!(Instant::now() < deadline, "saw {:?}", seen.lock().unwrap());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let seen = seen.lock().unwrap().clone();
+    let kinds: Vec<Change> = seen.iter().map(|(change, _)| *change).collect();
+    // The day's (empty) opening state crosses too: an empty checkpoint clears a reader's table.
+    assert_eq!(kinds, [Change::Checkpoint, Change::Upsert, Change::Delete]);
+    assert!(seen[0].1.is_empty());
+    assert_eq!(seen[1].1.len(), 3);
+    assert_eq!(seen[2].1, [(None, "s1".to_string())]);
+
+    // A keyed table takes no plain rows, an append table no upserts.
+    assert!(matches!(
+        writer.write(&batch(5..6), None),
+        Err(Error::Schema(_))
+    ));
+    producer.create_table(&ticks(), &schema()).unwrap();
+    let append = producer.writer(&ticks(), &feed, false).unwrap();
+    assert!(matches!(
+        append.upsert(&batch(0..1), None),
+        Err(Error::Schema(_))
+    ));
 }

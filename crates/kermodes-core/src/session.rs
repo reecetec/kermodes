@@ -78,6 +78,8 @@ enum Write {
     Upsert(RecordBatch),
     /// Key columns only.
     Delete(RecordBatch),
+    /// Every key not in these rows is gone; the rows are upserts. (`Feed::replace`)
+    Replace(RecordBatch),
     /// The fed table's source is gone (`Feed::fail`).
     Fail(String),
 }
@@ -195,7 +197,22 @@ struct TableState {
     dependents: usize,
     /// Released: an empty placeholder that no handle or table refers to.
     released: bool,
+    /// Told each cycle's changes (`Table::on_changes`).
+    listeners: Vec<Listener>,
 }
+
+/// One cycle's changes to a table, as Arrow: rows added, rows removed (with their last values),
+/// and rows modified (their values before, then after). Clones share the arrays.
+#[derive(Clone, Default)]
+pub struct Changes {
+    pub added: Vec<RecordBatch>,
+    pub removed: Vec<RecordBatch>,
+    pub modified: Vec<(RecordBatch, RecordBatch)>,
+}
+
+/// Told a table's changes each cycle, inside the cycle: it must be quick (hand them to another
+/// thread). Returning `false` stops it; a failure of the table is its last call.
+pub type Listener = Box<dyn FnMut(Result<Changes, Error>) -> bool + Send + Sync>;
 
 enum Source {
     Append,
@@ -581,6 +598,8 @@ fn pair(text: &str) -> (&str, &str) {
 
 /// An input table with one row per key value: upserts replace, deletes remove.
 struct Keyed {
+    /// Only a `Feed` writes it: a keyed table a store such as weir keeps.
+    fed: bool,
     /// The key within upsert batches, which hold full rows.
     rows: KeyKind,
     /// The key within delete batches, which hold only the key columns.
@@ -639,8 +658,64 @@ impl Feed {
         let Some(table) = self.table.upgrade() else {
             return Ok(false);
         };
+        table.expect_source("append", |s| matches!(s, Source::Fed))?;
         let batches = conform_all(&table.schema, batches)?;
         table.queue(batches.into_iter().map(Write::Append));
+        Ok(true)
+    }
+
+    /// Queues upserts to a fed keyed table, as `Table::upsert` does for a keyed input table;
+    /// `false` once the table is gone.
+    pub fn upsert(&self, batches: &[RecordBatch]) -> Result<bool, Error> {
+        let Some(table) = self.table.upgrade() else {
+            return Ok(false);
+        };
+        table.expect_source("upsert", |s| matches!(s, Source::Keyed(k) if k.fed))?;
+        table.queue_upserts(batches)?;
+        Ok(true)
+    }
+
+    /// Replaces a fed keyed table's rows with `batches`: every key not in them is gone. Empty
+    /// `batches` clear the table.
+    pub fn replace(&self, batches: &[RecordBatch]) -> Result<bool, Error> {
+        let Some(table) = self.table.upgrade() else {
+            return Ok(false);
+        };
+        table.expect_source("replace", |s| matches!(s, Source::Keyed(k) if k.fed))?;
+        // Unlike `conform_all`, an empty batch is kept: on its own, it is the clearing.
+        let mut batches = batches
+            .iter()
+            .map(|batch| conform(&table.schema, batch))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter();
+        let first = batches
+            .next()
+            .unwrap_or_else(|| RecordBatch::new_empty(table.schema.clone()));
+        table.queue(std::iter::once(Write::Replace(first)).chain(batches.map(Write::Upsert)));
+        Ok(true)
+    }
+
+    /// Queues deletes of keys. A store's deletes hold every column (the key's, and nulls), so
+    /// only the key columns are taken.
+    pub fn delete(&self, batches: &[RecordBatch]) -> Result<bool, Error> {
+        let Some(table) = self.table.upgrade() else {
+            return Ok(false);
+        };
+        table.expect_source("delete", |s| matches!(s, Source::Keyed(k) if k.fed))?;
+        let key_schema = table.key_schema();
+        let keys = batches
+            .iter()
+            .map(|batch| {
+                let columns = key_schema
+                    .fields()
+                    .iter()
+                    .map(|field| batch.schema().index_of(field.name()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                batch.project(&columns)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Error::Schema(e.to_string()))?;
+        table.queue_deletes(&keys)?;
         Ok(true)
     }
 
@@ -704,6 +779,36 @@ impl Session {
     /// A refreshing table with one row per value of `key`; rows arrive through `Table::upsert`
     /// and leave through `Table::delete`. Every column is nullable.
     pub fn keyed_input_table(&self, schema: &Schema, key: &[&str]) -> Result<Table, Error> {
+        self.keyed(
+            schema,
+            key,
+            format!("input keyed by {}", key.join(", ")),
+            false,
+        )
+    }
+
+    /// A keyed table whose upserts and deletes arrive only through the returned `Feed`, for keyed
+    /// tables a store keeps (weir's), as `fed_table` is for append tables.
+    pub fn fed_keyed_table(
+        &self,
+        schema: &Schema,
+        key: &[&str],
+        description: &str,
+    ) -> Result<(Table, Feed), Error> {
+        let table = self.keyed(schema, key, description.to_owned(), true)?;
+        let feed = Feed {
+            table: table.downgrade(),
+        };
+        Ok((table, feed))
+    }
+
+    fn keyed(
+        &self,
+        schema: &Schema,
+        key: &[&str],
+        description: String,
+        fed: bool,
+    ) -> Result<Table, Error> {
         if key.is_empty() {
             return Err(Error::Schema(
                 "a keyed table needs at least one key column".into(),
@@ -713,6 +818,7 @@ impl Session {
         let columns = resolve(&schema, key)?;
         let key_schema = Arc::new(schema.project(&columns).map_err(schema_error)?);
         let keyed = Keyed {
+            fed,
             rows: KeyKind::new(&schema, columns.clone()).map_err(schema_error)?,
             deletes: KeyKind::new(&key_schema, (0..key.len()).collect()).map_err(schema_error)?,
             key_schema,
@@ -720,7 +826,6 @@ impl Session {
             latest: Vec::new(),
             new: Vec::new(),
         };
-        let description = format!("input keyed by {}", key.join(", "));
         Ok(self.add(TableState::new(
             description,
             schema,
@@ -831,6 +936,7 @@ impl Session {
                 }
             };
             table.commit(result);
+            table.notify();
             if table.delta.is_some() || table.failure.is_some() {
                 table.changed = cycle;
             }
@@ -1039,6 +1145,7 @@ impl TableState {
             held: true,
             dependents: 0,
             released: false,
+            listeners: Vec::new(),
         }
     }
 
@@ -1049,6 +1156,7 @@ impl TableState {
         self.source = Source::Static;
         self.delta = None;
         self.failure = None;
+        self.listeners.clear();
     }
 
     /// Finishes building a derived table: its first rows are applied, so their delta goes. A
@@ -1064,8 +1172,32 @@ impl TableState {
     }
 
     fn fail(&mut self, error: Error) {
+        for mut listener in self.listeners.drain(..) {
+            listener(Err(error.clone()));
+        }
         self.failure = Some(error);
         self.delta = None;
+    }
+
+    /// Tells listeners this cycle's changes, if any; those returning `false` are dropped.
+    fn notify(&mut self) {
+        let Some(delta) = self.delta.as_ref().filter(|d| !d.is_empty()) else {
+            return;
+        };
+        if self.listeners.is_empty() {
+            return;
+        }
+        let changes = Changes {
+            added: delta.added.iter().map(|r| r.batch.clone()).collect(),
+            removed: delta.removed.iter().map(|r| r.batch.clone()).collect(),
+            modified: delta
+                .modified
+                .iter()
+                .map(|m| (m.previous.clone(), m.current.clone()))
+                .collect(),
+        };
+        self.listeners
+            .retain_mut(|listener| listener(Ok(changes.clone())));
     }
 
     /// Applies a cycle's computed changes, or keeps the error: a failed table stops updating
@@ -1096,7 +1228,7 @@ fn appended(storage: &Storage, writes: Vec<Write>) -> Delta {
         .into_iter()
         .filter_map(|write| match write {
             Write::Append(batch) => Some(batch),
-            Write::Upsert(_) | Write::Delete(_) | Write::Fail(_) => None,
+            Write::Upsert(_) | Write::Delete(_) | Write::Replace(_) | Write::Fail(_) => None,
         })
         .map(|batch| {
             let count = batch.num_rows() as RowKey;
@@ -1122,6 +1254,15 @@ impl Keyed {
             let (kind, batch, upserting) = match write {
                 Write::Upsert(batch) => (&self.rows, batch, true),
                 Write::Delete(batch) => (&self.deletes, batch, false),
+                Write::Replace(batch) => {
+                    // Every live key is deleted, unless the replacing rows upsert it again.
+                    for id in self.live.touch_live() {
+                        if let Some(latest) = self.latest.get_mut(id as usize) {
+                            *latest = None;
+                        }
+                    }
+                    (&self.rows, batch, true)
+                }
                 Write::Append(_) | Write::Fail(_) => continue,
             };
             let encoded = kind.encode(&batch)?;
@@ -1243,19 +1384,32 @@ impl Table {
 
     /// Queues rows that replace the current row with the same key, or add one.
     pub fn upsert(&self, batches: &[RecordBatch]) -> Result<(), Error> {
-        self.expect_source("upsert", |s| matches!(s, Source::Keyed(_)))?;
+        self.expect_source("upsert", |s| matches!(s, Source::Keyed(k) if !k.fed))?;
+        self.queue_upserts(batches)
+    }
+
+    /// Queues the removal of the rows with these keys; `batches` hold only the key columns.
+    pub fn delete(&self, batches: &[RecordBatch]) -> Result<(), Error> {
+        self.expect_source("delete", |s| matches!(s, Source::Keyed(k) if !k.fed))?;
+        self.queue_deletes(batches)
+    }
+
+    fn queue_upserts(&self, batches: &[RecordBatch]) -> Result<(), Error> {
         let batches = conform_all(&self.schema, batches)?;
         self.queue(batches.into_iter().map(Write::Upsert));
         Ok(())
     }
 
-    /// Queues the removal of the rows with these keys; `batches` hold only the key columns.
-    pub fn delete(&self, batches: &[RecordBatch]) -> Result<(), Error> {
-        self.expect_source("delete", |s| matches!(s, Source::Keyed(_)))?;
-        let key_schema = match &self.session.read().tables[self.id].source {
+    /// A keyed table's key columns.
+    fn key_schema(&self) -> SchemaRef {
+        match &self.session.read().tables[self.id].source {
             Source::Keyed(keyed) => keyed.key_schema.clone(),
-            _ => unreachable!("checked above"),
-        };
+            _ => unreachable!("callers check the table is keyed"),
+        }
+    }
+
+    fn queue_deletes(&self, batches: &[RecordBatch]) -> Result<(), Error> {
+        let key_schema = self.key_schema();
         let batches = conform_all(&key_schema, batches)?;
         self.queue(batches.into_iter().map(Write::Delete));
         Ok(())
@@ -1982,6 +2136,31 @@ impl Table {
                 table: table.description.clone(),
                 message: e.to_string(),
             })
+    }
+
+    /// Tells `listener` the table's changes: first its current rows (as added), then each
+    /// cycle's changes, with nothing missed or repeated between them. A failed table is an error
+    /// here; one failing later is the listener's last call.
+    pub fn on_changes(&self, mut listener: Listener) -> Result<(), Error> {
+        let mut graph = self.session.write();
+        let table = &graph.tables[self.id];
+        if let Some(error) = &table.failure {
+            return Err(error.clone());
+        }
+        let added = Reader::new(&graph.tables, self.id)
+            .snapshot()
+            .map_err(|e| Error::Compute {
+                table: table.description.clone(),
+                message: e.to_string(),
+            })?;
+        let current = Changes {
+            added,
+            ..Changes::default()
+        };
+        if listener(Ok(current)) && table.refreshing {
+            graph.tables[self.id].listeners.push(listener);
+        }
+        Ok(())
     }
 
     /// The rows at positions `start..start + count` in reading order (fewer past the end), with

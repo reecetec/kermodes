@@ -9,7 +9,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use kermodes_weir::{Date, Error, TableName};
 
-use crate::files::{Lake, dated, with_date_column};
+use crate::files::{Lake, dated, history_columns, with_date_column, with_op};
 use crate::weir::Weir;
 
 /// Dates of a table's history, read.
@@ -84,7 +84,7 @@ fn history(
     rows: bool,
 ) -> Result<History, Error> {
     let entry = weir.entry(name)?;
-    let schema = with_date_column(&entry.schema);
+    let schema = with_date_column(&history_columns(&entry)?);
     let first = first.unwrap_or(Date::MIN);
     let last = last.unwrap_or(Date::MAX);
     let held = weir.history(name)?;
@@ -124,8 +124,8 @@ fn history(
             }
             let mut read = Vec::new();
             if rows {
-                weir.read_date(name, date, &mut |batch| {
-                    read.push(dated(&schema, date, &batch)?);
+                weir.read_date(name, date, &mut |batch, change| {
+                    read.push(dated(&schema, date, &with_op(&entry, batch, change)?)?);
                     Ok(())
                 })?;
             }

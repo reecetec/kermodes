@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod catalog;
+mod keyed;
 mod names;
 mod partition;
 mod store;
@@ -16,7 +17,40 @@ use std::path::Path;
 
 pub use catalog::{Garbage, HistoryCommit, HistoryDate, HistoryFile, TableEntry};
 pub use names::{Date, SourceId, TableName};
-pub use store::{BRANCH, Pace, Store, Subscriber, Writer, conform};
+pub use store::{BRANCH, Pace, Store, Subscriber, Writer, conform, keys_only};
+
+/// What a batch is (§7.1): an append table's rows, or a keyed table's upserts, deletes, or the
+/// checkpoint of its state a day begins with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+    Rows,
+    Upsert,
+    Delete,
+    Checkpoint,
+}
+
+impl Change {
+    /// Its code in weir's index records and in Flight messages.
+    pub fn code(self) -> u8 {
+        match self {
+            Change::Rows => 0,
+            Change::Upsert => 1,
+            Change::Delete => 2,
+            Change::Checkpoint => 3,
+        }
+    }
+
+    /// `None` for a code this version does not know.
+    pub fn from_code(code: u32) -> Option<Self> {
+        match code {
+            0 => Some(Change::Rows),
+            1 => Some(Change::Upsert),
+            2 => Some(Change::Delete),
+            3 => Some(Change::Checkpoint),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum Error {

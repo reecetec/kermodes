@@ -10,7 +10,7 @@
 //! is a resend and is dropped.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Seek, Take, Write};
 use std::path::{Path, PathBuf};
 
 use arrow::datatypes::SchemaRef;
@@ -18,55 +18,72 @@ use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 
-use crate::Error;
+use crate::{Change, Error};
 
 /// Index file header: magic and format version. A new version is a new header; readers refuse
 /// versions they do not know.
 const HEADER: &[u8; 8] = b"KMWEIR\x00\x01";
 const RECORD: usize = 48;
-/// The change kind of a batch of plain rows. Keyed tables add upserts and deletes.
-const ROWS: u32 = 0;
 /// A segment stops taking batches once its stream reaches this size.
 const SEGMENT_BYTES: u64 = 64 << 20;
 
 /// One committed batch. Its index record (little-endian) is: seq u64, rows u64, ingest time ns
-/// i64, end offset u64, epoch u64 (the lease its writer held, §7.4), change kind u32, CRC-32 of
-/// the preceding 44 bytes.
+/// i64, end offset u64, epoch u64 (the lease its writer held, §7.4), change kind u32 (§7.1),
+/// CRC-32 of the preceding 44 bytes.
 #[derive(Clone, Copy, Debug)]
 struct Entry {
     seq: u64,
     rows: u64,
+    ingest_ns: i64,
     /// The stream's length once this batch is in it.
     end: u64,
+    change: Change,
+}
+
+/// What a batch was committed as: its change kind and when it arrived.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Stamp {
+    pub change: Change,
+    pub ingest_ns: i64,
 }
 
 impl Entry {
-    fn encode(&self, ingest_ns: i64, epoch: u64) -> [u8; RECORD] {
+    fn encode(&self, epoch: u64) -> [u8; RECORD] {
         let mut record = [0; RECORD];
         record[0..8].copy_from_slice(&self.seq.to_le_bytes());
         record[8..16].copy_from_slice(&self.rows.to_le_bytes());
-        record[16..24].copy_from_slice(&ingest_ns.to_le_bytes());
+        record[16..24].copy_from_slice(&self.ingest_ns.to_le_bytes());
         record[24..32].copy_from_slice(&self.end.to_le_bytes());
         record[32..40].copy_from_slice(&epoch.to_le_bytes());
-        record[40..44].copy_from_slice(&ROWS.to_le_bytes());
+        record[40..44].copy_from_slice(&u32::from(self.change.code()).to_le_bytes());
         let crc = crc32fast::hash(&record[..44]);
         record[44..48].copy_from_slice(&crc.to_le_bytes());
         record
     }
 
-    /// The record, unless it is torn, zeroed, or of a change kind this version does not know.
+    /// The record, unless it is torn, zeroed, or of a change kind this version does not know
+    /// (recovery then ends there, as an older version's would).
     fn decode(record: &[u8; RECORD]) -> Option<Self> {
         let word = |at: usize| u64::from_le_bytes(record[at..at + 8].try_into().expect("8 bytes"));
         let crc = u32::from_le_bytes(record[44..48].try_into().expect("4 bytes"));
-        let change = u32::from_le_bytes(record[40..44].try_into().expect("4 bytes"));
-        if crc32fast::hash(&record[..44]) != crc || change != ROWS {
+        if crc32fast::hash(&record[..44]) != crc {
             return None;
         }
+        let change = u32::from_le_bytes(record[40..44].try_into().expect("4 bytes"));
         Some(Self {
             seq: word(0),
             rows: word(8),
+            ingest_ns: word(16) as i64,
             end: word(24),
+            change: Change::from_code(change)?,
         })
+    }
+
+    fn stamp(&self) -> Stamp {
+        Stamp {
+            change: self.change,
+            ingest_ns: self.ingest_ns,
+        }
     }
 }
 
@@ -132,14 +149,15 @@ impl Partition {
         self.last_seq
     }
 
-    /// Appends `batch` as `seq`, written under lease `epoch`, durably, before returning; `false`
-    /// (and nothing written) when `seq` is not above the last sequence number.
+    /// Appends `batch` as `seq`, a `change` written under lease `epoch`, durably, before
+    /// returning; `false` (and nothing written) when `seq` is not above the last sequence number.
     pub(crate) fn append(
         &mut self,
         batch: &RecordBatch,
         seq: u64,
         ingest_ns: i64,
         epoch: u64,
+        change: Change,
     ) -> Result<bool, Error> {
         if self.last_seq.is_some_and(|last| seq <= last) {
             return Ok(false);
@@ -159,11 +177,13 @@ impl Partition {
         let entry = Entry {
             seq,
             rows: batch.num_rows() as u64,
+            ingest_ns,
             end,
+            change,
         };
         let index = index_path(&self.dir, open.segment.number);
         open.index
-            .write_all(&entry.encode(ingest_ns, epoch))
+            .write_all(&entry.encode(epoch))
             .and_then(|()| open.index.sync_data())
             .map_err(|e| Error::io(&index, e))?;
         open.segment.entries.push(entry);
@@ -214,7 +234,7 @@ impl Partition {
             segments.push(Committed {
                 path: data_path(&self.dir, segment.number),
                 end: last.end,
-                rows: segment.entries.iter().map(|e| e.rows).collect(),
+                entries: segment.entries.clone(),
             });
         }
         Cursor {
@@ -222,6 +242,22 @@ impl Partition {
             skip: first_skip,
             bytes,
         }
+    }
+
+    /// How many committed batches arrived at or before `ingest_ns`. Ingest times rise within a
+    /// partition, so the batches after a point in time are a cursor from here.
+    pub(crate) fn at_or_before(&self, ingest_ns: i64) -> usize {
+        self.segments()
+            .map(|s| s.entries.partition_point(|e| e.ingest_ns <= ingest_ns))
+            .sum()
+    }
+
+    /// When the newest committed batch arrived.
+    pub(crate) fn last_ingest_ns(&self) -> Option<i64> {
+        self.segments()
+            .last()
+            .and_then(|segment| segment.entries.last())
+            .map(|entry| entry.ingest_ns)
     }
 
     fn segments(&self) -> impl Iterator<Item = &Segment> {
@@ -268,12 +304,12 @@ impl Partition {
     }
 }
 
-/// A segment's committed batches: its stream up to the last committed byte, and each batch's row
-/// count, to check what the stream holds against what the index commits.
+/// A segment's committed batches: its stream up to the last committed byte, and each batch's
+/// record, to check what the stream holds against what the index commits.
 struct Committed {
     path: PathBuf,
     end: u64,
-    rows: Vec<u64>,
+    entries: Vec<Entry>,
 }
 
 /// Committed batches of a partition, read one at a time (`Partition::cursor`).
@@ -289,40 +325,128 @@ impl Cursor {
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
     }
-    /// Feeds `receive` each batch in order, decoding one at a time, until it returns `false`;
-    /// whether every batch was taken.
-    pub(crate) fn read(self, mut receive: impl FnMut(RecordBatch) -> bool) -> Result<bool, Error> {
-        let mut skip = self.skip;
-        for segment in self.segments {
-            let path = &segment.path;
-            let corrupt = || {
+
+    /// The batches in order, decoded one at a time as they are taken.
+    pub(crate) fn batches(self) -> Batches {
+        Batches {
+            segments: self.segments.into_iter(),
+            skip: self.skip,
+            current: None,
+        }
+    }
+}
+
+/// A cursor's batches, pulled one at a time (`Cursor::batches`).
+pub(crate) struct Batches {
+    segments: std::vec::IntoIter<Committed>,
+    skip: usize,
+    /// The segment being read: its stream and the records of its batches still to come.
+    current: Option<(Committed, StreamReader<Take<File>>, usize)>,
+}
+
+impl Iterator for Batches {
+    type Item = Result<(RecordBatch, Stamp), Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.current.is_none() {
+                let segment = self.segments.next()?;
+                let file = match File::open(&segment.path) {
+                    Ok(file) => file,
+                    Err(e) => return Some(Err(Error::io(&segment.path, e))),
+                };
+                let reader = match StreamReader::try_new(file.take(segment.end), None) {
+                    Ok(reader) => reader,
+                    Err(e) => {
+                        return Some(Err(Error::Arrow(format!(
+                            "{}: {e}",
+                            segment.path.display()
+                        ))));
+                    }
+                };
+                self.current = Some((segment, reader, 0));
+            }
+            let (segment, reader, at) = self.current.as_mut().expect("opened above");
+            let corrupt = |segment: &Committed| {
                 Error::Corrupt(format!(
                     "{}: the stream does not hold the {} batches its index commits",
-                    path.display(),
-                    segment.rows.len()
+                    segment.path.display(),
+                    segment.entries.len()
                 ))
             };
-            let file = File::open(path).map_err(|e| Error::io(path, e))?;
-            let mut batches = StreamReader::try_new(file.take(segment.end), None)
-                .map_err(|e| Error::Arrow(format!("{}: {e}", path.display())))?;
-            for (i, rows) in segment.rows.iter().enumerate() {
-                let batch = batches
-                    .next()
-                    .ok_or_else(corrupt)?
-                    .map_err(|e| Error::Arrow(format!("{}: {e}", path.display())))?;
-                if batch.num_rows() as u64 != *rows {
-                    return Err(corrupt());
+            let Some(&entry) = segment.entries.get(*at) else {
+                // Every committed batch read: the stream must end there.
+                let trailing = reader.next().is_some();
+                let segment = self.current.take().expect("reading one").0;
+                if trailing {
+                    return Some(Err(corrupt(&segment)));
                 }
-                if i >= skip && !receive(batch) {
-                    return Ok(false);
+                self.skip = 0;
+                continue;
+            };
+            *at += 1;
+            let batch = match reader.next() {
+                Some(Ok(batch)) => batch,
+                Some(Err(e)) => {
+                    return Some(Err(Error::Arrow(format!(
+                        "{}: {e}",
+                        segment.path.display()
+                    ))));
                 }
+                None => return Some(Err(corrupt(segment))),
+            };
+            if batch.num_rows() as u64 != entry.rows {
+                return Some(Err(corrupt(segment)));
             }
-            if batches.next().is_some() {
-                return Err(corrupt());
+            if *at > self.skip {
+                return Some(Ok((batch, entry.stamp())));
             }
-            skip = 0;
         }
-        Ok(true)
+    }
+}
+
+/// Batches of several partitions in the order they were committed: by ingest time, which a
+/// table's clock makes rise across all its partitions (ties, from before it did, go to the
+/// earlier partition). One batch of each partition in memory at a time.
+pub(crate) struct InOrder {
+    /// Each partition's batches, and its next one once read.
+    sources: Vec<(Batches, Option<(RecordBatch, Stamp)>)>,
+    primed: bool,
+}
+
+pub(crate) fn in_order(cursors: impl IntoIterator<Item = Cursor>) -> InOrder {
+    InOrder {
+        sources: cursors.into_iter().map(|c| (c.batches(), None)).collect(),
+        primed: false,
+    }
+}
+
+impl Iterator for InOrder {
+    type Item = Result<(RecordBatch, Stamp), Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.primed {
+            self.primed = true;
+            for (batches, next) in &mut self.sources {
+                match batches.next().transpose() {
+                    Ok(read) => *next = read,
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+        }
+        let (_, earliest) = self
+            .sources
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (_, next))| next.as_ref().map(|(_, stamp)| (stamp.ingest_ns, i)))
+            .min()?;
+        let (batches, next) = &mut self.sources[earliest];
+        let taken = next.take();
+        match batches.next().transpose() {
+            Ok(read) => *next = read,
+            Err(e) => return Some(Err(e)),
+        }
+        taken.map(Ok)
     }
 }
 
@@ -389,7 +513,7 @@ mod tests {
     use arrow::array::{AsArray, Int64Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Int64Type, Schema};
 
-    use super::Partition;
+    use super::{Change, Partition};
 
     /// A cursor from any batch delivers exactly the batches from there on, across segments,
     /// and counts their bytes.
@@ -405,7 +529,11 @@ mod tests {
         for v in 0..10_i64 {
             let n = Int64Array::from(vec![v; rows]);
             let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(n)]).unwrap();
-            assert!(partition.append(&batch, v as u64 + 1, 0, 1).unwrap());
+            assert!(
+                partition
+                    .append(&batch, v as u64 + 1, 0, 1, Change::Rows)
+                    .unwrap()
+            );
         }
         assert!(
             partition.segments().count() >= 3,
@@ -417,15 +545,16 @@ mod tests {
             let cursor = partition.cursor(from);
             assert!(cursor.bytes() < last_bytes || from == 10, "from {from}");
             last_bytes = cursor.bytes();
-            let mut read = Vec::new();
-            assert!(
-                cursor
-                    .read(|batch| {
-                        read.push(batch.column(0).as_primitive::<Int64Type>().value(0));
-                        true
-                    })
-                    .unwrap()
-            );
+            let read: Vec<i64> = cursor
+                .batches()
+                .map(|read| {
+                    read.unwrap()
+                        .0
+                        .column(0)
+                        .as_primitive::<Int64Type>()
+                        .value(0)
+                })
+                .collect();
             assert_eq!(read, (from as i64..10).collect::<Vec<_>>(), "from {from}");
         }
         assert_eq!(partition.cursor(10).bytes(), 0);

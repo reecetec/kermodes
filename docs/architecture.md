@@ -195,12 +195,13 @@ reason in this section.
 | append | weir → lake | Default. Rows are never modified or removed. |
 | keyed | weir → lake | One row per key, like a key-value bucket: writes upsert or delete by the table's key columns, and readers get every key's latest value, then each change. State carries across days (§7.3). |
 | blink | no | Only the current cycle's rows are visible; for high-rate transient signals. |
-| derived | optional | Engine output. May be published back to weir: as an append table, or as a keyed one (`publish(table, name, key=...)`), each cycle's changes written as upserts and deletes. |
+| derived | optional | Engine output. May be published back to weir as a keyed table (`publish(name, table, key=...)`): its rows replace the stored table's when publishing starts, so a restart leaves no stale keys, then each cycle's changes follow as deletes and upserts. One publication per table, holding the `publish` source's lease. Later: publishing to an append table, which needs its own exactly-once design across restarts. |
 | input | engine memory | As in Deephaven: append-only, or keyed (one row per key; upserts replace, deletes remove). Written from code or edited by hand in the UI. |
 
 A keyed table's key columns are declared when it is created and fixed for its life. Ingested
 mutable data (upserts, CDC, order books from a feed) goes to keyed tables; weir stores each change
 as written and never mutates a row, so a keyed table's history is its log of changes.
+`changes(name)` is that log for today, ticking: the latest checkpoint, then each change after it.
 
 ### 5.3 Access API
 
@@ -403,8 +404,11 @@ catalog as live tables.
 - Per-batch metadata (`seq`, ingest time) lives in the index, not in user columns. An
   `IngestTime` column can be materialized per table if requested.
 - The change-kind field says what a batch is: 0 rows (an append table's), 1 upserts, 2 deletes
-  (the rows' key columns name what goes), 3 a checkpoint (§7.3). The epoch field is written from
-  the start, so fencing (§17) needs no format change either.
+  (the rows' key columns name what goes), 3 a checkpoint: the table's whole state, replacing every
+  key before it (§7.3). The epoch field is written from the start, so fencing (§17) needs no
+  format change either.
+- Ingest times come from one clock per table, read under its lock: they rise in commit order
+  across all its sources, so replays and folds can merge partitions back into that order.
 
 ### 7.2 Serving
 
@@ -415,9 +419,11 @@ catalog as live tables.
   replayed into every reader, whose memory would otherwise grow with every day kept. A live table
   never drops rows at midnight: a reader that subscribed yesterday keeps yesterday's rows and goes
   on getting today's, while one that subscribes today starts from today.
-- A keyed table's day starts with its checkpoint, so its snapshot is every key's latest value
-  and then today's changes. A checkpoint is never delivered to a reader already tailing: it
-  repeats what that reader has.
+- Replays deliver batches in commit order across sources, empty ones included (an empty
+  checkpoint clears a reader's keyed table). A keyed table's replay starts from its latest
+  checkpoint and the changes committed after it, so a reader starts near now however busy the
+  day. A checkpoint is never delivered to a reader already tailing: it repeats what that reader
+  has.
 - The replay reads one batch at a time from disk without the table's lock, in rounds, until
   little is left (64 batches and 4 MiB); that it delivers under the lock and joins the writes,
   so no batch comes between or twice and writers wait only for that remainder. Each reader has a
@@ -437,10 +443,13 @@ segments as Arrow IPC files with footers, to memory-map and copy to S3.
 
 A keyed table's state carries across days through a checkpoint: the first thing in each day's
 data, in a partition of its own (`{date}/@checkpoint/`, a name no source can take), holding every
-key's latest row as the day began. Weir folds the latest earlier day it holds (its checkpoint,
-then its upserts and deletes in commit order) into the new day's checkpoint on the day's first
-write or subscription, and always before a merge drops the earlier day, so a key never depends on
-a day weir no longer has. Weir keeps no state per key in memory: the fold happens once a day.
+key's latest row as the day began. Weir folds the latest earlier day it holds (its latest
+checkpoint, then the upserts and deletes committed after it) into the new day's checkpoint on the
+day's first write or subscription, and always before a merge drops the earlier day, so a key
+never depends on a day weir no longer has. A busy day gets checkpoints as it goes: once the
+changes since the last checkpoint pass 64 MiB and that checkpoint's own size, the write that
+crosses it folds a new one, so folding costs in proportion to the bytes written. A publisher's
+first write is a checkpoint too (§5.2). Weir keeps no state per key in memory.
 
 ### 7.4 Source leases
 
@@ -505,6 +514,9 @@ begin with their branch, so one bucket holds every branch's history.
 - `Date` is stored in every file (run-length encoded, nearly free); key columns are
   dictionary-encoded (kdb+'s `sym`); column statistics and the page index are written so readers
   skip by date, key, and time. Parquet `field_id` is set from column IDs. Compression: ZSTD.
+- A keyed table's history is its log of changes in commit order: after `Date`, an `Op` column
+  (`upsert`, `delete`, `checkpoint`), then its columns. Later: retention per keyed table (the whole
+  log, or after N days only each day's checkpoint, its latest values) and downsampled logs.
 
 ### 8.2 Catalog
 

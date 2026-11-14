@@ -68,7 +68,7 @@ fn values(store: &Store) -> Vec<i64> {
     store
         .subscribe(
             &ticks(),
-            Box::new(move |batch, _| {
+            Box::new(move |batch, _, _| {
                 let Some(sink) = sink.upgrade() else {
                     return false;
                 };
@@ -226,7 +226,7 @@ fn subscribers_get_every_committed_batch_once_then_each_new_one() {
     store
         .subscribe(
             &ticks(),
-            Box::new(move |batch, _| {
+            Box::new(move |batch, _, _| {
                 let n = batch.column(0).as_primitive::<Int64Type>();
                 sink.lock().unwrap().extend(n.values().iter().copied());
                 true
@@ -239,7 +239,7 @@ fn subscribers_get_every_committed_batch_once_then_each_new_one() {
     store
         .subscribe(
             &ticks(),
-            Box::new(move |_, _| counter.fetch_add(1, Ordering::Relaxed) < 2),
+            Box::new(move |_, _, _| counter.fetch_add(1, Ordering::Relaxed) < 2),
         )
         .unwrap();
     west.write(&batch(4..5), None).unwrap();
@@ -278,7 +278,7 @@ fn a_slow_subscriber_catches_up_without_holding_writers_and_misses_nothing() {
     store
         .subscribe(
             &ticks(),
-            Box::new(move |batch, pace| {
+            Box::new(move |batch, _, pace| {
                 if pace == Pace::MayWait {
                     std::thread::sleep(std::time::Duration::from_micros(300));
                 }
@@ -467,7 +467,7 @@ fn full_segments_roll_over() {
         store
             .subscribe(
                 &name,
-                Box::new(move |batch, _| {
+                Box::new(move |batch, _, _| {
                     let Some(sink) = sink.upgrade() else {
                         return false;
                     };

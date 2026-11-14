@@ -602,6 +602,28 @@ impl Membership {
         std::mem::take(&mut self.created)
     }
 
+    /// Marks every live group touched (as `group` does), and returns their ids: a replace of a
+    /// keyed table's state reconsiders every key.
+    pub fn touch_live(&mut self) -> Vec<u32> {
+        let mut free = vec![false; self.slot.len()];
+        for &id in &self.free {
+            free[id as usize] = true;
+        }
+        self.touched.resize(self.slot.len(), false);
+        let mut live = Vec::new();
+        for (id, free) in free.into_iter().enumerate() {
+            if free {
+                continue;
+            }
+            live.push(id as u32);
+            if !self.touched[id] {
+                self.touched[id] = true;
+                self.touched_list.push(id as u32);
+            }
+        }
+        live
+    }
+
     /// Forgets an emptied group; its id may be reused by a later key.
     pub fn release(&mut self, id: u32) {
         if let Ok(entry) = self

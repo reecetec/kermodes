@@ -8,12 +8,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arrow::array::{Array, ArrayRef, AsArray, Date32Array, RecordBatch};
+use arrow::array::{Array, ArrayRef, AsArray, Date32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Date32Type, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt, TryFutureExt};
-use kermodes_weir::{Date, Error, HistoryDate, HistoryFile};
+use kermodes_weir::{Change, Date, Error, HistoryDate, HistoryFile, TableEntry};
 use object_store::aws::AmazonS3Builder;
 use object_store::buffered::BufWriter;
 use object_store::local::LocalFileSystem;
@@ -41,6 +41,53 @@ const ROW_GROUP_BYTES: usize = 128 << 20;
 
 /// The column every history file starts with.
 pub const DATE: &str = "Date";
+
+/// The column a keyed table's history adds after `Date`: each row's change kind (`upsert`,
+/// `delete`, or `checkpoint`), since a keyed table's history is its log of changes.
+pub const OP: &str = "Op";
+
+/// The columns history keeps of a table, after `Date`: a keyed table's with `Op` first.
+pub fn history_columns(entry: &TableEntry) -> Result<Schema, Error> {
+    if entry.key.is_empty() {
+        return Ok(entry.schema.as_ref().clone());
+    }
+    if entry.schema.column_with_name(OP).is_some() {
+        return Err(Error::Schema(format!(
+            "a keyed table with history cannot have its own `{OP}` column: history adds it"
+        )));
+    }
+    let mut fields = vec![Arc::new(Field::new(OP, DataType::Utf8, false))];
+    fields.extend(entry.schema.fields().iter().cloned());
+    Ok(Schema::new(fields))
+}
+
+/// A batch weir holds, as history keeps it (`history_columns`).
+pub fn with_op(
+    entry: &TableEntry,
+    batch: RecordBatch,
+    change: Change,
+) -> Result<RecordBatch, Error> {
+    if entry.key.is_empty() {
+        return Ok(batch);
+    }
+    let op = match change {
+        Change::Upsert => "upsert",
+        Change::Delete => "delete",
+        Change::Checkpoint => "checkpoint",
+        Change::Rows => {
+            return Err(Error::Corrupt(format!(
+                "{} is keyed but holds an append table's rows",
+                entry.name
+            )));
+        }
+    };
+    let schema = Arc::new(history_columns(entry)?);
+    let mut columns: Vec<ArrayRef> = vec![Arc::new(StringArray::from_iter_values(
+        std::iter::repeat_n(op, batch.num_rows()),
+    ))];
+    columns.extend(batch.columns().iter().cloned());
+    RecordBatch::try_new(schema, columns).map_err(|e| Error::Arrow(e.to_string()))
+}
 
 /// Where a store's history files live: a local directory, or `s3://bucket[/prefix]` with
 /// credentials and endpoint from the usual `AWS_*` variables (`AWS_ENDPOINT`, and

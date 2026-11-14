@@ -418,3 +418,167 @@ fn integer_keys_stay_distinct_groups() {
         assert_eq!(sorted(rows(&counts)), sorted(expected));
     }
 }
+
+/// A fed keyed table holds each key's latest row, whatever mix of upserts and deletes its store
+/// delivers in a cycle: checked against a model after every cycle, under seeded random changes.
+/// Deletes arrive as a store sends them, every column present and only the key's set.
+#[test]
+fn a_fed_keyed_table_holds_each_keys_latest_row() {
+    for seed in 1..=40u64 {
+        let session = Session::new();
+        let (book, feed) = session
+            .fed_keyed_table(&schema(), &["sym"], "md.quotes")
+            .unwrap();
+        let mut model = std::collections::BTreeMap::new();
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = |below: u64| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D) % below
+        };
+        for cycle in 0..30 {
+            for _ in 0..next(4) {
+                // A replace may hold no rows: it clears the table.
+                let op = next(8);
+                let count = usize::from(op != 2) + next(5) as usize;
+                let picked: Vec<(String, f64)> = (0..count)
+                    .map(|_| (format!("s{}", next(12)), next(100) as f64 + 0.5))
+                    .collect();
+                let rows: Vec<(&str, f64)> = picked.iter().map(|(s, p)| (s.as_str(), *p)).collect();
+                if op < 2 {
+                    let price: ArrayRef = Arc::new(Float64Array::new_null(rows.len()));
+                    let deletes = RecordBatch::try_from_iter([
+                        ("sym", quotes(&rows).column(0).clone()),
+                        ("price", price),
+                    ])
+                    .unwrap();
+                    assert!(feed.delete(&[deletes]).unwrap());
+                    for (sym, _) in &picked {
+                        model.remove(sym);
+                    }
+                } else if op == 2 {
+                    assert!(feed.replace(&[quotes(&rows)]).unwrap());
+                    model.clear();
+                    for (sym, price) in picked {
+                        model.insert(sym, price);
+                    }
+                } else {
+                    assert!(feed.upsert(&[quotes(&rows)]).unwrap());
+                    for (sym, price) in picked {
+                        model.insert(sym, price);
+                    }
+                }
+            }
+            session.step();
+            let want: Vec<String> = model
+                .iter()
+                .map(|(sym, price)| format!("sym={sym}, price={price}"))
+                .collect();
+            assert_eq!(sorted(rows(&book)), want, "seed {seed}, cycle {cycle}");
+        }
+    }
+}
+
+#[test]
+fn a_fed_keyed_table_is_written_only_through_its_feed() {
+    let session = Session::new();
+    let (book, feed) = session
+        .fed_keyed_table(&schema(), &["sym"], "md.quotes")
+        .unwrap();
+    assert!(matches!(
+        book.upsert(&[quotes(&[("a", 1.0)])]),
+        Err(Error::Unsupported(_))
+    ));
+    assert!(matches!(
+        feed.append(&[quotes(&[("a", 1.0)])]),
+        Err(Error::Unsupported(_))
+    ));
+}
+
+/// A listener told a table's current rows and then each cycle's changes can rebuild the table
+/// exactly, whenever it starts listening: checked after every cycle under seeded upserts and
+/// deletes, on a filter (whose rows come, go, and change).
+#[test]
+fn listeners_are_told_every_change_once() {
+    for seed in 1..=20u64 {
+        let session = Session::new();
+        let book = session.keyed_input_table(&schema(), &["sym"]).unwrap();
+        let rich = book.filter("price > 30").unwrap();
+        let told = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = |below: u64| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D) % below
+        };
+        let mut model = std::collections::BTreeMap::<String, String>::new();
+        for cycle in 0..30 {
+            if cycle == 5 {
+                let sink = told.clone();
+                rich.on_changes(Box::new(move |changes| {
+                    sink.lock().unwrap().push(changes.unwrap());
+                    true
+                }))
+                .unwrap();
+            }
+            let picked: Vec<(String, f64)> = (0..1 + next(6))
+                .map(|_| (format!("s{}", next(10)), next(60) as f64 + 0.5))
+                .collect();
+            let written: Vec<(&str, f64)> = picked.iter().map(|(s, p)| (s.as_str(), *p)).collect();
+            if next(3) == 0 {
+                let syms: Vec<&str> = written.iter().map(|r| r.0).collect();
+                book.delete(&[keys(&syms)]).unwrap();
+            } else {
+                book.upsert(&[quotes(&written)]).unwrap();
+            }
+            session.step();
+            for changes in told.lock().unwrap().drain(..) {
+                let removed = changes.removed.iter();
+                let previous = changes.modified.iter().map(|(before, _)| before);
+                for batch in removed.chain(previous) {
+                    for row in batch_rows(batch) {
+                        model.remove(sym_of(&row));
+                    }
+                }
+                let current = changes.modified.iter().map(|(_, after)| after);
+                for batch in changes.added.iter().chain(current) {
+                    for row in batch_rows(batch) {
+                        model.insert(sym_of(&row).to_string(), row);
+                    }
+                }
+            }
+            if cycle >= 5 {
+                let want = sorted(rows(&rich));
+                let have: Vec<String> = model.values().cloned().collect();
+                assert_eq!(have, want, "seed {seed}, cycle {cycle}");
+            }
+        }
+    }
+}
+
+fn batch_rows(batch: &RecordBatch) -> Vec<String> {
+    let options = FormatOptions::default().with_null("null");
+    let formatters: Vec<_> = batch
+        .columns()
+        .iter()
+        .map(|c| ArrayFormatter::try_new(c.as_ref(), &options).unwrap())
+        .collect();
+    (0..batch.num_rows())
+        .map(|row| {
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .zip(&formatters)
+                .map(|(field, f)| format!("{}={}", field.name(), f.value(row)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .collect()
+}
+
+fn sym_of(row: &str) -> &str {
+    row.split(", ").next().unwrap().trim_start_matches("sym=")
+}

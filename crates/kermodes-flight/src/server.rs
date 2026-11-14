@@ -16,7 +16,7 @@ use arrow_flight::{
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
 use futures::stream::{self, StreamExt, TryStreamExt};
-use kermodes_weir::{Date, Error, Pace, SourceId, Store, TableName};
+use kermodes_weir::{Change, Date, Error, Pace, SourceId, Store, TableName};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -162,6 +162,49 @@ fn ack(last_seq: Option<u64>, written: bool) -> PutResult {
     }
 }
 
+/// The schema, then each batch in messages of its own, tagged with its change kind
+/// (`app_metadata`: one byte, `Change::code`). Large batches still split into several messages,
+/// each tagged; an empty one, which the encoder would drop, is one message (an empty checkpoint
+/// clears a keyed table).
+fn tagged(
+    schema: arrow::datatypes::SchemaRef,
+    rows: impl futures::Stream<Item = Result<(RecordBatch, Change), FlightError>> + Send + 'static,
+) -> Stream<FlightData> {
+    let opening = FlightDataEncoderBuilder::new()
+        .with_schema(schema.clone())
+        .build(stream::empty());
+    let batches = rows
+        .then(move |row| {
+            let schema = schema.clone();
+            async move {
+                let (batch, change) = row?;
+                let messages: Vec<FlightData> = if batch.num_rows() == 0 {
+                    let mut encoded =
+                        arrow_flight::utils::batches_to_flight_data(&schema, [&batch])?;
+                    // The schema went first, once.
+                    encoded.split_off(1)
+                } else {
+                    FlightDataEncoderBuilder::new()
+                        .with_schema(schema)
+                        .build(stream::once(async move { Ok(batch) }))
+                        .skip(1)
+                        .try_collect()
+                        .await?
+                };
+                let messages = messages.into_iter().map(move |mut message| {
+                    message.app_metadata = vec![change.code()].into();
+                    Ok(message)
+                });
+                Ok::<_, FlightError>(stream::iter(messages))
+            }
+        })
+        .try_flatten();
+    opening
+        .chain(batches)
+        .map_err(|e| Status::internal(e.to_string()))
+        .boxed()
+}
+
 #[tonic::async_trait]
 impl FlightService for Service {
     type HandshakeStream = Stream<HandshakeResponse>;
@@ -215,16 +258,32 @@ impl FlightService for Service {
                 let DecodedPayload::RecordBatch(batch) = message.payload else {
                     continue;
                 };
-                let Ok(seq) = <[u8; 8]>::try_from(message.inner.app_metadata.as_ref()) else {
+                // The sequence number (8 bytes), then since keyed tables the change kind (one
+                // byte; absent, a plain write).
+                let metadata = message.inner.app_metadata.as_ref();
+                let change = match metadata.get(8) {
+                    None => Some(Change::Rows),
+                    Some(&code) => Change::from_code(u32::from(code)),
+                };
+                let (Ok(seq), Some(change)) = (
+                    <[u8; 8]>::try_from(&metadata[..metadata.len().min(8)]),
+                    change,
+                ) else {
                     let _ = acks.send(Err(Status::invalid_argument(
-                        "each batch's app_metadata is its sequence number (8 bytes)",
+                        "each batch's app_metadata is its sequence number (8 bytes), then its \
+                         change kind (one byte)",
                     )));
                     return;
                 };
                 let seq = u64::from_le_bytes(seq);
                 let writer = writer.clone();
                 let result = blocking(move || {
-                    let written = writer.write(&batch, Some(seq))?;
+                    let written = match change {
+                        Change::Rows => writer.write(&batch, Some(seq))?,
+                        Change::Upsert => writer.upsert(&batch, Some(seq))?,
+                        Change::Delete => writer.delete(&batch, Some(seq))?,
+                        Change::Checkpoint => writer.replace(&batch, Some(seq))?,
+                    };
                     Ok(ack(writer.last_seq(), written))
                 })
                 .await;
@@ -252,12 +311,13 @@ impl FlightService for Service {
             let date = date(&ticket, "date")?;
             // A past date's batches, then the end. The queue holds a few batches, so the read
             // keeps to the reader's pace and weir's memory stays bounded.
-            let (batches, mut receiver) = mpsc::channel::<Result<RecordBatch, FlightError>>(4);
+            let (batches, mut receiver) =
+                mpsc::channel::<Result<(RecordBatch, Change), FlightError>>(4);
             let store = self.store.clone();
             tokio::task::spawn_blocking(move || {
-                let read = store.read_date(&name, date, &mut |batch| {
+                let read = store.read_date(&name, date, &mut |batch, change| {
                     batches
-                        .blocking_send(Ok(batch))
+                        .blocking_send(Ok((batch, change)))
                         .map_err(|_| Error::Io("the reader went".into()))
                 });
                 if let Err(e) = read {
@@ -265,15 +325,11 @@ impl FlightService for Service {
                 }
             });
             let rows = futures::stream::poll_fn(move |cx| receiver.poll_recv(cx));
-            let data = FlightDataEncoderBuilder::new()
-                .with_schema(schema)
-                .build(rows)
-                .map_err(|e| Status::internal(e.to_string()));
-            return Ok(Response::new(data.boxed()));
+            return Ok(Response::new(tagged(schema, rows)));
         }
         // Batches sent to the reader's stream, and the bytes of them it has not taken yet.
         let (batches, receiver) =
-            mpsc::unbounded_channel::<(Result<RecordBatch, FlightError>, usize)>();
+            mpsc::unbounded_channel::<(Result<(RecordBatch, Change), FlightError>, usize)>();
         let queued = Arc::new(AtomicUsize::new(0));
         let store = self.store.clone();
         let sent = queued.clone();
@@ -283,7 +339,7 @@ impl FlightService for Service {
             let subscriber = batches.clone();
             let subscribed = store.subscribe(
                 &name,
-                Box::new(move |batch, pace| {
+                Box::new(move |batch, change, pace| {
                     let size = batch.get_array_memory_size();
                     match pace {
                         Pace::MayWait => {
@@ -303,7 +359,7 @@ impl FlightService for Service {
                     }
                     sent.fetch_add(size, Ordering::AcqRel);
                     // Fails once the reader went.
-                    subscriber.send((Ok(batch.clone()), size)).is_ok()
+                    subscriber.send((Ok((batch.clone(), change)), size)).is_ok()
                 }),
             );
             if let Err(e) = subscribed {
@@ -318,11 +374,7 @@ impl FlightService for Service {
                 Some((batch, receiver))
             }
         });
-        let data = FlightDataEncoderBuilder::new()
-            .with_schema(schema)
-            .build(rows)
-            .map_err(|e| Status::internal(e.to_string()));
-        Ok(Response::new(data.boxed()))
+        Ok(Response::new(tagged(schema, rows)))
     }
 
     async fn do_action(

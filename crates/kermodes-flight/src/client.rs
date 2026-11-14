@@ -12,8 +12,8 @@ use arrow_flight::utils::batches_to_flight_data;
 use arrow_flight::{Action, FlightData, FlightDescriptor, PutResult, Ticket};
 use futures::{StreamExt, TryStreamExt};
 use kermodes_weir::{
-    Date, Error, Garbage, HistoryCommit, HistoryDate, HistoryFile, Pace, SourceId, Subscriber,
-    TableEntry, TableName, conform,
+    Change, Date, Error, Garbage, HistoryCommit, HistoryDate, HistoryFile, Pace, SourceId,
+    Subscriber, TableEntry, TableName, conform, keys_only,
 };
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
@@ -165,12 +165,13 @@ impl Client {
         ))
     }
 
-    /// Every batch of a past `date` of `name`, to `each`, as the server reads them.
+    /// Every batch of a past `date` of `name` with its change kind, to `each`, as the server
+    /// reads them.
     pub fn read_date(
         &self,
         name: &TableName,
         date: Date,
-        each: &mut dyn FnMut(RecordBatch) -> Result<(), Error>,
+        each: &mut dyn FnMut(RecordBatch, Change) -> Result<(), Error>,
     ) -> Result<(), Error> {
         let mut flight = self.flight.clone();
         let ticket = Ticket {
@@ -192,7 +193,7 @@ impl Client {
             match message {
                 Ok(message) => {
                     if let DecodedPayload::RecordBatch(batch) = message.payload {
-                        each(batch)?;
+                        each(batch, change_of(&message.inner.app_metadata)?)?;
                     }
                 }
                 Err(FlightError::Tonic(status)) => return Err(error_from_status(&status)),
@@ -265,7 +266,7 @@ impl Client {
         source: &SourceId,
         wait: bool,
     ) -> Result<RemoteWriter, Error> {
-        let schema = self.table(name)?;
+        let TableEntry { schema, key, .. } = self.entry(name)?;
         let mut first: FlightData = batches_to_flight_data(&schema, [])
             .map_err(|e| Error::Arrow(e.to_string()))?
             .remove(0);
@@ -294,6 +295,7 @@ impl Client {
             runtime: self.runtime.clone(),
             table: name.clone(),
             schema,
+            key,
             sender,
             epoch: state["epoch"].as_u64(),
             state: Mutex::new(WriterState {
@@ -343,10 +345,14 @@ impl Client {
             let reason = loop {
                 match decoded.next().await {
                     Some(Ok(message)) => {
-                        if let DecodedPayload::RecordBatch(batch) = message.payload
-                            && !subscriber(&batch, Pace::MayWait)
-                        {
-                            return;
+                        if let DecodedPayload::RecordBatch(batch) = message.payload {
+                            let change = match change_of(&message.inner.app_metadata) {
+                                Ok(change) => change,
+                                Err(e) => break e.to_string(),
+                            };
+                            if !subscriber(&batch, change, Pace::MayWait) {
+                                return;
+                            }
                         }
                     }
                     Some(Err(e)) => break format!("the stream of {name} broke: {e}"),
@@ -364,6 +370,8 @@ pub struct RemoteWriter {
     runtime: Arc<Runtime>,
     table: TableName,
     schema: SchemaRef,
+    /// A keyed table's key columns; empty for an append table.
+    key: Vec<String>,
     sender: mpsc::UnboundedSender<FlightData>,
     epoch: Option<u64>,
     state: Mutex<WriterState>,
@@ -390,17 +398,45 @@ impl RemoteWriter {
     /// As `kermodes_weir::Writer::write`: returns once the server has the batch durably, or
     /// dropped it as a resend (`false`).
     pub fn write(&self, batch: &RecordBatch, seq: Option<u64>) -> Result<bool, Error> {
-        let batch = conform(&self.schema, batch)?;
+        self.send(&conform(&self.schema, batch)?, seq, Change::Rows)
+    }
+
+    /// As `kermodes_weir::Writer::upsert`.
+    pub fn upsert(&self, batch: &RecordBatch, seq: Option<u64>) -> Result<bool, Error> {
+        self.send(&conform(&self.schema, batch)?, seq, Change::Upsert)
+    }
+
+    /// As `kermodes_weir::Writer::delete`: `batch` needs only the key columns.
+    pub fn delete(&self, batch: &RecordBatch, seq: Option<u64>) -> Result<bool, Error> {
+        self.send(
+            &keys_only(&self.schema, &self.key, batch)?,
+            seq,
+            Change::Delete,
+        )
+    }
+
+    /// As `kermodes_weir::Writer::replace`.
+    pub fn replace(&self, batch: &RecordBatch, seq: Option<u64>) -> Result<bool, Error> {
+        self.send(&conform(&self.schema, batch)?, seq, Change::Checkpoint)
+    }
+
+    fn send(&self, batch: &RecordBatch, seq: Option<u64>, change: Change) -> Result<bool, Error> {
         let mut state = self
             .state
             .lock()
             .expect("kermodes writer poisoned by an earlier panic");
         let seq = seq.unwrap_or_else(|| state.last.map_or(1, |last| last + 1));
-        let mut data = batches_to_flight_data(&self.schema, [&batch])
+        let mut data = batches_to_flight_data(&self.schema, [batch])
             .map_err(|e| Error::Arrow(e.to_string()))?
             .pop()
             .expect("a batch message");
-        data.app_metadata = seq.to_le_bytes().to_vec().into();
+        // A plain write's metadata is its sequence number alone, as servers before keyed tables
+        // read it.
+        let mut metadata = seq.to_le_bytes().to_vec();
+        if change != Change::Rows {
+            metadata.push(change.code());
+        }
+        data.app_metadata = metadata.into();
         let bytes = data.data_header.len() + data.data_body.len();
         if bytes > MAX_WRITE_BYTES {
             return Err(Error::TooLarge(format!(
@@ -428,6 +464,16 @@ impl RemoteWriter {
         let last = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));
         state.last = Some(last);
         Ok(bytes[8] == 1)
+    }
+}
+
+/// A read batch's change kind: one byte, or none from a server before keyed tables (rows).
+fn change_of(metadata: &[u8]) -> Result<Change, Error> {
+    match metadata {
+        [] => Ok(Change::Rows),
+        [code] => Change::from_code(u32::from(*code))
+            .ok_or_else(|| Error::Io(format!("a change kind ({code}) this client cannot read"))),
+        _ => Err(Error::Io("batch metadata this client cannot read".into())),
     }
 }
 

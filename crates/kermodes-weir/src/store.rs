@@ -5,6 +5,7 @@
 //! {root}/lock                 held by the owning process
 //! {root}/catalog.sqlite       the catalog
 //! {root}/weir/{location}/{date}/{source}/seg-N.{arrows,idx}
+//! {root}/weir/{location}/{date}/@checkpoint/seg-N.{arrows,idx}    a keyed table's day opening
 //! ```
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -13,20 +14,24 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use arrow::array::new_null_array;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
 use crate::catalog::{Catalog, Garbage, HistoryCommit, HistoryDate, HistoryFile, TableEntry};
-use crate::partition::Partition;
-use crate::{Date, Error, SourceId, TableName};
+use crate::keyed::Fold;
+use crate::partition::{Partition, in_order};
+use crate::{Change, Date, Error, SourceId, TableName};
 
 /// The branch a local store's tables live on (architecture.md §10.1).
 pub const BRANCH: &str = "local";
 
-/// Receives a table's batches in order: every batch committed today (UTC) when it subscribes,
-/// then each new one as it commits. Returning `false` unsubscribes it (its reader is gone, or
-/// too far behind). `Pace` says whether it may wait for its reader before returning.
-pub type Subscriber = Box<dyn FnMut(&RecordBatch, Pace) -> bool + Send>;
+/// Receives a table's batches in order, each with its change kind: every batch committed today
+/// (UTC) when it subscribes (a keyed table's starting with its checkpoint), then each new one as
+/// it commits. Empty batches too: an empty checkpoint clears a keyed table. Returning `false`
+/// unsubscribes it (its reader is gone, or too far behind). `Pace` says whether it may wait for
+/// its reader before returning.
+pub type Subscriber = Box<dyn FnMut(&RecordBatch, Change, Pace) -> bool + Send>;
 
 /// Whether a subscriber may wait before taking the next batch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +50,11 @@ pub enum Pace {
 /// subscriber can take it all without waiting.
 const CATCH_UP_UNDER_LOCK: usize = 64;
 const CATCH_UP_UNDER_LOCK_BYTES: u64 = 4 << 20;
+
+/// A keyed table gets a new checkpoint once this much has been written since its last (and at
+/// least as much as that checkpoint holds): a subscriber's replay starts from the latest
+/// checkpoint, so it reads about this much of changes however busy the day.
+const CHECKPOINT_BYTES: usize = 64 << 20;
 
 pub struct Store {
     root: PathBuf,
@@ -67,11 +77,25 @@ struct Log {
 struct TableLog {
     entry: TableEntry,
     dir: PathBuf,
-    /// By date, then source: the order a subscriber receives existing batches in.
-    partitions: BTreeMap<(String, SourceId), Partition>,
+    /// By date, then stream (a keyed table's checkpoint first, then each source).
+    partitions: BTreeMap<(String, Stream), Partition>,
     subscribers: Vec<Subscriber>,
     /// Sources whose lease a `Writer` holds: one writer per source (§7.4).
     writing: HashSet<SourceId>,
+    /// The last ingest time given: each batch's is later, so ingest order is commit order.
+    clock: i64,
+    /// A keyed table's: bytes of changes written since its last checkpoint, and that
+    /// checkpoint's size (unknown, so 0, after a restart).
+    since_checkpoint: usize,
+    checkpoint_bytes: usize,
+}
+
+impl TableLog {
+    /// The next ingest time: now, or just after the last one if the clock has not moved on.
+    fn tick(&mut self) -> i64 {
+        self.clock = now_ns().max(self.clock + 1);
+        self.clock
+    }
 }
 
 impl Store {
@@ -192,7 +216,7 @@ impl Store {
                 .expect("kermodes store poisoned by an earlier panic");
         }
         state.writing.insert(source.clone());
-        let (table_id, schema) = (state.entry.id, state.entry.schema.clone());
+        let entry = state.entry.clone();
         drop(state);
         // The source is ours from here: the epoch is taken outside the log's lock, so the
         // catalog's lock is never held inside it.
@@ -200,10 +224,12 @@ impl Store {
         let mut writer = Writer {
             log,
             source: source.clone(),
-            schema,
+            schema: entry.schema,
+            name: entry.name,
+            key: entry.key,
             epoch: 0,
         };
-        writer.epoch = lock(&self.catalog).next_epoch(table_id, source)?;
+        writer.epoch = lock(&self.catalog).next_epoch(entry.id, source)?;
         Ok(writer)
     }
 
@@ -245,10 +271,15 @@ impl Store {
         )
         .to_string();
         let log = self.log(name)?;
-        // Batches delivered so far, by partition.
-        let mut delivered: BTreeMap<(String, SourceId), usize> = BTreeMap::new();
-        loop {
+        // Where the replay starts in each partition: a keyed table's latest checkpoint and the
+        // changes after it; every batch of an append table's.
+        let mut delivered = {
             let mut state = lock(&log.state);
+            ensure_checkpoint(&mut state, &today)?;
+            starts(&state, &today)
+        };
+        loop {
+            let state = lock(&log.state);
             let mut behind = Vec::new();
             let (mut left, mut left_bytes) = (0, 0);
             for (key, partition) in &state.partitions {
@@ -262,22 +293,31 @@ impl Store {
                 }
             }
             let schema = state.entry.schema.clone();
-            if left <= CATCH_UP_UNDER_LOCK && left_bytes <= CATCH_UP_UNDER_LOCK_BYTES {
-                for (_, cursor, _) in behind {
-                    if !cursor.read(|batch| subscriber(&batch, Pace::MustNotWait))? {
-                        return Ok(schema);
-                    }
+            let under_lock = left <= CATCH_UP_UNDER_LOCK && left_bytes <= CATCH_UP_UNDER_LOCK_BYTES;
+            // Held through the delivery when little is left, so no write comes between.
+            let (held, pace) = if under_lock {
+                (Some(state), Pace::MustNotWait)
+            } else {
+                drop(state);
+                (None, Pace::MayWait)
+            };
+            let mut caught_up = Vec::with_capacity(behind.len());
+            let mut cursors = Vec::with_capacity(behind.len());
+            for (key, cursor, committed) in behind {
+                caught_up.push((key, committed));
+                cursors.push(cursor);
+            }
+            for read in in_order(cursors) {
+                let (batch, stamp) = read?;
+                if !subscriber(&batch, stamp.change, pace) {
+                    return Ok(schema);
                 }
+            }
+            if let Some(mut state) = held {
                 state.subscribers.push(subscriber);
                 return Ok(schema);
             }
-            drop(state);
-            for (key, cursor, committed) in behind {
-                if !cursor.read(|batch| subscriber(&batch, Pace::MayWait))? {
-                    return Ok(schema);
-                }
-                delivered.insert(key, committed);
-            }
+            delivered.extend(caught_up);
         }
     }
 
@@ -312,13 +352,13 @@ impl Store {
             }))
     }
 
-    /// Every batch of a past `date` of `name`, source by source in commit order, to `each`.
-    /// Nothing writes a past date, so this reads without holding up writers.
+    /// Every batch of a past `date` of `name` with its change kind, to `each`, in the order they
+    /// were committed. Nothing writes a past date, so this reads without holding up writers.
     pub fn read_date(
         &self,
         name: &TableName,
         date: Date,
-        each: &mut dyn FnMut(RecordBatch) -> Result<(), Error>,
+        each: &mut dyn FnMut(RecordBatch, Change) -> Result<(), Error>,
     ) -> Result<(), Error> {
         past(date)?;
         let log = self.log(name)?;
@@ -329,18 +369,9 @@ impl Store {
             .filter(|((day, _), _)| *day == key)
             .map(|(_, partition)| partition.cursor(0))
             .collect();
-        for cursor in cursors {
-            let mut failed = None;
-            cursor.read(|batch| match each(batch) {
-                Ok(()) => true,
-                Err(e) => {
-                    failed = Some(e);
-                    false
-                }
-            })?;
-            if let Some(e) = failed {
-                return Err(e);
-            }
+        for read in in_order(cursors) {
+            let (batch, stamp) = read?;
+            each(batch, stamp.change)?;
         }
         Ok(())
     }
@@ -357,6 +388,8 @@ impl Store {
             .sum();
         let log = self.log(name)?;
         let mut state = lock(&log.state);
+        // A keyed table's state must not depend on the date going: today's checkpoint holds it.
+        ensure_checkpoint(&mut state, &Date::of_ns(now_ns()).to_string())?;
         let key = date.to_string();
         let rows: u64 = state
             .partitions
@@ -388,13 +421,18 @@ impl Store {
         }
         let dir = self.root.join("weir").join(&entry.location);
         let mut partitions = BTreeMap::new();
-        for (date, source) in partition_dirs(&dir)? {
-            let path = dir.join(&date).join(source.as_str());
+        for (date, stream) in partition_dirs(&dir)? {
+            let path = dir.join(&date).join(stream.dir_name());
             partitions.insert(
-                (date, source),
+                (date, stream),
                 Partition::open(&path, entry.schema.clone())?,
             );
         }
+        let clock = partitions
+            .values()
+            .filter_map(Partition::last_ingest_ns)
+            .max()
+            .unwrap_or(0);
         let log = Arc::new(Log {
             state: Mutex::new(TableLog {
                 entry: entry.clone(),
@@ -402,6 +440,9 @@ impl Store {
                 partitions,
                 subscribers: Vec::new(),
                 writing: HashSet::new(),
+                clock,
+                since_checkpoint: 0,
+                checkpoint_bytes: 0,
             }),
             released: Condvar::new(),
         });
@@ -412,11 +453,15 @@ impl Store {
 
 /// Writes one source's rows of a table, holding the source's lease (§7.4) until dropped. Each
 /// batch lands in the partition for the UTC date it arrives (its ingest time) and is durable
-/// before `write` returns.
+/// before it returns: an append table's rows by `write`, a keyed table's by `upsert` and
+/// `delete`.
 pub struct Writer {
     log: Arc<Log>,
     source: SourceId,
     schema: SchemaRef,
+    name: TableName,
+    /// A keyed table's key columns; empty for an append table.
+    key: Vec<String>,
     epoch: u64,
 }
 
@@ -437,31 +482,92 @@ impl Writer {
     /// Appends `batch` (columns matched by name to the table's) as `seq`, or the next number after
     /// the last; `false` when `seq` was already written (a resend), which writes nothing.
     pub fn write(&self, batch: &RecordBatch, seq: Option<u64>) -> Result<bool, Error> {
-        let batch = conform(&self.schema, batch)?;
-        let ingest_ns = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as i64);
-        let date = Date::of_ns(ingest_ns).to_string();
+        if !self.key.is_empty() {
+            return Err(Error::Schema(format!(
+                "{} is a keyed table: upsert or delete its rows",
+                self.name
+            )));
+        }
+        self.append(&conform(&self.schema, batch)?, seq, Change::Rows)
+    }
+
+    /// Sets each row's key to that row, as `write` does for an append table.
+    pub fn upsert(&self, batch: &RecordBatch, seq: Option<u64>) -> Result<bool, Error> {
+        self.keyed("upsert")?;
+        self.append(&conform(&self.schema, batch)?, seq, Change::Upsert)
+    }
+
+    /// Removes the keys of `batch`'s rows; it needs only the key columns.
+    pub fn delete(&self, batch: &RecordBatch, seq: Option<u64>) -> Result<bool, Error> {
+        self.keyed("delete")?;
+        self.append(
+            &keys_only(&self.schema, &self.key, batch)?,
+            seq,
+            Change::Delete,
+        )
+    }
+
+    /// Replaces the table's state with `batch`: every key not in it is gone (a checkpoint). A
+    /// publisher starts this way, so keys it no longer holds do not outlive its restart; a state
+    /// larger than one batch follows on in upserts.
+    pub fn replace(&self, batch: &RecordBatch, seq: Option<u64>) -> Result<bool, Error> {
+        self.keyed("replace")?;
+        self.append(&conform(&self.schema, batch)?, seq, Change::Checkpoint)
+    }
+
+    fn keyed(&self, action: &str) -> Result<(), Error> {
+        if self.key.is_empty() {
+            return Err(Error::Schema(format!(
+                "{} is an append table: write its rows; only keyed tables {action}",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+
+    fn append(&self, batch: &RecordBatch, seq: Option<u64>, change: Change) -> Result<bool, Error> {
         let mut guard = lock(&self.log.state);
         let log = &mut *guard;
+        // The day's opening checkpoint is stamped before the write that brings it, then the
+        // write: under the lock, so ingest times rise in commit order across sources. Twice only
+        // if the clock passed midnight between.
+        let ingest_ns = loop {
+            let date = Date::of_ns(now_ns().max(log.clock + 1));
+            ensure_checkpoint(log, &date.to_string())?;
+            let ingest_ns = log.tick();
+            if Date::of_ns(ingest_ns) == date {
+                break ingest_ns;
+            }
+        };
+        let date = Date::of_ns(ingest_ns).to_string();
         let seq = match seq {
             Some(seq) => seq,
             None => newest(log, &self.source)
                 .and_then(Partition::last_seq)
                 .map_or(1, |last| last + 1),
         };
-        let key = (date, self.source.clone());
+        let key = (date, Stream::Source(self.source.clone()));
         if !log.partitions.contains_key(&key) {
-            let path = log.dir.join(&key.0).join(self.source.as_str());
+            let path = log.dir.join(&key.0).join(key.1.dir_name());
             let partition = Partition::open(&path, log.entry.schema.clone())?;
             log.partitions.insert(key.clone(), partition);
         }
         let partition = log.partitions.get_mut(&key).expect("inserted above");
-        if !partition.append(&batch, seq, ingest_ns, self.epoch)? {
+        if !partition.append(batch, seq, ingest_ns, self.epoch, change)? {
             return Ok(false);
         }
         log.subscribers
-            .retain_mut(|subscriber| subscriber(&batch, Pace::MustNotWait));
+            .retain_mut(|subscriber| subscriber(batch, change, Pace::MustNotWait));
+        if !log.entry.key.is_empty() {
+            log.since_checkpoint += batch.get_array_memory_size();
+            // Past the last checkpoint's own size too, so folding costs in proportion to the
+            // changes written however large the state.
+            if log.since_checkpoint >= CHECKPOINT_BYTES.max(log.checkpoint_bytes) {
+                let mut fold = Fold::new(&log.entry.schema, &log.entry.key)?;
+                fold_latest(log, &key.0, &mut fold)?;
+                write_checkpoint(log, &key.0, &fold.state()?)?;
+            }
+        }
         Ok(true)
     }
 }
@@ -498,12 +604,30 @@ fn newest<'a>(log: &'a TableLog, source: &SourceId) -> Option<&'a Partition> {
     log.partitions
         .iter()
         .rev()
-        .find(|((_, s), _)| s == source)
+        .find(|((_, stream), _)| *stream == Stream::Source(source.clone()))
         .map(|(_, partition)| partition)
 }
 
-/// `{dir}/{date}/{source}` directories that exist.
-fn partition_dirs(dir: &Path) -> Result<Vec<(String, SourceId)>, Error> {
+/// What a partition holds within a date: a keyed table's checkpoint, or one source's writes.
+/// The checkpoint sorts first, so it is replayed first.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Stream {
+    Checkpoint,
+    Source(SourceId),
+}
+
+impl Stream {
+    /// `@` is in no source's name, so the checkpoint's directory cannot be a source's.
+    fn dir_name(&self) -> &str {
+        match self {
+            Stream::Checkpoint => "@checkpoint",
+            Stream::Source(source) => source.as_str(),
+        }
+    }
+}
+
+/// `{dir}/{date}/{stream}` directories that exist.
+fn partition_dirs(dir: &Path) -> Result<Vec<(String, Stream)>, Error> {
     let mut found = Vec::new();
     let Ok(dates) = fs::read_dir(dir) else {
         return Ok(found);
@@ -511,13 +635,108 @@ fn partition_dirs(dir: &Path) -> Result<Vec<(String, SourceId)>, Error> {
     for date in dates {
         let date = date.map_err(|e| Error::io(dir, e))?;
         let date_name = date.file_name().to_string_lossy().into_owned();
-        for source in fs::read_dir(date.path()).map_err(|e| Error::io(&date.path(), e))? {
-            let source = source.map_err(|e| Error::io(&date.path(), e))?;
-            let name = source.file_name().to_string_lossy().into_owned();
-            found.push((date_name.clone(), SourceId::parse(&name)?));
+        for stream in fs::read_dir(date.path()).map_err(|e| Error::io(&date.path(), e))? {
+            let stream = stream.map_err(|e| Error::io(&date.path(), e))?;
+            let name = stream.file_name().to_string_lossy().into_owned();
+            let stream = match name.as_str() {
+                "@checkpoint" => Stream::Checkpoint,
+                name => Stream::Source(SourceId::parse(name)?),
+            };
+            found.push((date_name.clone(), stream));
         }
     }
     Ok(found)
+}
+
+/// Gives a keyed table's day `today` its checkpoint, unless it has one: every key's latest row,
+/// folded from the latest earlier day weir holds (§7.3). Under the table's lock, since nothing
+/// may write the day before its checkpoint; it happens on the day's first write or
+/// subscription, or before an earlier day is dropped.
+fn ensure_checkpoint(log: &mut TableLog, today: &str) -> Result<(), Error> {
+    let opening = (today.to_owned(), Stream::Checkpoint);
+    if log.entry.key.is_empty()
+        || log
+            .partitions
+            .get(&opening)
+            .is_some_and(|partition| partition.committed() > 0)
+    {
+        return Ok(());
+    }
+    let mut fold = Fold::new(&log.entry.schema, &log.entry.key)?;
+    let earlier = log
+        .partitions
+        .keys()
+        .map(|(day, _)| day)
+        .filter(|day| day.as_str() < today)
+        .max()
+        .cloned();
+    if let Some(day) = earlier {
+        fold_latest(log, &day, &mut fold)?;
+    }
+    write_checkpoint(log, today, &fold.state()?)
+}
+
+/// Appends `state` to `day`'s checkpoints. Subscribers are not told: a reader already following
+/// the table has every row it repeats.
+fn write_checkpoint(log: &mut TableLog, day: &str, state: &RecordBatch) -> Result<(), Error> {
+    let ingest_ns = log.tick();
+    let key = (day.to_owned(), Stream::Checkpoint);
+    if !log.partitions.contains_key(&key) {
+        let path = log.dir.join(day).join(Stream::Checkpoint.dir_name());
+        let partition = Partition::open(&path, log.entry.schema.clone())?;
+        log.partitions.insert(key.clone(), partition);
+    }
+    let partition = log.partitions.get_mut(&key).expect("inserted above");
+    let seq = partition.last_seq().map_or(1, |last| last + 1);
+    partition.append(state, seq, ingest_ns, 0, Change::Checkpoint)?;
+    log.since_checkpoint = 0;
+    log.checkpoint_bytes = state.get_array_memory_size();
+    Ok(())
+}
+
+/// Folds `day` of a keyed table as it stands: its latest checkpoint, then the changes of its
+/// sources committed after it, in commit order.
+fn fold_latest(log: &TableLog, day: &str, fold: &mut Fold) -> Result<(), Error> {
+    let cursors = latest(log, day)
+        .into_iter()
+        .map(|(key, from)| log.partitions[&key].cursor(from));
+    for read in in_order(cursors.collect::<Vec<_>>()) {
+        let (batch, stamp) = read?;
+        fold.apply(batch, stamp.change)?;
+    }
+    Ok(())
+}
+
+/// Where `day`'s state starts in each of its partitions: the latest checkpoint, and in each
+/// source the first change committed after it (all of a day without one).
+fn latest(log: &TableLog, day: &str) -> Vec<((String, Stream), usize)> {
+    let checkpoint = log
+        .partitions
+        .get(&(day.to_owned(), Stream::Checkpoint))
+        .filter(|partition| partition.committed() > 0);
+    let after = checkpoint
+        .and_then(Partition::last_ingest_ns)
+        .unwrap_or(i64::MIN);
+    log.partitions
+        .iter()
+        .filter(|((date, _), _)| date == day)
+        .map(|(key, partition)| {
+            let from = match key.1 {
+                Stream::Checkpoint => partition.committed().saturating_sub(1),
+                Stream::Source(_) => partition.at_or_before(after),
+            };
+            (key.clone(), from)
+        })
+        .collect()
+}
+
+/// Where a subscription's replay of `today` starts in each partition: a keyed table's state as
+/// of its latest checkpoint (`latest`), an append table's every batch.
+fn starts(log: &TableLog, today: &str) -> BTreeMap<(String, Stream), usize> {
+    if log.entry.key.is_empty() {
+        return BTreeMap::new();
+    }
+    latest(log, today).into_iter().collect()
 }
 
 /// `batch` with the table's columns, matched by name: the same names, each of the same type.
@@ -555,6 +774,37 @@ pub fn conform(schema: &SchemaRef, batch: &RecordBatch) -> Result<RecordBatch, E
     RecordBatch::try_new(schema.clone(), columns).map_err(|e| Error::Schema(e.to_string()))
 }
 
+/// A delete's batch with the table's columns: its key columns as given (matched by name), every
+/// other column null.
+pub fn keys_only(
+    schema: &SchemaRef,
+    key: &[String],
+    batch: &RecordBatch,
+) -> Result<RecordBatch, Error> {
+    let incoming = batch.schema();
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| match incoming.index_of(field.name()) {
+            Ok(index) if incoming.field(index).data_type() == field.data_type() => {
+                Ok(batch.column(index).clone())
+            }
+            Ok(index) => Err(Error::Schema(format!(
+                "column `{}` is {}, expected {}",
+                field.name(),
+                incoming.field(index).data_type(),
+                field.data_type()
+            ))),
+            Err(_) if key.contains(field.name()) => Err(Error::Schema(format!(
+                "a delete needs the key column `{}`",
+                field.name()
+            ))),
+            Err(_) => Ok(new_null_array(field.data_type(), batch.num_rows())),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    RecordBatch::try_new(schema.clone(), columns).map_err(|e| Error::Schema(e.to_string()))
+}
+
 fn names(schema: &Schema) -> String {
     schema
         .fields()
@@ -574,6 +824,12 @@ fn unix_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
+}
+
+fn now_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as i64)
 }
 
 /// Today's date is still being written: only a past one is read whole, merged, or dropped.

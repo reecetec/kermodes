@@ -7,6 +7,7 @@ from kermodes import demo
 from kermodes._native import (
     HistoricalTable,
     KermodesError,
+    Publication,
     Session,
     Table,
     Writer,
@@ -17,6 +18,7 @@ from kermodes.project import deployment, ingester, websocket
 __all__ = [
     "HistoricalTable",
     "KermodesError",
+    "Publication",
     "Session",
     "Table",
     "Writer",

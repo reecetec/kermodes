@@ -322,3 +322,47 @@ fn history_reads_only_the_dates_asked_for() {
         assert!(read(Some(d(4)), None).batches.is_empty());
     }
 }
+
+/// A keyed table's history is its log of changes, each row with its kind in `Op`: the same read
+/// from weir before the merge as from the lake after it.
+#[test]
+fn a_keyed_tables_history_is_its_log_of_changes() {
+    let dir = TempDir::new();
+    let quotes = TableName::parse("md.quotes").unwrap();
+    let schema = Schema::new(vec![Field::new("n", DataType::Int64, true)]);
+    let store = Store::open(&dir.0).unwrap();
+    let location = store
+        .create_keyed_table(&quotes, &schema, &["n".to_string()])
+        .unwrap()
+        .location;
+    let writer = store
+        .writer(&quotes, &SourceId::parse("feed").unwrap(), false)
+        .unwrap();
+    writer.upsert(&batch(&[1, 2]), None).unwrap();
+    writer.delete(&batch(&[1]), None).unwrap();
+    drop((writer, store));
+    let dir_of = dir.0.join("weir").join(location);
+    fs::rename(
+        dir_of.join(today().to_string()),
+        dir_of.join(d(1).to_string()),
+    )
+    .unwrap();
+    let store = Store::open(&dir.0).unwrap();
+    let lake = Lake::open(dir.0.join("lake").to_str().unwrap()).unwrap();
+    let log = |store: &Store| -> Vec<(String, i64)> {
+        let history = read_history(store, &lake, &quotes, Some(d(1)), Some(d(1))).unwrap();
+        let mut log = Vec::new();
+        for batch in &history.batches {
+            let ops = batch.column(1).as_string::<i32>();
+            let n = batch.column(2).as_primitive::<Int64Type>();
+            log.extend((0..batch.num_rows()).map(|i| (ops.value(i).to_string(), n.value(i))));
+        }
+        log
+    };
+    let before = log(&store);
+    let want = [("upsert", 1), ("upsert", 2), ("delete", 1)];
+    assert_eq!(before, want.map(|(op, n)| (op.to_string(), n)));
+    assert_eq!(merge(&store, &lake, &quotes, d(1)).unwrap().rows, 3);
+    assert_eq!(store.date_rows(&quotes, d(1)).unwrap(), (0, 0));
+    assert_eq!(log(&store), before);
+}

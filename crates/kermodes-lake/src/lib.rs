@@ -11,7 +11,9 @@ mod read;
 mod weir;
 
 pub use bounds::date_bounds;
-pub use files::{Batches, DATE, Lake, TARGET_FILE_BYTES, Written, with_date_column};
+pub use files::{
+    Batches, DATE, Lake, TARGET_FILE_BYTES, Written, history_columns, with_date_column, with_op,
+};
 pub use merge::{GARBAGE_GRACE, Merged, collect_garbage, merge};
 pub use plan::{Held, Incoming, Plan, plan};
 pub use read::{Explain, History, explain_history, read_history};

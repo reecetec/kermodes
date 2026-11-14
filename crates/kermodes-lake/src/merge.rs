@@ -7,7 +7,7 @@ use std::time::Duration;
 use arrow::array::RecordBatch;
 use kermodes_weir::{Date, Error, HistoryCommit, HistoryDate, TableName};
 
-use crate::files::{Lake, TARGET_FILE_BYTES, Written};
+use crate::files::{Lake, TARGET_FILE_BYTES, Written, history_columns, with_op};
 use crate::plan::{Held, Incoming, plan};
 use crate::weir::Weir;
 
@@ -31,6 +31,7 @@ pub struct Merged {
 /// Moves a past `date` of `name` from weir into history.
 pub fn merge(weir: &dyn Weir, lake: &Lake, name: &TableName, date: Date) -> Result<Merged, Error> {
     let entry = weir.entry(name)?;
+    let columns = history_columns(&entry)?;
     let (rows, bytes) = weir.date_rows(name, date)?;
     if rows == 0 {
         return Ok(Merged::default());
@@ -57,11 +58,13 @@ pub fn merge(weir: &dyn Weir, lake: &Lake, name: &TableName, date: Date) -> Resu
         let wrote = planned.files.iter().try_for_each(|dates| {
             let part = lake.write(
                 &entry.location,
-                &entry.schema,
+                &columns,
                 dates,
                 |day, push| {
                     if day == date {
-                        return weir.read_date(name, day, push);
+                        return weir.read_date(name, day, &mut |batch, change| {
+                            push(with_op(&entry, batch, change)?)
+                        });
                     }
                     // A neighbour rewritten into the new file, from the file it was in.
                     for from in held.iter().filter(|h| h.date == day) {
