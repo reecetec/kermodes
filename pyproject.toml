@@ -1,6 +1,6 @@
 [project]
 name = "kermodes"
-version = "0.3.11"
+version = "0.3.12"
 description = "Live and historical tables on Arrow"
 readme = "README.md"
 requires-python = ">=3.12"
