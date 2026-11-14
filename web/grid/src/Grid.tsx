@@ -1524,6 +1524,11 @@ class Grid extends PureComponent<GridProps, GridState> {
     this.notifyKeyboardHandlers('onUp', event);
   }
 
+  /** Shows `cursor` over the canvas, eg. when a modifier key changes under a still pointer */
+  setCursor(cursor: string | null): void {
+    this.setState({ cursor });
+  }
+
   /**
    * Notify all of the mouse handlers for this grid of a mouse event.
    * @param functionName The name of the function in the mouse handler to call

@@ -117,6 +117,46 @@ describe('ViewportGridModel', () => {
     expect(model.backgroundColorForCell(4, 12, darkTheme)).toBeNull();
   });
 
+  it('colours numbers by sign and dates, as Deephaven does', () => {
+    const model = new ViewportGridModel(COLUMNS, 2);
+    model.setWindow(0, twoRows(), KEYS);
+    const color = (column: number, row: number) =>
+      model.colorForCell(column, row, darkTheme);
+
+    expect([color(1, 0), color(1, 1)]).toEqual([
+      darkTheme.positiveNumberColor,
+      darkTheme.negativeNumberColor,
+    ]);
+    // int64 arrives as bigint; a null or NaN is no sign
+    expect([color(2, 0), color(2, 1), color(3, 0), color(3, 1)]).toEqual([
+      darkTheme.positiveNumberColor,
+      darkTheme.textColor,
+      darkTheme.positiveNumberColor,
+      darkTheme.textColor,
+    ]);
+    expect([color(5, 0), color(6, 0)]).toEqual([darkTheme.dateColor, darkTheme.dateColor]);
+    expect([color(0, 0), color(4, 0)]).toEqual([darkTheme.textColor, darkTheme.textColor]);
+
+    const zeros = new ViewportGridModel(
+      [
+        { name: 'n', type: 'int64' },
+        { name: 'x', type: 'float64' },
+      ],
+      1
+    );
+    zeros.setWindow(
+      0,
+      new Table({
+        n: vectorFromArray([BigInt(0)], new Int64()),
+        x: vectorFromArray([0], new Float64()),
+      }),
+      BigUint64Array.of(BigInt(1))
+    );
+    expect([zeros.colorForCell(0, 0, darkTheme), zeros.colorForCell(1, 0, darkTheme)]).toEqual(
+      [darkTheme.zeroNumberColor, darkTheme.zeroNumberColor]
+    );
+  });
+
   it('drops the window when the columns change', () => {
     const model = new ViewportGridModel(COLUMNS, 2);
     model.setWindow(0, twoRows(), KEYS);

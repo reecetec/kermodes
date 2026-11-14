@@ -1,7 +1,7 @@
 import { type Table, type Vector } from 'apache-arrow';
 import GridModel from './GridModel';
 import { type ModelIndex } from './GridMetrics';
-import { type GridTheme, type NullableGridColor } from './GridTheme';
+import { type GridColor, type GridTheme, type NullableGridColor } from './GridTheme';
 
 /** A column of the viewed table, as the engine names its type */
 export type ViewportColumn = {
@@ -331,6 +331,33 @@ export class ViewportGridModel extends GridModel {
     return isNumericType(this.viewColumns[column]?.type ?? '')
       ? 'right'
       : 'left';
+  }
+
+  /** Numbers by sign and dates in their theme colours, after Deephaven's grid */
+  colorForCell(column: ModelIndex, row: ModelIndex, theme: GridTheme): GridColor {
+    const type = this.viewColumns[column]?.type ?? '';
+    if (type === 'timestamp' || type === 'date32') {
+      return theme.dateColor;
+    }
+    if (!isNumericType(type)) {
+      return theme.textColor;
+    }
+    const value = this.valueAt(column, row);
+    if (typeof value === 'bigint') {
+      return value > 0n
+        ? theme.positiveNumberColor
+        : value < 0n
+          ? theme.negativeNumberColor
+          : theme.zeroNumberColor;
+    }
+    if (typeof value !== 'number' || Number.isNaN(value)) {
+      return theme.textColor;
+    }
+    return value > 0
+      ? theme.positiveNumberColor
+      : value < 0
+        ? theme.negativeNumberColor
+        : theme.zeroNumberColor;
   }
 
   backgroundColorForCell(

@@ -27,6 +27,8 @@ import {
   type FilterCell,
 } from './FilterBar';
 import { nextSort, shownView } from './sorting';
+import ContextMenu from './ContextMenu';
+import { contextMenu, type MenuAction, type MenuItem, type MenuTarget } from './menuItems';
 import {
   COPY_ROW_LIMIT,
   copyText,
@@ -44,8 +46,6 @@ import {
 const FILTER_DEBOUNCE_MS = 250;
 const TOAST_MS = 1600;
 const FETCH_TIMEOUT_MS = 30_000;
-// Width of the gutter left of the rows; its top cell holds the filter button
-const GUTTER_WIDTH = 22;
 
 /** Clicking a header cycles its sort; shift-click adds or cycles it as another key */
 class SortMouseHandler extends GridMouseHandler {
@@ -86,10 +86,35 @@ class SortMouseHandler extends GridMouseHandler {
   }
 }
 
-/** Cmd/Ctrl-click on a cell copies that cell, instead of adding it to the selection */
+/**
+ * Cmd/Ctrl-click on a cell copies that cell, instead of adding it to the selection. While the
+ * key is down over a cell, the cursor says so.
+ */
 class CopyCellMouseHandler extends GridMouseHandler {
+  // Whether the pointer was last over a cell, for the cursor when only the key changes
+  isOverCell = false;
+
   constructor(private readonly onCopyCell: (column: VisibleIndex, row: number) => void) {
     super(800);
+  }
+
+  cursorFor(isModifierDown: boolean): string | null {
+    return this.isOverCell && isModifierDown ? 'copy' : null;
+  }
+
+  onMove(
+    gridPoint: GridPoint,
+    _grid: Grid,
+    event: GridMouseEvent
+  ): EventHandlerResult {
+    this.isOverCell = gridPoint.column != null && gridPoint.row != null;
+    this.cursor = this.cursorFor(GridUtils.isModifierKeyDown(event));
+    return this.cursor == null ? false : { stopPropagation: false, preventDefault: false };
+  }
+
+  onLeave(): EventHandlerResult {
+    this.isOverCell = false;
+    return false;
   }
 
   onDown(
@@ -102,6 +127,31 @@ class CopyCellMouseHandler extends GridMouseHandler {
       return false;
     }
     this.onCopyCell(column, row);
+    return true;
+  }
+}
+
+/**
+ * Right-clicking a header or cell opens the viewer's menu. It runs after the selection
+ * handler, which moves the selection to a clicked cell outside it.
+ */
+class ContextMenuMouseHandler extends GridMouseHandler {
+  constructor(
+    private readonly onOpen: (gridPoint: GridPoint, event: GridMouseEvent) => void
+  ) {
+    super(950);
+  }
+
+  onContextMenu(
+    gridPoint: GridPoint,
+    _grid: Grid,
+    event: GridMouseEvent
+  ): EventHandlerResult {
+    const isHeader = gridPoint.row == null && gridPoint.columnHeaderDepth === 0;
+    if (gridPoint.column == null || (gridPoint.row == null && !isHeader)) {
+      return false;
+    }
+    this.onOpen(gridPoint, event);
     return true;
   }
 }
@@ -206,13 +256,9 @@ export type TableViewerProps = {
  */
 export function TableViewer({
   channel,
-  theme: baseTheme,
+  theme,
   maxGridHeight,
 }: TableViewerProps): React.ReactElement {
-  const theme = useMemo(
-    () => ({ ...baseTheme, rowHeaderWidth: GUTTER_WIDTH }),
-    [baseTheme]
-  );
   const [state, setState] = useState<ViewerState>(() => channel.state());
   const model = useMemo(() => {
     const initial = channel.state();
@@ -336,19 +382,46 @@ export function TableViewer({
     [viewport, model]
   );
 
+  /** Sends every column's filter entry now, as the entries the viewer shows */
+  const sendFilters = useCallback(
+    (filters: Record<string, string>) => {
+      clearTimeout(filterTimer.current ?? undefined);
+      filterTimer.current = null;
+      draftRef.current = filters;
+      setDraft(filters);
+      sent.current += 1;
+      setIsUpdating(true);
+      // A selection is by position: after a filter it would point at other rows, or none
+      gridRef.current?.clearSelectedRanges();
+      channel.send({ type: 'filter', filters, request: sent.current });
+    },
+    [channel]
+  );
+
   const handleFilterChange = useCallback(
     (column: string, text: string) => {
       draftRef.current = { ...draftRef.current, [column]: text };
       setDraft(draftRef.current);
       clearTimeout(filterTimer.current ?? undefined);
-      filterTimer.current = window.setTimeout(() => {
-        filterTimer.current = null;
-        sent.current += 1;
-        setIsUpdating(true);
-        channel.send({ type: 'filter', filters: draftRef.current, request: sent.current });
-      }, FILTER_DEBOUNCE_MS);
+      filterTimer.current = window.setTimeout(
+        () => sendFilters(draftRef.current),
+        FILTER_DEBOUNCE_MS
+      );
     },
-    [channel]
+    [sendFilters]
+  );
+
+  const sortBy = useCallback(
+    (by: SortKey[]) => {
+      sent.current += 1;
+      askedSort.current = by;
+      setIsUpdating(true);
+      // A selection is by position: after a sort it would point at other rows
+      gridRef.current?.clearSelectedRanges();
+      model.setSort(by);
+      channel.send({ type: 'sort', by, request: sent.current });
+    },
+    [model, channel]
   );
 
   const copySelection = useCallback(
@@ -423,6 +496,121 @@ export function TableViewer({
     [model, showToast]
   );
 
+  const copyCellHandler = useMemo(() => new CopyCellMouseHandler(copyCell), [copyCell]);
+
+  // The copy cursor follows the modifier key while the pointer stays still over a cell
+  useEffect(() => {
+    const update = (event: KeyboardEvent): void => {
+      if ((event.key === 'Meta' || event.key === 'Control') && copyCellHandler.isOverCell) {
+        gridRef.current?.setCursor(
+          copyCellHandler.cursorFor(GridUtils.isModifierKeyDown(event))
+        );
+      }
+    };
+    window.addEventListener('keydown', update);
+    window.addEventListener('keyup', update);
+    return () => {
+      window.removeEventListener('keydown', update);
+      window.removeEventListener('keyup', update);
+    };
+  }, [copyCellHandler]);
+
+  const [menu, setMenu] = useState<{
+    x: number;
+    y: number;
+    sections: MenuItem[][];
+    column: VisibleIndex;
+    row: number | null;
+  } | null>(null);
+  const closeMenu = useCallback(() => setMenu(null), []);
+
+  const openMenu = useCallback(
+    (gridPoint: GridPoint, event: GridMouseEvent) => {
+      const grid = gridRef.current;
+      const container = containerRef.current;
+      const { column, row } = gridPoint;
+      if (grid == null || container == null || column == null) {
+        return;
+      }
+      const modelColumn = GridUtils.getModelIndex(column, grid.state.movedColumns);
+      const { name, type } = model.columns[modelColumn];
+      const target: MenuTarget =
+        row == null
+          ? { kind: 'header', column: name, type }
+          : {
+              kind: 'cell',
+              column: name,
+              type,
+              value: model.valueAt(modelColumn, row),
+              text: model.textForCell(modelColumn, row),
+            };
+      // A cell outside the selection becomes the selection
+      const { selection } = grid.state;
+      const plan = planCopy(selectionToRanges(selection), model.columnCount, model.rowCount);
+      const isSelectionWide =
+        row != null &&
+        selection.isCellSelected(column, row) &&
+        plan.selectedRowCount * plan.columns.length > 1;
+      const bounds = container.getBoundingClientRect();
+      setMenu({
+        x: event.clientX - bounds.left,
+        y: event.clientY - bounds.top,
+        sections: contextMenu(target, {
+          sort: model.sortKeys,
+          filters: draftRef.current,
+          isSelectionWide,
+        }),
+        column,
+        row,
+      });
+    },
+    [model]
+  );
+
+  const runMenuAction = useCallback(
+    (action: MenuAction, column: VisibleIndex, row: number | null) => {
+      switch (action.type) {
+        case 'sort':
+          sortBy(action.by);
+          break;
+        case 'filter':
+          setIsFilterBarShown(true);
+          sendFilters({ ...draftRef.current, [action.column]: action.text });
+          break;
+        case 'clear-filters':
+          sendFilters({});
+          break;
+        case 'edit-filter': {
+          setIsFilterBarShown(true);
+          const label = CSS.escape(`Filter ${action.column}`);
+          requestAnimationFrame(() =>
+            containerRef.current
+              ?.querySelector<HTMLInputElement>(`input[aria-label="${label}"]`)
+              ?.focus()
+          );
+          break;
+        }
+        case 'copy-cell':
+          if (row != null) {
+            copyCell(column, row);
+          }
+          break;
+        case 'copy-selection':
+          copySelection(action.header).catch((error: Error) =>
+            showToast(`Copy failed: ${error.message}`)
+          );
+          break;
+        case 'copy-text':
+          writeClipboard(action.text).then(
+            () => showToast(`Copied ${action.text}`),
+            (error: Error) => showToast(`Copy failed: ${error.message}`)
+          );
+          break;
+      }
+    },
+    [sortBy, sendFilters, copyCell, copySelection, showToast]
+  );
+
   const mouseHandlers = useMemo(
     () => [
       new SortMouseHandler((column, additive) => {
@@ -431,16 +619,12 @@ export function TableViewer({
           return;
         }
         const modelColumn = GridUtils.getModelIndex(column, grid.state.movedColumns);
-        const by = nextSort(model.sortKeys, model.columns[modelColumn].name, additive);
-        sent.current += 1;
-        askedSort.current = by;
-        setIsUpdating(true);
-        model.setSort(by);
-        channel.send({ type: 'sort', by, request: sent.current });
+        sortBy(nextSort(model.sortKeys, model.columns[modelColumn].name, additive));
       }),
-      new CopyCellMouseHandler(copyCell),
+      copyCellHandler,
+      new ContextMenuMouseHandler(openMenu),
     ],
-    [model, channel, copyCell]
+    [model, sortBy, copyCellHandler, openMenu]
   );
 
   const handleKeyDown = useCallback(
@@ -523,38 +707,6 @@ export function TableViewer({
           mouseHandlers={mouseHandlers}
           onViewChanged={handleViewChanged}
         />
-        <button
-          type="button"
-          title={FILTER_SYNTAX}
-          aria-pressed={isFilterBarShown}
-          onClick={() => setIsFilterBarShown(shown => !shown)}
-          style={{
-            position: 'absolute',
-            top: 0,
-            left: 0,
-            width: GUTTER_WIDTH,
-            height: theme.columnHeaderHeight,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            padding: 0,
-            border: 'none',
-            borderRight: `1px solid ${theme.headerSeparatorColor}`,
-            borderBottom: `1px solid ${theme.headerSeparatorColor}`,
-            background: isFilterBarShown
-              ? theme.backgroundColor
-              : theme.headerBackgroundColor,
-            cursor: 'pointer',
-          }}
-        >
-          <FilterIcon
-            color={
-              isFilterBarShown || hasFilters
-                ? theme.selectionOutlineColor
-                : theme.headerColor
-            }
-          />
-        </button>
         {isFilterBarShown && (
           <FilterBar
             cells={cells}
@@ -586,6 +738,17 @@ export function TableViewer({
             {toast.text}
           </div>
         )}
+        {menu != null && (
+          <ContextMenu
+            x={menu.x}
+            y={menu.y}
+            sections={menu.sections}
+            theme={theme}
+            font={theme.font.replace(/^\S+/, '12px')}
+            onPick={action => runMenuAction(action, menu.column, menu.row)}
+            onClose={closeMenu}
+          />
+        )}
         {isUpdating && (
           <div
             data-testid="updating"
@@ -614,6 +777,27 @@ export function TableViewer({
           fontVariantNumeric: 'tabular-nums',
         }}
       >
+        <button
+          type="button"
+          title={`Quick filters (⌘F). ${FILTER_SYNTAX}`}
+          aria-pressed={isFilterBarShown}
+          onClick={() => setIsFilterBarShown(shown => !shown)}
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 4,
+            padding: 0,
+            border: 'none',
+            background: 'transparent',
+            font: 'inherit',
+            color:
+              isFilterBarShown || hasFilters ? theme.selectionOutlineColor : theme.headerColor,
+            cursor: 'pointer',
+          }}
+        >
+          <FilterIcon color="currentColor" />
+          {hasFilters ? 'Filtered' : 'Filter'}
+        </button>
         <span>
           {rowCount.toLocaleString('en-US')} {rowCount === 1 ? 'row' : 'rows'}
         </span>

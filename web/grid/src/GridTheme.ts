@@ -30,6 +30,12 @@ export type GridTheme = {
   // Color to draw text
   textColor: GridColor;
 
+  // Text of numbers above, below, and at zero, and of dates and times, after Deephaven's grid
+  positiveNumberColor: GridColor;
+  negativeNumberColor: GridColor;
+  zeroNumberColor: GridColor;
+  dateColor: GridColor;
+
   // Muted tint over cells that hold no value (nulls)
   nullBackgroundColor: NullableGridColor;
 
@@ -58,6 +64,8 @@ export type GridTheme = {
   columnHoverBackgroundColor: NullableGridColor;
   rowHoverBackgroundColor: NullableGridColor;
   selectedRowHoverBackgroundColor: NullableGridColor;
+  // Background of the whole row holding the cursor cell (the cell last clicked or moved to)
+  cursorRowBackgroundColor: NullableGridColor;
 
   // Background colors to draw for each row, cycling through each value (eg. alternating stripes)
   rowBackgroundColors: GridColorWay;
@@ -158,6 +166,7 @@ export const darkTheme: GridTheme = Object.freeze({
   columnHoverBackgroundColor: null,
   rowHoverBackgroundColor: '#2d2a2e',
   selectedRowHoverBackgroundColor: '#34303a',
+  cursorRowBackgroundColor: '#4c7dee26',
   rowBackgroundColors: '#1a171a #211f22',
   minScrollHandleSize: 50,
   scrollBarBackgroundColor: '#1a171a',
@@ -181,6 +190,10 @@ export const darkTheme: GridTheme = Object.freeze({
   shadowColor: '#000000',
   flashColor: '#4c7dee99',
   errorColor: '#f95d84',
+  positiveNumberColor: '#ace97e',
+  negativeNumberColor: '#f85e85',
+  zeroNumberColor: '#fad459',
+  dateColor: '#fad459',
   scrollBarSelectionTick: true,
   scrollBarSelectionTickColor: '#4c7dee66',
   scrollBarActiveSelectionTickColor: '#4c7deecc',
@@ -214,6 +227,7 @@ export const lightTheme: GridTheme = Object.freeze({
   headerSeparatorColor: '#dcdbdc',
   headerSeparatorHoverColor: '#787679',
   headerHiddenSeparatorHoverColor: '#2f5bc4',
+  cursorRowBackgroundColor: '#2f5bc41a',
   headerColor: '#4a474b',
   rowHoverBackgroundColor: '#eceff8',
   selectedRowHoverBackgroundColor: '#dfe6f7',
@@ -231,6 +245,10 @@ export const lightTheme: GridTheme = Object.freeze({
   shadowColor: '#00000066',
   flashColor: '#2f5bc466',
   errorColor: '#d0204b',
+  positiveNumberColor: '#008f5d',
+  negativeNumberColor: '#ea3829',
+  zeroNumberColor: '#7326d3',
+  dateColor: '#7326d3',
   scrollBarSelectionTickColor: '#2f5bc466',
   scrollBarActiveSelectionTickColor: '#2f5bc4cc',
   floatingGridColumnColor: '#e6e5e6',

@@ -23,10 +23,12 @@ const GRID_CSS = `
 .grid-cursor-col-resize { cursor: col-resize; }
 .grid-cursor-pointer { cursor: pointer; }
 .grid-cursor-move { cursor: grabbing; }
+.grid-cursor-copy { cursor: copy; }
 .grid-block-events { pointer-events: none; }
 .kermodes-filter-input { box-sizing: border-box; padding: 0 5px; margin: 0; border-radius: 2px; outline: none; }
 .kermodes-filter-input::placeholder { color: var(--kermodes-placeholder); opacity: 1; }
 .kermodes-filter-input:focus { border-color: var(--kermodes-accent) !important; }
+.kermodes-menu-item:hover, .kermodes-menu-item:focus { background: var(--kermodes-menu-hover) !important; outline: none; }
 `;
 
 export function injectGridStyles(doc: Document = document): void {

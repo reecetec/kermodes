@@ -1249,9 +1249,11 @@ proven parts.
   is not checked in.
 - From day one: virtual scrolling over rows and columns; column resize and reorder; sort by
   clicking a header (shift-click adds a key); per-column quick filters; row and range
-  selection; copy rows (Cmd/Ctrl-C, as tab-separated text) and copy one cell (Cmd/Ctrl-click);
-  ticking rows briefly highlighted when they change; row count and update status; dark and
-  light themes after Deephaven's.
+  selection, the clicked cell's row tinted; copy rows (Cmd/Ctrl-C, as tab-separated text) and
+  copy one cell (Cmd/Ctrl-click, with a copy cursor while the key is down); a right-click menu
+  on headers and cells (sort, filter by the clicked value, copy); ticking rows briefly
+  highlighted when they change; row count and update status; dark and light themes after
+  Deephaven's, numbers coloured by sign and dates by type as Deephaven does.
 - Sort and filter run in the engine, on tables the viewer derives and releases with the view
   (`where` for filters; `sort` for static tables and an incremental sort for ticking ones).
   Fetching rows by position needs a rank index for keyed tables.

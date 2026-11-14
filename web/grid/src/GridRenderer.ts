@@ -522,6 +522,8 @@ export class GridRenderer {
       this.drawMouseRowHover(context, state);
     }
 
+    this.drawCursorRow(context, state);
+
     this.drawGridLines(context, state);
 
     this.drawCellBackgrounds(context, state);
@@ -711,6 +713,26 @@ export class GridRenderer {
     ) {
       this.drawMouseRowHoverForRow(context, state, mouseRow);
     }
+  }
+
+  /** Tints the whole row of the cursor cell, so a clicked cell's row stands out */
+  drawCursorRow(context: CanvasRenderingContext2D, state: GridRenderState): void {
+    const { metrics, selection, theme } = state;
+    const row = selection.cursorRow;
+    if (
+      row == null ||
+      theme.cursorRowBackgroundColor == null ||
+      !metrics.allRowYs.has(row)
+    ) {
+      return;
+    }
+    context.fillStyle = theme.cursorRowBackgroundColor;
+    context.fillRect(
+      0,
+      getOrThrow(metrics.allRowYs, row),
+      metrics.maxX,
+      getOrThrow(metrics.allRowHeights, row)
+    );
   }
 
   drawMouseRowHoverForRow(
