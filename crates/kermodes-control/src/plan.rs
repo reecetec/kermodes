@@ -7,15 +7,152 @@
 //! and Kubernetes rolls it as the resource asks: start the new run, wait until it is ready, stop
 //! the old (§11.4). A PodDisruptionBudget keeps a drain from evicting a healthy run; the
 //! controller moves it instead, by the same rollout (§17.1).
+//!
+//! Past dates weir still holds are merged into history by a Job each (§8.3): which to start, and
+//! what one looks like, are decided here too.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
+use kermodes_weir::Date;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::manifest::{Resource, Rollout, Update};
+
+/// Where history goes, as a merge Job needs it (§8.1): `KERMODES_HISTORY`, the S3 endpoint, and
+/// the Secret holding `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` for that bucket alone.
+#[derive(Clone, Debug, Deserialize)]
+pub struct History {
+    pub url: String,
+    pub endpoint: String,
+    pub secret: String,
+}
+
+/// A merge Job that exists: the table and date it merges, and whether it is still running.
+#[derive(Clone, Debug)]
+pub struct MergeJob {
+    pub table: String,
+    pub date: Date,
+    pub active: bool,
+}
+
+/// How long after a date's midnight (UTC) its merge waits: a write timestamped just before
+/// midnight may still be committing to it.
+pub const MERGE_GRACE_SECONDS: i64 = 300;
+
+/// The merges to start at `now` (ns since the epoch): per table, the oldest past date weir still
+/// holds whose midnight is the grace behind, unless one of the table's merges is still running
+/// (merges of one table would only race each other's commits) or that date has a Job already. A
+/// finished Job expires after a day, so a date whose merge failed gets another then; meanwhile
+/// the next date goes ahead.
+pub fn merges_due(
+    now: i64,
+    held: &[(String, Vec<Date>)],
+    jobs: &[MergeJob],
+) -> Vec<(String, Date)> {
+    const NS_PER_DAY: i64 = 86_400_000_000_000;
+    let mut due = Vec::new();
+    for (table, dates) in held {
+        if jobs.iter().any(|job| &job.table == table && job.active) {
+            continue;
+        }
+        let next = dates
+            .iter()
+            .copied()
+            .filter(|date| {
+                let midnight = (i64::from(date.days()) + 1) * NS_PER_DAY;
+                now >= midnight + MERGE_GRACE_SECONDS * 1_000_000_000
+            })
+            .filter(|date| {
+                !jobs
+                    .iter()
+                    .any(|job| &job.table == table && job.date == *date)
+            })
+            .min();
+        if let Some(date) = next {
+            due.push((table.clone(), date));
+        }
+    }
+    due
+}
+
+/// The Job that merges `date` of `table` from weir into history: `kermodes merge`, against weir
+/// over Flight, writing to the history bucket with that bucket's credentials alone.
+pub fn merge_job(
+    history: &History,
+    image: &str,
+    weir: &str,
+    pull_secrets: &[String],
+    table: &str,
+    date: Date,
+) -> Job {
+    let merge = json!({
+        "name": "merge",
+        "image": image,
+        "args": ["merge", table, date.to_string(), "--server", weir],
+        "env": [
+            {"name": "PYTHONDONTWRITEBYTECODE", "value": "1"},
+            {"name": "KERMODES_HISTORY", "value": history.url},
+            {"name": "AWS_ENDPOINT", "value": history.endpoint},
+            {"name": "AWS_ALLOW_HTTP", "value": history.endpoint.starts_with("http://").to_string()},
+            {"name": "AWS_REGION", "value": "us-east-1"},
+        ],
+        "envFrom": [{"secretRef": {"name": history.secret}}],
+        // A merge streams the date through: a 1.5 GB day took 6 s and little memory.
+        "resources": {
+            "requests": {"cpu": "1", "memory": "2Gi"},
+            "limits": {"cpu": "1", "memory": "2Gi"},
+        },
+        "volumeMounts": [{"name": "tmp", "mountPath": "/tmp"}],
+        "securityContext": container_security(),
+    });
+    let object = json!({
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": merge_job_name(table, date),
+            "labels": {
+                "app.kubernetes.io/component": "merge",
+                "app.kubernetes.io/managed-by": "kermodes-control",
+                "kermodes.io/table": table,
+                "kermodes.io/date": date.to_string(),
+            },
+        },
+        "spec": {
+            "backoffLimit": 2,
+            "ttlSecondsAfterFinished": 86_400,
+            "activeDeadlineSeconds": 3_600,
+            "template": {
+                "metadata": {"labels": {"app.kubernetes.io/component": "merge"}},
+                "spec": {
+                    "restartPolicy": "Never",
+                    "imagePullSecrets": pull_secrets
+                        .iter()
+                        .map(|name| json!({"name": name}))
+                        .collect::<Vec<_>>(),
+                    "securityContext": pod_security(),
+                    "containers": [merge],
+                    "volumes": [{"name": "tmp", "emptyDir": {}}],
+                },
+            },
+        },
+    });
+    serde_json::from_value(object).expect("a Job built from known fields")
+}
+
+/// One Job per table and date: `merge-{table}-{date}`, the table's name shortened to fit and
+/// told apart by a hash of the whole of it.
+pub fn merge_job_name(table: &str, date: Date) -> String {
+    let short: String = table.replace(['.', '_'], "-").chars().take(30).collect();
+    // FNV-1a: stable across Rust versions, unlike the standard hasher.
+    let hash = table.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    format!("merge-{short}-{date}-{:06x}", hash & 0xff_ffff)
+}
 
 /// Where a project's commit runs.
 #[derive(Clone, Debug)]
@@ -290,13 +427,7 @@ fn pod(target: &Target, init: Vec<Value>, containers: Vec<Value>, restart: &str)
             .iter()
             .map(|name| json!({"name": name}))
             .collect::<Vec<_>>(),
-        "securityContext": {
-            "runAsNonRoot": true,
-            "runAsUser": 10001,
-            "runAsGroup": 10001,
-            "fsGroup": 10001,
-            "seccompProfile": {"type": "RuntimeDefault"},
-        },
+        "securityContext": pod_security(),
         "initContainers": init,
         "containers": containers,
         "volumes": [
@@ -311,6 +442,17 @@ fn container_security() -> Value {
         "allowPrivilegeEscalation": false,
         "readOnlyRootFilesystem": true,
         "capabilities": {"drop": ["ALL"]},
+    })
+}
+
+/// The namespace's restricted Pod Security profile: not root, the default seccomp profile.
+fn pod_security() -> Value {
+    json!({
+        "runAsNonRoot": true,
+        "runAsUser": 10001,
+        "runAsGroup": 10001,
+        "fsGroup": 10001,
+        "seccompProfile": {"type": "RuntimeDefault"},
     })
 }
 
@@ -497,5 +639,162 @@ mod tests {
             ["on-cordoned", "one-of-two-cordoned"]
         );
         assert!(to_move(&placements, &BTreeSet::new()).is_empty());
+    }
+
+    fn day(text: &str) -> Date {
+        Date::parse(text).unwrap()
+    }
+
+    /// Nanoseconds since the epoch at `hh:mm` UTC on 2026-11-14.
+    fn at(hour: i64, minute: i64) -> i64 {
+        let midnight = i64::from(day("2026-11-14").days()) * 86_400_000_000_000;
+        midnight + (hour * 60 + minute) * 60_000_000_000
+    }
+
+    #[test]
+    fn each_table_merges_its_oldest_settled_past_date_one_at_a_time() {
+        let held = |table: &str, dates: &[&str]| {
+            (table.to_string(), dates.iter().map(|d| day(d)).collect())
+        };
+        let job = |table: &str, date: &str, active: bool| MergeJob {
+            table: table.into(),
+            date: day(date),
+            active,
+        };
+        type Case<'a> = (
+            &'a str,
+            i64,
+            Vec<(String, Vec<Date>)>,
+            Vec<MergeJob>,
+            Vec<(&'a str, &'a str)>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "the oldest first",
+                at(9, 0),
+                vec![held("md.ticks", &["2026-11-13", "2026-11-12"])],
+                vec![],
+                vec![("md.ticks", "2026-11-12")],
+            ),
+            (
+                "yesterday waits out the grace",
+                at(0, 3),
+                vec![held("md.ticks", &["2026-11-13"])],
+                vec![],
+                vec![],
+            ),
+            (
+                "and then goes",
+                at(0, 10),
+                vec![held("md.ticks", &["2026-11-13"])],
+                vec![],
+                vec![("md.ticks", "2026-11-13")],
+            ),
+            (
+                "one merge of a table at a time",
+                at(9, 0),
+                vec![held("md.ticks", &["2026-11-13"])],
+                vec![job("md.ticks", "2026-11-12", true)],
+                vec![],
+            ),
+            (
+                "a date with a Job, finished, is not merged again while it lasts",
+                at(9, 0),
+                vec![held("md.ticks", &["2026-11-12", "2026-11-13"])],
+                vec![job("md.ticks", "2026-11-12", false)],
+                vec![("md.ticks", "2026-11-13")],
+            ),
+            (
+                "tables go side by side",
+                at(9, 0),
+                vec![
+                    held("md.ticks", &["2026-11-13"]),
+                    held("md.quotes", &["2026-11-12"]),
+                ],
+                vec![job("md.other", "2026-11-12", true)],
+                vec![("md.ticks", "2026-11-13"), ("md.quotes", "2026-11-12")],
+            ),
+            (
+                "nothing held, nothing to do",
+                at(9, 0),
+                vec![held("md.ticks", &[])],
+                vec![],
+                vec![],
+            ),
+        ];
+        for (case, now, held, jobs, due) in cases {
+            let due: Vec<(String, Date)> =
+                due.iter().map(|&(t, d)| (t.to_string(), day(d))).collect();
+            assert_eq!(merges_due(now, &held, &jobs), due, "{case}");
+        }
+    }
+
+    #[test]
+    fn a_merge_job_is_named_validly_runs_restricted_and_reaches_only_the_history_bucket() {
+        let history = History {
+            url: "s3://kermodes-history".into(),
+            endpoint: "http://rustfs:9000".into(),
+            secret: "kermodes-history".into(),
+        };
+        let table = "research_desk.a_very_long_table_name_for_options_quotes";
+        let job = merge_job(
+            &history,
+            "img:1",
+            "grpc://kermodes-weir:8731",
+            &["pull".into()],
+            table,
+            day("2026-11-12"),
+        );
+
+        let name = job.metadata.name.clone().unwrap();
+        assert!(
+            name.len() <= 63 && name.ends_with(char::is_alphanumeric),
+            "{name}"
+        );
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "{name}"
+        );
+        assert_ne!(
+            name,
+            merge_job_name(
+                "research_desk.a_very_long_table_name_for_options_bonds",
+                day("2026-11-12")
+            )
+        );
+
+        let pod = job.spec.unwrap().template.spec.unwrap();
+        let security = pod.security_context.unwrap();
+        assert_eq!(security.run_as_non_root, Some(true));
+        assert_eq!(security.seccomp_profile.unwrap().type_, "RuntimeDefault");
+        let merge = &pod.containers[0];
+        let container = merge.security_context.clone().unwrap();
+        assert_eq!(container.allow_privilege_escalation, Some(false));
+        assert_eq!(container.capabilities.unwrap().drop.unwrap(), ["ALL"]);
+        assert_eq!(
+            merge.args.clone().unwrap(),
+            [
+                "merge",
+                table,
+                "2026-11-12",
+                "--server",
+                "grpc://kermodes-weir:8731"
+            ]
+        );
+        let env: BTreeMap<String, String> = merge
+            .env
+            .clone()
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.name, e.value.unwrap_or_default()))
+            .collect();
+        assert_eq!(env["KERMODES_HISTORY"], "s3://kermodes-history");
+        assert_eq!(env["AWS_ALLOW_HTTP"], "true");
+        let secret = merge.env_from.clone().unwrap()[0]
+            .secret_ref
+            .clone()
+            .unwrap();
+        assert_eq!(secret.name, "kermodes-history");
     }
 }

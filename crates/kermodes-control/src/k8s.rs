@@ -15,7 +15,7 @@ use kube::api::{
     PatchParams, PostParams,
 };
 
-use crate::plan::Placement;
+use crate::plan::{MergeJob, Placement};
 use crate::report::{self, Observed};
 
 const MANAGER: &str = "kermodes-control";
@@ -392,6 +392,44 @@ impl Kube {
             .await
             .map_err(|e| format!("cannot restart {name}: {e}"))?;
         Ok(())
+    }
+
+    /// The merge Jobs that exist (`plan::merge_job`), and whether each is still running.
+    pub async fn merge_jobs(&self) -> Result<Vec<MergeJob>, String> {
+        let jobs = self
+            .jobs
+            .list(&ListParams::default().labels("app.kubernetes.io/component=merge"))
+            .await
+            .map_err(|e| format!("cannot list merge jobs: {e}"))?;
+        Ok(jobs
+            .items
+            .into_iter()
+            .filter_map(|job| {
+                let labels = job.metadata.labels?;
+                let table = labels.get("kermodes.io/table")?.clone();
+                let date = kermodes_weir::Date::parse(labels.get("kermodes.io/date")?).ok()?;
+                let finished = job
+                    .status
+                    .and_then(|status| status.conditions)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|c| (c.type_ == "Complete" || c.type_ == "Failed") && c.status == "True");
+                Some(MergeJob {
+                    table,
+                    date,
+                    active: !finished,
+                })
+            })
+            .collect())
+    }
+
+    /// Starts a Job; one of the same name already there is left as it is.
+    pub async fn start(&self, job: &Job) -> Result<(), String> {
+        match self.jobs.create(&PostParams::default(), job).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(e)) if e.code == 409 => Ok(()),
+            Err(e) => Err(format!("cannot start a job: {e}")),
+        }
     }
 
     /// Runs a discovery Job (or waits for the one already running for this commit) and returns

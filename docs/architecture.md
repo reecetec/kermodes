@@ -423,8 +423,10 @@ catalog as live tables.
 
 ### 7.3 Day roll
 
-At UTC midnight + a short grace window weir seals all open segments for `D` and rejects new
-writes to `D`. Writers have already rolled to `D+1` because `date` comes from ingest time.
+Weir dates each batch by its arrival (UTC), so writers roll to `D+1` by themselves and nothing new
+is written to `D` once it is over; a write timestamped just before midnight may still be
+committing for a moment, which the merge waits out (§8.3). Later: sealing rewrites `D`'s
+segments as Arrow IPC files with footers, to memory-map and copy to S3.
 
 ### 7.4 Source leases
 
@@ -507,16 +509,20 @@ the only record of what history exists.
 
 ### 8.3 Merge
 
-1. At UTC midnight plus a grace window, weir seals date `D` (§7.3).
-2. The controller finds sealed dates not yet merged and starts one merge Job per `(table, D)`: a
-   Kubernetes Job on the same image, its memory sized to the day, so a large sort cannot take
-   weir down. Locally the same merge runs on a thread; `kermodes merge ns.table DATE` runs one by
+1. Once a minute the leading controller starts a merge Job for each table's oldest past date weir
+   still holds, 5 minutes after that date's midnight. One merge per table runs at a time (they
+   would only race each other's commits); a date whose Job failed is retried once that Job
+   expires, a day later, while later dates go ahead. The Job is `kermodes merge TABLE DATE` on
+   the platform image, under the namespace's restricted pod security, with credentials for the
+   history bucket alone; it reaches weir by its Service. Locally, `kermodes merge` runs one by
    hand.
-3. The Job reads `D` from weir over Flight, projects every schema version present onto the
-   table's current one by column ID (§5.4), sorts, and writes per the plan (§8.1).
-4. It commits, replacing `D` (a re-run after a crash is the same commit), after checking that
-   row counts per source match weir's indexes.
-5. Weir then deletes its partitions for `D`.
+2. The Job reads `D` from weir over Flight and writes it per the plan (§8.1). Later: projecting
+   every schema version present onto the table's current one by column ID (§5.4), and sorting by
+   the table's key columns.
+3. It commits, replacing `D` (a re-run after a crash is the same commit), after checking that
+   the rows written equal the rows weir holds of `D`.
+4. Weir then deletes its partitions for `D`, and refuses to unless history holds `D` with as
+   many rows.
 
 Batch jobs (end-of-day files, vendor data, backfills, corrections) write history directly, never
 through weir: `write_history(table, date, data)` goes through the same planner, writer, and

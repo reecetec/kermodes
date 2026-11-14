@@ -36,6 +36,14 @@ control:
     limits:
       memory: 512Mi
 
+# Where merged history goes (architecture.md §8): with a url, the controller merges each table's
+# past dates from weir into it, each date by a Job. The Secret holds AWS_ACCESS_KEY_ID and
+# AWS_SECRET_ACCESS_KEY for that bucket alone.
+history:
+  url: ""  # s3://kermodes-history
+  endpoint: ""  # the S3 endpoint inside the cluster, e.g. http://rustfs-svc.rustfs.svc.cluster.local:9000
+  secretName: ""
+
 imagePullSecrets: []
 
 weir:

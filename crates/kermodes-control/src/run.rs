@@ -46,6 +46,9 @@ pub struct Config {
     #[serde(default)]
     pub git_password: Option<String>,
     pub projects: Vec<ProjectConfig>,
+    /// Where history goes; without it, nothing is merged.
+    #[serde(default)]
+    pub history: Option<plan::History>,
 }
 
 fn poll_seconds() -> u64 {
@@ -124,8 +127,8 @@ pub async fn run(config: Config) -> Result<(), String> {
     Ok(())
 }
 
-/// Waits for the leader lock, then syncs, reconciles, moves runs off cordoned nodes, and reports
-/// to `sys.deployments` until it is lost; returns why.
+/// Waits for the leader lock, then syncs, reconciles, moves runs off cordoned nodes, merges past
+/// dates into history, and reports to `sys.deployments` until it is lost; returns why.
 async fn lead(controller: &Controller) -> String {
     let (mut leadership, mut wake) = match Leadership::acquire(&controller.config.database).await {
         Ok(won) => won,
@@ -136,8 +139,63 @@ async fn lead(controller: &Controller) -> String {
         reason = leadership.lost() => reason,
         () = sync_forever(controller, &mut wake) => unreachable!("syncs until stopped"),
         () = move_off_cordoned(controller) => unreachable!("moves until stopped"),
+        () = merge_forever(controller) => unreachable!("merges until stopped"),
         () = report_forever(controller) => unreachable!("reports until stopped"),
     }
+}
+
+/// How often the leader looks for past dates to merge.
+const MERGE_EVERY: Duration = Duration::from_secs(60);
+
+/// Starts a merge Job for each table's oldest past date weir still holds, as `plan::merges_due`
+/// says, once a minute (§8.3).
+async fn merge_forever(controller: &Controller) {
+    let Some(history) = &controller.config.history else {
+        return std::future::pending().await;
+    };
+    loop {
+        if let Err(e) = merge_once(controller, history).await {
+            eprintln!("kermodes control: merging: {e}");
+        }
+        tokio::time::sleep(MERGE_EVERY).await;
+    }
+}
+
+async fn merge_once(controller: &Controller, history: &plan::History) -> Result<(), String> {
+    let weir = controller.config.weir.clone();
+    // The Flight client blocks on a runtime of its own.
+    let held = tokio::task::spawn_blocking(move || {
+        let client = kermodes_flight::Client::connect(&weir).map_err(|e| e.to_string())?;
+        client
+            .tables()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|(name, _)| {
+                let dates = client.past_dates(&name).map_err(|e| e.to_string())?;
+                Ok((name.to_string(), dates))
+            })
+            .collect::<Result<Vec<_>, String>>()
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let jobs = controller.kube.merge_jobs().await?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as i64);
+    for (table, date) in plan::merges_due(now, &held, &jobs) {
+        let config = &controller.config;
+        let job = plan::merge_job(
+            history,
+            &config.image,
+            &config.weir,
+            &config.pull_secrets,
+            &table,
+            date,
+        );
+        controller.kube.start(&job).await?;
+        eprintln!("kermodes control: merging {table} {date}");
+    }
+    Ok(())
 }
 
 /// How often each deployment's row goes to `sys.deployments`.

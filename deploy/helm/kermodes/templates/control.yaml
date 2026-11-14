@@ -100,15 +100,18 @@ metadata:
     app.kubernetes.io/component: control
 data:
   control.json: |
-    {{- dict
+    {{- $config := dict
         "image" (include "kermodes.image" .)
         "weir" (include "kermodes.weirUrl" .)
         "snapshots" (printf "http://%s:8732/snapshots" $name)
         "listen" "0.0.0.0:8732"
         "pull_secrets" $pullSecrets
         "poll_seconds" .Values.control.pollSeconds
-        "projects" .Values.control.projects
-      | toPrettyJson | nindent 4 }}
+        "projects" .Values.control.projects }}
+    {{- with .Values.history.url }}
+    {{- $_ := set $config "history" (dict "url" . "endpoint" $.Values.history.endpoint "secret" $.Values.history.secretName) }}
+    {{- end }}
+    {{- $config | toPrettyJson | nindent 4 }}
 ---
 apiVersion: v1
 kind: Service
