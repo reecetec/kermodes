@@ -145,6 +145,14 @@ impl Tables {
         })
     }
 
+    /// What each table takes in the store and in history, and the store's volume.
+    fn stats(&self) -> Result<serde_json::Value, kermodes_weir::Error> {
+        match self {
+            Tables::Local(store) => store.stats_json(),
+            Tables::Remote(client) => client.stats(),
+        }
+    }
+
     /// Every stored table with its columns' names and type names, as the web UI lists them.
     fn listing(&self) -> Result<Vec<kermodes_gateway::Listed>, kermodes_weir::Error> {
         let columns = |schema: &Schema| {
@@ -410,12 +418,13 @@ impl Session {
         let session = self.engine.clone();
         // The store's tables, each opened live while the app views it.
         let stored = self.tables.clone().map(|tables| {
-            let (lister, engine) = (tables.clone(), self.engine.clone());
+            let (lister, reader, engine) = (tables.clone(), tables.clone(), self.engine.clone());
             kermodes_gateway::Stored {
                 list: Box::new(move || lister.listing().map_err(|e| e.to_string())),
                 open: Box::new(move |name| {
                     open_live(&engine, &tables, name).map_err(|e| e.to_string())
                 }),
+                stats: Box::new(move || reader.stats().map_err(|e| e.to_string())),
                 idle: VIEWED_IDLE,
             }
         });

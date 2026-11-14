@@ -62,11 +62,16 @@ pub type ListTables = Box<dyn Fn() -> Result<Vec<Listed>, String> + Send + Sync>
 /// Opens the stored table `name` live, fed by the store.
 pub type OpenTable = Box<dyn Fn(&str) -> Result<Table, String> + Send + Sync>;
 
+/// What each stored table takes in the store and in history, and the store's volume, as JSON
+/// (`kermodes_weir::Store::stats_json`).
+pub type ReadStats = Box<dyn Fn() -> Result<Value, String> + Send + Sync>;
+
 /// The stored tables a server can open, given by whoever holds the store connection: listed
 /// for the app without reading their rows, and opened live only while a view shows one.
 pub struct Stored {
     pub list: ListTables,
     pub open: OpenTable,
+    pub stats: ReadStats,
     /// How long a table no view shows stays open, so a view opened again soon finds it at once.
     pub idle: Duration,
 }
@@ -242,6 +247,7 @@ pub fn serve(
     let router = Router::new()
         .route("/ws", get(upgrade))
         .route("/api/projects", get(projects))
+        .route("/api/catalog", get(catalog))
         .route("/api/components", get(components))
         .route("/api/components/{component}/{action}", get(component_get))
         .route(
@@ -424,6 +430,19 @@ async fn index(State(shared): State<Arc<Shared>>) -> Response {
 /// Every project the controller syncs, with the commit it runs and any that failed discovery.
 async fn projects(State(shared): State<Arc<Shared>>) -> Response {
     to_control(&shared, Method::GET, "/api/projects").await
+}
+
+/// Every stored table with what it takes in weir and in history, and weir's volume: the
+/// Catalog tab's list (§15.2), read from the store, not from the tables' rows.
+async fn catalog(State(shared): State<Arc<Shared>>) -> Response {
+    if shared.stored.is_none() {
+        return control_error(StatusCode::NOT_FOUND, "this server has no store");
+    }
+    let reader = shared.clone();
+    match blocking(move || (reader.stored.as_ref().expect("checked above").stats)()).await {
+        Ok(stats) => axum::Json(stats).into_response(),
+        Err(e) => control_error(StatusCode::SERVICE_UNAVAILABLE, &e),
+    }
 }
 
 /// The platform's components (weir, Postgres, the controller, the web UI), as Kubernetes shows

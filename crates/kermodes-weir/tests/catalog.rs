@@ -437,3 +437,88 @@ fn both_catalogs_keep_a_tables_sort() {
         }
     }
 }
+
+/// What each table takes, for the catalog: its rows and bytes in weir by date, over every
+/// source; its history by date, a date spread over files counted once with its files; and the
+/// store's volume.
+#[test]
+fn stats_say_what_each_table_takes_in_weir_and_in_history() {
+    for backend in backends() {
+        let dir = TempDir::new();
+        let store = open(&dir, &backend);
+        store.create_table(&ticks(), &schema()).unwrap();
+        let refs = TableName::parse("md.refs").unwrap();
+        store
+            .create_keyed_table(&refs, &schema(), &["n".to_owned()])
+            .unwrap();
+        let rows = arrow::record_batch::RecordBatch::try_from_iter([
+            (
+                "n",
+                Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3])) as arrow::array::ArrayRef,
+            ),
+            (
+                "sym",
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b", "c"])),
+            ),
+        ])
+        .unwrap();
+        for source in ["feed", "backfill"] {
+            let writer = store
+                .writer(&ticks(), &SourceId::parse(source).unwrap(), false)
+                .unwrap();
+            writer.write(&rows, None).unwrap();
+        }
+        // 2026-11-02 is in two files (a pack being rewritten), 2026-11-01 in one.
+        let history = HistoryCommit {
+            written: vec![date("2026-11-01"), date("2026-11-02")],
+            replaced: Vec::new(),
+            files: vec![
+                file("a", "2026-11-01", "2026-11-02", 3),
+                file("b", "2026-11-02", "2026-11-02", 4),
+            ],
+            dates: vec![
+                on("2026-11-01", "a", 1),
+                on("2026-11-02", "a", 2),
+                on("2026-11-02", "b", 4),
+            ],
+        };
+        store.commit_history(&ticks(), &history).unwrap();
+
+        let stats = store.stats_json().unwrap();
+        let table = |name: &str| {
+            stats["tables"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["table"] == name)
+                .unwrap()
+                .clone()
+        };
+        let ticks = table("md.ticks");
+        assert_eq!(ticks["kind"], "append");
+        assert_eq!(ticks["columns"][1]["type"], "utf8");
+        let today = &ticks["weir"].as_array().unwrap()[..];
+        assert_eq!(today.len(), 1, "{today:?}");
+        assert_eq!(today[0]["rows"], 6, "both sources' rows");
+        assert!(today[0]["bytes"].as_u64().unwrap() > 0);
+        assert_eq!(
+            ticks["history"],
+            serde_json::json!([
+                {"date": "2026-11-01", "rows": 1, "bytes": 10, "files": 1},
+                {"date": "2026-11-02", "rows": 6, "bytes": 60, "files": 2},
+            ])
+        );
+        let refs = table("md.refs");
+        assert_eq!(
+            (refs["kind"].clone(), refs["key"].clone()),
+            (serde_json::json!("keyed"), serde_json::json!(["n"]))
+        );
+        assert_eq!(refs["weir"], serde_json::json!([]));
+        let volume = &stats["volume"];
+        let (size, free) = (
+            volume["bytes"].as_u64().unwrap(),
+            volume["free"].as_u64().unwrap(),
+        );
+        assert!(size > 0 && free > 0 && free <= size, "{volume}");
+    }
+}

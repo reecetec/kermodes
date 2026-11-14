@@ -1610,6 +1610,7 @@ dependencies = [
  "mimalloc",
  "pyo3",
  "pyo3-arrow",
+ "serde_json",
 ]
 
 [[package]]
@@ -1619,6 +1620,7 @@ dependencies = [
  "arrow",
  "crc32fast",
  "kermodes-core",
+ "nix",
  "postgres",
  "rusqlite",
  "serde_json",

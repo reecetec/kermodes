@@ -17,6 +17,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arrow::array::new_null_array;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use kermodes_core::type_name;
+use nix::sys::statvfs::statvfs;
+use serde_json::json;
 
 use crate::catalog::{Catalog, Garbage, HistoryCommit, HistoryDate, HistoryFile, TableEntry};
 use crate::keyed::Fold;
@@ -180,6 +183,69 @@ impl Store {
     pub fn history(&self, name: &TableName) -> Result<Vec<HistoryDate>, Error> {
         let id = self.table(name)?.id;
         lock(&self.catalog).history(id)
+    }
+
+    /// What every table takes, as JSON for the web UI's catalog (§15.2): per table, the rows
+    /// and stream bytes of each date weir holds (today's, and past dates not yet dropped) and the
+    /// rows, bytes, and files of each date of its history; and the store's volume, its size and
+    /// the bytes free on it.
+    pub fn stats_json(&self) -> Result<serde_json::Value, Error> {
+        let mut tables = Vec::new();
+        for entry in self.tables()? {
+            let log = self.log(&entry.name)?;
+            let mut weir: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+            for ((day, _), partition) in &lock(&log.state).partitions {
+                let held = weir.entry(day.clone()).or_default();
+                held.0 += partition.rows();
+                held.1 += partition.cursor(0).bytes();
+            }
+            let mut history: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
+            for date in lock(&self.catalog).history(entry.id)? {
+                let held = history.entry(date.date.to_string()).or_default();
+                held.0 += date.rows;
+                held.1 += date.bytes;
+                held.2 += 1;
+            }
+            let columns: Vec<serde_json::Value> = entry
+                .schema
+                .fields()
+                .iter()
+                .map(|f| json!({"name": f.name(), "type": type_name(f.data_type())}))
+                .collect();
+            let weir: Vec<serde_json::Value> = weir
+                .iter()
+                .map(|(date, (rows, bytes))| json!({"date": date, "rows": rows, "bytes": bytes}))
+                .collect();
+            let history: Vec<serde_json::Value> = history
+                .iter()
+                .map(|(date, (rows, bytes, files))| {
+                    json!({"date": date, "rows": rows, "bytes": bytes, "files": files})
+                })
+                .collect();
+            tables.push(json!({
+                "table": entry.name.to_string(),
+                "kind": if entry.key.is_empty() { "append" } else { "keyed" },
+                "key": entry.key,
+                "sort": entry.sort,
+                "columns": columns,
+                "weir": weir,
+                "history": history,
+            }));
+        }
+        let volume = statvfs(&self.root).map_err(|e| {
+            Error::Io(format!(
+                "cannot read the volume of {}: {e}",
+                self.root.display()
+            ))
+        })?;
+        let unit = widen(volume.fragment_size());
+        Ok(json!({
+            "tables": tables,
+            "volume": {
+                "bytes": widen(volume.blocks()) * unit,
+                "free": widen(volume.blocks_available()) * unit,
+            },
+        }))
     }
 
     /// The files of `name`'s history holding any date from `first` to `last`, by first date.
@@ -831,6 +897,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .expect("kermodes store poisoned by an earlier panic")
+}
+
+/// `statvfs`'s counts as u64: 32 bits on some platforms (macOS), 64 on others (Linux).
+fn widen(n: impl Into<u64>) -> u64 {
+    n.into()
 }
 
 fn unix_seconds() -> i64 {

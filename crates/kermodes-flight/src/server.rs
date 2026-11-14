@@ -451,6 +451,8 @@ impl FlightService for Service {
                         .collect(),
                 )
             }
+            // What each table takes in weir and in history, and weir's volume (§15.2).
+            "stats" => blocking(move || store.stats_json()).await?,
             "last_seq" => {
                 let command = command(&action.body)?;
                 let (name, source) = (table_name(&command)?, source_id(&command)?);

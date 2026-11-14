@@ -14,6 +14,8 @@
 //! - Actions, JSON in and out: `create_table` `{"table", "columns": [[name, type]]}`; `tables`;
 //!   `last_seq` `{"table", "source"}` → `{"last_seq", "epoch"}`. A writer asks for it once its
 //!   `DoPut` holds the lease, so nothing can write between the answer and its first batch.
+//!   `stats` → what each table takes in weir and in history, and weir's volume
+//!   (`Store::stats_json`), for the web UI's catalog.
 //! - History (§8), dates as `YYYY-MM-DD`: `date_rows` `{"table", "date"}` → `{"rows", "bytes"}`;
 //!   `past_dates` `{"table"}` → dates; `history` `{"table"}` → dates in files;
 //!   `history_files` `{"table", "first", "last"}` → files; `commit_history`

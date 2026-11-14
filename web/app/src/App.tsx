@@ -15,6 +15,7 @@ import {
   type KermodesConnection,
 } from '@kermodes/client';
 import { TableViewer, gridThemes, type GridThemeName } from '@kermodes/grid';
+import { CatalogPage } from '@/Catalog';
 import { DEPLOYMENTS_VIEW, DeploymentsPage } from '@/Deployments';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -32,7 +33,13 @@ import { cn } from '@/lib/utils';
 const THEME_KEY = 'kermodes-theme';
 
 type Tab = { key: string; view: SocketView };
-type Page = 'deployments' | 'tables';
+type Page = 'deployments' | 'catalog' | 'tables';
+
+const PAGE_LABEL: Record<Page, string> = {
+  deployments: 'Deployments',
+  catalog: 'Catalog',
+  tables: 'Tables',
+};
 
 /** Re-render when the connection's status, tables, or last error change */
 function useConnection(connection: KermodesConnection): void {
@@ -110,22 +117,21 @@ function TopBar({
         <PawPrint className="size-4" />
       </div>
       <span className="text-[15px] font-semibold tracking-tight">Kermodes</span>
-      {hasDeployments ? (
-        <nav className="flex items-center gap-1">
-          {(['deployments', 'tables'] as const).map(name => (
-            <Button
-              key={name}
-              variant={page === name ? 'secondary' : 'ghost'}
-              size="sm"
-              onClick={() => onPage(name)}
-            >
-              {name === 'tables' ? 'Tables' : 'Deployments'}
-            </Button>
-          ))}
-        </nav>
-      ) : (
-        <span className="text-sm text-muted-foreground">Tables</span>
-      )}
+      <nav className="flex items-center gap-1">
+        {(hasDeployments
+          ? (['deployments', 'catalog', 'tables'] as const)
+          : (['catalog', 'tables'] as const)
+        ).map(name => (
+          <Button
+            key={name}
+            variant={page === name ? 'secondary' : 'ghost'}
+            size="sm"
+            onClick={() => onPage(name)}
+          >
+            {PAGE_LABEL[name]}
+          </Button>
+        ))}
+      </nav>
       <div className="ml-auto flex items-center gap-2">
         <ConnectionPill status={connection.status} error={connection.lastError} />
         <Tooltip>
@@ -260,7 +266,7 @@ export default function App({ connection }: { connection: KermodesConnection }) 
   // Deployments is the main tab wherever a controller reports them, until someone picks a tab.
   const hasDeployments = connection.pages.includes(DEPLOYMENTS_VIEW);
   const [picked, setPicked] = useState<Page | null>(null);
-  const page: Page = hasDeployments ? (picked ?? 'deployments') : 'tables';
+  const page: Page = picked ?? (hasDeployments ? 'deployments' : 'tables');
 
   const openTable = useCallback(
     (table: string) => {
@@ -322,8 +328,16 @@ export default function App({ connection }: { connection: KermodesConnection }) 
           hasDeployments={hasDeployments}
         />
         {page === 'deployments' && <DeploymentsPage connection={connection} />}
+        {page === 'catalog' && (
+          <CatalogPage
+            onOpen={table => {
+              openTable(table);
+              setPicked('tables');
+            }}
+          />
+        )}
         {/* Hidden rather than unmounted, so open tables keep their views. */}
-        <div className={cn('flex min-h-0 flex-1', page === 'deployments' && 'hidden')}>
+        <div className={cn('flex min-h-0 flex-1', page !== 'tables' && 'hidden')}>
           <Sidebar
             tables={connection.tables}
             activeTable={activeTable}

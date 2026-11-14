@@ -1194,8 +1194,9 @@ namespaces).
   lucide icons, React Router — juicebear's web baseline plus shadcn.
 - `@kermodes/client`: TypeScript package speaking the delta protocol over WebSocket and decoding Arrow
   IPC with `apache-arrow`. Used by the UI and any other TypeScript consumer.
-- Ticking and large tables: the table viewer (§15.3). Static lists (catalog, pipelines, jobs,
-  models) use TanStack Table with shadcn table components.
+- Ticking and large tables: the table viewer (§15.3). Lists of things (deployments, the
+  catalog) are plain tables with fixed column widths, so values changing or a panel opening
+  never moves a column, and details open in a panel docked beside or below the list.
 - Auth: OIDC authorization code + PKCE (`oidc-client-ts`). Local mode skips login.
 - The production build ships inside the `kermodes` wheel and is served by the gateway, so local mode
   and the cluster serve the same UI with no separate web server.
@@ -1234,6 +1235,13 @@ namespaces).
   With `kermodes ui --control URL` (the chart sets it with the controller), the server passes
   the controller's project, component, event, log, rollout, and restart routes through, by name
   only. Without a controller the tab is absent.
+- Catalog: every stored table under its namespace, each namespace a row of its tables' totals
+  that folds them away. Per table: kind and key, rows today, bytes in weir over every date it
+  holds, history rows and bytes, the dates held (a date counts once while it is in both weir
+  and history, between a merge and weir dropping it), and its columns. weir's volume, used of
+  its size, sits above the list. A row opens its columns and every date with what weir and
+  history hold of it in a panel docked to the right; Open live views it in Tables. The server
+  reads it all from weir's `stats` action (`/api/catalog`) without opening a table.
 - Later: a batch job's progress live on its row (a tqdm-style hook in the job's code), and its
   DAG drawn when the row is opened, as Argo Workflows shows a workflow. Times shown in each
   user's time zone, a user setting, instead of UTC.

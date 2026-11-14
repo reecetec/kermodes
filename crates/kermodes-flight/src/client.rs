@@ -122,6 +122,12 @@ impl Client {
         schema_from_json(&created["columns"])
     }
 
+    /// What each table takes in weir and in history, and the server's volume, as
+    /// `Store::stats_json` gives it.
+    pub fn stats(&self) -> Result<Value, Error> {
+        self.action("stats", json!({}))
+    }
+
     /// Every table, by name, with its schema.
     pub fn tables(&self) -> Result<Vec<(TableName, SchemaRef)>, Error> {
         let tables = self.action("tables", json!({}))?;

@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 arrow = { workspace = true, features = ["ipc"] }
 crc32fast = "1.5"
+nix = { version = "0.31", default-features = false, features = ["fs"] }
 kermodes-core.workspace = true
 postgres = { version = "0.19.14", default-features = false }
 rusqlite = { version = "0.42", features = ["bundled"] }

@@ -67,9 +67,10 @@ def main(argv: list[str] | None = None) -> None:
         "ui",
         help="serve every table of a store in the web UI",
         description=(
-            "Connects to a store server (kermodes weir or dev), follows every table as it "
-            "appears, and serves them in the web UI. Exits when it loses the store, so that "
-            "its supervisor restarts it. The engine's half of `kermodes dev`, for a cluster."
+            "Connects to a store server (kermodes weir or dev) and serves its tables in the "
+            "web UI, each opened while someone views it. Exits when it loses the store, so "
+            "that its supervisor restarts it. The engine's half of `kermodes dev`, for a "
+            "cluster."
         ),
     )
     ui.add_argument(

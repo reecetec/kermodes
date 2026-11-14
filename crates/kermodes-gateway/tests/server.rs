@@ -350,6 +350,7 @@ async fn stored_tables_are_open_only_while_viewed() {
                 opened.lock().unwrap().push(feed);
                 Ok(table)
             }),
+            stats: Box::new(|| Ok(json!({"tables": [{"table": "md.ticks", "weir": []}]}))),
             idle: Duration::ZERO,
         }
     };
@@ -431,4 +432,21 @@ async fn stored_tables_are_open_only_while_viewed() {
     .await;
     let missing = text(&mut socket).await;
     assert_eq!(missing["retry"], Value::Null, "{missing}");
+
+    // The Catalog tab's list comes from the store's stats, not from opening tables.
+    let catalog = {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = TcpStream::connect(server.addr()).await.unwrap();
+        let request = "GET /api/catalog HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    };
+    assert!(catalog.starts_with("HTTP/1.1 200"), "{catalog}");
+    assert!(
+        catalog.ends_with(r#"{"tables":[{"table":"md.ticks","weir":[]}]}"#),
+        "{catalog}"
+    );
+    assert_eq!(openings(), 4 - 1, "listing the catalog opened nothing");
 }
