@@ -16,14 +16,17 @@ use arrow_flight::{
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
 use futures::stream::{self, StreamExt, TryStreamExt};
-use kermodes_weir::{Error, Pace, SourceId, Store, TableName};
+use kermodes_weir::{Date, Error, Pace, SourceId, Store, TableName};
 use serde_json::{Value, json};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::{columns_json, schema_from_json, status};
+use crate::{
+    columns_json, commit_from_json, garbage_from_json, garbage_json, history_date_json,
+    history_file_json, schema_from_json, status,
+};
 
 /// Bytes queued for one reader while it catches up: the replay waits for the reader past this,
 /// so a day of any size costs about this much of the server's memory per reader.
@@ -144,6 +147,13 @@ fn source_id(value: &Value) -> Result<SourceId, Status> {
     SourceId::parse(source).map_err(status)
 }
 
+fn date(value: &Value, field: &str) -> Result<Date, Status> {
+    let text = value[field]
+        .as_str()
+        .ok_or_else(|| Status::invalid_argument(format!("missing `{field}`")))?;
+    Date::parse(text).map_err(status)
+}
+
 fn ack(last_seq: Option<u64>, written: bool) -> PutResult {
     let mut bytes = last_seq.unwrap_or(0).to_le_bytes().to_vec();
     bytes.push(u8::from(written));
@@ -238,6 +248,29 @@ impl FlightService for Service {
             let (store, name) = (self.store.clone(), name.clone());
             blocking(move || store.table(&name).map(|entry| entry.schema)).await?
         };
+        if !ticket["date"].is_null() {
+            let date = date(&ticket, "date")?;
+            // A past date's batches, then the end. The queue holds a few batches, so the read
+            // keeps to the reader's pace and weir's memory stays bounded.
+            let (batches, mut receiver) = mpsc::channel::<Result<RecordBatch, FlightError>>(4);
+            let store = self.store.clone();
+            tokio::task::spawn_blocking(move || {
+                let read = store.read_date(&name, date, &mut |batch| {
+                    batches
+                        .blocking_send(Ok(batch))
+                        .map_err(|_| Error::Io("the reader went".into()))
+                });
+                if let Err(e) = read {
+                    let _ = batches.blocking_send(Err(FlightError::Tonic(Box::new(status(e)))));
+                }
+            });
+            let rows = futures::stream::poll_fn(move |cx| receiver.poll_recv(cx));
+            let data = FlightDataEncoderBuilder::new()
+                .with_schema(schema)
+                .build(rows)
+                .map_err(|e| Status::internal(e.to_string()));
+            return Ok(Response::new(data.boxed()));
+        }
         // Batches sent to the reader's stream, and the bytes of them it has not taken yet.
         let (batches, receiver) =
             mpsc::unbounded_channel::<(Result<RecordBatch, FlightError>, usize)>();
@@ -308,10 +341,18 @@ impl FlightService for Service {
             }
             "tables" => {
                 let tables = blocking(move || store.tables()).await?;
+                // `id` and `location` since history: a merge Job writes under the location.
                 Value::Array(
                     tables
                         .iter()
-                        .map(|t| json!({"table": t.name.to_string(), "columns": columns_json(&t.schema)}))
+                        .map(|t| {
+                            json!({
+                                "table": t.name.to_string(),
+                                "columns": columns_json(&t.schema),
+                                "id": t.id,
+                                "location": t.location,
+                            })
+                        })
                         .collect(),
                 )
             }
@@ -320,6 +361,51 @@ impl FlightService for Service {
                 let (name, source) = (table_name(&command)?, source_id(&command)?);
                 let (last, epoch) = blocking(move || store.source_state(&name, &source)).await?;
                 json!({ "last_seq": last, "epoch": epoch })
+            }
+            "date_rows" => {
+                let command = command(&action.body)?;
+                let (name, date) = (table_name(&command)?, date(&command, "date")?);
+                let (rows, bytes) = blocking(move || store.date_rows(&name, date)).await?;
+                json!({"rows": rows, "bytes": bytes})
+            }
+            "history" => {
+                let name = table_name(&command(&action.body)?)?;
+                let held = blocking(move || store.history(&name)).await?;
+                Value::Array(held.iter().map(history_date_json).collect())
+            }
+            "history_files" => {
+                let command = command(&action.body)?;
+                let name = table_name(&command)?;
+                let (first, last) = (date(&command, "first")?, date(&command, "last")?);
+                let files = blocking(move || store.history_files(&name, first, last)).await?;
+                Value::Array(files.iter().map(history_file_json).collect())
+            }
+            "commit_history" => {
+                let command = command(&action.body)?;
+                let name = table_name(&command)?;
+                let commit = commit_from_json(&command).map_err(status)?;
+                blocking(move || store.commit_history(&name, &commit)).await?;
+                json!({})
+            }
+            "drop_date" => {
+                let command = command(&action.body)?;
+                let (name, date) = (table_name(&command)?, date(&command, "date")?);
+                blocking(move || store.drop_date(&name, date)).await?;
+                json!({})
+            }
+            "history_garbage" => {
+                let command = command(&action.body)?;
+                let grace = command["grace_secs"]
+                    .as_u64()
+                    .ok_or_else(|| Status::invalid_argument("missing `grace_secs`"))?;
+                let garbage =
+                    blocking(move || store.history_garbage(Duration::from_secs(grace))).await?;
+                Value::Array(garbage.iter().map(garbage_json).collect())
+            }
+            "forget_garbage" => {
+                let garbage = garbage_from_json(&command(&action.body)?).map_err(status)?;
+                blocking(move || store.forget_garbage(&garbage)).await?;
+                json!({})
             }
             other => return Err(Status::invalid_argument(format!("no action `{other}`"))),
         };
@@ -342,6 +428,34 @@ impl FlightService for Service {
             (
                 "last_seq",
                 "{table, source}: the source's last sequence number and latest lease epoch",
+            ),
+            (
+                "date_rows",
+                "{table, date}: rows and bytes weir holds of a past date",
+            ),
+            (
+                "history",
+                "{table}: every date of its history, in its files",
+            ),
+            (
+                "history_files",
+                "{table, first, last}: its history files holding those dates",
+            ),
+            (
+                "commit_history",
+                "{table, written, replaced, files, dates}: commit a write of history",
+            ),
+            (
+                "drop_date",
+                "{table, date}: drop a past date its history holds whole",
+            ),
+            (
+                "history_garbage",
+                "{grace_secs}: history files replaced at least that long ago",
+            ),
+            (
+                "forget_garbage",
+                "{table_id, location, file}: forget a deleted file",
             ),
         ];
         let actions = actions.map(|(kind, description)| {

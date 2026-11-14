@@ -9,10 +9,16 @@
 //!   acknowledged once durable (or dropped as a resend) with a `PutResult` whose `app_metadata` is
 //!   the source's last sequence number (u64) and whether the batch was written (one byte). A
 //!   batch's message is at most `MAX_WRITE_BYTES`: the client refuses a larger one as `TooLarge`.
-//! - `DoGet` reads: the ticket `{"table"}` streams every committed batch, then each new one.
+//! - `DoGet` reads: the ticket `{"table"}` streams every committed batch, then each new one;
+//!   `{"table", "date"}` streams a past date's batches and ends (a merge's read, §8.3).
 //! - Actions, JSON in and out: `create_table` `{"table", "columns": [[name, type]]}`; `tables`;
 //!   `last_seq` `{"table", "source"}` → `{"last_seq", "epoch"}`. A writer asks for it once its
 //!   `DoPut` holds the lease, so nothing can write between the answer and its first batch.
+//! - History (§8), dates as `YYYY-MM-DD`: `date_rows` `{"table", "date"}` → `{"rows", "bytes"}`;
+//!   `history` `{"table"}` → dates; `history_files` `{"table", "first", "last"}` → files;
+//!   `commit_history` `{"table", "written", "replaced", "files", "dates"}`; `drop_date`
+//!   `{"table", "date"}`; `history_garbage` `{"grace_secs"}` → garbage; `forget_garbage`
+//!   garbage. Each mirrors the `Store` method of its name.
 
 #![forbid(unsafe_code)]
 
@@ -23,7 +29,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use kermodes_core::{parse_type, type_name};
-use kermodes_weir::Error;
+use kermodes_weir::{Date, Error, Garbage, HistoryCommit, HistoryDate, HistoryFile};
 use serde_json::{Value, json};
 use tonic::{Code, Status};
 
@@ -59,6 +65,103 @@ fn schema_from_json(value: &Value) -> Result<SchemaRef, Error> {
         })
         .collect::<Result<Vec<_>, Error>>()?;
     Ok(Arc::new(Schema::new(fields)))
+}
+
+fn date_from_json(value: &Value) -> Result<Date, Error> {
+    Date::parse(value.as_str().unwrap_or_default())
+}
+
+fn u64_from_json(value: &Value, field: &str) -> Result<u64, Error> {
+    value[field]
+        .as_u64()
+        .ok_or_else(|| Error::Schema(format!("`{field}` must be a count, not {}", value[field])))
+}
+
+fn str_from_json<'a>(value: &'a Value, field: &str) -> Result<&'a str, Error> {
+    value[field]
+        .as_str()
+        .ok_or_else(|| Error::Schema(format!("`{field}` must be text, not {}", value[field])))
+}
+
+fn list_from_json<T>(
+    value: &Value,
+    each: impl Fn(&Value) -> Result<T, Error>,
+) -> Result<Vec<T>, Error> {
+    value
+        .as_array()
+        .ok_or_else(|| Error::Schema(format!("expected a list, not {value}")))?
+        .iter()
+        .map(each)
+        .collect()
+}
+
+fn history_date_json(held: &HistoryDate) -> Value {
+    json!({"date": held.date.to_string(), "file": held.file, "rows": held.rows, "bytes": held.bytes})
+}
+
+fn history_date_from_json(value: &Value) -> Result<HistoryDate, Error> {
+    Ok(HistoryDate {
+        date: date_from_json(&value["date"])?,
+        file: str_from_json(value, "file")?.to_owned(),
+        rows: u64_from_json(value, "rows")?,
+        bytes: u64_from_json(value, "bytes")?,
+    })
+}
+
+fn history_file_json(file: &HistoryFile) -> Value {
+    json!({
+        "name": file.name,
+        "first": file.first.to_string(),
+        "last": file.last.to_string(),
+        "rows": file.rows,
+        "bytes": file.bytes,
+    })
+}
+
+fn history_file_from_json(value: &Value) -> Result<HistoryFile, Error> {
+    Ok(HistoryFile {
+        name: str_from_json(value, "name")?.to_owned(),
+        first: date_from_json(&value["first"])?,
+        last: date_from_json(&value["last"])?,
+        rows: u64_from_json(value, "rows")?,
+        bytes: u64_from_json(value, "bytes")?,
+    })
+}
+
+fn commit_json(commit: &HistoryCommit) -> Value {
+    json!({
+        "written": commit.written.iter().map(Date::to_string).collect::<Vec<_>>(),
+        "replaced": commit.replaced,
+        "files": commit.files.iter().map(history_file_json).collect::<Vec<_>>(),
+        "dates": commit.dates.iter().map(history_date_json).collect::<Vec<_>>(),
+    })
+}
+
+fn commit_from_json(value: &Value) -> Result<HistoryCommit, Error> {
+    Ok(HistoryCommit {
+        written: list_from_json(&value["written"], date_from_json)?,
+        replaced: list_from_json(&value["replaced"], |file| {
+            file.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| Error::Schema(format!("a replaced file is named, not {file}")))
+        })?,
+        files: list_from_json(&value["files"], history_file_from_json)?,
+        dates: list_from_json(&value["dates"], history_date_from_json)?,
+    })
+}
+
+fn garbage_json(garbage: &Garbage) -> Value {
+    json!({"table_id": garbage.table_id, "location": garbage.location, "file": garbage.file})
+}
+
+fn garbage_from_json(value: &Value) -> Result<Garbage, Error> {
+    Ok(Garbage {
+        table_id: value["table_id"]
+            .as_i64()
+            .ok_or_else(|| Error::Schema(format!("garbage needs its table_id, not {value}")))?,
+        location: str_from_json(value, "location")?.to_owned(),
+        file: str_from_json(value, "file")?.to_owned(),
+    })
 }
 
 /// A store error as a gRPC status; `error_from_status` reverses it.

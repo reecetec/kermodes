@@ -5,10 +5,11 @@
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
-use kermodes_weir::{Date, Error, HistoryCommit, HistoryDate, Store, TableName};
+use kermodes_weir::{Date, Error, HistoryCommit, HistoryDate, TableName};
 
 use crate::files::{Lake, TARGET_FILE_BYTES, Written};
 use crate::plan::{Held, Incoming, plan};
+use crate::weir::Weir;
 
 /// Replaced files are deleted this long after their commit, when no read can still be using
 /// them.
@@ -28,16 +29,16 @@ pub struct Merged {
 }
 
 /// Moves a past `date` of `name` from weir into history.
-pub fn merge(store: &Store, lake: &Lake, name: &TableName, date: Date) -> Result<Merged, Error> {
-    let entry = store.table(name)?;
-    let (rows, bytes) = store.date_rows(name, date)?;
+pub fn merge(weir: &dyn Weir, lake: &Lake, name: &TableName, date: Date) -> Result<Merged, Error> {
+    let entry = weir.entry(name)?;
+    let (rows, bytes) = weir.date_rows(name, date)?;
     if rows == 0 {
         return Ok(Merged::default());
     }
     for _ in 0..ATTEMPTS {
-        let held = store.history(name)?;
+        let held = weir.history(name)?;
         if rows_on(&held, date) == rows {
-            store.drop_date(name, date)?;
+            weir.drop_date(name, date)?;
             return Ok(Merged::default());
         }
         let planned = plan(
@@ -60,7 +61,7 @@ pub fn merge(store: &Store, lake: &Lake, name: &TableName, date: Date) -> Result
                 dates,
                 |day, push| {
                     if day == date {
-                        return store.read_date(name, day, push);
+                        return weir.read_date(name, day, push);
                     }
                     // A neighbour rewritten into the new file, from the file it was in.
                     for from in held.iter().filter(|h| h.date == day) {
@@ -92,10 +93,10 @@ pub fn merge(store: &Store, lake: &Lake, name: &TableName, date: Date) -> Result
             files: written.files.clone(),
             dates: written.dates.clone(),
         };
-        match checked.and_then(|()| store.commit_history(name, &commit)) {
+        match checked.and_then(|()| weir.commit_history(name, &commit)) {
             Ok(()) => {
-                store.drop_date(name, date)?;
-                collect_garbage(store, lake, GARBAGE_GRACE)?;
+                weir.drop_date(name, date)?;
+                collect_garbage(weir, lake, GARBAGE_GRACE)?;
                 return Ok(Merged {
                     rows,
                     files: commit.files.len(),
@@ -119,10 +120,10 @@ pub fn merge(store: &Store, lake: &Lake, name: &TableName, date: Date) -> Result
 }
 
 /// Deletes history files replaced at least `grace` ago.
-pub fn collect_garbage(store: &Store, lake: &Lake, grace: Duration) -> Result<(), Error> {
-    for garbage in store.history_garbage(grace)? {
+pub fn collect_garbage(weir: &dyn Weir, lake: &Lake, grace: Duration) -> Result<(), Error> {
+    for garbage in weir.history_garbage(grace)? {
         lake.delete(&garbage.location, &garbage.file)?;
-        store.forget_garbage(&garbage)?;
+        weir.forget_garbage(&garbage)?;
     }
     Ok(())
 }

@@ -1,6 +1,7 @@
 //! A process's handle on a served store: the store's operations, over Flight.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -10,14 +11,20 @@ use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::utils::batches_to_flight_data;
 use arrow_flight::{Action, FlightData, FlightDescriptor, PutResult, Ticket};
 use futures::{StreamExt, TryStreamExt};
-use kermodes_weir::{Error, Pace, SourceId, Subscriber, TableName, conform};
+use kermodes_weir::{
+    Date, Error, Garbage, HistoryCommit, HistoryDate, HistoryFile, Pace, SourceId, Subscriber,
+    TableEntry, TableName, conform,
+};
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tonic::Streaming;
 use tonic::transport::Channel;
 
-use crate::{MAX_WRITE_BYTES, columns_json, error_from_status, schema_from_json};
+use crate::{
+    MAX_WRITE_BYTES, columns_json, commit_json, error_from_status, garbage_from_json, garbage_json,
+    history_date_from_json, history_file_from_json, list_from_json, schema_from_json,
+};
 
 /// Connected to a store's Flight server. Calls block until the server answers. Clones share the
 /// connection.
@@ -106,6 +113,125 @@ impl Client {
             .find(|(n, _)| n == name)
             .map(|(_, schema)| schema)
             .ok_or_else(|| Error::NotFound(format!("no table {name}; create it first")))
+    }
+
+    /// The catalog's entry for `name`: its ID, location, and schema.
+    pub fn entry(&self, name: &TableName) -> Result<TableEntry, Error> {
+        let tables = self.action("tables", json!({}))?;
+        let table = tables
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|t| t["table"].as_str() == Some(&name.to_string()))
+            .ok_or_else(|| Error::NotFound(format!("no table {name}; create it first")))?;
+        let older = || {
+            Error::Io(format!(
+                "the server is older than history: {name} has no location"
+            ))
+        };
+        Ok(TableEntry {
+            id: table["id"].as_i64().ok_or_else(older)?,
+            name: name.clone(),
+            location: table["location"].as_str().ok_or_else(older)?.to_owned(),
+            schema: schema_from_json(&table["columns"])?,
+        })
+    }
+
+    /// The rows and stream bytes weir holds of a past `date` of `name`.
+    pub fn date_rows(&self, name: &TableName, date: Date) -> Result<(u64, u64), Error> {
+        let held = self.action(
+            "date_rows",
+            json!({"table": name.to_string(), "date": date.to_string()}),
+        )?;
+        Ok((
+            held["rows"].as_u64().unwrap_or(0),
+            held["bytes"].as_u64().unwrap_or(0),
+        ))
+    }
+
+    /// Every batch of a past `date` of `name`, to `each`, as the server reads them.
+    pub fn read_date(
+        &self,
+        name: &TableName,
+        date: Date,
+        each: &mut dyn FnMut(RecordBatch) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let mut flight = self.flight.clone();
+        let ticket = Ticket {
+            ticket: json!({"table": name.to_string(), "date": date.to_string()})
+                .to_string()
+                .into(),
+        };
+        let mut decoded = self.runtime.block_on(async move {
+            let data = flight
+                .do_get(ticket)
+                .await
+                .map_err(|s| error_from_status(&s))?
+                .into_inner()
+                .map_err(FlightError::from);
+            Ok::<_, Error>(FlightDataDecoder::new(data))
+        })?;
+        // `each` runs outside the client's runtime: it may block on another (a history write).
+        while let Some(message) = self.runtime.block_on(decoded.next()) {
+            match message {
+                Ok(message) => {
+                    if let DecodedPayload::RecordBatch(batch) = message.payload {
+                        each(batch)?;
+                    }
+                }
+                Err(FlightError::Tonic(status)) => return Err(error_from_status(&status)),
+                Err(e) => return Err(Error::Io(format!("reading {name} {date}: {e}"))),
+            }
+        }
+        Ok(())
+    }
+
+    /// Every date of `name`'s history, by date then file.
+    pub fn history(&self, name: &TableName) -> Result<Vec<HistoryDate>, Error> {
+        let held = self.action("history", json!({"table": name.to_string()}))?;
+        list_from_json(&held, history_date_from_json)
+    }
+
+    /// The files of `name`'s history holding any date from `first` to `last`.
+    pub fn history_files(
+        &self,
+        name: &TableName,
+        first: Date,
+        last: Date,
+    ) -> Result<Vec<HistoryFile>, Error> {
+        let files = self.action(
+            "history_files",
+            json!({"table": name.to_string(), "first": first.to_string(), "last": last.to_string()}),
+        )?;
+        list_from_json(&files, history_file_from_json)
+    }
+
+    /// Commits a write of `name`'s history; `Busy` when it changed since the commit was planned.
+    pub fn commit_history(&self, name: &TableName, commit: &HistoryCommit) -> Result<(), Error> {
+        let mut body = commit_json(commit);
+        body["table"] = json!(name.to_string());
+        self.action("commit_history", body).map(|_| ())
+    }
+
+    /// Drops a past `date` of `name` from weir once its history holds it whole.
+    pub fn drop_date(&self, name: &TableName, date: Date) -> Result<(), Error> {
+        self.action(
+            "drop_date",
+            json!({"table": name.to_string(), "date": date.to_string()}),
+        )
+        .map(|_| ())
+    }
+
+    /// History files replaced at least `grace` ago.
+    pub fn history_garbage(&self, grace: Duration) -> Result<Vec<Garbage>, Error> {
+        let garbage = self.action("history_garbage", json!({"grace_secs": grace.as_secs()}))?;
+        list_from_json(&garbage, garbage_from_json)
+    }
+
+    /// Forgets a garbage file once it is deleted.
+    pub fn forget_garbage(&self, garbage: &Garbage) -> Result<(), Error> {
+        self.action("forget_garbage", garbage_json(garbage))
+            .map(|_| ())
     }
 
     /// A writer for `source`'s rows of `name`, holding the source's lease server-wide until it

@@ -185,3 +185,49 @@ fn a_merge_cut_short_after_its_commit_finishes_by_dropping() {
     assert_eq!(history(&store, &lake, d(1), d(1)), [1, 2]);
     assert_eq!(store.history_files(&ticks(), d(1), d(1)).unwrap().len(), 1);
 }
+
+/// The same merge from another process, as a merge Job runs it: over Flight, against a served
+/// store, with weir reading the date out and checking the drop.
+#[test]
+fn a_merge_over_flight_moves_dates_the_same() {
+    let dir = TempDir::new();
+    let store = Arc::new(store_with(
+        &dir.0.join("store"),
+        &[
+            (d(1), &[("a", &[1, 2, 3]), ("b", &[4, 5])]),
+            (d(2), &[("a", &[6, 7])]),
+        ],
+    ));
+    let server = kermodes_flight::serve(store.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+    let client = kermodes_flight::Client::connect(&format!("grpc://{}", server.addr())).unwrap();
+    let lake = Lake::open(dir.0.join("lake").to_str().unwrap()).unwrap();
+
+    let merged = [d(1), d(2)].map(|date| merge(&client, &lake, &ticks(), date).unwrap());
+    assert_eq!(
+        merged,
+        [
+            Merged {
+                rows: 5,
+                files: 1,
+                replaced: 0
+            },
+            Merged {
+                rows: 2,
+                files: 1,
+                replaced: 1
+            }
+        ]
+    );
+    assert_eq!(history(&store, &lake, d(1), d(2)), [1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(store.date_rows(&ticks(), d(1)).unwrap(), (0, 0));
+    let location = store.table(&ticks()).unwrap().location;
+    collect_garbage(&client, &lake, Duration::ZERO).unwrap();
+    let files = fs::read_dir(dir.0.join("lake").join(location))
+        .unwrap()
+        .count();
+    assert_eq!(files, 1);
+    assert!(matches!(
+        merge(&client, &lake, &ticks(), today()),
+        Err(Error::Busy(_))
+    ));
+}
