@@ -29,3 +29,29 @@ export function nextSort(
     ? sort.filter(key => key.column !== column)
     : sort.map(key => (key.column === column ? next : key));
 }
+
+/**
+ * The sort a header shows, given the sort `asked` for and not yet seen applied
+ * (or `null`), and the one the engine `reported`; and what is still asked. A
+ * sort of a big table takes a while, and the engine's reports until it lands
+ * carry the old sort: showing those would flip the header back. The engine
+ * always ends up reporting the sort asked for, even one it could not apply.
+ */
+export function shownSort(
+  asked: readonly SortKey[] | null,
+  reported: readonly SortKey[]
+): { shown: readonly SortKey[]; asked: readonly SortKey[] | null } {
+  if (asked == null || sameSort(asked, reported)) {
+    return { shown: reported, asked: null };
+  }
+  return { shown: asked, asked };
+}
+
+function sameSort(a: readonly SortKey[], b: readonly SortKey[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every(
+      (key, i) => key.column === b[i].column && key.descending === b[i].descending
+    )
+  );
+}

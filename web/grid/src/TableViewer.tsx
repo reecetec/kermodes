@@ -14,7 +14,7 @@ import { type GridTheme } from './GridTheme';
 import GridUtils, { type GridPoint } from './GridUtils';
 import { type EventHandlerResult } from './EventHandlerResult';
 import { selectionToRanges } from './RangedSelection';
-import ViewportGridModel from './ViewportGridModel';
+import ViewportGridModel, { type SortKey } from './ViewportGridModel';
 import {
   TableViewerMetricCalculator,
   TableViewerRenderer,
@@ -26,7 +26,7 @@ import {
   filterCells,
   type FilterCell,
 } from './FilterBar';
-import { nextSort } from './sorting';
+import { nextSort, shownSort } from './sorting';
 import {
   COPY_ROW_LIMIT,
   copyText,
@@ -234,6 +234,8 @@ export function TableViewer({
   );
   const draftRef = useRef(draft);
   const filterTimer = useRef<number | null>(null);
+  // A sort clicked and not yet applied by the engine (`shownSort`)
+  const askedSort = useRef<readonly SortKey[] | null>(null);
   const [cells, setCells] = useState<readonly FilterCell[]>([]);
   const cellsKey = useRef('');
 
@@ -260,7 +262,9 @@ export function TableViewer({
         viewport.reset();
       }
       model.setRowCount(next.row_count);
-      model.setSort(next.sort);
+      const sorted = shownSort(askedSort.current, next.sort);
+      askedSort.current = sorted.asked;
+      model.setSort(sorted.shown);
       // Typing wins over the engine's echo of an older entry
       if (filterTimer.current == null) {
         draftRef.current = next.filters;
@@ -419,6 +423,7 @@ export function TableViewer({
         }
         const modelColumn = GridUtils.getModelIndex(column, grid.state.movedColumns);
         const by = nextSort(model.sortKeys, model.columns[modelColumn].name, additive);
+        askedSort.current = by;
         model.setSort(by);
         channel.send({ type: 'sort', by });
       }),

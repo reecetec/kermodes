@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { nextSort } from './sorting';
+import { nextSort, shownSort } from './sorting';
 
 const asc = (column: string) => ({ column, descending: false });
 const desc = (column: string) => ({ column, descending: true });
@@ -31,5 +31,25 @@ describe('nextSort', () => {
     const flipped = nextSort(sort, 'px', true);
     expect(flipped).toEqual([asc('sym'), desc('px'), desc('qty')]);
     expect(nextSort(flipped, 'px', true)).toEqual([asc('sym'), desc('qty')]);
+  });
+});
+
+describe('shownSort', () => {
+  it('shows the sort asked for until the engine reports it', () => {
+    // Reports of the old sort while the engine sorts
+    expect(shownSort([desc('px')], [asc('px')])).toEqual({
+      shown: [desc('px')],
+      asked: [desc('px')],
+    });
+    expect(shownSort([desc('px')], [desc('px')])).toEqual({
+      shown: [desc('px')],
+      asked: null,
+    });
+  });
+
+  it('shows what the engine reports when nothing is asked', () => {
+    expect(shownSort(null, [asc('sym')])).toEqual({ shown: [asc('sym')], asked: null });
+    // Cleared: asked for no sort, and the engine reports none
+    expect(shownSort([], [])).toEqual({ shown: [], asked: null });
   });
 });
