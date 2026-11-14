@@ -2,7 +2,7 @@ import { AppWindow, Database, HardDrive, ServerCog, TriangleAlert, type LucideIc
 import { cn } from '@/lib/utils';
 import type { Sample } from './data';
 import { type Component, bytes, componentUsage, cores } from './model';
-import { Status, StatusDot, Usage } from './parts';
+import { DiskUse, Status, StatusDot, Usage } from './parts';
 
 /** How each component is named and drawn */
 export const COMPONENTS: Record<string, { label: string; icon: LucideIcon; about: string }> = {
@@ -79,6 +79,8 @@ function Card({
   const ready = component.instances.filter(i => i.ready).length;
   const restarts = component.instances.reduce((sum, i) => sum + i.restarts, 0);
   const primary = component.instances.find(i => i.role === 'primary');
+  // Postgres's disks are its primary's; the replicas' are in the details.
+  const disks = (primary ?? component.instances[0])?.disks ?? [];
   return (
     <button
       type="button"
@@ -131,6 +133,13 @@ function Card({
           />
         </div>
       </div>
+      {disks.length > 0 && (
+        <div className="flex flex-col gap-1">
+          {disks.map(d => (
+            <DiskUse key={d.name} name={d.name} used={d.used} size={d.size} />
+          ))}
+        </div>
+      )}
       {component.warning != null && (
         <div className="truncate text-xs text-destructive" title={component.warning}>
           {component.warning}

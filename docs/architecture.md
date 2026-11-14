@@ -1232,9 +1232,13 @@ namespaces).
   as Kubernetes shows their pods: readiness, version, node, restarts, CPU and memory, and the
   newest Warning event, each opening its pods, events, and logs. The controller reads them
   (`/api/components`) rather than a `sys.*` table, so the page can say weir is down while it is.
+  Each pod's disks come from the component itself, not the node (no kubelet access): weir's
+  volume from its `stats` action; each Postgres instance's databases and WAL from its CNPG
+  metrics, its data volume's size from its claim. One that cannot be read in two seconds shows
+  no disk rather than holding up the page.
   With `kermodes ui --control URL` (the chart sets it with the controller), the server passes
   the controller's project, component, event, log, rollout, and restart routes through, by name
-  only. Without a controller the tab is absent.
+  only. Without a controller the tab is absent. Catalog appears wherever the server has a store.
 - Catalog: every stored table under its namespace, each namespace a row of its tables' totals
   that folds them away. Per table: kind and key, rows today, bytes in weir over every date it
   holds, history rows and bytes, the dates held (a date counts once while it is in both weir

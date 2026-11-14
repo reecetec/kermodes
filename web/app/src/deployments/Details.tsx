@@ -5,7 +5,7 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { cn } from '@/lib/utils';
 import { type Component, type Deployment, ago, bytes, cores } from './model';
-import { Commit, Events, Field, Logs, Status } from './parts';
+import { Commit, DiskUse, Events, Field, Logs, Status } from './parts';
 import { componentMeta, versionOf } from './SystemStrip';
 
 async function post(url: string): Promise<string | null> {
@@ -173,7 +173,7 @@ export function ComponentDetail({ component, onClose }: { component: Component; 
     <table className="w-full text-sm">
       <thead>
         <tr className="border-b text-left text-xs text-muted-foreground">
-          {['Pod', 'Role', 'Ready', 'Version', 'Node', 'Up', 'Restarts', 'CPU', 'Memory'].map(h => (
+          {['Pod', 'Role', 'Ready', 'Version', 'Node', 'Up', 'Restarts', 'CPU', 'Memory', 'Disks'].map(h => (
             <th key={h} className="py-2 pr-4 font-medium first:pl-4">
               {h}
             </th>
@@ -199,6 +199,17 @@ export function ComponentDetail({ component, onClose }: { component: Component; 
             <td className="py-2 pr-4 tabular-nums">
               {bytes(i.memory)}
               {i.memory_limit != null && <span className="text-muted-foreground"> of {bytes(i.memory_limit)}</span>}
+            </td>
+            <td className="py-2 pr-4">
+              {i.disks.length === 0 ? (
+                <span className="text-muted-foreground">—</span>
+              ) : (
+                <div className="flex flex-col gap-1">
+                  {i.disks.map(d => (
+                    <DiskUse key={d.name} name={d.name} used={d.used} size={d.size} />
+                  ))}
+                </div>
+              )}
             </td>
           </tr>
         ))}

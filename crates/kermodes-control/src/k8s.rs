@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{Event, Node, Pod};
+use k8s_openapi::api::core::v1::{Event, Node, PersistentVolumeClaim, Pod};
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::Api;
 use kube::api::{
@@ -24,6 +24,8 @@ const MANAGER: &str = "kermodes-control";
 const COMPONENTS_SELECTOR: &str = "app.kubernetes.io/component in (weir,database,control,ui)";
 /// How long discovery may take: fetching the snapshot and importing the project.
 const DISCOVERY_DEADLINE: Duration = Duration::from_secs(360);
+/// How long reading a component's disks may take before the page shows it without them.
+const DISK_DEADLINE: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct Kube {
@@ -33,6 +35,8 @@ pub struct Kube {
     pods: Api<Pod>,
     nodes: Api<Node>,
     events: Api<Event>,
+    /// Postgres's volumes, for their sizes.
+    claims: Api<PersistentVolumeClaim>,
     /// metrics-server's pod usage (`metrics.k8s.io`).
     metrics: Api<DynamicObject>,
 }
@@ -62,6 +66,7 @@ impl Kube {
             pods: Api::namespaced(client.clone(), namespace),
             nodes: Api::all(client.clone()),
             events: Api::namespaced(client.clone(), namespace),
+            claims: Api::namespaced(client.clone(), namespace),
             metrics: Api::namespaced_with(
                 client,
                 namespace,
@@ -191,8 +196,9 @@ impl Kube {
     }
 
     /// The platform's components as their pods show them, in `system::COMPONENTS` order; one
-    /// without pods is left out. Usage is zero while metrics-server is not answering.
-    pub async fn components(&self) -> Result<Vec<system::Component>, String> {
+    /// without pods is left out. Usage is zero while metrics-server is not answering, and an
+    /// instance whose disks cannot be read in time shows none.
+    pub async fn components(&self, weir: &str) -> Result<Vec<system::Component>, String> {
         let selector = ListParams::default().labels(COMPONENTS_SELECTOR);
         let pods = self
             .pods
@@ -224,6 +230,7 @@ impl Kube {
         let mut instances: BTreeMap<String, Vec<system::Instance>> = BTreeMap::new();
         let mut about: BTreeMap<String, String> = BTreeMap::new();
         let mut ready_since: BTreeMap<String, i64> = BTreeMap::new();
+        let mut addresses: BTreeMap<String, String> = BTreeMap::new();
         for pod in pods
             .iter()
             .filter(|p| p.metadata.deletion_timestamp.is_none())
@@ -240,11 +247,20 @@ impl Kube {
             if let Some(since) = ready_since_ns(pod) {
                 ready_since.insert(name.clone(), since);
             }
+            if let Some(ip) = pod.status.as_ref().and_then(|s| s.pod_ip.clone()) {
+                addresses.insert(name.clone(), ip);
+            }
             let (cpu, memory) = usage.get(&name).copied().unwrap_or_default();
             instances
                 .entry(component)
                 .or_default()
                 .push(instance(pod, name, cpu, memory));
+        }
+        if let Some(postgres) = instances.get_mut("database") {
+            self.postgres_disks(postgres, &addresses).await;
+        }
+        if let Some(store) = instances.get_mut("weir").and_then(|pods| pods.first_mut()) {
+            store.disks = weir_disks(weir).await;
         }
         let mut warnings: BTreeMap<String, (String, i64)> = BTreeMap::new();
         for event in self
@@ -293,6 +309,44 @@ impl Kube {
                 })
             })
             .collect())
+    }
+
+    /// Each Postgres instance's data and WAL disks, from its CNPG metrics and its data volume's
+    /// size. Instances are read at once, each within `DISK_DEADLINE`.
+    async fn postgres_disks(
+        &self,
+        instances: &mut [system::Instance],
+        addresses: &BTreeMap<String, String>,
+    ) {
+        let data = ListParams::default().labels("cnpg.io/pvcRole=PG_DATA");
+        let sizes: BTreeMap<String, u64> = match self.claims.list(&data).await {
+            Ok(claims) => claims
+                .items
+                .iter()
+                .filter_map(|claim| {
+                    let storage = claim.status.as_ref()?.capacity.as_ref()?.get("storage")?;
+                    let size = u64::try_from(report::bytes(&storage.0)?).ok()?;
+                    Some((claim.metadata.name.clone()?, size))
+                })
+                .collect(),
+            Err(_) => BTreeMap::new(),
+        };
+        let mut reads = tokio::task::JoinSet::new();
+        for (index, instance) in instances.iter().enumerate() {
+            if let Some(ip) = addresses.get(&instance.pod) {
+                let url = format!("{ip}:9187");
+                reads.spawn(async move {
+                    let text =
+                        tokio::time::timeout(DISK_DEADLINE, http_get(&url, "/metrics")).await;
+                    (index, text.ok().and_then(Result::ok))
+                });
+            }
+        }
+        while let Some(Ok((index, Some(text)))) = reads.join_next().await {
+            let instance = &mut instances[index];
+            // CNPG names an instance's data volume after its pod.
+            instance.disks = system::postgres_disks(&text, sizes.get(&instance.pod).copied());
+        }
     }
 
     /// A component's events, newest first: its pods' and their owners'.
@@ -664,6 +718,47 @@ impl Kube {
     }
 }
 
+/// weir's store volume, from its `stats` action; none if weir does not answer in time.
+async fn weir_disks(weir: &str) -> Vec<system::Disk> {
+    let url = weir.to_owned();
+    let stats = tokio::task::spawn_blocking(move || {
+        kermodes_flight::Client::connect(&url).and_then(|client| client.stats())
+    });
+    match tokio::time::timeout(DISK_DEADLINE, stats).await {
+        Ok(Ok(Ok(stats))) => system::weir_disk(&stats).into_iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The body of an HTTP/1.0 GET of `path` from `address` (`host:port`): a scrape of a pod's
+/// metrics, which needs no client beyond a socket.
+async fn http_get(address: &str, path: &str) -> Result<String, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .map_err(|e| format!("cannot reach {address}: {e}"))?;
+    let request = format!("GET {path} HTTP/1.0\r\nHost: {address}\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| format!("{address} sent no HTTP response"))?;
+    if !head.starts_with("HTTP/1.0 200") && !head.starts_with("HTTP/1.1 200") {
+        return Err(format!(
+            "{address}: {}",
+            head.lines().next().unwrap_or_default()
+        ));
+    }
+    Ok(body.to_owned())
+}
+
 /// Where a Deployment's rollout stands, from its status.
 fn rollout_of(deployment: &Deployment) -> Rollout {
     let status = deployment.status.clone().unwrap_or_default();
@@ -835,6 +930,7 @@ fn instance(pod: &Pod, name: String, cpu: f64, memory: i64) -> system::Instance 
                     .sum::<Option<i64>>()
             })
             .flatten(),
+        disks: Vec::new(),
     }
 }
 

@@ -3,7 +3,7 @@ import { ExternalLink, GitCommitHorizontal } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
 import { usePolled } from './data';
-import { ago } from './model';
+import { ago, bytes } from './model';
 
 const STATUS_VARIANT: Record<string, 'success' | 'warning' | 'destructive' | 'outline'> = {
   Running: 'success',
@@ -125,6 +125,26 @@ export function Usage({
         {pct == null ? format(value) : `${pct.toFixed(0)}%`}
       </span>
     </div>
+  );
+}
+
+/** A disk's use: its name, a bar of its size when known (red past 85%), and used of size */
+export function DiskUse({ name, used, size }: { name: string; used: number; size: number | null }) {
+  const share = size != null && size > 0 ? used / size : null;
+  return (
+    <span className="flex items-center gap-2 text-xs text-muted-foreground tabular-nums">
+      {name}
+      {share != null && (
+        <span className="h-1.5 w-16 shrink-0 overflow-hidden rounded-full bg-muted">
+          <span
+            className={cn('block h-full', share > 0.85 ? 'bg-destructive' : 'bg-primary')}
+            style={{ width: `${Math.min(100, 100 * share)}%` }}
+          />
+        </span>
+      )}
+      <span className="text-foreground">{bytes(used)}</span>
+      {size != null && <span>of {bytes(size)}</span>}
+    </span>
   );
 }
 

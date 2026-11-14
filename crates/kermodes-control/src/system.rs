@@ -27,6 +27,61 @@ pub struct Instance {
     pub cpu_limit: Option<f64>,
     pub memory: i64,
     pub memory_limit: Option<i64>,
+    /// Its volumes: weir's store; Postgres's data and WAL.
+    pub disks: Vec<Disk>,
+}
+
+/// A volume of a pod: what it holds, the bytes in use, and its size when known.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Disk {
+    /// `store` (weir's), `data` (Postgres's databases), or `wal` (Postgres's write-ahead log).
+    pub name: &'static str,
+    pub used: u64,
+    pub size: Option<u64>,
+}
+
+/// A Postgres instance's disks from its CNPG metrics (Prometheus text): its databases, together,
+/// on its data volume of `data_size` bytes, and its write-ahead log on its WAL volume. A disk
+/// whose metric is missing is left out rather than shown empty.
+pub fn postgres_disks(metrics: &str, data_size: Option<u64>) -> Vec<Disk> {
+    let (mut databases, mut wal, mut wal_size) = (None, None, None);
+    for line in metrics.lines().filter(|line| !line.starts_with('#')) {
+        let Some((series, value)) = line.rsplit_once(' ') else {
+            continue;
+        };
+        let Some(value) = value.parse::<f64>().ok().filter(|v| v.is_finite()) else {
+            continue;
+        };
+        if series.starts_with("cnpg_pg_database_size_bytes{") {
+            *databases.get_or_insert(0.0) += value;
+        } else if series == r#"cnpg_collector_pg_wal{value="size"}"# {
+            wal = Some(value);
+        } else if series == r#"cnpg_collector_pg_wal{value="volume_size"}"# {
+            wal_size = Some(value as u64);
+        }
+    }
+    let data = databases.map(|used| Disk {
+        name: "data",
+        used: used as u64,
+        size: data_size,
+    });
+    let wal = wal.map(|used| Disk {
+        name: "wal",
+        used: used as u64,
+        size: wal_size,
+    });
+    data.into_iter().chain(wal).collect()
+}
+
+/// weir's store volume, from its `stats` action's `volume`.
+pub fn weir_disk(stats: &serde_json::Value) -> Option<Disk> {
+    let size = stats["volume"]["bytes"].as_u64()?;
+    let free = stats["volume"]["free"].as_u64()?;
+    Some(Disk {
+        name: "store",
+        used: size.saturating_sub(free),
+        size: Some(size),
+    })
 }
 
 /// A component: its pods, how it is doing, and its newest Warning event.
@@ -72,7 +127,7 @@ pub fn recovered(reason: &str, at_ns: i64, ready_since_ns: Option<i64>) -> bool 
 
 #[cfg(test)]
 mod tests {
-    use super::{Instance, image_tag, recovered, status};
+    use super::{Disk, Instance, image_tag, postgres_disks, recovered, status, weir_disk};
 
     #[test]
     fn a_component_is_running_degraded_or_says_why_it_is_not() {
@@ -126,5 +181,51 @@ mod tests {
         assert!(!recovered("Unhealthy", 10, None));
         // Not a probe failure.
         assert!(!recovered("BackOff", 10, Some(12)));
+    }
+
+    /// As a CNPG instance reports them (cnpg 1.25), with the lines around them it ignores.
+    const METRICS: &str = r#"# HELP cnpg_collector_pg_wal Total size in bytes of WAL files
+# TYPE cnpg_collector_pg_wal gauge
+cnpg_collector_pg_wal{value="count"} 36
+cnpg_collector_pg_wal{value="size"} 6.03979776e+08
+cnpg_collector_pg_wal{value="slots_max"} NaN
+cnpg_collector_pg_wal{value="volume_size"} 2.147483648e+09
+cnpg_pg_database_size_bytes{datname="kermodes"} 8.615615e+06
+cnpg_pg_database_size_bytes{datname="postgres"} 8.017599e+06
+cnpg_pg_settings_setting{name="max_wal_size"} 1024
+"#;
+
+    #[test]
+    fn a_postgres_instance_has_its_databases_and_its_wal_on_their_volumes() {
+        let disk = |name, used, size| Disk { name, used, size };
+        assert_eq!(
+            postgres_disks(METRICS, Some(5 << 30)),
+            [
+                disk("data", 16_633_214, Some(5 << 30)),
+                disk("wal", 603_979_776, Some(2 << 30)),
+            ]
+        );
+        // WAL on the data volume: no WAL volume of its own to size.
+        let shared = METRICS.replace("volume_size", "volume_unknown");
+        assert_eq!(
+            postgres_disks(&shared, None)[1],
+            disk("wal", 603_979_776, None)
+        );
+        // No metrics, no disks: unknown is not empty.
+        assert_eq!(postgres_disks("# nothing yet\n", Some(1)), []);
+    }
+
+    #[test]
+    fn weirs_store_is_its_volume_less_what_is_free() {
+        let stats = serde_json::json!({"tables": [], "volume": {"bytes": 1000, "free": 250}});
+        assert_eq!(
+            weir_disk(&stats),
+            Some(Disk {
+                name: "store",
+                used: 750,
+                size: Some(1000)
+            })
+        );
+        assert_eq!(weir_disk(&serde_json::json!({"tables": []})), None);
     }
 }

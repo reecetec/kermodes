@@ -17,7 +17,7 @@ import {
 } from '@/catalog/model';
 import { usePolled } from '@/deployments/data';
 import { bytes, matchesSearch } from '@/deployments/model';
-import { Field } from '@/deployments/parts';
+import { DiskUse, Field } from '@/deployments/parts';
 
 const parseCatalog = (r: Response) => r.json() as Promise<Catalog>;
 
@@ -238,7 +238,6 @@ export function CatalogPage({ onOpen }: { onOpen: (table: string) => void }) {
     });
 
   const volume = catalog?.volume;
-  const used = volume ? volume.bytes - volume.free : 0;
   const spaces = new Set(tables.map(t => namespaceOf(t.table))).size;
   const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
   return (
@@ -284,21 +283,12 @@ export function CatalogPage({ onOpen }: { onOpen: (table: string) => void }) {
             {count(all.today)} rows today · history {size(all.historyBytes)}
           </span>
           {volume && (
-            <span
-              className="flex items-center gap-2 text-xs text-muted-foreground tabular-nums"
-              title={`${bytes(volume.free)} free`}
-            >
-              weir volume
-              <span className="h-1.5 w-24 overflow-hidden rounded-full bg-muted">
-                <span
-                  className={cn(
-                    'block h-full',
-                    used / volume.bytes > 0.85 ? 'bg-destructive' : 'bg-primary'
-                  )}
-                  style={{ width: `${(100 * used) / volume.bytes}%` }}
-                />
-              </span>
-              {bytes(used)} of {bytes(volume.bytes)}
+            <span title={`${bytes(volume.free)} free`}>
+              <DiskUse
+                name="weir volume"
+                used={volume.bytes - volume.free}
+                size={volume.bytes}
+              />
             </span>
           )}
         </div>

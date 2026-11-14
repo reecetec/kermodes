@@ -45,6 +45,10 @@ rules:
   - apiGroups: [metrics.k8s.io]
     resources: [pods]
     verbs: [list]
+  # The Deployments tab's disks: Postgres's data volume sizes.
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    verbs: [list]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

@@ -42,7 +42,12 @@ export type Instance = {
   cpu_limit: number | null;
   memory: number;
   memory_limit: number | null;
+  /** Its volumes: weir's store; Postgres's data (its databases) and WAL */
+  disks: Disk[];
 };
+
+/** A volume of a pod: bytes in use, and its size when known */
+export type Disk = { name: string; used: number; size: number | null };
 
 /** A platform component: weir, Postgres, the controller, or the web UI */
 export type Component = {

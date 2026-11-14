@@ -92,7 +92,7 @@ async fn logs(
 
 /// The platform's own components: weir, Postgres, the controller, and the web UI.
 async fn components(State(controller): State<Arc<Controller>>) -> Response {
-    match controller.kube.components().await {
+    match controller.kube.components(&controller.config.weir).await {
         Ok(components) => axum::Json(components).into_response(),
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
     }
