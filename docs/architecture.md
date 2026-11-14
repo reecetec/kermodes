@@ -465,8 +465,9 @@ date is one catalog transaction, and weir deletes its copy only after that commi
 ### 8.1 Layout
 
 Parquet files written by Kermodes to object storage through `object_store`: at
-`KERMODES_HISTORY` (`s3://kermodes-history/{branch}` on rustfs in the cluster, credentials from
-the `AWS_*` variables of a user scoped to that bucket), or in `lake` beside a local store.
+`KERMODES_HISTORY` (`s3://kermodes-history` on rustfs in the cluster, credentials from the `AWS_*`
+variables of a user scoped to that bucket), or in `lake` beside a local store. Table locations
+begin with their branch, so one bucket holds every branch's history.
 
 ```
 {lake}/{location}/{first_date}-{file_id}.parquet      the catalog holds each file's date range
