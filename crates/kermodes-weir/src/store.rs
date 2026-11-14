@@ -18,7 +18,7 @@ use arrow::record_batch::RecordBatch;
 
 use crate::catalog::{Catalog, TableEntry};
 use crate::partition::Partition;
-use crate::{Error, SourceId, TableName};
+use crate::{Date, Error, SourceId, TableName};
 
 /// The branch a local store's tables live on (architecture.md §10.1).
 pub const BRANCH: &str = "local";
@@ -183,11 +183,12 @@ impl Store {
         name: &TableName,
         mut subscriber: Subscriber,
     ) -> Result<SchemaRef, Error> {
-        let today = utc_date(
+        let today = Date::of_ns(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.as_nanos() as i64),
-        );
+        )
+        .to_string();
         let log = self.log(name)?;
         // Batches delivered so far, by partition.
         let mut delivered: BTreeMap<(String, SourceId), usize> = BTreeMap::new();
@@ -287,7 +288,7 @@ impl Writer {
         let ingest_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos() as i64);
-        let date = utc_date(ingest_ns);
+        let date = Date::of_ns(ingest_ns).to_string();
         let mut guard = lock(&self.log.state);
         let log = &mut *guard;
         let seq = match seq {
@@ -410,40 +411,8 @@ fn names(schema: &Schema) -> String {
         .join(", ")
 }
 
-/// `YYYY-MM-DD` of a UTC instant in nanoseconds since the epoch.
-fn utc_date(ns: i64) -> String {
-    // Days to civil date (Howard Hinnant's `civil_from_days`).
-    let days = ns.div_euclid(86_400_000_000_000);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!("{year:04}-{month:02}-{day:02}")
-}
-
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .expect("kermodes store poisoned by an earlier panic")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::utc_date;
-
-    #[test]
-    fn utc_dates_follow_the_calendar() {
-        let day = 86_400_000_000_000_i64;
-        assert_eq!(utc_date(0), "1970-01-01");
-        assert_eq!(utc_date(-1), "1969-12-31");
-        assert_eq!(utc_date(1_767_225_600 * 1_000_000_000), "2026-01-01");
-        // 2024 is a leap year; 2100 is not.
-        assert_eq!(utc_date(19_782 * day), "2024-02-29");
-        assert_eq!(utc_date(47_541 * day), "2100-03-01");
-    }
 }

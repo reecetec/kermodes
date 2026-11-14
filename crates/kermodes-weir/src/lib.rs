@@ -15,7 +15,7 @@ use std::fmt;
 use std::path::Path;
 
 pub use catalog::TableEntry;
-pub use names::{SourceId, TableName};
+pub use names::{Date, SourceId, TableName};
 pub use store::{BRANCH, Pace, Store, Subscriber, Writer, conform};
 
 #[derive(Debug)]
