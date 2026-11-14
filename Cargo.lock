@@ -1604,6 +1604,7 @@ dependencies = [
  "kermodes-flight",
  "kermodes-gateway",
  "kermodes-ingest",
+ "kermodes-lake",
  "kermodes-weir",
  "libmimalloc-sys",
  "mimalloc",

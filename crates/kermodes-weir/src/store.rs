@@ -112,6 +112,11 @@ impl Store {
         lock(&self.catalog).list(&self.branch)
     }
 
+    /// The store's directory.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// The table called `name`.
     pub fn table(&self, name: &TableName) -> Result<TableEntry, Error> {
         lock(&self.catalog)

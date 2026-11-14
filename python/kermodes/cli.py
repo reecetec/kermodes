@@ -174,6 +174,22 @@ def main(argv: list[str] | None = None) -> None:
         help="created once the run can take over from one it replaces (readiness probes)",
     )
 
+    merge = commands.add_parser(
+        "merge",
+        help="move a past date of a table from weir into its history",
+        description="Moves DATE of TABLE from weir into history (architecture.md §8.3): "
+        "written as Parquet beside the store or at $KERMODES_HISTORY, committed to the "
+        "catalog, then dropped from weir. Running it again changes nothing. On a server's "
+        "tables (--server, $KERMODES_URL, else kermodes dev) or a local store (--data-dir).",
+    )
+    merge.add_argument("table", help="namespace.table")
+    merge.add_argument("date", help="YYYY-MM-DD, before today (UTC)")
+    store = merge.add_mutually_exclusive_group()
+    store.add_argument("--server", help="the store server")
+    store.add_argument(
+        "--data-dir", type=Path, help="a local store instead of a server"
+    )
+
     args = parser.parse_args(argv)
     # A supervisor stops a process with SIGTERM: shut down as on Ctrl-C.
     signal.signal(signal.SIGTERM, signal.default_int_handler)
@@ -214,6 +230,18 @@ def main(argv: list[str] | None = None) -> None:
         run_control(args.config)
     elif args.command == "fetch-snapshot":
         fetch_snapshot(args.url, args.dest)
+    elif args.command == "merge":
+        session = (
+            km.local(args.data_dir)
+            if args.data_dir
+            else connect_when_up(args.server, "kermodes merge")
+        )
+        moved = session.merge_history(args.table, args.date)
+        print(
+            f"{args.table} {args.date}: {moved['rows']} rows into {moved['files']} files, "
+            f"{moved['replaced']} replaced",
+            flush=True,
+        )
 
 
 def run_control(config_path: Path) -> None:

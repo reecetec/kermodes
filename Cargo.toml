@@ -19,6 +19,7 @@ kermodes-control = { path = "crates/kermodes-control" }
 kermodes-flight = { path = "crates/kermodes-flight" }
 kermodes-gateway = { path = "crates/kermodes-gateway" }
 kermodes-ingest = { path = "crates/kermodes-ingest" }
+kermodes-lake = { path = "crates/kermodes-lake" }
 kermodes-weir = { path = "crates/kermodes-weir" }
 
 # Line tables are enough for backtraces; full debug info makes compiles, links, and target/ far

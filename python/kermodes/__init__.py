@@ -4,10 +4,18 @@ import os
 from os import PathLike
 
 from kermodes import demo
-from kermodes._native import KermodesError, Session, Table, Writer, merge
+from kermodes._native import (
+    HistoricalTable,
+    KermodesError,
+    Session,
+    Table,
+    Writer,
+    merge,
+)
 from kermodes.project import deployment, ingester, websocket
 
 __all__ = [
+    "HistoricalTable",
     "KermodesError",
     "Session",
     "Table",

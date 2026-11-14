@@ -23,4 +23,5 @@ kermodes-flight.workspace = true
 kermodes-gateway.workspace = true
 kermodes-control.workspace = true
 kermodes-ingest.workspace = true
+kermodes-lake.workspace = true
 kermodes-weir.workspace = true

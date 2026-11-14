@@ -61,6 +61,28 @@ pub fn read_history(
     first: Option<Date>,
     last: Option<Date>,
 ) -> Result<History, Error> {
+    history(weir, lake, name, first, last, true)
+}
+
+/// What `read_history` would touch, from the catalog and the files' footers alone.
+pub fn explain_history(
+    weir: &dyn Weir,
+    lake: &Lake,
+    name: &TableName,
+    first: Option<Date>,
+    last: Option<Date>,
+) -> Result<Explain, Error> {
+    history(weir, lake, name, first, last, false).map(|history| history.explain)
+}
+
+fn history(
+    weir: &dyn Weir,
+    lake: &Lake,
+    name: &TableName,
+    first: Option<Date>,
+    last: Option<Date>,
+    rows: bool,
+) -> Result<History, Error> {
     let entry = weir.entry(name)?;
     let schema = with_date_column(&entry.schema);
     let first = first.unwrap_or(Date::MIN);
@@ -82,8 +104,13 @@ pub fn read_history(
     let mut parts: Vec<(Date, Vec<RecordBatch>)> = Vec::new();
     if first <= last {
         for file in weir.history_files(name, first, last)? {
+            // A file's footer is read here; its row groups only as the batches are taken.
             let mut batches = lake.read(&entry.location, &file.name, first, last)?;
-            let read = batches.by_ref().collect::<Result<Vec<_>, _>>()?;
+            let read = if rows {
+                batches.by_ref().collect::<Result<Vec<_>, _>>()?
+            } else {
+                Vec::new()
+            };
             explain.files.0 += 1;
             explain.row_groups.0 += batches.row_groups.0;
             explain.row_groups.1 += batches.row_groups.1;
@@ -96,10 +123,12 @@ pub fn read_history(
                 continue;
             }
             let mut read = Vec::new();
-            weir.read_date(name, date, &mut |batch| {
-                read.push(dated(&schema, date, &batch)?);
-                Ok(())
-            })?;
+            if rows {
+                weir.read_date(name, date, &mut |batch| {
+                    read.push(dated(&schema, date, &batch)?);
+                    Ok(())
+                })?;
+            }
             explain.weir_dates += 1;
             parts.push((date, read));
         }

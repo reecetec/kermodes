@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use arrow::array::{Array, ArrayIterator, ArrayRef, AsArray, RecordBatch, StructArray};
@@ -83,6 +83,8 @@ impl Key {
 pub struct Session {
     engine: kermodes_core::Session,
     tables: Option<Tables>,
+    /// Where history's files are, opened on first use (`Session::lake`).
+    lake: OnceLock<Arc<kermodes_lake::Lake>>,
 }
 
 /// Where a session's stored tables are: a store this process owns, or a server's.
@@ -93,6 +95,14 @@ enum Tables {
 }
 
 impl Tables {
+    /// What history needs of the store: this process's, or the server's.
+    fn weir(&self) -> &dyn kermodes_lake::Weir {
+        match self {
+            Tables::Local(store) => store.as_ref(),
+            Tables::Remote(client) => client,
+        }
+    }
+
     fn create_table(
         &self,
         name: &kermodes_weir::TableName,
@@ -213,6 +223,7 @@ impl Session {
         Ok(Self {
             engine: kermodes_core::Session::new(),
             tables,
+            lake: OnceLock::new(),
         })
     }
 
@@ -340,6 +351,43 @@ impl Session {
         Ok(Writer(writer))
     }
 
+    /// The stored table `name`'s history (architecture.md §8), a `HistoricalTable`: nothing is
+    /// read until it is used, so `where` can read only the dates it asks for.
+    fn historical_table(&self, py: Python<'_>, name: &str) -> PyResult<HistoricalTable> {
+        let tables = self.stored()?.clone();
+        let name = kermodes_weir::TableName::parse(name).map_err(store_error)?;
+        py.detach(|| tables.schema(&name)).map_err(store_error)?;
+        Ok(HistoricalTable {
+            engine: self.engine.clone(),
+            tables,
+            lake: self.lake()?,
+            name,
+        })
+    }
+
+    /// Moves a past `date` (`YYYY-MM-DD`) of the stored table `name` from weir into its
+    /// history, and says what moved: `{"rows", "files", "replaced"}`. Run again, it changes
+    /// nothing.
+    fn merge_history<'py>(
+        &self,
+        py: Python<'py>,
+        name: &str,
+        date: &str,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let tables = self.stored()?;
+        let name = kermodes_weir::TableName::parse(name).map_err(store_error)?;
+        let date = kermodes_weir::Date::parse(date).map_err(store_error)?;
+        let lake = self.lake()?;
+        let merged = py
+            .detach(|| kermodes_lake::merge(tables.weir(), &lake, &name, date))
+            .map_err(store_error)?;
+        let moved = PyDict::new(py);
+        moved.set_item("rows", merged.rows)?;
+        moved.set_item("files", merged.files)?;
+        moved.set_item("replaced", merged.replaced)?;
+        Ok(moved)
+    }
+
     /// The stored table `name`, ticking: every row written so far, then each batch as it is
     /// written. Its rows come only from its writers.
     fn live_table(&self, py: Python<'_>, name: &str) -> PyResult<Table> {
@@ -435,6 +483,98 @@ impl Session {
                  one with km.connect(url)",
             )
         })
+    }
+
+    /// History's files: at `KERMODES_HISTORY` (`s3://bucket/prefix` in the cluster), or in
+    /// `lake` beside a store this process owns.
+    fn lake(&self) -> PyResult<Arc<kermodes_lake::Lake>> {
+        if let Some(lake) = self.lake.get() {
+            return Ok(lake.clone());
+        }
+        let url = match (std::env::var("KERMODES_HISTORY").ok(), self.stored()?) {
+            (Some(url), _) => url,
+            (None, Tables::Local(store)) => store.root().join("lake").display().to_string(),
+            (None, Tables::Remote(_)) => {
+                return Err(KermodesError::new_err(
+                    "history is in object storage: set KERMODES_HISTORY to where \
+                     (s3://bucket/prefix)",
+                ));
+            }
+        };
+        let lake = Arc::new(kermodes_lake::Lake::open(&url).map_err(store_error)?);
+        Ok(self.lake.get_or_init(|| lake).clone())
+    }
+}
+
+/// A stored table's history (`Session.historical_table`): nothing is read until it is used.
+#[pyclass(module = "kermodes", name = "HistoricalTable", frozen)]
+pub struct HistoricalTable {
+    engine: kermodes_core::Session,
+    tables: Tables,
+    lake: Arc<kermodes_lake::Lake>,
+    name: kermodes_weir::TableName,
+}
+
+#[pymethods]
+impl HistoricalTable {
+    /// Rows for which `predicate` is true. Its `and`-ed comparisons of `Date` with a date
+    /// (`Date = '2026-11-12'`, `Date >= '2026-11-01'`) choose the dates read: only their files,
+    /// and in those only their row groups.
+    #[pyo3(name = "where")]
+    fn where_(&self, py: Python<'_>, predicate: &str) -> PyResult<Table> {
+        let (first, last) = kermodes_lake::date_bounds(predicate);
+        py.detach(|| {
+            self.read(first, last)?
+                .filter(predicate)
+                .map_err(engine_error)
+        })
+        .map(Table)
+    }
+
+    /// All of it.
+    fn table(&self, py: Python<'_>) -> PyResult<Table> {
+        py.detach(|| self.read(None, None)).map(Table)
+    }
+
+    /// What `where(predicate)`, or `table()` without one, would read: files, row groups, and
+    /// bytes, from the catalog and the files' footers alone.
+    #[pyo3(signature = (predicate=None))]
+    fn explain(&self, py: Python<'_>, predicate: Option<&str>) -> PyResult<String> {
+        let (first, last) = predicate.map_or((None, None), kermodes_lake::date_bounds);
+        let explain = py
+            .detach(|| {
+                kermodes_lake::explain_history(
+                    self.tables.weir(),
+                    &self.lake,
+                    &self.name,
+                    first,
+                    last,
+                )
+            })
+            .map_err(store_error)?;
+        let bound =
+            |date: Option<kermodes_weir::Date>| date.map_or("…".into(), |d| d.to_string());
+        Ok(format!(
+            "{} {} to {}: {explain}",
+            self.name,
+            bound(first),
+            bound(last)
+        ))
+    }
+}
+
+impl HistoricalTable {
+    fn read(
+        &self,
+        first: Option<kermodes_weir::Date>,
+        last: Option<kermodes_weir::Date>,
+    ) -> PyResult<kermodes_core::Table> {
+        let history =
+            kermodes_lake::read_history(self.tables.weir(), &self.lake, &self.name, first, last)
+                .map_err(store_error)?;
+        self.engine
+            .static_table(history.schema, history.batches)
+            .map_err(engine_error)
     }
 }
 
@@ -1208,8 +1348,8 @@ impl Viewer {
 mod _native {
     #[pymodule_export]
     use super::{
-        Ingest, IngestStats, Server, Session, StoreServer, Table, Ticker, Viewer, Writer, control,
-        merge, ticker,
+        HistoricalTable, Ingest, IngestStats, Server, Session, StoreServer, Table, Ticker, Viewer,
+        Writer, control, merge, ticker,
     };
 
     use pyo3::prelude::*;

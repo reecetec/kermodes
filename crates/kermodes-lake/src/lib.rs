@@ -14,5 +14,5 @@ pub use bounds::date_bounds;
 pub use files::{Batches, DATE, Lake, TARGET_FILE_BYTES, Written, with_date_column};
 pub use merge::{GARBAGE_GRACE, Merged, collect_garbage, merge};
 pub use plan::{Held, Incoming, Plan, plan};
-pub use read::{Explain, History, read_history};
+pub use read::{Explain, History, explain_history, read_history};
 pub use weir::Weir;
