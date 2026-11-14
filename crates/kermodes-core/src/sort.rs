@@ -227,7 +227,7 @@ fn pack(word: &[&Field], row: u32) -> u128 {
 }
 
 /// A sort key: an unsigned integer whose top bits pick a partition.
-trait Key: Ord + Copy + Default + Send + Sync {
+pub(crate) trait Key: Ord + Copy + Default + Send + Sync {
     fn top(self, shift: u32) -> usize;
 }
 
@@ -264,8 +264,13 @@ fn sort_pairs<K: Key>(order: &[u32], width: u32, mut pairs: Vec<(K, u32)>) -> Ve
     pairs.iter().map(|(_, at)| order[*at as usize]).collect()
 }
 
-/// Partitions `pairs` by their key's top 8 bits, then sorts the partitions on `threads` cores.
-fn partitioned_sort<K: Key>(pairs: Vec<(K, u32)>, width: u32, threads: usize) -> Vec<(K, u32)> {
+/// Partitions `pairs` by their key's top 8 bits (of `width`), then sorts the partitions on
+/// `threads` cores: `pairs` sorted, as `sort_unstable` would.
+pub(crate) fn partitioned_sort<K: Key>(
+    pairs: Vec<(K, u32)>,
+    width: u32,
+    threads: usize,
+) -> Vec<(K, u32)> {
     let shift = width.saturating_sub(8);
     let mut counts = [0usize; 256];
     for (key, _) in &pairs {

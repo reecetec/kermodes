@@ -297,6 +297,72 @@ fn large_ticking_sort_follows_heavy_churn() {
     }
 }
 
+/// Cycles large enough to sort on every core: names that share a prefix and then the same 8
+/// bytes in three ways, so ties on those bytes need the rest of the name; prices that repeat and
+/// are NULL, so ties need the row key. The first cycle builds the order; the second gives every
+/// row new values, in an order unlike its keys', and deletes some.
+#[test]
+fn large_cycles_sort_on_every_core_like_the_static_sort() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("price", DataType::Float64, true),
+    ]));
+    let batch = |rng: &mut Rng, ids: Vec<i64>| {
+        let (mut names, mut prices) = (vec![], vec![]);
+        for _ in &ids {
+            let kind = ["equity--", "future--", "option--"][rng.below(3) as usize];
+            let name = format!("instrument/{kind}/{:04}", rng.below(10_000));
+            names.push(rng.maybe(name));
+            let price = rng.below(2_000) as f64 / 8.0 - 100.0;
+            prices.push(rng.maybe(price));
+        }
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids)) as ArrayRef,
+                Arc::new(StringArray::from(names)),
+                Arc::new(Float64Array::from(prices)),
+            ],
+        )
+        .unwrap()
+    };
+    let orders: &[&[(&str, bool)]] = &[
+        &[("name", false)],
+        &[("price", true), ("name", false)],
+        &[("name", true), ("price", false)],
+    ];
+    let mut rng = Rng(5);
+    let session = Session::new();
+    let input = session.keyed_input_table(&schema, &["id"]).unwrap();
+    let sorts: Vec<Table> = orders.iter().map(|keys| sort_by(&input, keys)).collect();
+    for cycle in 0..2 {
+        if cycle == 0 {
+            input
+                .upsert(&[batch(&mut rng, (0..300_000).collect())])
+                .unwrap();
+        } else {
+            // 7919 is prime to 300,000: every id once, shuffled.
+            let moved = (0..300_000).map(|i| (i * 7919) % 300_000).collect();
+            input.upsert(&[batch(&mut rng, moved)]).unwrap();
+            let gone: Vec<i64> = (0..30_000).map(|_| rng.below(300_000) as i64).collect();
+            let ids =
+                RecordBatch::try_from_iter([("id", Arc::new(Int64Array::from(gone)) as ArrayRef)])
+                    .unwrap();
+            input.delete(&[ids]).unwrap();
+        }
+        session.step();
+        let fixed = session
+            .static_table(schema.clone(), input.snapshot().unwrap())
+            .unwrap();
+        for (sorted, keys) in sorts.iter().zip(orders) {
+            let context = format!("cycle {cycle}, by {keys:?}");
+            assert_eq!(rows(sorted), rows(&sort_by(&fixed, keys)), "{context}");
+            assert_windows_match(sorted, &context);
+        }
+    }
+}
+
 #[test]
 fn nothing_is_built_on_a_ticking_sort_and_entries_are_clear() {
     let session = Session::new();
