@@ -56,8 +56,10 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # Dependencies (arrow's kernels above all) optimised: the engine's oracle tests run in half
+      # the time, and the compile cache keeps them built.
       - name: Run Rust tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --config 'profile.dev.package."*".opt-level=3'
 
       - name: Check for a second arrow-rs major
         run: |
