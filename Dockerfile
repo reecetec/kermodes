@@ -3,28 +3,27 @@
 # every role (`kermodes weir`, `kermodes ui`, ...). Built once per release and promoted as is.
 # Image names are fully qualified: CI builds with buildah, which does not guess registries.
 
-ARG RUST_VERSION=1.98.1
+# The image CI checks with (ci/Dockerfile): the same Rust, Bun, and uv build the release.
+ARG CI_IMAGE=git.rcolclough.com/rcolclough/kermodes-ci:rust1.98.1-bun1.4.2-sccache0.19.0
 
-# The web app and the notebook widget, which the wheel serves from kermodes/static.
-FROM docker.io/oven/bun:1.4.2 AS web
-WORKDIR /src/web
-COPY web/ ./
-RUN bun install --frozen-lockfile && bun run build
-
-FROM ghcr.io/astral-sh/uv:0.13.7-python3.14-trixie-slim AS wheel
-ARG RUST_VERSION
-ENV CARGO_HOME=/usr/local/cargo \
-    RUSTUP_HOME=/usr/local/rustup \
-    PATH=/usr/local/cargo/bin:$PATH
-RUN apt-get update && \
-    apt-get install --yes --no-install-recommends build-essential ca-certificates curl && \
-    rm -rf /var/lib/apt/lists/* && \
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-    sh -s -- -y --profile minimal --default-toolchain "$RUST_VERSION"
+# The wheel, with the web app and notebook widget it serves from kermodes/static. With sccache's
+# credentials as build secrets (the release job passes them), compiles share CI's cache on
+# rustfs; secrets never land in a layer.
+FROM ${CI_IMAGE} AS wheel
+ARG SCCACHE_ENDPOINT=http://rustfs-svc.rustfs.svc.cluster.local:9000
 WORKDIR /src
 COPY . .
-COPY --from=web /src/python/kermodes/static python/kermodes/static
-RUN uv build --wheel --out-dir /dist
+RUN --mount=type=secret,id=sccache_id --mount=type=secret,id=sccache_key \
+    if [ -s /run/secrets/sccache_id ]; then \
+        export RUSTC_WRAPPER=sccache CARGO_INCREMENTAL=0 SCCACHE_BUCKET=kermodes-sccache \
+            SCCACHE_ENDPOINT="$SCCACHE_ENDPOINT" SCCACHE_REGION=us-east-1 \
+            SCCACHE_S3_USE_SSL=false SCCACHE_IGNORE_SERVER_IO_ERROR=1 \
+            AWS_ACCESS_KEY_ID="$(cat /run/secrets/sccache_id)" \
+            AWS_SECRET_ACCESS_KEY="$(cat /run/secrets/sccache_key)"; \
+    fi && \
+    (cd web && bun install --frozen-lockfile && bun run build) && \
+    uv build --wheel --out-dir /dist && \
+    if [ -n "${RUSTC_WRAPPER:-}" ]; then sccache --show-stats; fi
 
 FROM docker.io/library/python:3.14-slim-trixie AS runtime
 ARG IMAGE_CREATED

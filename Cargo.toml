@@ -21,6 +21,12 @@ kermodes-gateway = { path = "crates/kermodes-gateway" }
 kermodes-ingest = { path = "crates/kermodes-ingest" }
 kermodes-weir = { path = "crates/kermodes-weir" }
 
+# Dependencies (arrow's kernels above all) optimised in dev and test builds: the engine's oracle
+# tests run in half the time, while workspace crates stay quick to rebuild. Dependencies compile
+# once, then come from the build cache (sccache in CI).
+[profile.dev.package."*"]
+opt-level = 3
+
 # Editable Python builds (uv sync): optimised enough to use the engine, fast to rebuild.
 [profile.dev-py]
 inherits = "release"
