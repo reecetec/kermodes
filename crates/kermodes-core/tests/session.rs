@@ -144,6 +144,7 @@ fn a_failed_table_fails_its_dependents_but_not_the_session() {
 fn a_fed_table_that_loses_its_source_fails_with_its_dependents() {
     let session = Session::new();
     let (fed, feed) = session.fed_table(&schema(), "live md.ticks").unwrap();
+    feed.ready();
     let downstream = fed.filter("size > 0").unwrap();
     feed.append(&[rows(&["a"], &[1])]).unwrap();
     session.step();
@@ -342,6 +343,7 @@ fn rows_at_positions_match_the_snapshot() {
 fn a_fed_table_is_fed_while_a_table_is_built_on_it() {
     let session = Session::new();
     let (fed, feed) = session.fed_table(&schema(), "live md.ticks").unwrap();
+    feed.ready();
     let downstream = fed.filter("size > 0").unwrap();
     drop(fed);
     assert!(feed.append(&[rows(&["a"], &[1])]).unwrap());
@@ -355,4 +357,40 @@ fn a_fed_table_is_fed_while_a_table_is_built_on_it() {
         !feed.append(&[rows(&["c"], &[3])]).unwrap(),
         "nothing uses it"
     );
+}
+
+/// A fed table loads whole: what its store held when it subscribed shows in one cycle, once the
+/// feed says it is all there, not batch by batch as it arrives. A lost source fails it at once.
+#[test]
+fn a_fed_table_loads_whole_once_ready() {
+    let session = Session::new();
+    let (fed, feed) = session.fed_table(&schema(), "live md.ticks").unwrap();
+    let downstream = fed.filter("size > 0").unwrap();
+    assert!(fed.is_loading());
+    assert!(
+        downstream.is_loading(),
+        "a table built on it is loading too"
+    );
+    feed.append(&[rows(&["a"], &[1])]).unwrap();
+    session.step();
+    feed.append(&[rows(&["b"], &[2])]).unwrap();
+    session.step();
+    assert!(
+        sizes(&downstream).is_empty(),
+        "nothing shows while it loads"
+    );
+
+    feed.ready();
+    let cycle = session.step();
+    assert!(!fed.is_loading() && !downstream.is_loading());
+    assert_eq!(sizes(&downstream), [1, 2]);
+    assert_eq!(fed.changed(), cycle, "all of it in one cycle");
+    feed.append(&[rows(&["c"], &[3])]).unwrap();
+    session.step();
+    assert_eq!(sizes(&downstream), [1, 2, 3]);
+
+    let (lost, feed) = session.fed_table(&schema(), "live md.quotes").unwrap();
+    feed.fail("the store closed the stream".into());
+    session.step();
+    assert!(matches!(lost.snapshot(), Err(Error::Source { .. })));
 }

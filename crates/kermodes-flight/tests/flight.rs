@@ -92,6 +92,9 @@ fn clients_share_a_served_store() {
     let sink = seen.clone();
     let lost = Arc::new(Mutex::new(None::<String>));
     let reason = lost.clone();
+    // How many values the reader had when told it caught up: all the table held, no fewer.
+    let at_caught_up = Arc::new(Mutex::new(None::<Vec<i64>>));
+    let (had, ready) = (seen.clone(), at_caught_up.clone());
     let schema = reader
         .subscribe(
             &ticks(),
@@ -100,11 +103,21 @@ fn clients_share_a_served_store() {
                 sink.lock().unwrap().extend(n.values().iter().copied());
                 true
             }),
+            Box::new(move || *ready.lock().unwrap() = Some(had.lock().unwrap().clone())),
             Box::new(move |why| *reason.lock().unwrap() = Some(why)),
         )
         .unwrap();
     assert_eq!(schema.field(1).name(), "sym");
     eventually(&seen, &[0, 1, 2]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while at_caught_up.lock().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "never told it caught up");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        at_caught_up.lock().unwrap().as_deref(),
+        Some(&[0, 1, 2][..])
+    );
     // Columns in another order are matched by name.
     let reordered = RecordBatch::try_from_iter([
         ("sym", Arc::new(StringArray::from(vec!["x"])) as ArrayRef),
@@ -265,6 +278,7 @@ fn a_long_history_reaches_a_remote_reader_once_while_writes_go_on() {
                 }
                 true
             }),
+            Box::new(|| {}),
             Box::new(|why| panic!("lost the stream: {why}")),
         )
         .unwrap();
@@ -330,6 +344,7 @@ fn keyed_changes_cross_the_wire_with_their_kind() {
                 sink.lock().unwrap().push((change, rows));
                 true
             }),
+            Box::new(|| {}),
             Box::new(|_| {}),
         )
         .unwrap();

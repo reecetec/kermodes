@@ -22,9 +22,9 @@ use tonic::Streaming;
 use tonic::transport::Channel;
 
 use crate::{
-    MAX_WRITE_BYTES, columns_json, commit_json, date_from_json, error_from_status,
-    garbage_from_json, garbage_json, history_date_from_json, history_file_from_json,
-    list_from_json, names_from_json, schema_from_json, stamp_of,
+    CAUGHT_UP, MARKS_CAUGHT_UP, MAX_WRITE_BYTES, columns_json, commit_json, date_from_json,
+    error_from_status, garbage_from_json, garbage_json, history_date_from_json,
+    history_file_from_json, list_from_json, names_from_json, schema_from_json, stamp_of,
 };
 
 /// Connected to a store's Flight server. Calls block until the server answers. Clones share the
@@ -325,20 +325,24 @@ impl Client {
     }
 
     /// Feeds `subscriber` every committed batch of `name`, then each new one, from a background
-    /// task until it returns `false`; returns the table's schema. If the stream ends first (the
-    /// server stopped, the connection broke), `lost` gets the reason: the subscriber would
-    /// otherwise wait forever on rows that cannot come.
+    /// task until it returns `false`; returns the table's schema. `caught_up` runs once the
+    /// batches the table held when it subscribed are all given (at once, from a server too old to
+    /// say). If the stream ends first (the server stopped, the connection broke), `lost` gets the
+    /// reason: the subscriber would otherwise wait forever on rows that cannot come.
     pub fn subscribe(
         &self,
         name: &TableName,
         mut subscriber: Subscriber,
+        caught_up: Box<dyn FnOnce() + Send>,
         lost: Box<dyn FnOnce(String) + Send>,
     ) -> Result<SchemaRef, Error> {
         let mut flight = self.flight.clone();
         let ticket = Ticket {
-            ticket: json!({"table": name.to_string()}).to_string().into(),
+            ticket: json!({"table": name.to_string(), "caught_up": true})
+                .to_string()
+                .into(),
         };
-        let (schema, mut decoded) = self.runtime.block_on(async move {
+        let (schema, marks, mut decoded) = self.runtime.block_on(async move {
             let data = flight
                 .do_get(ticket)
                 .await
@@ -350,8 +354,9 @@ impl Client {
             loop {
                 match decoded.next().await {
                     Some(Ok(message)) => {
+                        let marks = message.inner.app_metadata.as_ref() == MARKS_CAUGHT_UP;
                         if let DecodedPayload::Schema(schema) = message.payload {
-                            return Ok((schema, decoded));
+                            return Ok((schema, marks, decoded));
                         }
                     }
                     Some(Err(e)) => return Err(Error::Io(e.to_string())),
@@ -359,12 +364,23 @@ impl Client {
                 }
             }
         })?;
+        let mut caught_up = Some(caught_up);
+        if !marks && let Some(ready) = caught_up.take() {
+            ready();
+        }
         let name = name.to_string();
         self.runtime.spawn(async move {
             let reason = loop {
                 match decoded.next().await {
-                    Some(Ok(message)) => {
-                        if let DecodedPayload::RecordBatch(batch) = message.payload {
+                    Some(Ok(message)) => match message.payload {
+                        DecodedPayload::RecordBatch(_)
+                            if message.inner.app_metadata.as_ref() == CAUGHT_UP =>
+                        {
+                            if let Some(ready) = caught_up.take() {
+                                ready();
+                            }
+                        }
+                        DecodedPayload::RecordBatch(batch) => {
                             let stamp = match stamp_of(&message.inner.app_metadata, now_ns) {
                                 Ok(stamp) => stamp,
                                 Err(e) => break e.to_string(),
@@ -373,7 +389,8 @@ impl Client {
                                 return;
                             }
                         }
-                    }
+                        _ => {}
+                    },
                     Some(Err(e)) => break format!("the stream of {name} broke: {e}"),
                     None => break format!("the server ended the stream of {name}"),
                 }

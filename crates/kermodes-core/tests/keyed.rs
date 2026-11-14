@@ -429,6 +429,7 @@ fn a_fed_keyed_table_holds_each_keys_latest_row() {
         let (book, feed) = session
             .fed_keyed_table(&schema(), &["sym"], "md.quotes")
             .unwrap();
+        feed.ready();
         let mut model = std::collections::BTreeMap::new();
         let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
         let mut next = |below: u64| {
@@ -486,6 +487,7 @@ fn a_fed_keyed_table_is_written_only_through_its_feed() {
     let (book, feed) = session
         .fed_keyed_table(&schema(), &["sym"], "md.quotes")
         .unwrap();
+    feed.ready();
     assert!(matches!(
         book.upsert(&[quotes(&[("a", 1.0)])]),
         Err(Error::Unsupported(_))

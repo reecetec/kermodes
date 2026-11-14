@@ -51,6 +51,9 @@ struct Inner {
     graph: RwLock<Graph>,
     /// Writes waiting for the next cycle, in arrival order.
     pending: Mutex<Vec<(usize, Write)>>,
+    /// Writes of tables still loading (`Feed::ready`), in arrival order: apart from `pending`,
+    /// so the clock sleeps while they wait.
+    held: Mutex<Vec<(usize, Write)>>,
     /// Signalled when writes are queued or the clock is told to stop.
     arrived: Condvar,
     /// The background clock started by `Session::start`, if running.
@@ -199,6 +202,9 @@ struct TableState {
     released: bool,
     /// Told each cycle's changes (`Table::on_changes`).
     listeners: Vec<Listener>,
+    /// A fed table not yet given what its store held when it subscribed (`Feed::ready`): its
+    /// writes wait, so it loads in one cycle rather than in pieces.
+    loading: bool,
 }
 
 /// One cycle's changes to a table, as Arrow: rows added, rows removed (with their last values),
@@ -669,11 +675,16 @@ impl Feed {
         let session = Session {
             inner: self.session.upgrade()?,
         };
-        let released = session.read().tables[self.id].released;
+        let (released, loading) = {
+            let graph = session.read();
+            let table = &graph.tables[self.id];
+            (table.released, table.loading)
+        };
         (!released).then(|| Target {
             session,
             id: self.id,
             schema: self.schema.clone(),
+            hold: loading,
         })
     }
 }
@@ -756,6 +767,26 @@ impl Feed {
         table.queue(std::iter::once(Write::Fail(message)));
         true
     }
+
+    /// The table has everything its source held when it subscribed: the writes waiting so far
+    /// apply together at the next cycle, and later ones as they come.
+    pub fn ready(&self) {
+        let Some(inner) = self.session.upgrade() else {
+            return;
+        };
+        let session = Session { inner };
+        // Under the graph's lock, as `step` takes `pending`: the held writes go first, before
+        // any a cycle could take ahead of them.
+        let mut graph = session.write();
+        graph.tables[self.id].loading = false;
+        let mut held = session.held();
+        let (ready, waiting): (Vec<_>, Vec<_>) = held.drain(..).partition(|(id, _)| *id == self.id);
+        *held = waiting;
+        drop(held);
+        session.pending().splice(0..0, ready);
+        drop(graph);
+        session.inner.arrived.notify_all();
+    }
 }
 
 /// A table in a session. Cheap to clone; clones refer to the same table. The table lives while
@@ -787,7 +818,7 @@ impl Session {
 
     /// An append-only refreshing table whose rows arrive only through the returned `Feed`, for
     /// tables a store keeps (weir's live tables): their writers go through the store, and
-    /// `Table::append` refuses them. Every column is nullable.
+    /// `Table::append` refuses them. Every column is nullable. It loads until `Feed::ready`.
     pub fn fed_table(&self, schema: &Schema, description: &str) -> Result<(Table, Feed), Error> {
         let schema = nullable(schema)?;
         let table = self.add(TableState::new(
@@ -797,6 +828,7 @@ impl Session {
             Growth::AppendOnly,
             Source::Fed,
         ));
+        self.write().tables[table.id].loading = true;
         let feed = Feed::of(&table);
         Ok((table, feed))
     }
@@ -813,7 +845,8 @@ impl Session {
     }
 
     /// A keyed table whose upserts and deletes arrive only through the returned `Feed`, for keyed
-    /// tables a store keeps (weir's), as `fed_table` is for append tables.
+    /// tables a store keeps (weir's), as `fed_table` is for append tables. It loads until
+    /// `Feed::ready`.
     pub fn fed_keyed_table(
         &self,
         schema: &Schema,
@@ -821,6 +854,7 @@ impl Session {
         description: &str,
     ) -> Result<(Table, Feed), Error> {
         let table = self.keyed(schema, key, description.to_owned(), true)?;
+        self.write().tables[table.id].loading = true;
         let feed = Feed::of(&table);
         Ok((table, feed))
     }
@@ -873,13 +907,27 @@ impl Session {
     /// Runs one cycle: applies pending writes to input tables, then updates every refreshing
     /// derived table in creation order. Returns the cycle number.
     pub fn step(&self) -> u64 {
-        let pending = std::mem::take(&mut *self.pending());
         let mut graph = self.write();
+        // Taken under the graph's lock, as `Feed::ready` moves held writes: no cycle runs a
+        // table's later writes before its held ones.
+        let pending = std::mem::take(&mut *self.pending());
         let cycle = graph.cycle + 1;
         let mut writes: Vec<Vec<Write>> = graph.tables.iter().map(|_| Vec::new()).collect();
-        for (id, write) in pending {
-            writes[id].push(write);
+        // A loading table's writes wait until it is ready, so it loads whole; once it is, those
+        // still held (a write that raced `Feed::ready`) go first.
+        let mut held = self.held();
+        let (ready, waiting): (Vec<_>, Vec<_>) = held
+            .drain(..)
+            .partition(|(id, _)| !graph.tables[*id].loading);
+        *held = waiting;
+        for (id, write) in ready.into_iter().chain(pending) {
+            if graph.tables[id].loading && !matches!(write, Write::Fail(_)) {
+                held.push((id, write));
+            } else {
+                writes[id].push(write);
+            }
         }
+        drop(held);
         for (index, writes) in writes.into_iter().enumerate() {
             let (before, rest) = graph.tables.split_at_mut(index);
             let table = &mut rest[0];
@@ -1107,6 +1155,13 @@ impl Session {
             .lock()
             .expect("kermodes write queue poisoned by an earlier panic")
     }
+
+    fn held(&self) -> MutexGuard<'_, Vec<(usize, Write)>> {
+        self.inner
+            .held
+            .lock()
+            .expect("kermodes write queue poisoned by an earlier panic")
+    }
 }
 
 impl TableState {
@@ -1169,6 +1224,7 @@ impl TableState {
             dependents: 0,
             released: false,
             listeners: Vec::new(),
+            loading: false,
         }
     }
 
@@ -1396,6 +1452,21 @@ impl Table {
         self.session.read().tables[self.id].refreshing
     }
 
+    /// Whether it, or a table it is computed from, is a fed table still loading what its store
+    /// held (`Feed::ready`): its rows are not all there yet.
+    pub fn is_loading(&self) -> bool {
+        let graph = self.session.read();
+        let mut tables = vec![self.id];
+        while let Some(id) = tables.pop() {
+            let table = &graph.tables[id];
+            if table.loading {
+                return true;
+            }
+            tables.extend(table.source.parents());
+        }
+        false
+    }
+
     /// Queues rows for the next cycle. Columns are matched by name; all batches are checked
     /// before any is queued.
     pub fn append(&self, batches: &[RecordBatch]) -> Result<(), Error> {
@@ -1425,6 +1496,7 @@ impl Table {
             session: self.session.clone(),
             id: self.id,
             schema: self.schema.clone(),
+            hold: false,
         }
     }
 
@@ -2274,6 +2346,8 @@ struct Target {
     session: Session,
     id: usize,
     schema: SchemaRef,
+    /// It is loading (`Feed::ready`): its writes wait apart, and wake no cycle.
+    hold: bool,
 }
 
 impl Target {
@@ -2289,9 +2363,17 @@ impl Target {
         )))
     }
 
+    /// Queues `writes` for the next cycle, or, while the table loads, holds them; a lost source
+    /// (`Write::Fail`) never waits.
     fn queue(&self, writes: impl Iterator<Item = Write>) {
-        self.session.pending().extend(writes.map(|w| (self.id, w)));
-        self.session.inner.arrived.notify_all();
+        let (now, later): (Vec<_>, Vec<_>) = writes
+            .map(|write| (self.id, write))
+            .partition(|(_, write)| !self.hold || matches!(write, Write::Fail(_)));
+        self.session.held().extend(later);
+        if !now.is_empty() {
+            self.session.pending().extend(now);
+            self.session.inner.arrived.notify_all();
+        }
     }
 
     fn queue_upserts(&self, batches: &[RecordBatch]) -> Result<(), Error> {

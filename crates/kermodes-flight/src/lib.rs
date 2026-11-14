@@ -109,6 +109,15 @@ fn names_from_json(value: &Value) -> Result<Vec<String>, Error> {
     })
 }
 
+/// A subscription that asks (`"caught_up": true` in its ticket) gets this on its schema
+/// message: the server marks the end of its replay (`CAUGHT_UP`). A client that does not see it
+/// (a server before the marker) treats the table as caught up at once.
+const MARKS_CAUGHT_UP: &[u8] = b"marks-caught-up";
+
+/// The `app_metadata` of the empty batch that ends a subscription's replay of what the table
+/// held when it subscribed; what follows is live. Twelve bytes, never a stamp's nine.
+const CAUGHT_UP: &[u8] = b"caught-up-v1";
+
 /// A read batch's `app_metadata`: its change kind (one byte, `Change::code`), then when it
 /// arrived (ns, i64 little-endian).
 fn stamp_metadata(stamp: Stamp) -> Vec<u8> {

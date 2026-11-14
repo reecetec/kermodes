@@ -419,6 +419,11 @@ catalog as live tables.
   replayed into every reader, whose memory would otherwise grow with every day kept. A live table
   never drops rows at midnight: a reader that subscribed yesterday keeps yesterday's rows and goes
   on getting today's, while one that subscribes today starts from today.
+- A subscription's stream marks where its replay ends and the tail begins (an empty batch
+  tagged `caught-up-v1`, sent only to readers that ask). An engine's live table holds what it is
+  given until then (it reads as "loading…"), then shows it in one cycle: a reader that starts or
+  restarts sees the table whole, not filling batch by batch. Only that reader waits; weir, its
+  writers, and other readers do not.
 - Replays deliver batches in commit order across sources, empty ones included (an empty
   checkpoint clears a reader's keyed table). A keyed table's replay starts from its latest
   checkpoint and the changes committed after it, so a reader starts near now however busy the

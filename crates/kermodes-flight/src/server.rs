@@ -24,8 +24,9 @@ use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::{
-    columns_json, commit_from_json, garbage_from_json, garbage_json, history_date_json,
-    history_file_json, names_from_json, schema_from_json, stamp_metadata, status,
+    CAUGHT_UP, MARKS_CAUGHT_UP, columns_json, commit_from_json, garbage_from_json, garbage_json,
+    history_date_json, history_file_json, names_from_json, schema_from_json, stamp_metadata,
+    status,
 };
 
 /// Bytes queued for one reader while it catches up: the replay waits for the reader past this,
@@ -162,22 +163,41 @@ fn ack(last_seq: Option<u64>, written: bool) -> PutResult {
     }
 }
 
+/// What a reader's stream carries after the schema: a batch with its stamp, or (a subscription)
+/// the end of the replay of what the table held when it subscribed.
+enum Sent {
+    Batch(RecordBatch, Stamp),
+    CaughtUp,
+}
+
 /// The schema, then each batch in messages of its own, tagged with its stamp (`app_metadata`,
-/// `stamp_metadata`). Large batches still split into several messages,
-/// each tagged; an empty one, which the encoder would drop, is one message (an empty checkpoint
-/// clears a keyed table).
+/// `stamp_metadata`). Large batches still split into several messages, each tagged; an empty
+/// one, which the encoder would drop, is one message (an empty checkpoint clears a keyed table).
+/// With `marks` (a subscription that asked), the schema message says `MARKS_CAUGHT_UP`, and the
+/// end of its replay is an empty batch tagged `CAUGHT_UP`.
 fn tagged(
     schema: arrow::datatypes::SchemaRef,
-    rows: impl futures::Stream<Item = Result<(RecordBatch, Stamp), FlightError>> + Send + 'static,
+    rows: impl futures::Stream<Item = Result<Sent, FlightError>> + Send + 'static,
+    marks: bool,
 ) -> Stream<FlightData> {
     let opening = FlightDataEncoderBuilder::new()
         .with_schema(schema.clone())
-        .build(stream::empty());
+        .build(stream::empty())
+        .map_ok(move |mut message| {
+            if marks {
+                message.app_metadata = MARKS_CAUGHT_UP.into();
+            }
+            message
+        });
     let batches = rows
         .then(move |row| {
             let schema = schema.clone();
             async move {
-                let (batch, stamp) = row?;
+                let (batch, metadata) = match row? {
+                    Sent::Batch(batch, stamp) => (batch, stamp_metadata(stamp)),
+                    // An empty batch: every reader decodes one.
+                    Sent::CaughtUp => (RecordBatch::new_empty(schema.clone()), CAUGHT_UP.to_vec()),
+                };
                 let messages: Vec<FlightData> = if batch.num_rows() == 0 {
                     let mut encoded =
                         arrow_flight::utils::batches_to_flight_data(&schema, [&batch])?;
@@ -191,10 +211,13 @@ fn tagged(
                         .try_collect()
                         .await?
                 };
-                let messages = messages.into_iter().map(move |mut message| {
-                    message.app_metadata = stamp_metadata(stamp).into();
-                    Ok(message)
-                });
+                let messages = messages
+                    .into_iter()
+                    .map(|mut message| {
+                        message.app_metadata = metadata.clone().into();
+                        Ok(message)
+                    })
+                    .collect::<Vec<_>>();
                 Ok::<_, FlightError>(stream::iter(messages))
             }
         })
@@ -307,17 +330,18 @@ impl FlightService for Service {
             let (store, name) = (self.store.clone(), name.clone());
             blocking(move || store.table(&name).map(|entry| entry.schema)).await?
         };
+        // Asked for since the marker; a reader before it would not know one.
+        let marks = ticket["caught_up"].as_bool() == Some(true);
         if !ticket["date"].is_null() {
             let date = date(&ticket, "date")?;
             // A past date's batches, then the end. The queue holds a few batches, so the read
             // keeps to the reader's pace and weir's memory stays bounded.
-            let (batches, mut receiver) =
-                mpsc::channel::<Result<(RecordBatch, Stamp), FlightError>>(4);
+            let (batches, mut receiver) = mpsc::channel::<Result<Sent, FlightError>>(4);
             let store = self.store.clone();
             tokio::task::spawn_blocking(move || {
                 let read = store.read_date(&name, date, &mut |batch, stamp| {
                     batches
-                        .blocking_send(Ok((batch, stamp)))
+                        .blocking_send(Ok(Sent::Batch(batch, stamp)))
                         .map_err(|_| Error::Io("the reader went".into()))
                 });
                 if let Err(e) = read {
@@ -325,11 +349,10 @@ impl FlightService for Service {
                 }
             });
             let rows = futures::stream::poll_fn(move |cx| receiver.poll_recv(cx));
-            return Ok(Response::new(tagged(schema, rows)));
+            return Ok(Response::new(tagged(schema, rows, false)));
         }
         // Batches sent to the reader's stream, and the bytes of them it has not taken yet.
-        let (batches, receiver) =
-            mpsc::unbounded_channel::<(Result<(RecordBatch, Stamp), FlightError>, usize)>();
+        let (batches, receiver) = mpsc::unbounded_channel::<(Result<Sent, FlightError>, usize)>();
         let queued = Arc::new(AtomicUsize::new(0));
         let store = self.store.clone();
         let sent = queued.clone();
@@ -359,12 +382,18 @@ impl FlightService for Service {
                     }
                     sent.fetch_add(size, Ordering::AcqRel);
                     // Fails once the reader went.
-                    subscriber.send((Ok((batch.clone(), stamp)), size)).is_ok()
+                    subscriber
+                        .send((Ok(Sent::Batch(batch.clone(), stamp)), size))
+                        .is_ok()
                 }),
             );
-            if let Err(e) = subscribed {
-                let _ = batches.send((Err(FlightError::Tonic(Box::new(status(e)))), 0));
-            }
+            // Everything the table held is sent; what follows is live.
+            let sent = match subscribed {
+                Ok(_) if marks => Ok(Sent::CaughtUp),
+                Ok(_) => return,
+                Err(e) => Err(FlightError::Tonic(Box::new(status(e)))),
+            };
+            let _ = batches.send((sent, 0));
         });
         let rows = futures::stream::unfold(receiver, move |mut receiver| {
             let queued = queued.clone();
@@ -374,7 +403,7 @@ impl FlightService for Service {
                 Some((batch, receiver))
             }
         });
-        Ok(Response::new(tagged(schema, rows)))
+        Ok(Response::new(tagged(schema, rows, marks)))
     }
 
     async fn do_action(

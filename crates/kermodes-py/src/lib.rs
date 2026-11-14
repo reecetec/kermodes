@@ -192,16 +192,25 @@ impl Tables {
             })
         });
         match self {
-            Tables::Local(store) => store.subscribe(name, subscriber).map(drop),
-            Tables::Remote(client) => client
-                .subscribe(
-                    name,
-                    subscriber,
-                    Box::new(move |reason| {
-                        feed.fail(reason);
-                    }),
-                )
-                .map(drop),
+            // The replay is done when it returns.
+            Tables::Local(store) => {
+                store.subscribe(name, subscriber)?;
+                feed.ready();
+                Ok(())
+            }
+            Tables::Remote(client) => {
+                let ready = feed.clone();
+                client
+                    .subscribe(
+                        name,
+                        subscriber,
+                        Box::new(move || ready.ready()),
+                        Box::new(move |reason| {
+                            feed.fail(reason);
+                        }),
+                    )
+                    .map(drop)
+            }
         }
     }
 
@@ -1348,7 +1357,9 @@ impl Table {
     /// The first `rows` rows as an HTML table, with the row count, or the table's error.
     fn _preview_html(&self, py: Python<'_>, rows: usize) -> PyResult<String> {
         let (preview, status) = py.detach(|| {
-            let status = if self.0.is_refreshing() {
+            let status = if self.0.is_loading() {
+                "loading…".to_owned()
+            } else if self.0.is_refreshing() {
                 format!("ticking · updated in cycle {}", self.0.changed())
             } else {
                 "static".to_owned()
