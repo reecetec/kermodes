@@ -53,7 +53,7 @@ impl StoredTable {
                 let yesterday = Date::from_days(today.days() - 1);
                 let before = last.map_or(yesterday, |last| last.min(yesterday));
                 parts.push(
-                    self.history(first, before)?
+                    self.history(first, before, predicate)?
                         .filter(predicate)
                         .map_err(engine_error)?,
                 );
@@ -92,6 +92,7 @@ impl StoredTable {
                     name,
                     Some(first),
                     Some(before),
+                    &kermodes_lake::column_bounds(predicate),
                 )
                 .map_err(store_error)
             })?;
@@ -109,8 +110,9 @@ impl StoredTable {
         self.lake.clone().map_err(KermodesError::new_err)
     }
 
-    /// `first` to `last` of history, read now.
-    fn history(&self, first: Date, last: Date) -> PyResult<kermodes_core::Table> {
+    /// `first` to `last` of history, read now: only the row groups and pages `predicate`'s
+    /// bounds allow.
+    fn history(&self, first: Date, last: Date, predicate: &str) -> PyResult<kermodes_core::Table> {
         let lake = self.lake()?;
         let history = kermodes_lake::read_history(
             self.tables.weir(),
@@ -118,6 +120,7 @@ impl StoredTable {
             &self.entry.name,
             Some(first),
             Some(last),
+            &kermodes_lake::column_bounds(predicate),
         )
         .map_err(store_error)?;
         self.engine

@@ -563,9 +563,12 @@ The engine reads history itself, on its static operator path (§9.1).
 
 - `db.historical_table(...)` is static. Date predicates in its `where` are pushed down: the
   catalog returns only files whose date range overlaps them, the reader skips row groups by their
-  statistics (a packed small date costs its own row groups, not its pack), and key predicates
-  skip further by statistics and the page index. `EXPLAIN` shows files and row groups considered
-  and read. A date sealed but not yet merged is read from weir, so history has no gap.
+  statistics (a packed small date costs its own row groups, not its pack). The predicate's other
+  top-level `and`-ed comparisons of a column with a value (`sym = 'AAPL'`, `px > 10`) skip row
+  groups and pages by their statistics and the page index; on a sorted table (§8.1) a symbol is
+  a narrow run of pages in each row group. The engine still applies the whole predicate.
+  `EXPLAIN` shows files, row groups, and rows considered and read. A date sealed but not yet
+  merged is read from weir, so history has no gap.
 - `db.live_table(...)` is today's rows at subscription, then every row written after, across
   midnight too: nothing leaves at midnight, and memory grows with the run's uptime. A run that
   restarts starts from today again, so a program needing earlier rows reads them from history

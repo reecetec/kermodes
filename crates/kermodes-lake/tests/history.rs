@@ -84,7 +84,7 @@ fn history(store: &Store, lake: &Lake, first: Date, last: Date) -> Vec<i64> {
     let location = store.table(&ticks()).unwrap().location;
     let mut n = Vec::new();
     for file in store.history_files(&ticks(), first, last).unwrap() {
-        for batch in lake.read(&location, &file.name, first, last).unwrap() {
+        for batch in lake.read(&location, &file.name, first, last, &[]).unwrap() {
             let batch = batch.unwrap();
             n.extend(batch.column(1).as_primitive::<Int64Type>().values().iter());
         }
@@ -178,7 +178,7 @@ fn a_merge_cut_short_after_its_commit_finishes_by_dropping() {
     let store = store_with(&root, &[(d(1), &[("a", &[1, 2])])]);
     assert_eq!(store.date_rows(&ticks(), d(1)).unwrap().0, 2);
     // In both places: a read takes it from history alone.
-    let read = read_history(&store, &lake, &ticks(), None, None).unwrap();
+    let read = read_history(&store, &lake, &ticks(), None, None, &[]).unwrap();
     assert_eq!((rows(&read).len(), read.explain.weir_dates), (2, 0));
 
     assert_eq!(
@@ -274,7 +274,7 @@ fn history_reads_only_the_dates_asked_for() {
 
     let (one, two, three) = (d(1).days(), d(2).days(), d(3).days());
     for weir in [&*store as &dyn Weir, &client] {
-        let read = |first, last| read_history(weir, &lake, &ticks(), first, last).unwrap();
+        let read = |first, last| read_history(weir, &lake, &ticks(), first, last, &[]).unwrap();
 
         let all = read(None, None);
         let mut expected: Vec<(i32, i64)> = [1, 2, 3, 4, 5].map(|n| (one, n)).to_vec();
@@ -350,7 +350,7 @@ fn a_keyed_tables_history_is_its_log_of_changes() {
     let store = Store::open(&dir.0).unwrap();
     let lake = Lake::open(dir.0.join("lake").to_str().unwrap()).unwrap();
     let log = |store: &Store| -> Vec<(String, i64)> {
-        let history = read_history(store, &lake, &quotes, Some(d(1)), Some(d(1))).unwrap();
+        let history = read_history(store, &lake, &quotes, Some(d(1)), Some(d(1)), &[]).unwrap();
         let mut log = Vec::new();
         for batch in &history.batches {
             let ops = batch.column(1).as_string::<i32>();

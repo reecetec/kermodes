@@ -69,7 +69,7 @@ pub fn merge(weir: &dyn Weir, lake: &Lake, name: &TableName, date: Date) -> Resu
                     }
                     // A neighbour rewritten into the new file, from the file it was in.
                     for from in held.iter().filter(|h| h.date == day) {
-                        for batch in lake.read(&entry.location, &from.file, day, day)? {
+                        for batch in lake.read(&entry.location, &from.file, day, day, &[])? {
                             push(without_date(batch?)?)?;
                         }
                     }

@@ -667,12 +667,14 @@ pub struct HistoricalTable {
 impl HistoricalTable {
     /// Rows for which `predicate` is true. Its `and`-ed comparisons of `Date` with a date
     /// (`Date = '2026-11-12'`, `Date >= '2026-11-01'`) choose the dates read: only their files,
-    /// and in those only their row groups.
+    /// and in those only their row groups; its comparisons of other columns with values
+    /// (`sym = 'AAPL'`) skip the row groups and pages whose statistics rule them out.
     #[pyo3(name = "where")]
     fn where_(&self, py: Python<'_>, predicate: &str) -> PyResult<Table> {
         let (first, last) = kermodes_lake::date_bounds(predicate);
+        let bounds = kermodes_lake::column_bounds(predicate);
         py.detach(|| {
-            self.read(first, last)?
+            self.read(first, last, &bounds)?
                 .filter(predicate)
                 .map_err(engine_error)
         })
@@ -681,14 +683,15 @@ impl HistoricalTable {
 
     /// All of it.
     fn table(&self, py: Python<'_>) -> PyResult<Table> {
-        py.detach(|| self.read(None, None)).map(Table)
+        py.detach(|| self.read(None, None, &[])).map(Table)
     }
 
-    /// What `where(predicate)`, or `table()` without one, would read: files, row groups, and
-    /// bytes, from the catalog and the files' footers alone.
+    /// What `where(predicate)`, or `table()` without one, would read: files, row groups, rows,
+    /// and bytes, from the catalog and the files' footers and page indexes alone.
     #[pyo3(signature = (predicate=None))]
     fn explain(&self, py: Python<'_>, predicate: Option<&str>) -> PyResult<String> {
         let (first, last) = predicate.map_or((None, None), kermodes_lake::date_bounds);
+        let bounds = predicate.map_or_else(Vec::new, kermodes_lake::column_bounds);
         let explain = py
             .detach(|| {
                 kermodes_lake::explain_history(
@@ -697,6 +700,7 @@ impl HistoricalTable {
                     &self.name,
                     first,
                     last,
+                    &bounds,
                 )
             })
             .map_err(store_error)?;
@@ -716,10 +720,17 @@ impl HistoricalTable {
         &self,
         first: Option<kermodes_weir::Date>,
         last: Option<kermodes_weir::Date>,
+        bounds: &[kermodes_lake::Bound],
     ) -> PyResult<kermodes_core::Table> {
-        let history =
-            kermodes_lake::read_history(self.tables.weir(), &self.lake, &self.name, first, last)
-                .map_err(store_error)?;
+        let history = kermodes_lake::read_history(
+            self.tables.weir(),
+            &self.lake,
+            &self.name,
+            first,
+            last,
+            bounds,
+        )
+        .map_err(store_error)?;
         self.engine
             .static_table(history.schema, history.batches)
             .map_err(engine_error)

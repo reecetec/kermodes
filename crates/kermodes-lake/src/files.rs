@@ -8,7 +8,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arrow::array::{Array, ArrayRef, AsArray, Date32Array, RecordBatch, StringArray};
+use arrow::array::{
+    Array, ArrayRef, AsArray, Date32Array, Float64Array, Int64Array, RecordBatch, Scalar,
+    StringArray,
+};
+use arrow::compute::kernels::cmp::{gt_eq, lt_eq};
 use arrow::compute::{SortColumn, concat_batches, lexsort_to_indices, take_record_batch};
 use arrow::datatypes::{DataType, Date32Type, Field, Schema, SchemaRef};
 use bytes::Bytes;
@@ -22,17 +26,19 @@ use object_store::path::Path;
 use object_store::prefix::PrefixStore;
 use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt};
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
-use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
+use parquet::arrow::arrow_reader::{ArrowReaderOptions, RowSelection, RowSelector};
 use parquet::arrow::async_reader::{
     AsyncFileReader, MetadataSuffixFetch, ParquetRecordBatchStream,
 };
 use parquet::arrow::async_writer::AsyncArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::errors::ParquetError;
-use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
+use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use tokio::runtime::Runtime;
+
+use crate::bounds::{Bound, Literal};
 
 /// The size a history file grows to (§8.1).
 pub const TARGET_FILE_BYTES: u64 = 256 << 20;
@@ -252,33 +258,39 @@ impl Lake {
     }
 
     /// The rows of `first` to `last` in a history file, reading only the row groups of those
-    /// dates.
+    /// dates; and of those, only the row groups and pages whose statistics allow `bounds`. The
+    /// rows read may still include some outside them: the caller applies its predicate.
     pub fn read(
         &self,
         location: &str,
         file: &str,
         first: Date,
         last: Date,
+        bounds: &[Bound],
     ) -> Result<Batches<'_>, Error> {
         let path = Path::from(format!("{location}/{file}"));
         let reader = StoreReader {
             store: self.store.clone(),
             path,
         };
+        let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
         self.runtime.block_on(async {
-            let builder = ParquetRecordBatchStreamBuilder::new(reader)
+            let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
                 .await
                 .map_err(parquet_error)?;
-            let dates =
-                StatisticsConverter::try_new(DATE, builder.schema(), builder.parquet_schema())
-                    .map_err(parquet_error)?;
-            let groups = builder.metadata().row_groups();
+            let metadata = builder.metadata().clone();
+            let groups = metadata.row_groups();
+            let statistics = |column: &str| {
+                StatisticsConverter::try_new(column, builder.schema(), builder.parquet_schema())
+                    .map_err(parquet_error)
+            };
+            let dates = statistics(DATE)?;
             let mins = dates.row_group_mins(groups.iter()).map_err(parquet_error)?;
             let maxes = dates
                 .row_group_maxes(groups.iter())
                 .map_err(parquet_error)?;
             let (mins, maxes) = (as_dates(&mins)?, as_dates(&maxes)?);
-            let wanted: Vec<usize> = (0..groups.len())
+            let mut wanted: Vec<usize> = (0..groups.len())
                 .filter(|&g| {
                     mins.is_valid(g)
                         && maxes.is_valid(g)
@@ -286,15 +298,79 @@ impl Lake {
                         && maxes.value(g) >= first.days()
                 })
                 .collect();
+            // Bounds by column, for the columns the file has.
+            let mut columns: Vec<(&str, Vec<&Bound>)> = Vec::new();
+            for bound in bounds {
+                let column = bound.column();
+                if builder.schema().column_with_name(column).is_none() {
+                    continue;
+                }
+                match columns.iter_mut().find(|(c, _)| *c == column) {
+                    Some((_, of)) => of.push(bound),
+                    None => columns.push((column, vec![bound])),
+                }
+            }
+            for (column, bounds) in &columns {
+                let converter = statistics(column)?;
+                let mins = converter
+                    .row_group_mins(groups.iter())
+                    .map_err(parquet_error)?;
+                let maxes = converter
+                    .row_group_maxes(groups.iter())
+                    .map_err(parquet_error)?;
+                let keep = allowed(&mins, &maxes, bounds);
+                wanted.retain(|&g| keep[g]);
+            }
+            let mut selection: Option<RowSelection> = None;
+            if let Some(page_index) = metadata.page_index()
+                && !wanted.is_empty()
+            {
+                for (column, bounds) in &columns {
+                    let converter = statistics(column)?;
+                    let pages = |maxes: bool| {
+                        if maxes {
+                            converter.data_page_maxes(page_index.as_ref(), wanted.iter())
+                        } else {
+                            converter.data_page_mins(page_index.as_ref(), wanted.iter())
+                        }
+                        .map_err(parquet_error)
+                    };
+                    let (mins, maxes) = (pages(false)?, pages(true)?);
+                    let counts = converter
+                        .data_page_row_counts(page_index.as_ref(), groups, wanted.iter())
+                        .map_err(parquet_error)?;
+                    let Some(counts) = counts.filter(|c| c.null_count() == 0) else {
+                        continue;
+                    };
+                    let keep = allowed(&mins, &maxes, bounds);
+                    let pages: Vec<RowSelector> = (0..counts.len())
+                        .map(|page| match keep[page] {
+                            true => RowSelector::select(counts.value(page) as usize),
+                            false => RowSelector::skip(counts.value(page) as usize),
+                        })
+                        .collect();
+                    let pages = RowSelection::from(pages);
+                    selection = Some(match selection {
+                        Some(selection) => selection.intersection(&pages),
+                        None => pages,
+                    });
+                }
+            }
             let row_groups = (wanted.len(), groups.len());
-            let stream = builder
-                .with_row_groups(wanted)
-                .build()
-                .map_err(parquet_error)?;
+            let in_groups: u64 = wanted.iter().map(|&g| groups[g].num_rows() as u64).sum();
+            let selected = selection
+                .as_ref()
+                .map_or(in_groups, |selection| selection.row_count() as u64);
+            let mut builder = builder.with_row_groups(wanted);
+            if let Some(selection) = selection {
+                builder = builder.with_row_selection(selection);
+            }
+            let stream = builder.build().map_err(parquet_error)?;
             Ok(Batches {
                 runtime: &self.runtime,
                 stream,
                 row_groups,
+                rows: (selected, in_groups),
             })
         })
     }
@@ -396,6 +472,50 @@ pub struct Batches<'a> {
     stream: ParquetRecordBatchStream<StoreReader>,
     /// Row groups read, and in the file.
     pub row_groups: (usize, usize),
+    /// Rows read (the pages bounds allow), and in the row groups read.
+    pub rows: (u64, u64),
+}
+
+/// Which of a column's row groups or pages, given their minimums and maximums, may hold values
+/// within every one of `bounds`. Unknown statistics, or a literal that is not of the column's
+/// type, rule nothing out.
+fn allowed(mins: &ArrayRef, maxes: &ArrayRef, bounds: &[&Bound]) -> Vec<bool> {
+    let mut keep = vec![true; mins.len()];
+    for bound in bounds {
+        let (side, literal) = match bound {
+            Bound::Low(_, literal) => (maxes, literal),
+            Bound::High(_, literal) => (mins, literal),
+        };
+        let Some(value) = literal_as(literal, side.data_type()) else {
+            continue;
+        };
+        let value = Scalar::new(value);
+        let within = match bound {
+            Bound::Low(..) => gt_eq(side, &value),
+            Bound::High(..) => lt_eq(side, &value),
+        };
+        let Ok(within) = within else {
+            continue;
+        };
+        for (unit, keep) in keep.iter_mut().enumerate() {
+            // A null comparison (no statistics) keeps the unit.
+            *keep &= !within.is_valid(unit) || within.value(unit);
+        }
+    }
+    keep
+}
+
+/// `literal` as a one-value array of `data_type`, if it is one.
+fn literal_as(literal: &Literal, data_type: &DataType) -> Option<ArrayRef> {
+    let written: ArrayRef = match literal {
+        Literal::Text(text) => Arc::new(StringArray::from(vec![text.as_str()])),
+        Literal::Number(number) => match number.parse::<i64>() {
+            Ok(integer) => Arc::new(Int64Array::from(vec![integer])),
+            Err(_) => Arc::new(Float64Array::from(vec![number.parse::<f64>().ok()?])),
+        },
+    };
+    let cast = arrow::compute::cast(&written, data_type).ok()?;
+    cast.is_valid(0).then_some(cast)
 }
 
 impl Iterator for Batches<'_> {

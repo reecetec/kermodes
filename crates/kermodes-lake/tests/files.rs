@@ -56,7 +56,7 @@ fn d(day: u32) -> Date {
 
 /// Each row read: its `Date` and its `n`.
 fn read(lake: &Lake, file: &str, first: Date, last: Date) -> (Vec<(i32, i64)>, (usize, usize)) {
-    let mut batches = lake.read("md/ticks.1", file, first, last).unwrap();
+    let mut batches = lake.read("md/ticks.1", file, first, last, &[]).unwrap();
     let mut rows = Vec::new();
     for batch in batches.by_ref() {
         let batch = batch.unwrap();
@@ -200,7 +200,7 @@ fn a_sorted_tables_dates_are_written_in_sort_order() {
     let file = &written.files[0].name;
     for day in 1..=3 {
         let mut syms = Vec::new();
-        for batch in lake.read("md/ticks.1", file, d(day), d(day)).unwrap() {
+        for batch in lake.read("md/ticks.1", file, d(day), d(day), &[]).unwrap() {
             let batch = batch.unwrap();
             let column = batch.column(2).as_string::<i32>();
             syms.extend((0..batch.num_rows()).map(|i| column.value(i).to_string()));
@@ -217,4 +217,61 @@ fn a_sorted_tables_dates_are_written_in_sort_order() {
         1 << 30,
     );
     assert!(matches!(refused, Err(Error::Schema(_))), "{refused:?}");
+}
+
+/// A read bounded on a sorted column reads only the pages that can hold it, and still every row
+/// that matches.
+#[test]
+fn a_bounded_read_of_a_sorted_date_skips_the_pages_it_cannot_need() {
+    let dir = TempDir::new();
+    let lake = Lake::open(dir.0.to_str().unwrap()).unwrap();
+    const ROWS: i64 = 400_000;
+    let day = |_: Date, push: &mut dyn FnMut(RecordBatch) -> Result<(), Error>| {
+        let n: Vec<i64> = (0..ROWS).collect();
+        let syms: Vec<String> = n
+            .iter()
+            .map(|v| format!("sym-{:08}", (v * 7919) % 200))
+            .collect();
+        push(
+            RecordBatch::try_from_iter([
+                ("n", Arc::new(Int64Array::from(n)) as ArrayRef),
+                ("sym", Arc::new(StringArray::from(syms))),
+            ])
+            .unwrap(),
+        )
+    };
+    let written = lake
+        .write(
+            "md/ticks.1",
+            &schema(),
+            &["sym".to_string()],
+            &[d(1)],
+            day,
+            1 << 30,
+        )
+        .unwrap();
+    let file = &written.files[0].name;
+    let bounds = kermodes_lake::column_bounds("sym = 'sym-00000042'");
+    let mut batches = lake.read("md/ticks.1", file, d(1), d(1), &bounds).unwrap();
+    let (mut matching, mut returned) = (0, 0);
+    for batch in batches.by_ref() {
+        let batch = batch.unwrap();
+        returned += batch.num_rows() as u64;
+        let syms = batch.column(2).as_string::<i32>();
+        matching += (0..batch.num_rows())
+            .filter(|&i| syms.value(i) == "sym-00000042")
+            .count();
+    }
+    assert_eq!(
+        matching,
+        (ROWS / 200) as usize,
+        "every matching row is read"
+    );
+    let (read, held) = batches.rows;
+    assert_eq!(
+        (read, held),
+        (returned, ROWS as u64),
+        "the rows it says it reads"
+    );
+    assert!(read < held / 10, "{read} of {held} rows read");
 }

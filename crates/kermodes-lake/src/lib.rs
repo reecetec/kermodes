@@ -10,7 +10,7 @@ mod plan;
 mod read;
 mod weir;
 
-pub use bounds::date_bounds;
+pub use bounds::{Bound, Literal, column_bounds, date_bounds};
 pub use files::{
     Batches, DATE, Lake, TARGET_FILE_BYTES, Written, dated, history_columns, with_date_column,
     with_op,

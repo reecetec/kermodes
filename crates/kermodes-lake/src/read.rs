@@ -1,6 +1,6 @@
 //! Reading a table's history (architecture.md §8.4): from the files the catalog says hold the
-//! dates asked for, only their row groups; and the past dates weir holds that are not merged yet,
-//! so history has no gap.
+//! dates asked for, only their row groups, and of those the row groups and pages a predicate's
+//! bounds allow; and the past dates weir holds that are not merged yet, so history has no gap.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -9,6 +9,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use kermodes_weir::{Date, Error, TableName};
 
+use crate::bounds::Bound;
 use crate::files::{Lake, dated, history_columns, with_date_column, with_op};
 use crate::weir::Weir;
 
@@ -27,6 +28,8 @@ pub struct Explain {
     pub files: (usize, usize),
     /// Row groups read, and in the files read.
     pub row_groups: (usize, usize),
+    /// Rows read from files (the pages bounds allow), and in the row groups read.
+    pub rows: (u64, u64),
     /// Bytes of the dates read, and of the table's whole history.
     pub bytes: (u64, u64),
     /// Past dates read from weir, not merged yet.
@@ -37,11 +40,13 @@ impl fmt::Display for Explain {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} of {} files, {} of {} row groups, {} of {}",
+            "{} of {} files, {} of {} row groups, {} of {} rows, {} of {}",
             self.files.0,
             self.files.1,
             self.row_groups.0,
             self.row_groups.1,
+            self.rows.0,
+            self.rows.1,
             size(self.bytes.0),
             size(self.bytes.1)
         )?;
@@ -53,26 +58,31 @@ impl fmt::Display for Explain {
     }
 }
 
-/// `name`'s history from `first` to `last` (all of it where `None`).
+/// `name`'s history from `first` to `last` (all of it where `None`), reading from files only
+/// the row groups and pages `bounds` allow. Rows outside the bounds may still be read: the
+/// caller applies its predicate.
 pub fn read_history(
     weir: &dyn Weir,
     lake: &Lake,
     name: &TableName,
     first: Option<Date>,
     last: Option<Date>,
+    bounds: &[Bound],
 ) -> Result<History, Error> {
-    history(weir, lake, name, first, last, true)
+    history(weir, lake, name, first, last, bounds, true)
 }
 
-/// What `read_history` would touch, from the catalog and the files' footers alone.
+/// What `read_history` would touch, from the catalog and the files' footers and page indexes
+/// alone.
 pub fn explain_history(
     weir: &dyn Weir,
     lake: &Lake,
     name: &TableName,
     first: Option<Date>,
     last: Option<Date>,
+    bounds: &[Bound],
 ) -> Result<Explain, Error> {
-    history(weir, lake, name, first, last, false).map(|history| history.explain)
+    history(weir, lake, name, first, last, bounds, false).map(|history| history.explain)
 }
 
 fn history(
@@ -81,6 +91,7 @@ fn history(
     name: &TableName,
     first: Option<Date>,
     last: Option<Date>,
+    bounds: &[Bound],
     rows: bool,
 ) -> Result<History, Error> {
     let entry = weir.entry(name)?;
@@ -105,7 +116,7 @@ fn history(
     if first <= last {
         for file in weir.history_files(name, first, last)? {
             // A file's footer is read here; its row groups only as the batches are taken.
-            let mut batches = lake.read(&entry.location, &file.name, first, last)?;
+            let mut batches = lake.read(&entry.location, &file.name, first, last, bounds)?;
             let read = if rows {
                 batches.by_ref().collect::<Result<Vec<_>, _>>()?
             } else {
@@ -114,6 +125,8 @@ fn history(
             explain.files.0 += 1;
             explain.row_groups.0 += batches.row_groups.0;
             explain.row_groups.1 += batches.row_groups.1;
+            explain.rows.0 += batches.rows.0;
+            explain.rows.1 += batches.rows.1;
             parts.push((file.first.max(first), read));
         }
         let merged: BTreeSet<Date> = held.iter().map(|h| h.date).collect();

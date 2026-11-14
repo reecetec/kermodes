@@ -49,6 +49,93 @@ pub fn date_bounds(predicate: &str) -> (Option<Date>, Option<Date>) {
     (first, last)
 }
 
+/// A literal a predicate compares a column with, as written: typed only once compared with a
+/// file's column.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Literal {
+    Text(String),
+    Number(String),
+}
+
+/// One side of what a predicate allows a column (inclusive, so a strict bound reads a little
+/// more than it needs): `column >= low`, or `column <= high`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Bound {
+    Low(String, Literal),
+    High(String, Literal),
+}
+
+impl Bound {
+    pub fn column(&self) -> &str {
+        match self {
+            Bound::Low(column, _) | Bound::High(column, _) => column,
+        }
+    }
+}
+
+/// The bounds `predicate`'s top-level `and` terms put on its columns other than `Date` (which
+/// `date_bounds` gives): `sym = 'AAPL'` is a low and a high bound of `sym`. Rows outside any of
+/// them cannot match, so reads may skip the row groups and pages whose statistics say so.
+pub fn column_bounds(predicate: &str) -> Vec<Bound> {
+    let parsed = Parser::new(&GenericDialect {})
+        .try_with_sql(predicate)
+        .and_then(|mut parser| parser.parse_expr());
+    let Ok(ast) = parsed else {
+        return Vec::new();
+    };
+    let mut bounds = Vec::new();
+    for term in terms(&ast) {
+        let Expr::BinaryOp { left, op, right } = term else {
+            continue;
+        };
+        let (column, op, literal) = match (column_of(left), literal_of(right)) {
+            (Some(column), Some(literal)) => (column, op.clone(), literal),
+            _ => match (literal_of(left), column_of(right)) {
+                (Some(literal), Some(column)) => (column, flipped(op), literal),
+                _ => continue,
+            },
+        };
+        if column == DATE {
+            continue;
+        }
+        match op {
+            BinaryOperator::Eq => {
+                bounds.push(Bound::Low(column.clone(), literal.clone()));
+                bounds.push(Bound::High(column, literal));
+            }
+            BinaryOperator::Gt | BinaryOperator::GtEq => bounds.push(Bound::Low(column, literal)),
+            BinaryOperator::Lt | BinaryOperator::LtEq => bounds.push(Bound::High(column, literal)),
+            _ => {}
+        }
+    }
+    bounds
+}
+
+fn column_of(ast: &Expr) -> Option<String> {
+    match ast {
+        Expr::Identifier(ident) => Some(ident.value.clone()),
+        _ => None,
+    }
+}
+
+fn literal_of(ast: &Expr) -> Option<Literal> {
+    match ast {
+        Expr::Value(value) => match &value.value {
+            Value::SingleQuotedString(text) => Some(Literal::Text(text.clone())),
+            Value::Number(number, _) => Some(Literal::Number(number.clone())),
+            _ => None,
+        },
+        Expr::UnaryOp {
+            op: sqlparser::ast::UnaryOperator::Minus,
+            expr,
+        } => match literal_of(expr)? {
+            Literal::Number(number) => Some(Literal::Number(format!("-{number}"))),
+            Literal::Text(_) => None,
+        },
+        _ => None,
+    }
+}
+
 /// The terms of a predicate's top-level `and`s.
 fn terms(ast: &Expr) -> Vec<&Expr> {
     match ast {
@@ -95,7 +182,7 @@ fn flipped(op: &BinaryOperator) -> BinaryOperator {
 mod tests {
     use kermodes_weir::Date;
 
-    use super::date_bounds;
+    use super::{Bound, Literal, column_bounds, date_bounds};
 
     fn d(day: u32) -> Option<Date> {
         Some(Date::parse(&format!("2026-11-{day:02}")).unwrap())
@@ -125,6 +212,34 @@ mod tests {
         ];
         for (predicate, bounds) in cases {
             assert_eq!(date_bounds(predicate), bounds, "{predicate}");
+        }
+    }
+
+    #[test]
+    fn predicates_bound_the_columns_they_compare() {
+        let text = |s: &str| Literal::Text(s.into());
+        let number = |s: &str| Literal::Number(s.into());
+        let low = |c: &str, l: Literal| Bound::Low(c.into(), l);
+        let high = |c: &str, l: Literal| Bound::High(c.into(), l);
+        let cases = [
+            (
+                "sym = 'AAPL'",
+                vec![low("sym", text("AAPL")), high("sym", text("AAPL"))],
+            ),
+            (
+                "Date >= '2026-11-01' and px > 10 and px <= 20.5",
+                vec![low("px", number("10")), high("px", number("20.5"))],
+            ),
+            ("-5 < n", vec![low("n", number("-5"))]),
+            ("n > -5", vec![low("n", number("-5"))]),
+            // `or`, `not`, and comparisons of two columns say nothing.
+            ("sym = 'a' or sym = 'b'", vec![]),
+            ("not px > 1", vec![]),
+            ("px > n", vec![]),
+            ("px > ", vec![]),
+        ];
+        for (predicate, bounds) in cases {
+            assert_eq!(column_bounds(predicate), bounds, "{predicate}");
         }
     }
 }
