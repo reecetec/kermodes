@@ -468,12 +468,13 @@ Parquet files written by Kermodes to object storage (rustfs in the cluster, a lo
 local mode) through `object_store`.
 
 ```
-{lake}/{location}/{first_date}_{last_date}-{file_id}.parquet
+{lake}/{location}/{first_date}-{file_id}.parquet      the catalog holds each file's date range
 ```
 
 - **A date is the logical unit, not the physical one.** Every write replaces whole dates. A file
-  holds whole dates only: a big date has its own file (or several, split by key range), and
-  consecutive small dates share a pack. No file holds part of one date and part of another.
+  holds whole dates only: a big date is split over files of about the target size (by key range
+  once keys are declared, by arrival order until then), and consecutive small dates share a pack.
+  No file holds part of one date and part of another.
 - **Small dates are packed as part of the write.** Writing date `D` decides, by a pure planning
   function over the dates' sizes and the current files, what to write and what to delete: a
   small `D` joins the neighbouring pack while the result stays under the target file size
