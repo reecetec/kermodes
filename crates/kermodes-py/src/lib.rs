@@ -1,6 +1,7 @@
 //! `kermodes._native`: the engine exposed to Python. Engine work runs with the interpreter released.
 
 mod publish;
+mod stored;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -163,11 +164,11 @@ impl Tables {
         taking: Fed,
     ) -> Result<(), kermodes_weir::Error> {
         let rows = feed.clone();
-        let subscriber: kermodes_weir::Subscriber = Box::new(move |batch, change, _| {
+        let subscriber: kermodes_weir::Subscriber = Box::new(move |batch, stamp, _| {
             let fed = match &taking {
                 Fed::State => {
                     let batch = std::slice::from_ref(batch);
-                    match change {
+                    match stamp.change {
                         kermodes_weir::Change::Rows => rows.append(batch),
                         kermodes_weir::Change::Upsert => rows.upsert(batch),
                         kermodes_weir::Change::Delete => rows.delete(batch),
@@ -175,9 +176,15 @@ impl Tables {
                     }
                     .map_err(|e| e.to_string())
                 }
-                Fed::Log(entry) => kermodes_lake::with_op(entry, batch.clone(), change)
+                Fed::Log(entry) => kermodes_lake::with_op(entry, batch.clone(), stamp.change)
                     .map_err(|e| e.to_string())
                     .and_then(|logged| rows.append(&[logged]).map_err(|e| e.to_string())),
+                Fed::Dated(schema) => {
+                    let date = kermodes_weir::Date::of_ns(stamp.ingest_ns);
+                    kermodes_lake::dated(schema, date, batch)
+                        .map_err(|e| e.to_string())
+                        .and_then(|dated| rows.append(&[dated]).map_err(|e| e.to_string()))
+                }
             };
             fed.unwrap_or_else(|e| {
                 rows.fail(e);
@@ -213,11 +220,14 @@ impl Tables {
     }
 }
 
-/// How a fed table takes a stored table's changes: as the table they make (`live_table`), or as
-/// their log, each row with its kind as history keeps it (`changes`).
+/// How a fed table takes a stored table's changes: as the table they make (`live_table`), as
+/// their log, each row with its kind as history keeps it (`changes`), or as an append table's
+/// rows with the `Date` they arrived on, as history has them (`table`; the schema is history's,
+/// `Date` first).
 enum Fed {
     State,
     Log(kermodes_weir::TableEntry),
+    Dated(arrow::datatypes::SchemaRef),
 }
 
 enum SourceWriter {
@@ -413,6 +423,20 @@ impl Session {
             .detach(|| tables.writer(&name, &source, wait))
             .map_err(store_error)?;
         Ok(Writer(writer))
+    }
+
+    /// The stored table `name` across its history and today, a `StoredTable`: nothing is read
+    /// until `where` says which dates.
+    fn table(&self, py: Python<'_>, name: &str) -> PyResult<stored::StoredTable> {
+        let tables = self.stored()?.clone();
+        let name = kermodes_weir::TableName::parse(name).map_err(store_error)?;
+        let entry = py.detach(|| tables.entry(&name)).map_err(store_error)?;
+        Ok(stored::StoredTable {
+            engine: self.engine.clone(),
+            tables,
+            lake: self.lake().map_err(|e| e.to_string()),
+            entry,
+        })
     }
 
     /// The stored table `name`'s history (architecture.md §8), a `HistoricalTable`: nothing is
@@ -1509,7 +1533,7 @@ mod _native {
     #[pymodule_export]
     use super::{
         HistoricalTable, Ingest, IngestStats, Server, Session, StoreServer, Table, Ticker, Viewer,
-        Writer, control, merge, publish::Publication, ticker,
+        Writer, control, merge, publish::Publication, stored::StoredTable, ticker,
     };
 
     use pyo3::prelude::*;

@@ -40,9 +40,10 @@ struct Entry {
     change: Change,
 }
 
-/// What a batch was committed as: its change kind and when it arrived.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Stamp {
+/// What a batch was committed as: its change kind, and when it arrived (ns since the epoch, UTC),
+/// which dates it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stamp {
     pub change: Change,
     pub ingest_ns: i64,
 }

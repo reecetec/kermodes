@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use kermodes_core::{parse_type, type_name};
-use kermodes_weir::{Date, Error, Garbage, HistoryCommit, HistoryDate, HistoryFile};
+use kermodes_weir::{Change, Date, Error, Garbage, HistoryCommit, HistoryDate, HistoryFile, Stamp};
 use serde_json::{Value, json};
 use tonic::{Code, Status};
 
@@ -107,6 +107,41 @@ fn names_from_json(value: &Value) -> Result<Vec<String>, Error> {
             .map(str::to_owned)
             .ok_or_else(|| Error::Schema(format!("a column is named, not {column}")))
     })
+}
+
+/// A read batch's `app_metadata`: its change kind (one byte, `Change::code`), then when it
+/// arrived (ns, i64 little-endian).
+fn stamp_metadata(stamp: Stamp) -> Vec<u8> {
+    let mut metadata = vec![stamp.change.code()];
+    metadata.extend_from_slice(&stamp.ingest_ns.to_le_bytes());
+    metadata
+}
+
+/// A read batch's stamp (`stamp_metadata`). A server before keyed tables sends none (rows), one
+/// before ingest times only the change kind: the batch is then dated by when it was received.
+fn stamp_of(metadata: &[u8], received_ns: impl FnOnce() -> i64) -> Result<Stamp, Error> {
+    let change = |code: u8| {
+        Change::from_code(u32::from(code))
+            .ok_or_else(|| Error::Io(format!("a change kind ({code}) this client cannot read")))
+    };
+    match metadata {
+        [] => Ok(Stamp {
+            change: Change::Rows,
+            ingest_ns: received_ns(),
+        }),
+        [code] => Ok(Stamp {
+            change: change(*code)?,
+            ingest_ns: received_ns(),
+        }),
+        [code, ingest @ ..] => Ok(Stamp {
+            change: change(*code)?,
+            ingest_ns: i64::from_le_bytes(
+                ingest
+                    .try_into()
+                    .map_err(|_| Error::Io("batch metadata this client cannot read".into()))?,
+            ),
+        }),
+    }
 }
 
 fn history_date_json(held: &HistoryDate) -> Value {

@@ -20,18 +20,18 @@ use arrow::record_batch::RecordBatch;
 
 use crate::catalog::{Catalog, Garbage, HistoryCommit, HistoryDate, HistoryFile, TableEntry};
 use crate::keyed::Fold;
-use crate::partition::{Partition, in_order};
+use crate::partition::{Partition, Stamp, in_order};
 use crate::{Change, Date, Error, SourceId, TableName};
 
 /// The branch a local store's tables live on (architecture.md §10.1).
 pub const BRANCH: &str = "local";
 
-/// Receives a table's batches in order, each with its change kind: every batch committed today
-/// (UTC) when it subscribes (a keyed table's starting with its checkpoint), then each new one as
-/// it commits. Empty batches too: an empty checkpoint clears a keyed table. Returning `false`
-/// unsubscribes it (its reader is gone, or too far behind). `Pace` says whether it may wait for
-/// its reader before returning.
-pub type Subscriber = Box<dyn FnMut(&RecordBatch, Change, Pace) -> bool + Send>;
+/// Receives a table's batches in order, each with its stamp (change kind and ingest time): every
+/// batch committed today (UTC) when it subscribes (a keyed table's starting with its
+/// checkpoint), then each new one as it commits. Empty batches too: an empty checkpoint clears a
+/// keyed table. Returning `false` unsubscribes it (its reader is gone, or too far behind).
+/// `Pace` says whether it may wait for its reader before returning.
+pub type Subscriber = Box<dyn FnMut(&RecordBatch, Stamp, Pace) -> bool + Send>;
 
 /// Whether a subscriber may wait before taking the next batch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -321,7 +321,7 @@ impl Store {
             }
             for read in in_order(cursors) {
                 let (batch, stamp) = read?;
-                if !subscriber(&batch, stamp.change, pace) {
+                if !subscriber(&batch, stamp, pace) {
                     return Ok(schema);
                 }
             }
@@ -370,7 +370,7 @@ impl Store {
         &self,
         name: &TableName,
         date: Date,
-        each: &mut dyn FnMut(RecordBatch, Change) -> Result<(), Error>,
+        each: &mut dyn FnMut(RecordBatch, Stamp) -> Result<(), Error>,
     ) -> Result<(), Error> {
         past(date)?;
         let log = self.log(name)?;
@@ -383,7 +383,7 @@ impl Store {
             .collect();
         for read in in_order(cursors) {
             let (batch, stamp) = read?;
-            each(batch, stamp.change)?;
+            each(batch, stamp)?;
         }
         Ok(())
     }
@@ -568,8 +568,9 @@ impl Writer {
         if !partition.append(batch, seq, ingest_ns, self.epoch, change)? {
             return Ok(false);
         }
+        let stamp = Stamp { change, ingest_ns };
         log.subscribers
-            .retain_mut(|subscriber| subscriber(batch, change, Pace::MustNotWait));
+            .retain_mut(|subscriber| subscriber(batch, stamp, Pace::MustNotWait));
         if !log.entry.key.is_empty() {
             log.since_checkpoint += batch.get_array_memory_size();
             // Past the last checkpoint's own size too, so folding costs in proportion to the

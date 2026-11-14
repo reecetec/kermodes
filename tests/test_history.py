@@ -82,3 +82,27 @@ def test_today_is_not_history_yet(tmp_path):
         s.merge_history("md.ticks", today)
     with pytest.raises(km.KermodesError, match="no table"):
         s.historical_table("md.nope")
+
+
+def test_a_stored_table_is_its_history_then_today_ticking(tmp_path):
+    s = store_with_past_days(tmp_path)
+    s.merge_history("md.ticks", "2026-11-01")  # 11-02 and 11-03 stay in weir, unmerged
+    w = s.writer("md.ticks", source="feed")
+    w.write(pa.table({"sym": ["d", "e"], "px": [7.0, 0.1]}))
+    today = datetime.now(UTC).date()
+    ticks = s.table("md.ticks")
+    rich = ticks.where("Date >= '2026-11-02' and px > 1")
+    s.step()
+    want = expected(lambda day, sym, px: day >= date(2026, 11, 2) and px > 1)
+    assert rows(pa.table(rich)) == sorted(want + [(today, "d", 7.0)])
+    # Today ticks.
+    w.write(pa.table({"sym": ["f"], "px": [8.0]}))
+    s.step()
+    assert rows(pa.table(rich)) == sorted(want + [(today, "d", 7.0), (today, "f", 8.0)])
+    # A range that ends before today reads history alone.
+    past = ticks.where("Date <= '2026-11-02' and Date >= '2026-11-01'")
+    assert rows(pa.table(past)) == expected(lambda day, *_: day <= date(2026, 11, 2))
+    plan = ticks.explain("Date >= '2026-11-02'")
+    assert "2026-11-02 to" in plan and "ticking from weir" in plan
+    with pytest.raises(ValueError, match="say which dates"):
+        ticks.where("px > 1")

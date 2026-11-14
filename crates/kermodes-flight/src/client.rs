@@ -12,7 +12,7 @@ use arrow_flight::utils::batches_to_flight_data;
 use arrow_flight::{Action, FlightData, FlightDescriptor, PutResult, Ticket};
 use futures::{StreamExt, TryStreamExt};
 use kermodes_weir::{
-    Change, Date, Error, Garbage, HistoryCommit, HistoryDate, HistoryFile, Pace, SourceId,
+    Change, Date, Error, Garbage, HistoryCommit, HistoryDate, HistoryFile, Pace, SourceId, Stamp,
     Subscriber, TableEntry, TableName, conform, keys_only,
 };
 use serde_json::{Value, json};
@@ -24,7 +24,7 @@ use tonic::transport::Channel;
 use crate::{
     MAX_WRITE_BYTES, columns_json, commit_json, date_from_json, error_from_status,
     garbage_from_json, garbage_json, history_date_from_json, history_file_from_json,
-    list_from_json, names_from_json, schema_from_json,
+    list_from_json, names_from_json, schema_from_json, stamp_of,
 };
 
 /// Connected to a store's Flight server. Calls block until the server answers. Clones share the
@@ -190,7 +190,7 @@ impl Client {
         &self,
         name: &TableName,
         date: Date,
-        each: &mut dyn FnMut(RecordBatch, Change) -> Result<(), Error>,
+        each: &mut dyn FnMut(RecordBatch, Stamp) -> Result<(), Error>,
     ) -> Result<(), Error> {
         let mut flight = self.flight.clone();
         let ticket = Ticket {
@@ -212,7 +212,7 @@ impl Client {
             match message {
                 Ok(message) => {
                     if let DecodedPayload::RecordBatch(batch) = message.payload {
-                        each(batch, change_of(&message.inner.app_metadata)?)?;
+                        each(batch, stamp_of(&message.inner.app_metadata, now_ns)?)?;
                     }
                 }
                 Err(FlightError::Tonic(status)) => return Err(error_from_status(&status)),
@@ -365,11 +365,11 @@ impl Client {
                 match decoded.next().await {
                     Some(Ok(message)) => {
                         if let DecodedPayload::RecordBatch(batch) = message.payload {
-                            let change = match change_of(&message.inner.app_metadata) {
-                                Ok(change) => change,
+                            let stamp = match stamp_of(&message.inner.app_metadata, now_ns) {
+                                Ok(stamp) => stamp,
                                 Err(e) => break e.to_string(),
                             };
-                            if !subscriber(&batch, change, Pace::MayWait) {
+                            if !subscriber(&batch, stamp, Pace::MayWait) {
                                 return;
                             }
                         }
@@ -486,16 +486,6 @@ impl RemoteWriter {
     }
 }
 
-/// A read batch's change kind: one byte, or none from a server before keyed tables (rows).
-fn change_of(metadata: &[u8]) -> Result<Change, Error> {
-    match metadata {
-        [] => Ok(Change::Rows),
-        [code] => Change::from_code(u32::from(*code))
-            .ok_or_else(|| Error::Io(format!("a change kind ({code}) this client cannot read"))),
-        _ => Err(Error::Io("batch metadata this client cannot read".into())),
-    }
-}
-
 /// An error and its causes: tonic's own message ("transport error") says nothing on its own.
 fn chain(error: &dyn std::error::Error) -> String {
     let mut text = error.to_string();
@@ -506,4 +496,11 @@ fn chain(error: &dyn std::error::Error) -> String {
         cause = next.source();
     }
     text
+}
+
+/// Now, for a batch from a server that sends no ingest time.
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as i64)
 }

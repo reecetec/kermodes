@@ -571,10 +571,14 @@ The engine reads history itself, on its static operator path (§9.1).
   restarts starts from today again, so a program needing earlier rows reads them from history
   (`db.table`), not from having stayed up. Later, if wanted: an opt-in daily restart of a
   deployment, or rows leaving in place at midnight.
-- `db.table(..., days=N)` is the last `N` days of history plus today, ticking. The cut is fixed
-  when it starts: history before the start date, read once; weir from it on. At midnight the
-  oldest day leaves and the day that ended stays, its rows already in memory, so nothing is
-  re-read, missing, or doubled; a later merge of that day changes nothing a running engine sees.
+- `db.table(name).where(predicate)` is a stored table across its history and today. An append
+  table's predicate must say which dates (`Date >= '2026-11-01' && ...`): dates before today are
+  read once from history (files and row groups by date; unmerged dates from weir), and if the
+  dates reach today, today on ticks from weir, each row dated by its arrival (the ingest time
+  each batch carries to its readers), across midnight too. Which day is today is fixed when
+  `where` runs, so nothing is read twice or missed; a later merge of a day changes nothing a
+  running engine sees. A keyed table is its latest state, ticking. `explain(predicate)` says what
+  history it reads.
 - Later: a date replaced while an engine runs reaches it on restart only; catalog notifications
   could swap it as a remove-then-add delta. Workers may cache fetched files on local NVMe.
 

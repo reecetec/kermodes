@@ -63,8 +63,8 @@ pub fn merge(weir: &dyn Weir, lake: &Lake, name: &TableName, date: Date) -> Resu
                 dates,
                 |day, push| {
                     if day == date {
-                        return weir.read_date(name, day, &mut |batch, change| {
-                            push(with_op(&entry, batch, change)?)
+                        return weir.read_date(name, day, &mut |batch, stamp| {
+                            push(with_op(&entry, batch, stamp.change)?)
                         });
                     }
                     // A neighbour rewritten into the new file, from the file it was in.

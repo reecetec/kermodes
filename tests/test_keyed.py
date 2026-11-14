@@ -105,3 +105,18 @@ def test_changes_are_a_keyed_tables_log(tmp_path):
     s.create_table("md.ticks", QUOTES)
     with pytest.raises(ValueError, match="append table"):
         s.changes("md.ticks")
+
+
+def test_a_keyed_stored_table_is_its_latest_state(tmp_path):
+    s = km.local(tmp_path, manual=True)
+    s.create_table("md.quotes", QUOTES, key="sym")
+    w = s.writer("md.quotes")
+    w.upsert(quotes([("a", 1.0), ("b", 20.0), ("c", 30.0)]))
+    # No dates to say: a keyed table is its latest state.
+    rich = s.table("md.quotes").where("px > 10")
+    s.step()
+    assert as_dict(rich) == {"b": 20.0, "c": 30.0}
+    w.upsert(quotes([("a", 40.0), ("b", 2.0)]))
+    w.delete(pa.table({"sym": ["c"]}))
+    s.step()
+    assert as_dict(rich) == {"a": 40.0}

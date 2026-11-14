@@ -124,8 +124,12 @@ fn history(
             }
             let mut read = Vec::new();
             if rows {
-                weir.read_date(name, date, &mut |batch, change| {
-                    read.push(dated(&schema, date, &with_op(&entry, batch, change)?)?);
+                weir.read_date(name, date, &mut |batch, stamp| {
+                    read.push(dated(
+                        &schema,
+                        date,
+                        &with_op(&entry, batch, stamp.change)?,
+                    )?);
                     Ok(())
                 })?;
             }

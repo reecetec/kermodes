@@ -320,7 +320,8 @@ fn keyed_changes_cross_the_wire_with_their_kind() {
     reader
         .subscribe(
             &quotes,
-            Box::new(move |batch, change, _| {
+            Box::new(move |batch, stamp, _| {
+                let change = stamp.change;
                 let n = batch.column(0).as_primitive::<Int64Type>();
                 let syms = batch.column(1).as_string::<i32>();
                 let rows: Vec<(Option<i64>, String)> = (0..batch.num_rows())

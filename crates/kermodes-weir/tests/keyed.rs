@@ -91,7 +91,8 @@ fn subscribe(store: &Store) -> Vec<(Change, Vec<(String, f64)>)> {
     store
         .subscribe(
             &quotes(),
-            Box::new(move |batch, change, _| {
+            Box::new(move |batch, stamp, _| {
+                let change = stamp.change;
                 let syms = batch.column(0).as_string::<i32>();
                 let px = batch.column(1).as_primitive::<Float64Type>();
                 let rows = (0..batch.num_rows())
@@ -260,7 +261,8 @@ fn replay(store: &Store) -> (std::collections::BTreeMap<String, f64>, usize, Vec
     store
         .subscribe(
             &quotes(),
-            Box::new(move |batch, change, _| {
+            Box::new(move |batch, stamp, _| {
+                let change = stamp.change;
                 let mut seen = sink.lock().unwrap();
                 let (state, rows, kinds) = &mut *seen;
                 if change == Change::Checkpoint {

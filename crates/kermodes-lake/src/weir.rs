@@ -6,7 +6,7 @@ use std::time::Duration;
 use arrow::array::RecordBatch;
 use kermodes_flight::Client;
 use kermodes_weir::{
-    Change, Date, Error, Garbage, HistoryCommit, HistoryDate, HistoryFile, Store, TableEntry,
+    Date, Error, Garbage, HistoryCommit, HistoryDate, HistoryFile, Stamp, Store, TableEntry,
     TableName,
 };
 
@@ -18,7 +18,7 @@ pub trait Weir {
         &self,
         name: &TableName,
         date: Date,
-        each: &mut dyn FnMut(RecordBatch, Change) -> Result<(), Error>,
+        each: &mut dyn FnMut(RecordBatch, Stamp) -> Result<(), Error>,
     ) -> Result<(), Error>;
     fn past_dates(&self, name: &TableName) -> Result<Vec<Date>, Error>;
     fn history(&self, name: &TableName) -> Result<Vec<HistoryDate>, Error>;
@@ -47,7 +47,7 @@ impl Weir for Store {
         &self,
         name: &TableName,
         date: Date,
-        each: &mut dyn FnMut(RecordBatch, Change) -> Result<(), Error>,
+        each: &mut dyn FnMut(RecordBatch, Stamp) -> Result<(), Error>,
     ) -> Result<(), Error> {
         Store::read_date(self, name, date, each)
     }
@@ -99,7 +99,7 @@ impl Weir for Client {
         &self,
         name: &TableName,
         date: Date,
-        each: &mut dyn FnMut(RecordBatch, Change) -> Result<(), Error>,
+        each: &mut dyn FnMut(RecordBatch, Stamp) -> Result<(), Error>,
     ) -> Result<(), Error> {
         Client::read_date(self, name, date, each)
     }
