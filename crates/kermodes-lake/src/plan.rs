@@ -3,7 +3,8 @@
 //!
 //! - A file holding a date being written is rewritten, with that date replaced.
 //! - A small date outside every file joins the file just before it, or else the one just after,
-//!   if the result stays within the target size; otherwise it starts a file of its own.
+//!   if that file is under half the target size and the result stays within it; otherwise it
+//!   starts a file of its own. A file nearly full is not rewritten to add a little.
 //! - The dates rewritten are packed in date order up to the target size, never across a file kept
 //!   as it is; a date of the target size or more is a file of its own.
 //!
@@ -92,7 +93,7 @@ pub fn plan<F: Clone + Ord>(held: &[Held<F>], incoming: &[Incoming], target: u64
             .filter(|(_, (first, _, _))| *first > date)
             .min_by_key(|(_, (first, _, _))| *first);
         for (file, (_, _, size)) in before.into_iter().chain(after) {
-            if split.contains(file) {
+            if split.contains(file) || *size >= target / 2 {
                 continue;
             }
             let so_far = taken.get(file).copied().unwrap_or(0);
@@ -242,7 +243,11 @@ mod tests {
             ("small packs a write touches are packed together",
              &[(1, "a", 30), (2, "b", 30)], &[(1, 30), (2, 30)], &[&[1, 2]], &["a", "b"]),
             ("several small dates fill one neighbour up to the target",
-             &[(1, "a", 70)], &[(2, 20), (3, 20)], &[&[1, 2], &[3]], &["a"]),
+             &[(1, "a", 40)], &[(2, 30), (3, 30), (4, 30)], &[&[1, 2, 3], &[4]], &["a"]),
+            ("a file half the target or more is not rewritten to add a small date",
+             &[(1, "a", 60)], &[(2, 10)], &[&[2]], &[]),
+            ("the small dates after a full file pack together instead",
+             &[(1, "a", 60), (2, "b", 10)], &[(3, 10)], &[&[2, 3]], &["b"]),
             ("a big date in several files is rewritten from all of them",
              &[(1, "a", 100), (1, "b", 100)], &[(1, 300)], &[&[1]], &["a", "b"]),
             ("the last piece of a split date takes on no small date",

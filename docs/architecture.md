@@ -479,9 +479,10 @@ begin with their branch, so one bucket holds every branch's history.
   No file holds part of one date and part of another.
 - **Small dates are packed as part of the write.** Writing date `D` decides, by a pure planning
   function over the dates' sizes and the current files, what to write and what to delete: a
-  small `D` joins the neighbouring pack while the result stays under the target file size
-  (256 MiB); replacing a packed date rewrites its pack. A write rewrites at most one pack, so a
-  sparse table never accumulates tiny files and there is no compaction service.
+  small `D` joins the neighbouring pack if that pack is under half the target file size (256 MiB)
+  and the result stays under the target; replacing a packed date rewrites its pack. A write
+  rewrites at most one pack, never a nearly full one to add a little, so a sparse table never
+  accumulates tiny files and there is no compaction service.
 - Sort by `(Date, key columns..., ts_column)`, the analogue of kdb+'s `p#` within a date. Row
   groups never straddle dates (a new one starts at every date boundary) and are at most about
   128 MiB.
