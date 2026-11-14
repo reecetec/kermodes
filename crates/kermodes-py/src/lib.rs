@@ -145,6 +145,29 @@ impl Tables {
         })
     }
 
+    /// Every stored table with its columns' names and type names, as the web UI lists them.
+    fn listing(&self) -> Result<Vec<kermodes_gateway::Listed>, kermodes_weir::Error> {
+        let columns = |schema: &Schema| {
+            schema
+                .fields()
+                .iter()
+                .map(|f| (f.name().clone(), kermodes_core::type_name(f.data_type())))
+                .collect()
+        };
+        Ok(match self {
+            Tables::Local(store) => store
+                .tables()?
+                .iter()
+                .map(|t| (t.name.to_string(), columns(&t.schema)))
+                .collect(),
+            Tables::Remote(client) => client
+                .tables()?
+                .iter()
+                .map(|(name, schema)| (name.to_string(), columns(schema)))
+                .collect(),
+        })
+    }
+
     fn entry(
         &self,
         name: &kermodes_weir::TableName,
@@ -385,8 +408,19 @@ impl Session {
         let package: PathBuf = py.import("kermodes")?.getattr("__file__")?.extract()?;
         let app = package.parent().map(|dir| dir.join("static").join("app"));
         let session = self.engine.clone();
+        // The store's tables, each opened live while the app views it.
+        let stored = self.tables.clone().map(|tables| {
+            let (lister, engine) = (tables.clone(), self.engine.clone());
+            kermodes_gateway::Stored {
+                list: Box::new(move || lister.listing().map_err(|e| e.to_string())),
+                open: Box::new(move |name| {
+                    open_live(&engine, &tables, name).map_err(|e| e.to_string())
+                }),
+                idle: VIEWED_IDLE,
+            }
+        });
         let server = py
-            .detach(|| kermodes_gateway::serve(session, addr, app, control))
+            .detach(|| kermodes_gateway::serve(session, addr, app, control, stored))
             .map_err(|e| PyValueError::new_err(format!("cannot listen on {addr}: {e}")))?;
         Ok(Server(Mutex::new(server)))
     }
@@ -489,22 +523,12 @@ impl Session {
     /// written. Its rows come only from its writers. A keyed table holds each key's latest row.
     fn live_table(&self, py: Python<'_>, name: &str) -> PyResult<Table> {
         let tables = self.stored()?;
-        let name = kermodes_weir::TableName::parse(name).map_err(store_error)?;
-        let table = py.detach(|| {
-            let entry = tables.entry(&name).map_err(store_error)?;
-            let description = format!("live {name}");
-            let key: Vec<&str> = entry.key.iter().map(String::as_str).collect();
-            let (table, feed) = if key.is_empty() {
-                self.engine.fed_table(&entry.schema, &description)
-            } else {
-                self.engine
-                    .fed_keyed_table(&entry.schema, &key, &description)
-            }
-            .map_err(engine_error)?;
-            tables.feed(&name, feed, Fed::State).map_err(store_error)?;
-            Ok::<_, PyErr>(table)
-        })?;
-        Ok(Table(table))
+        let table = py.detach(|| open_live(&self.engine, tables, name));
+        match table {
+            Ok(table) => Ok(Table(table)),
+            Err(OpenError::Store(e)) => Err(store_error(e)),
+            Err(OpenError::Engine(e)) => Err(engine_error(e)),
+        }
     }
 
     /// The stored keyed table `name`'s changes as they happen, ticking: its state as of its
@@ -997,6 +1021,48 @@ fn ticker(py: Python<'_>, port: u16, rate: u32, symbols: u32, host: &str) -> PyR
         .detach(|| kermodes_ingest::ticker(addr, rate, symbols))
         .map_err(|e| PyValueError::new_err(format!("cannot listen on {addr}: {e}")))?;
     Ok(Ticker(Mutex::new(feed)))
+}
+
+/// How long the web UI keeps a stored table open after its last view closes, so switching back
+/// to it is instant; after that its rows are let go.
+const VIEWED_IDLE: Duration = Duration::from_secs(60);
+
+/// Why a stored table could not be opened live.
+enum OpenError {
+    Store(kermodes_weir::Error),
+    Engine(kermodes_core::Error),
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpenError::Store(e) => e.fmt(f),
+            OpenError::Engine(e) => e.fmt(f),
+        }
+    }
+}
+
+/// The stored table `name`, ticking in `engine`: every row written so far, then each batch as
+/// it is written; a keyed table holds each key's latest row.
+fn open_live(
+    engine: &kermodes_core::Session,
+    tables: &Tables,
+    name: &str,
+) -> Result<kermodes_core::Table, OpenError> {
+    let name = kermodes_weir::TableName::parse(name).map_err(OpenError::Store)?;
+    let entry = tables.entry(&name).map_err(OpenError::Store)?;
+    let description = format!("live {name}");
+    let key: Vec<&str> = entry.key.iter().map(String::as_str).collect();
+    let (table, feed) = if key.is_empty() {
+        engine.fed_table(&entry.schema, &description)
+    } else {
+        engine.fed_keyed_table(&entry.schema, &key, &description)
+    }
+    .map_err(OpenError::Engine)?;
+    tables
+        .feed(&name, feed, Fed::State)
+        .map_err(OpenError::Store)?;
+    Ok(table)
 }
 
 fn store_error(error: kermodes_weir::Error) -> PyErr {

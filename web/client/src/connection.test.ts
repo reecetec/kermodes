@@ -236,4 +236,62 @@ describe('KermodesConnection', () => {
     jest.advanceTimersByTime(60_000);
     expect(sockets).toHaveLength(1);
   });
+
+  it('pauses a hidden view, and keeps it paused across a reconnect', () => {
+    const { connection, sockets } = connect();
+    sockets[0].open();
+    const view = connection.open('trades');
+    view.pause();
+    view.pause();
+    expect(sockets[0].sent.slice(1)).toEqual([{ type: 'pause', view: view.id }]);
+
+    sockets[0].drop();
+    jest.advanceTimersByTime(1);
+    sockets[1].open();
+    expect(sockets[1].sent).toEqual([
+      { type: 'open', view: view.id, table: 'trades' },
+      { type: 'pause', view: view.id },
+    ]);
+    view.resume();
+    view.resume();
+    expect(sockets[1].sent.slice(2)).toEqual([{ type: 'resume', view: view.id }]);
+  });
+
+  it('opens a view again, backing off, while the server says to retry', () => {
+    const { connection, sockets } = connect();
+    sockets[0].open();
+    const view = connection.open('trades');
+    view.send({ type: 'sort', by: [{ column: 'px', descending: true }] });
+    const ended = { type: 'error', view: view.id, message: 'weir restarted', retry: true };
+    const isOpen = (m: unknown) =>
+      typeof m === 'object' && m != null && 'type' in m && m.type === 'open';
+    const opens = () => sockets[0].sent.filter(isOpen).length;
+    expect(opens()).toBe(1);
+
+    sockets[0].receive(JSON.stringify(ended));
+    expect(view.state().status).toContain('retrying');
+    jest.advanceTimersByTime(1);
+    expect(opens()).toBe(2);
+    // Opened with its sort, as before it ended.
+    expect(sockets[0].sent.at(-1)).toMatchObject({ type: 'sort', view: view.id });
+
+    // Still away: the next try waits twice as long.
+    sockets[0].receive(JSON.stringify(ended));
+    jest.advanceTimersByTime(1);
+    expect(opens()).toBe(2);
+    jest.advanceTimersByTime(1);
+    expect(opens()).toBe(3);
+
+    // Back: rows arrive, and a later failure starts from the first delay again.
+    sockets[0].receive(frame({ view: view.id, type: 'rows', start: 0, total: 0, cycle: 9 }, new Uint8Array(0), []));
+    sockets[0].receive(JSON.stringify(ended));
+    jest.advanceTimersByTime(1);
+    expect(opens()).toBe(4);
+
+    // A view closed while waiting is not opened again.
+    sockets[0].receive(JSON.stringify(ended));
+    view.close();
+    jest.advanceTimersByTime(60_000);
+    expect(opens()).toBe(4);
+  });
 });

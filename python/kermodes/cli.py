@@ -8,7 +8,6 @@ import signal
 import tarfile
 import time
 import urllib.request
-from collections.abc import Callable
 from pathlib import Path
 
 import kermodes as km
@@ -305,7 +304,11 @@ def run_dev(
     supervisor = None
     try:
         supervisor = Supervisor(project, flight.url) if project else None
-        follow(session, ui.publish, supervisor.tick if supervisor else None)
+        # The UI's server lists the store's tables and opens each while it is viewed.
+        while True:
+            if supervisor:
+                supervisor.tick()
+            time.sleep(1)
     except KeyboardInterrupt:
         pass
     finally:
@@ -334,32 +337,32 @@ def run_weir(
 
 def run_ui(server: str | None, host: str, port: int, control: str | None) -> None:
     """Serves the web UI over a store server until stopped. It waits for the store to start;
-    after that it serves throughout, so a page never fails to load: while the store is away (a
-    restart, an upgrade) its tables go from the UI, and they come back with it."""
+    after that it serves throughout, so a page never fails to load. The server lists the
+    store's tables and opens each only while the app views it; this keeps the Deployments
+    tab's view of `sys.deployments`, which goes while the store is away (a restart, an
+    upgrade) and comes back with it."""
     session = connect_when_up(server, "kermodes ui")
     ui = session.serve(port=port, host=host, control=control)
     print(f"kermodes ui: {ui.url}", flush=True)
-    live: dict[str, km.Table] = {}
+    deployments: km.Table | None = None
     away = False
-
-    def drop(name: str) -> None:
-        ui.unpublish(name)
-        if name == "sys.deployments":
-            ui.unpublish("deployments")
-        del live[name]
-
     try:
         while True:
+            # A live table fails when it loses its store; it opens again when the store is back.
+            if deployments is not None:
+                try:
+                    len(deployments)
+                except km.KermodesError:
+                    ui.unpublish("deployments")
+                    deployments = None
             try:
+                # Listing the tables also says whether the store is there.
                 names = session.tables
-                for name in names:
-                    if name not in live:
-                        live[name] = session.live_table(name)
-                        ui.publish(name, live[name])
-                        if name == "sys.deployments":
-                            # The Deployments tab's view: each deployment's newest row.
-                            newest = live[name].last_by("project", "name")
-                            ui.publish_view("deployments", newest)
+                if deployments is None and "sys.deployments" in names:
+                    # The Deployments tab's view: each deployment's newest row.
+                    reports = session.live_table("sys.deployments")
+                    deployments = reports.last_by("project", "name")
+                    ui.publish_view("deployments", deployments)
                 if away:
                     print("kermodes ui: the store is back", flush=True)
                     away = False
@@ -369,12 +372,6 @@ def run_ui(server: str | None, host: str, port: int, control: str | None) -> Non
                         f"kermodes ui: the store is away ({e}); serving on", flush=True
                     )
                     away = True
-            # A live table fails when it loses its store; it opens again when the store is back.
-            for name, table in list(live.items()):
-                try:
-                    len(table)
-                except km.KermodesError:
-                    drop(name)
             time.sleep(1)
     except KeyboardInterrupt:
         pass
@@ -391,29 +388,6 @@ def connect_when_up(server: str | None, who: str) -> km.Session:
                 print(f"{who}: waiting for the store: {e}", flush=True)
                 said = True
             time.sleep(1)
-
-
-def follow(
-    session: km.Session,
-    publish: Callable[[str, km.Table], None],
-    every_second: Callable[[], None] | None = None,
-) -> None:
-    """Publishes every stored table, including those created later, until the store goes.
-
-    A live table fails when it loses the store it follows; listing tables or reading a live
-    table then raises KermodesError, which ends this.
-    """
-    live: dict[str, km.Table] = {}
-    while True:
-        for name in session.tables:
-            if name not in live:
-                live[name] = session.live_table(name)
-                publish(name, live[name])
-        for table in live.values():
-            len(table)
-        if every_second:
-            every_second()
-        time.sleep(1)
 
 
 def run_websocket(

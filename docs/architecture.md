@@ -1204,10 +1204,16 @@ namespaces).
   or the server stops). It listens on 127.0.0.1 and has no authentication; the WebSocket
   protocol is in `kermodes-gateway`'s module doc. `kermodes dev` and `kermodes ui` start the same
   server.
+  A session with a store also lists every stored table, from the catalog without reading its
+  rows, and opens one live only while a view shows it, letting it go a minute after the last
+  view closes. The server's memory follows what is being looked at, not what is stored. A tab
+  not on screen pauses its view: the server sends it nothing until it is shown again, with its
+  sort and filters kept.
   `kermodes ui` waits for weir to start, then serves throughout: while weir is away (a restart,
-  an upgrade) its tables go from the UI and come back with it, and pages keep loading. A
-  `kermodes run` started while weir is away waits for it too, so a program that lost weir
-  restarts once rather than crash-looping.
+  an upgrade) pages keep loading, and a view of a stored table ends with an error the app
+  retries, backing off, until weir is back and the table opens afresh. A `kermodes run` started
+  while weir is away waits for it too, so a program that lost weir restarts once rather than
+  crash-looping.
 - Deployments, the home page wherever a controller runs, as Deephaven's query monitor lists
   persistent queries: `kermodes ui` serves `sys.deployments`' newest row per deployment as the
   view `deployments`, which the app opens for this tab and does not list among Tables. Each row shows the deployment and its project,

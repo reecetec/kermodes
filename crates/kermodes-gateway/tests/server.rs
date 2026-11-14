@@ -99,9 +99,14 @@ async fn the_app_lists_opens_filters_and_follows_published_tables() {
     book.upsert(&[batch(vec!["aa", "AB", "b"], vec![3.0, 1.0, 4.0])])
         .unwrap();
     session.step();
-    let mut server =
-        kermodes_gateway::serve(session.clone(), "127.0.0.1:0".parse().unwrap(), None, None)
-            .unwrap();
+    let mut server = kermodes_gateway::serve(
+        session.clone(),
+        "127.0.0.1:0".parse().unwrap(),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     server.publish("book", &book);
     // A page's view (the Deployments tab): named for the app, not listed among tables.
     server.publish_view("page", &book);
@@ -209,6 +214,7 @@ async fn the_app_is_served_from_its_directory_only() {
         "127.0.0.1:0".parse().unwrap(),
         Some(app.clone()),
         None,
+        None,
     )
     .unwrap();
     let get = |path: &str| {
@@ -272,6 +278,7 @@ async fn only_the_apps_controller_routes_reach_the_controller() {
         "127.0.0.1:0".parse().unwrap(),
         None,
         Some(url),
+        None,
     )
     .unwrap();
     let status = |path: &str| {
@@ -311,4 +318,117 @@ async fn only_the_apps_controller_routes_reach_the_controller() {
             "/api/components/weir/events",
         ]
     );
+}
+
+/// Stored tables are listed without being opened, opened once however many views show one,
+/// and let go when the last view closes; one that fails (its store restarted) ends its views
+/// with an error the app retries, and the next view opens it afresh.
+#[tokio::test(flavor = "multi_thread")]
+async fn stored_tables_are_open_only_while_viewed() {
+    let session = Session::new();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("sym", DataType::Utf8, true),
+        Field::new("price", DataType::Float64, true),
+    ]));
+    // Each opening's feed, as the store would hold it.
+    let opened = Arc::new(std::sync::Mutex::new(Vec::<kermodes_core::Feed>::new()));
+    let stored = {
+        let (session, opened) = (session.clone(), opened.clone());
+        kermodes_gateway::Stored {
+            list: Box::new(|| {
+                let columns = vec![
+                    ("sym".to_owned(), "utf8".to_owned()),
+                    ("price".to_owned(), "float64".to_owned()),
+                ];
+                Ok(vec![("md.ticks".to_owned(), columns)])
+            }),
+            open: Box::new(move |name| {
+                let (table, feed) = session
+                    .fed_table(&schema, &format!("live {name}"))
+                    .map_err(|e| e.to_string())?;
+                feed.ready();
+                opened.lock().unwrap().push(feed);
+                Ok(table)
+            }),
+            idle: Duration::ZERO,
+        }
+    };
+    let server = kermodes_gateway::serve(
+        session.clone(),
+        "127.0.0.1:0".parse().unwrap(),
+        None,
+        None,
+        Some(stored),
+    )
+    .unwrap();
+    let url = format!("ws://{}/ws", server.addr());
+    let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    // Listed once the server has asked the store, with nothing opened.
+    loop {
+        let tables = text(&mut socket).await;
+        if tables["tables"][0]["name"] == "md.ticks" {
+            assert_eq!(tables["tables"][0]["columns"][1]["type"], "float64");
+            break;
+        }
+    }
+    let openings = || opened.lock().unwrap().len();
+    assert_eq!(openings(), 0);
+
+    for view in [1, 2] {
+        send(
+            &mut socket,
+            json!({"type": "open", "view": view, "table": "md.ticks"}),
+        )
+        .await;
+        let (state, ..) = window(&mut socket).await;
+        assert_eq!(state["view"], view);
+    }
+    assert_eq!(openings(), 1, "two views of one table open it once");
+
+    for view in [1, 2] {
+        send(&mut socket, json!({"type": "close", "view": view})).await;
+    }
+    send(
+        &mut socket,
+        json!({"type": "open", "view": 3, "table": "md.ticks"}),
+    )
+    .await;
+    window(&mut socket).await;
+    assert_eq!(openings(), 2, "closing the last view let it go");
+
+    // The store restarts: the table fails, and its view ends with an error to retry.
+    let feed = opened.lock().unwrap()[1].clone();
+    feed.fail("weir restarted".into());
+    session.step();
+    let ended = text(&mut socket).await;
+    assert_eq!(
+        (
+            ended["type"].clone(),
+            ended["view"].clone(),
+            ended["retry"].clone()
+        ),
+        (json!("error"), json!(3), json!(true)),
+        "{ended}"
+    );
+    assert!(
+        ended["message"]
+            .as_str()
+            .unwrap()
+            .contains("weir restarted")
+    );
+    send(
+        &mut socket,
+        json!({"type": "open", "view": 4, "table": "md.ticks"}),
+    )
+    .await;
+    window(&mut socket).await;
+    assert_eq!(openings(), 3, "a failed table is opened afresh");
+
+    send(
+        &mut socket,
+        json!({"type": "open", "view": 5, "table": "md.nothing"}),
+    )
+    .await;
+    let missing = text(&mut socket).await;
+    assert_eq!(missing["retry"], Value::Null, "{missing}");
 }

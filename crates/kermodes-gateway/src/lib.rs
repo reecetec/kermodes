@@ -1,26 +1,33 @@
 //! The gateway (architecture.md §4, §15.2): the web UI's server. This first slice serves one
 //! local session: the built web app, and on `/ws` a WebSocket over which the app lists the
-//! session's published tables and opens them in the table viewer (§15.3). Authentication,
-//! routing to worker pods, and Flight come with the cluster gateway (M4).
+//! session's tables and opens them in the table viewer (§15.3). Authentication, routing to
+//! worker pods, and Flight come with the cluster gateway (M4).
+//!
+//! The tables are those published (`Server::publish`) and, given a store (`Stored`), every
+//! stored table: listed from the catalog without reading rows, and opened live only while a
+//! view shows it, so the server holds what is being looked at rather than everything.
 //!
 //! Messages from the app are JSON text: `{"type": "tables"}`, `{"type": "open", "view": id,
-//! "table": name}`, `{"type": "close", "view": id}`, and the viewer's own messages (`viewport`,
-//! `sort`, `filter`, `fetch`, as in `kermodes_core::viewer`) with a `"view"` field. The server
-//! answers with JSON text (`tables`, which lists the published tables and names the views
-//! published for pages of their own; `state` for a view before each of its windows; `error`)
-//! and binary frames: a little-endian u32 header length, the header (JSON: `view`, `type`
-//! "rows" or "fetched", `id` for fetches, `start`, `total`, `cycle`), a u32 rows length, the
-//! rows (Arrow IPC stream), then the rows' keys (little-endian u64 each). After every engine
-//! cycle, each open view whose table changed gets its window again.
+//! "table": name}`, `{"type": "close", "view": id}`, `{"type": "pause" | "resume", "view":
+//! id}` (a paused view gets no windows until resumed, keeping its sort and filters), and the
+//! viewer's own messages (`viewport`, `sort`, `filter`, `fetch`, as in `kermodes_core::viewer`)
+//! with a `"view"` field. The server answers with JSON text (`tables`, which lists the tables
+//! and names the views published for pages of their own; `state` for a view before each of its
+//! windows; `error`, with `"retry": true` when the view has ended because its stored table could
+//! not be read, as while the store restarts, and opening it again later may work) and binary
+//! frames: a little-endian u32 header length, the header (JSON: `view`, `type` "rows" or
+//! "fetched", `id` for fetches, `start`, `total`, `cycle`), a u32 rows length, the rows (Arrow
+//! IPC stream), then the rows' keys (little-endian u64 each). After every engine cycle, each
+//! open view whose table changed gets its window again.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -42,6 +49,27 @@ use tokio::sync::{oneshot, watch};
 const CYCLE_WAIT: Duration = Duration::from_millis(500);
 /// How long the controller may take to answer the programs page.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often the server refreshes the stored tables it lists and lets go of tables no view
+/// shows.
+const MAINTAIN_EVERY: Duration = Duration::from_secs(2);
+
+/// A stored table as the app lists it: its name, and its columns' names and type names.
+pub type Listed = (String, Vec<(String, String)>);
+
+/// Lists every stored table.
+pub type ListTables = Box<dyn Fn() -> Result<Vec<Listed>, String> + Send + Sync>;
+
+/// Opens the stored table `name` live, fed by the store.
+pub type OpenTable = Box<dyn Fn(&str) -> Result<Table, String> + Send + Sync>;
+
+/// The stored tables a server can open, given by whoever holds the store connection: listed
+/// for the app without reading their rows, and opened live only while a view shows one.
+pub struct Stored {
+    pub list: ListTables,
+    pub open: OpenTable,
+    /// How long a table no view shows stays open, so a view opened again soon finds it at once.
+    pub idle: Duration,
+}
 
 /// A running server; stops when dropped.
 pub struct Server {
@@ -59,7 +87,7 @@ struct Shared {
     /// Views the app opens by name for a page of its own (the Deployments tab), not listed
     /// among the published tables.
     views: Mutex<BTreeMap<String, Table>>,
-    /// Bumped when the published set changes, so connections resend the list.
+    /// Bumped when the listed tables change, so connections resend the list.
     catalog: watch::Sender<u64>,
     /// The last finished engine cycle.
     cycles: watch::Sender<u64>,
@@ -67,11 +95,62 @@ struct Shared {
     app: Option<PathBuf>,
     /// `kermodes control`, whose API the programs page reads through this server.
     control: Option<Control>,
+    stored: Option<Stored>,
+    /// The stored tables last listed.
+    listed: Mutex<Vec<Listed>>,
+    /// Stored tables open for views, by name.
+    live: Mutex<HashMap<String, Live>>,
+    /// Numbers each opening of a stored table, so a view's hold on one let go (failed) never
+    /// counts against the next.
+    generations: AtomicU64,
 }
 
 struct Control {
     url: String,
     client: Client<HttpConnector, Full<Bytes>>,
+}
+
+/// A stored table open for views: how many hold it, and since when none has.
+struct Live {
+    table: Table,
+    generation: u64,
+    leases: usize,
+    idle_since: Option<Instant>,
+}
+
+/// A view's hold on a stored table: the table stays open while any view holds it.
+struct Lease {
+    shared: Arc<Shared>,
+    name: String,
+    generation: u64,
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let idle = self
+            .shared
+            .stored
+            .as_ref()
+            .map_or(Duration::ZERO, |s| s.idle);
+        let mut live = self.shared.live();
+        let Some(entry) = live
+            .get_mut(&self.name)
+            .filter(|entry| entry.generation == self.generation)
+        else {
+            return;
+        };
+        entry.leases -= 1;
+        if entry.leases > 0 {
+            return;
+        }
+        if idle.is_zero() {
+            let gone = live.remove(&self.name);
+            drop(live);
+            drop(gone);
+        } else {
+            entry.idle_since = Some(Instant::now());
+        }
+    }
 }
 
 impl Shared {
@@ -86,15 +165,39 @@ impl Shared {
             .lock()
             .expect("kermodes gateway views poisoned by an earlier panic")
     }
+
+    fn listed(&self) -> MutexGuard<'_, Vec<Listed>> {
+        self.listed
+            .lock()
+            .expect("kermodes gateway listing poisoned by an earlier panic")
+    }
+
+    fn live(&self) -> MutexGuard<'_, HashMap<String, Live>> {
+        self.live
+            .lock()
+            .expect("kermodes gateway live tables poisoned by an earlier panic")
+    }
+
+    /// Lets go of a stored table that failed, if it is still that opening of it, so the next
+    /// view subscribes afresh.
+    fn evict(&self, name: &str, generation: u64) {
+        let mut live = self.live();
+        if live.get(name).is_some_and(|e| e.generation == generation) {
+            let gone = live.remove(name);
+            drop(live);
+            drop(gone);
+        }
+    }
 }
 
-/// Serves `session` on `addr` (port 0 picks a free one), with the web app in `app` and the
-/// programs of `control`, `kermodes control`'s URL, if there is one.
+/// Serves `session` on `addr` (port 0 picks a free one), with the web app in `app`, the
+/// programs of `control` (`kermodes control`'s URL), and the tables of `stored`, if there are.
 pub fn serve(
     session: Session,
     addr: SocketAddr,
     app: Option<PathBuf>,
     control: Option<String>,
+    stored: Option<Stored>,
 ) -> io::Result<Server> {
     let listener = TcpListener::bind(addr)?;
     listener.set_nonblocking(true)?;
@@ -109,6 +212,10 @@ pub fn serve(
             url: url.trim_end_matches('/').to_owned(),
             client: Client::builder(TokioExecutor::new()).build_http(),
         }),
+        stored,
+        listed: Mutex::new(Vec::new()),
+        live: Mutex::new(HashMap::new()),
+        generations: AtomicU64::new(0),
     });
     let stopping = Arc::new(AtomicBool::new(false));
     let watcher = {
@@ -144,10 +251,12 @@ pub fn serve(
         .route("/", get(index))
         .route("/{*path}", get(asset))
         .with_state(shared.clone());
+    let maintained = shared.clone();
     let runtime = thread::Builder::new()
         .name("kermodes-gateway".into())
         .spawn(move || {
             runtime.block_on(async move {
+                tokio::spawn(maintain(maintained));
                 let listener =
                     tokio::net::TcpListener::from_std(listener).expect("a bound listener converts");
                 let _ = axum::serve(listener, router)
@@ -212,7 +321,94 @@ impl Server {
             let _ = handle.join();
         }
         self.shared.tables().clear();
+        self.shared.live().clear();
     }
+}
+
+/// Every `MAINTAIN_EVERY`: lists the stored tables again (telling connections when they
+/// change; the last list stays while the store is away), and lets go of stored tables no view
+/// has shown for the idle time, or that failed, so the next view subscribes afresh.
+async fn maintain(shared: Arc<Shared>) {
+    let Some(stored) = &shared.stored else {
+        return;
+    };
+    let mut every = tokio::time::interval(MAINTAIN_EVERY);
+    loop {
+        every.tick().await;
+        let lister = shared.clone();
+        let listed =
+            blocking(move || (lister.stored.as_ref().expect("checked above").list)()).await;
+        if let Ok(listed) = listed {
+            let changed = {
+                let mut current = shared.listed();
+                let changed = *current != listed;
+                *current = listed;
+                changed
+            };
+            if changed {
+                shared.catalog.send_modify(|v| *v += 1);
+            }
+        }
+        let now = Instant::now();
+        let gone: Vec<Live> = {
+            let mut live = shared.live();
+            let names: Vec<String> = live
+                .iter()
+                .filter(|(_, e)| {
+                    e.idle_since
+                        .is_some_and(|since| now.duration_since(since) >= stored.idle)
+                        || e.table.num_rows().is_err()
+                })
+                .map(|(name, _)| name.clone())
+                .collect();
+            names.iter().filter_map(|name| live.remove(name)).collect()
+        };
+        drop(gone);
+    }
+}
+
+/// Why a stored table could not be opened for a view.
+enum Refused {
+    /// There is no such table.
+    Missing,
+    /// The store could not be read (it may be restarting): a later try may work.
+    Unavailable(String),
+}
+
+/// The stored table `name` for a view, opened unless it is open already, and the view's hold
+/// on it.
+async fn lease(shared: &Arc<Shared>, name: &str) -> Result<(Table, Lease), Refused> {
+    if shared.stored.is_none() || !shared.listed().iter().any(|(n, _)| n == name) {
+        return Err(Refused::Missing);
+    }
+    let hold = |entry: &mut Live| {
+        entry.leases += 1;
+        entry.idle_since = None;
+        let lease = Lease {
+            shared: shared.clone(),
+            name: name.to_owned(),
+            generation: entry.generation,
+        };
+        (entry.table.clone(), lease)
+    };
+    if let Some(entry) = shared.live().get_mut(name) {
+        return Ok(hold(entry));
+    }
+    // Opening waits on the store: off the async workers, without the lock.
+    let opener = shared.clone();
+    let wanted = name.to_owned();
+    let table = blocking(move || (opener.stored.as_ref().expect("checked above").open)(&wanted))
+        .await
+        .map_err(Refused::Unavailable)?;
+    let mut live = shared.live();
+    // Another view may have opened it meanwhile: the first opening stays.
+    let entry = live.entry(name.to_owned()).or_insert_with(|| Live {
+        table,
+        generation: shared.generations.fetch_add(1, Ordering::Relaxed),
+        leases: 0,
+        idle_since: None,
+    });
+    Ok(hold(entry))
 }
 
 impl Drop for Server {
@@ -400,10 +596,40 @@ async fn upgrade(ws: WebSocketUpgrade, State(shared): State<Arc<Shared>>) -> Res
     ws.on_upgrade(move |socket| connection(socket, shared))
 }
 
-/// An open view: its viewer and the cycle of the window last sent.
+/// An open view: its viewer, the cycle of the window last sent, whether the app has paused it,
+/// and its hold on the stored table it shows, if it shows one.
 struct Open {
     viewer: Arc<Mutex<Viewer>>,
     sent: Option<u64>,
+    paused: bool,
+    lease: Option<Lease>,
+}
+
+/// The messages for a view's reply, and whether the view goes on: one showing a stored table
+/// that failed (or was let go) ends with an error the app retries, and lets the table go so a
+/// retry subscribes afresh.
+fn deliver(
+    shared: &Shared,
+    id: u64,
+    open: &mut Open,
+    reply: Result<Option<Frame>, kermodes_core::Error>,
+) -> (Vec<Message>, bool) {
+    if let Some(lease) = &open.lease
+        && !matches!(reply, Ok(Some(_)))
+    {
+        shared.evict(&lease.name, lease.generation);
+        let why = match reply {
+            Err(e) => e.to_string(),
+            _ => format!("{} is gone", lease.name),
+        };
+        return (vec![retry(id, &why)], false);
+    }
+    if let Ok(Some(frame)) = &reply
+        && frame.fetched.is_none()
+    {
+        open.sent = Some(frame.cycle);
+    }
+    (answer(id, &open.viewer, reply), true)
 }
 
 async fn connection(mut socket: WebSocket, shared: Arc<Shared>) {
@@ -427,15 +653,27 @@ async fn connection(mut socket: WebSocket, shared: Arc<Shared>) {
             },
             Ok(()) = cycles.changed() => {
                 cycles.borrow_and_update();
+                let mut ended = Vec::new();
                 for (id, open) in &mut views {
+                    if open.paused {
+                        continue;
+                    }
                     let viewer = open.viewer.clone();
                     let changed = blocking(move || lock(&viewer).changed()).await;
-                    if changed.is_some() && changed != open.sent {
-                        open.sent = changed;
-                        let viewer = open.viewer.clone();
-                        let reply = blocking(move || lock(&viewer).rows()).await;
-                        outgoing.extend(answer(*id, &open.viewer, reply));
+                    // Unchanged, or a published table let go (which keeps today's quiet).
+                    if changed == open.sent || (changed.is_none() && open.lease.is_none()) {
+                        continue;
                     }
+                    let viewer = open.viewer.clone();
+                    let reply = blocking(move || lock(&viewer).rows()).await;
+                    let (messages, goes_on) = deliver(&shared, *id, open, reply);
+                    outgoing.extend(messages);
+                    if !goes_on {
+                        ended.push(*id);
+                    }
+                }
+                for id in ended {
+                    views.remove(&id);
                 }
             },
             Ok(()) = catalog.changed() => {
@@ -447,7 +685,7 @@ async fn connection(mut socket: WebSocket, shared: Arc<Shared>) {
 }
 
 /// The replies to one message from the app.
-async fn handle(shared: &Shared, views: &mut HashMap<u64, Open>, text: &str) -> Vec<Message> {
+async fn handle(shared: &Arc<Shared>, views: &mut HashMap<u64, Open>, text: &str) -> Vec<Message> {
     let message: Value = match serde_json::from_str(text) {
         Ok(message) => message,
         Err(e) => return vec![error(None, &format!("not JSON: {e}"))],
@@ -457,24 +695,58 @@ async fn handle(shared: &Shared, views: &mut HashMap<u64, Open>, text: &str) -> 
     match (kind, view) {
         ("tables", _) => vec![tables(shared)],
         ("open", Some(id)) => {
-            let name = message["table"].as_str().unwrap_or_default();
-            let table = shared.tables().get(name).cloned();
-            let Some(table) = table.or_else(|| shared.views().get(name).cloned()) else {
-                return vec![error(Some(id), &format!("no published table `{name}`"))];
+            let name = message["table"].as_str().unwrap_or_default().to_owned();
+            let published = shared.tables().get(&name).cloned();
+            let published = published.or_else(|| shared.views().get(&name).cloned());
+            let (table, lease) = match published {
+                Some(table) => (table, None),
+                None => match lease(shared, &name).await {
+                    Ok((table, lease)) => (table, Some(lease)),
+                    Err(Refused::Missing) => {
+                        return vec![error(Some(id), &format!("no table `{name}`"))];
+                    }
+                    Err(Refused::Unavailable(why)) => return vec![retry(id, &why)],
+                },
             };
             let viewer = Arc::new(Mutex::new(blocking(move || Viewer::new(&table)).await));
             let rows = {
                 let viewer = viewer.clone();
                 blocking(move || lock(&viewer).rows()).await
             };
-            let sent = rows.as_ref().ok().and_then(|f| f.as_ref()).map(|f| f.cycle);
-            let replies = answer(id, &viewer, rows);
-            views.insert(id, Open { viewer, sent });
-            replies
+            let mut open = Open {
+                viewer,
+                sent: None,
+                paused: false,
+                lease,
+            };
+            let (messages, goes_on) = deliver(shared, id, &mut open, rows);
+            if goes_on {
+                views.insert(id, open);
+            }
+            messages
         }
         ("close", Some(id)) => {
             views.remove(&id);
             Vec::new()
+        }
+        ("pause", Some(id)) => {
+            if let Some(open) = views.get_mut(&id) {
+                open.paused = true;
+            }
+            Vec::new()
+        }
+        ("resume", Some(id)) => {
+            let Some(open) = views.get_mut(&id) else {
+                return vec![error(Some(id), "no such view")];
+            };
+            open.paused = false;
+            let viewer = open.viewer.clone();
+            let reply = blocking(move || lock(&viewer).rows()).await;
+            let (messages, goes_on) = deliver(shared, id, open, reply);
+            if !goes_on {
+                views.remove(&id);
+            }
+            messages
         }
         (_, Some(id)) => {
             let Some(open) = views.get_mut(&id) else {
@@ -487,12 +759,11 @@ async fn handle(shared: &Shared, views: &mut HashMap<u64, Open>, text: &str) -> 
             };
             let viewer = open.viewer.clone();
             let reply = blocking(move || lock(&viewer).receive(request)).await;
-            if let Ok(Some(frame)) = &reply
-                && frame.fetched.is_none()
-            {
-                open.sent = Some(frame.cycle);
+            let (messages, goes_on) = deliver(shared, id, open, reply);
+            if !goes_on {
+                views.remove(&id);
             }
-            answer(id, &open.viewer, reply)
+            messages
         }
         _ => vec![error(None, &format!("unknown message `{kind}`"))],
     }
@@ -614,8 +885,8 @@ fn binary(id: u64, frame: Frame) -> Message {
 }
 
 fn tables(shared: &Shared) -> Message {
-    let tables: Vec<Value> = shared
-        .tables()
+    let published = shared.tables();
+    let mut tables: Vec<(String, Value)> = published
         .iter()
         .map(|(name, table)| {
             let columns: Vec<Value> = table
@@ -624,12 +895,37 @@ fn tables(shared: &Shared) -> Message {
                 .iter()
                 .map(|f| json!({"name": f.name(), "type": type_name(f.data_type())}))
                 .collect();
-            json!({"name": name, "columns": columns, "refreshing": table.is_refreshing()})
+            let info =
+                json!({"name": name, "columns": columns, "refreshing": table.is_refreshing()});
+            (name.clone(), info)
         })
         .collect();
+    for (name, columns) in shared.listed().iter() {
+        if !published.contains_key(name) {
+            let columns: Vec<Value> = columns
+                .iter()
+                .map(|(column, kind)| json!({"name": column, "type": kind}))
+                .collect();
+            let info = json!({"name": name, "columns": columns, "refreshing": true});
+            tables.push((name.clone(), info));
+        }
+    }
+    drop(published);
+    tables.sort_by(|a, b| a.0.cmp(&b.0));
+    let tables: Vec<Value> = tables.into_iter().map(|(_, info)| info).collect();
     let views: Vec<String> = shared.views().keys().cloned().collect();
     Message::Text(
         json!({"type": "tables", "tables": tables, "views": views})
+            .to_string()
+            .into(),
+    )
+}
+
+/// An error ending view `id` that opening it again later may not have: its stored table could
+/// not be read.
+fn retry(id: u64, message: &str) -> Message {
+    Message::Text(
+        json!({"type": "error", "view": id, "message": message, "retry": true})
             .to_string()
             .into(),
     )

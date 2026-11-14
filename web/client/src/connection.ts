@@ -52,7 +52,7 @@ type StateMessage = {
 type TextMessage =
   | { type: 'tables'; tables: TableInfo[]; views?: string[] }
   | StateMessage
-  | { type: 'error'; view: number | null; message: string };
+  | { type: 'error'; view: number | null; message: string; retry?: boolean };
 
 /** One table open in the viewer over the shared socket */
 export class SocketView implements ViewerChannel {
@@ -70,6 +70,9 @@ export class SocketView implements ViewerChannel {
   >();
 
   private stateHandlers = new Set<() => void>();
+
+  // Whether the app has paused this view: the server sends it nothing until resumed
+  private paused = false;
 
   constructor(
     private readonly connection: KermodesConnection,
@@ -122,6 +125,24 @@ export class SocketView implements ViewerChannel {
     this.connection.closeView(this.id);
   }
 
+  /**
+   * Stop the server sending this view anything while it is not shown (a hidden tab), keeping
+   * its sort and filters; `resume` starts again with the current window.
+   */
+  pause(): void {
+    if (!this.paused) {
+      this.paused = true;
+      this.connection.sendControl(this.id, 'pause');
+    }
+  }
+
+  resume(): void {
+    if (this.paused) {
+      this.paused = false;
+      this.connection.sendControl(this.id, 'resume');
+    }
+  }
+
   /** @internal The messages that reopen this view on a new socket */
   reopenMessages(): object[] {
     const { replay } = this;
@@ -131,6 +152,7 @@ export class SocketView implements ViewerChannel {
         .map(kind => replay.get(kind))
         .filter(message => message != null)
         .map(message => ({ ...message, view: this.id })),
+      ...(this.paused ? [{ type: 'pause', view: this.id }] : []),
     ];
   }
 
@@ -175,6 +197,13 @@ export class KermodesConnection {
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 
   private isClosed = false;
+
+  // Views the server ended to retry (their table's store was away): when each opens again,
+  // and the delay before the next try, doubled up to the maximum until rows arrive
+  private retries = new Map<
+    number,
+    { timer: ReturnType<typeof setTimeout>; delay: number }
+  >();
 
   private readonly createSocket: (url: string) => SocketLike;
 
@@ -237,10 +266,28 @@ export class KermodesConnection {
   }
 
   /** @internal */
+  sendControl(view: number, type: 'pause' | 'resume'): void {
+    this.sendText({ type, view });
+  }
+
+  /** @internal */
   closeView(view: number): void {
+    clearTimeout(this.retries.get(view)?.timer);
+    this.retries.delete(view);
     if (this.views.delete(view)) {
       this.sendText({ type: 'close', view });
     }
+  }
+
+  /** Opens `view` again after a delay that doubles with each try until its rows arrive */
+  private retry(view: SocketView): void {
+    const delay = this.retries.get(view.id)?.delay ?? this.initialBackoff;
+    const timer = setTimeout(() => {
+      if (this.views.has(view.id)) {
+        view.reopenMessages().forEach(message => this.sendText(message));
+      }
+    }, delay);
+    this.retries.set(view.id, { timer, delay: Math.min(delay * 2, this.maxBackoff) });
   }
 
   private sendText(message: object): void {
@@ -265,6 +312,9 @@ export class KermodesConnection {
       this.status = 'open';
       this.lastError = null;
       this.notify();
+      // Every view opens again on the new socket, including any waiting to retry.
+      this.retries.forEach(({ timer }) => clearTimeout(timer));
+      this.retries.clear();
       this.views.forEach(view =>
         view.reopenMessages().forEach(message => this.sendText(message))
       );
@@ -293,6 +343,10 @@ export class KermodesConnection {
       return;
     }
     const { header, rows, keys } = parseFrame(data as ArrayBuffer);
+    if (header.type === 'rows' && this.retries.has(header.view)) {
+      clearTimeout(this.retries.get(header.view)?.timer);
+      this.retries.delete(header.view);
+    }
     this.views.get(header.view)?.receive(header, [rows, keys]);
   }
 
@@ -325,6 +379,9 @@ export class KermodesConnection {
         if (view == null) {
           this.lastError = message.message;
           this.notify();
+        } else if (message.retry) {
+          view.update({ status: `${message.message} · retrying…` });
+          this.retry(view);
         } else {
           view.update({ status: message.message });
         }

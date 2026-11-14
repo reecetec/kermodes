@@ -298,6 +298,18 @@ export default function App({ connection }: { connection: KermodesConnection }) 
     [tabs, active]
   );
 
+  // Only the table on screen gets windows: hidden tabs, and every tab while another page is
+  // open, pause their views, keeping their sort and filters.
+  useEffect(() => {
+    for (const tab of tabs) {
+      if (page === 'tables' && tab.key === active) {
+        tab.view.resume();
+      } else {
+        tab.view.pause();
+      }
+    }
+  }, [tabs, active, page]);
+
   return (
     <TooltipProvider>
       <div className="flex h-full flex-col">
