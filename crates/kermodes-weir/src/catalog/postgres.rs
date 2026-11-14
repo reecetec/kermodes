@@ -6,7 +6,7 @@
 use postgres::{Client, GenericClient, NoTls};
 
 use super::{
-    FORMAT, Garbage, HistoryCommit, HistoryDate, HistoryFile, Row, check_commit, location,
+    FORMAT, Found, Garbage, HistoryCommit, HistoryDate, HistoryFile, Row, check_commit, location,
 };
 use crate::{Date, Error, SourceId, TableName};
 
@@ -41,6 +41,10 @@ impl Postgres {
                  source TEXT NOT NULL,
                  epoch BIGINT NOT NULL,
                  PRIMARY KEY (table_id, source)
+             );
+             CREATE TABLE IF NOT EXISTS kermodes_table_keys (
+                 table_id BIGINT PRIMARY KEY REFERENCES kermodes_tables (id),
+                 key TEXT NOT NULL
              );
              CREATE TABLE IF NOT EXISTS kermodes_history_files (
                  table_id BIGINT NOT NULL REFERENCES kermodes_tables (id),
@@ -92,6 +96,7 @@ impl Postgres {
         branch: &str,
         name: &TableName,
         columns: &str,
+        key: Option<&str>,
     ) -> Result<Option<(i64, String)>, Error> {
         let mut tx = self.client()?.transaction().map_err(sql)?;
         let Some(row) = tx
@@ -113,37 +118,52 @@ impl Postgres {
             &[&location, &id],
         )
         .map_err(sql)?;
+        if let Some(key) = key {
+            tx.execute(
+                "INSERT INTO kermodes_table_keys (table_id, key) VALUES ($1, $2)",
+                &[&id, &key],
+            )
+            .map_err(sql)?;
+        }
         tx.commit().map_err(sql)?;
         Ok(Some((id, location)))
     }
 
-    pub(crate) fn get(
-        &mut self,
-        branch: &str,
-        name: &TableName,
-    ) -> Result<Option<(i64, String, String)>, Error> {
+    pub(crate) fn get(&mut self, branch: &str, name: &TableName) -> Result<Option<Found>, Error> {
         Ok(self
             .client()?
             .query_opt(
-                "SELECT id, location, columns FROM kermodes_tables
-                 WHERE branch = $1 AND namespace = $2 AND name = $3",
+                "SELECT t.id, t.location, t.columns, k.key FROM kermodes_tables t
+                 LEFT JOIN kermodes_table_keys k ON k.table_id = t.id
+                 WHERE t.branch = $1 AND t.namespace = $2 AND t.name = $3",
                 &[&branch, &name.namespace(), &name.table()],
             )
             .map_err(sql)?
-            .map(|row| (row.get(0), row.get(1), row.get(2))))
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3))))
     }
 
     pub(crate) fn list(&mut self, branch: &str) -> Result<Vec<Row>, Error> {
         Ok(self
             .client()?
             .query(
-                "SELECT id, namespace, name, location, columns FROM kermodes_tables
-                 WHERE branch = $1 ORDER BY namespace, name",
+                "SELECT t.id, t.namespace, t.name, t.location, t.columns, k.key
+                 FROM kermodes_tables t
+                 LEFT JOIN kermodes_table_keys k ON k.table_id = t.id
+                 WHERE t.branch = $1 ORDER BY t.namespace, t.name",
                 &[&branch],
             )
             .map_err(sql)?
             .iter()
-            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)))
+            .map(|row| {
+                (
+                    row.get(0),
+                    row.get(1),
+                    row.get(2),
+                    row.get(3),
+                    row.get(4),
+                    row.get(5),
+                )
+            })
             .collect())
     }
 

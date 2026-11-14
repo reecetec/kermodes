@@ -130,6 +130,75 @@ fn both_catalogs_keep_tables_and_epochs() {
     }
 }
 
+/// A keyed table's key columns are part of its definition: kept across a reopen, required to
+/// match when it is created again, and checked against its columns.
+#[test]
+fn both_catalogs_keep_a_keyed_tables_key() {
+    let key = |columns: &[&str]| columns.iter().map(|c| c.to_string()).collect::<Vec<_>>();
+    for backend in backends() {
+        let dir = TempDir::new();
+        {
+            let store = open(&dir, &backend);
+            let created = store
+                .create_keyed_table(&ticks(), &schema(), &key(&["sym"]))
+                .unwrap();
+            assert_eq!(created.key, ["sym"]);
+            let quotes = TableName::parse("md.quotes").unwrap();
+            assert!(
+                store
+                    .create_table(&quotes, &schema())
+                    .unwrap()
+                    .key
+                    .is_empty()
+            );
+        }
+        let store = open(&dir, &backend);
+        assert_eq!(store.table(&ticks()).unwrap().key, ["sym"]);
+        let listed: Vec<Vec<String>> = store.tables().unwrap().into_iter().map(|t| t.key).collect();
+        assert_eq!(listed, [vec![], vec!["sym".to_string()]]);
+        // The same definition is the same table.
+        store
+            .create_keyed_table(&ticks(), &schema(), &key(&["sym"]))
+            .unwrap();
+        let refused = [
+            (
+                "another key",
+                store.create_keyed_table(&ticks(), &schema(), &key(&["n"])),
+            ),
+            (
+                "as an append table",
+                store.create_table(&ticks(), &schema()),
+            ),
+            (
+                "a key that is not a column",
+                store.create_keyed_table(
+                    &TableName::parse("md.x").unwrap(),
+                    &schema(),
+                    &key(&["px"]),
+                ),
+            ),
+            (
+                "a column twice",
+                store.create_keyed_table(
+                    &TableName::parse("md.y").unwrap(),
+                    &schema(),
+                    &key(&["sym", "sym"]),
+                ),
+            ),
+            (
+                "no key",
+                store.create_keyed_table(&TableName::parse("md.z").unwrap(), &schema(), &[]),
+            ),
+        ];
+        for (case, result) in refused {
+            assert!(
+                matches!(result, Err(Error::Schema(_))),
+                "{case}: {result:?}"
+            );
+        }
+    }
+}
+
 /// Weirs sharing a Postgres catalog: one definition per table, however they race to create it,
 /// and epochs that rise across all of them.
 #[test]

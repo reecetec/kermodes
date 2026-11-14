@@ -96,6 +96,19 @@ fn list_from_json<T>(
         .collect()
 }
 
+/// A table's key columns; absent (an older peer, or an append table) is none.
+fn key_from_json(value: &Value) -> Result<Vec<String>, Error> {
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    list_from_json(value, |column| {
+        column
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| Error::Schema(format!("a key column is named, not {column}")))
+    })
+}
+
 fn history_date_json(held: &HistoryDate) -> Value {
     json!({"date": held.date.to_string(), "file": held.file, "rows": held.rows, "bytes": held.bytes})
 }

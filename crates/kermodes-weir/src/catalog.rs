@@ -28,6 +28,8 @@ pub struct TableEntry {
     /// when the table is created (architecture.md §5.1).
     pub location: String,
     pub schema: SchemaRef,
+    /// A keyed table's key columns (§5.2), fixed when it is created; empty for an append table.
+    pub key: Vec<String>,
 }
 
 /// A file of a table's history: its name within the table's location, the dates it holds, and
@@ -77,8 +79,11 @@ pub(crate) enum Catalog {
     Postgres(Box<postgres::Postgres>),
 }
 
-/// A table's row: id, namespace, name, location, and columns as stored.
-type Row = (i64, String, String, String, String);
+/// A table's row: id, namespace, name, location, columns, and key columns as stored.
+type Row = (i64, String, String, String, String, Option<String>);
+
+/// A table found by name: id, location, columns, and key columns as stored.
+type Found = (i64, String, String, Option<String>);
 
 impl Catalog {
     pub(crate) fn sqlite(path: &Path) -> Result<Self, Error> {
@@ -89,16 +94,18 @@ impl Catalog {
         Ok(Self::Postgres(Box::new(postgres::Postgres::open(url)?)))
     }
 
-    /// Creates `name` on `branch` with `schema`, or returns it if it exists with the same
-    /// columns. A table with other columns is an error: schema changes are planned (§5.4).
+    /// Creates `name` on `branch` with `schema`, keyed by `key` (empty for an append table), or
+    /// returns it if it exists with the same columns and key. A table with other columns or
+    /// another key is an error: schema changes are planned (§5.4).
     pub(crate) fn create(
         &mut self,
         branch: &str,
         name: &TableName,
         schema: &Schema,
+        key: &[String],
     ) -> Result<TableEntry, Error> {
         if let Some(existing) = self.get(branch, name)? {
-            return same_columns(name, existing, schema);
+            return same_definition(name, existing, schema, key);
         }
         for field in schema.fields() {
             let kind = type_name(field.data_type());
@@ -109,10 +116,24 @@ impl Catalog {
                 )));
             }
         }
+        for (i, column) in key.iter().enumerate() {
+            if schema.column_with_name(column).is_none() {
+                return Err(Error::Schema(format!(
+                    "{name}'s key column `{column}` is not one of its columns ({})",
+                    listed(schema)
+                )));
+            }
+            if key[..i].contains(column) {
+                return Err(Error::Schema(format!(
+                    "{name}'s key names `{column}` twice"
+                )));
+            }
+        }
         let columns = encode(schema).to_string();
+        let key_json = (!key.is_empty()).then(|| serde_json::json!(key).to_string());
         let inserted = match self {
-            Self::Sqlite(c) => c.insert(branch, name, &columns)?,
-            Self::Postgres(c) => c.insert(branch, name, &columns)?,
+            Self::Sqlite(c) => c.insert(branch, name, &columns, key_json.as_deref())?,
+            Self::Postgres(c) => c.insert(branch, name, &columns, key_json.as_deref())?,
         };
         match inserted {
             Some((id, location)) => Ok(TableEntry {
@@ -120,13 +141,14 @@ impl Catalog {
                 name: name.clone(),
                 location,
                 schema: Arc::new(nullable(schema)),
+                key: key.to_vec(),
             }),
             // Another catalog client created it first: it must agree.
             None => {
                 let existing = self.get(branch, name)?.ok_or_else(|| {
                     Error::Catalog(format!("{name} was created and then vanished"))
                 })?;
-                same_columns(name, existing, schema)
+                same_definition(name, existing, schema, key)
             }
         }
     }
@@ -140,12 +162,13 @@ impl Catalog {
             Self::Sqlite(c) => c.get(branch, name)?,
             Self::Postgres(c) => c.get(branch, name)?,
         };
-        row.map(|(id, location, columns)| {
+        row.map(|(id, location, columns, key)| {
             Ok(TableEntry {
                 id,
                 name: name.clone(),
                 location,
                 schema: Arc::new(decode(&columns)?),
+                key: decode_key(key.as_deref())?,
             })
         })
         .transpose()
@@ -158,12 +181,13 @@ impl Catalog {
             Self::Postgres(c) => c.list(branch)?,
         };
         rows.into_iter()
-            .map(|(id, namespace, table, location, columns)| {
+            .map(|(id, namespace, table, location, columns, key)| {
                 Ok(TableEntry {
                     id,
                     name: TableName::parse(&format!("{namespace}.{table}"))?,
                     location,
                     schema: Arc::new(decode(&columns)?),
+                    key: decode_key(key.as_deref())?,
                 })
             })
             .collect()
@@ -294,10 +318,11 @@ fn location(branch: &str, name: &TableName, id: i64) -> String {
     format!("{branch}/{}/{}.{id}", name.namespace(), name.table())
 }
 
-fn same_columns(
+fn same_definition(
     name: &TableName,
     existing: TableEntry,
     schema: &Schema,
+    key: &[String],
 ) -> Result<TableEntry, Error> {
     if columns(&existing.schema) != columns(schema) {
         return Err(Error::Schema(format!(
@@ -306,7 +331,25 @@ fn same_columns(
             listed(schema)
         )));
     }
+    if existing.key != key {
+        let keyed = |key: &[String]| match key {
+            [] => "as an append table".to_owned(),
+            key => format!("keyed by ({})", key.join(", ")),
+        };
+        return Err(Error::Schema(format!(
+            "{name} already exists {}, not {}",
+            keyed(&existing.key),
+            keyed(key)
+        )));
+    }
     Ok(existing)
+}
+
+fn decode_key(text: Option<&str>) -> Result<Vec<String>, Error> {
+    text.map_or(Ok(Vec::new()), |text| {
+        serde_json::from_str(text)
+            .map_err(|_| Error::Corrupt(format!("catalog key columns `{text}` are unreadable")))
+    })
 }
 
 /// Column names and type names, in order: what makes two definitions the same.

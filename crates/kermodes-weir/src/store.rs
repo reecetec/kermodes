@@ -104,7 +104,23 @@ impl Store {
 
     /// Creates `name` with `schema`, or returns it if it exists with the same columns.
     pub fn create_table(&self, name: &TableName, schema: &Schema) -> Result<TableEntry, Error> {
-        lock(&self.catalog).create(&self.branch, name, schema)
+        lock(&self.catalog).create(&self.branch, name, schema, &[])
+    }
+
+    /// Creates `name` as a keyed table (§5.2): one row per value of the `key` columns, written as
+    /// upserts and deletes. Returns it if it exists with the same columns and key.
+    pub fn create_keyed_table(
+        &self,
+        name: &TableName,
+        schema: &Schema,
+        key: &[String],
+    ) -> Result<TableEntry, Error> {
+        if key.is_empty() {
+            return Err(Error::Schema(format!(
+                "a keyed table needs key columns; {name} has none"
+            )));
+        }
+        lock(&self.catalog).create(&self.branch, name, schema, key)
     }
 
     /// Every table, by name.

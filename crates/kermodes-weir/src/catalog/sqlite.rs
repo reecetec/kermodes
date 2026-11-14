@@ -5,7 +5,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::{
-    FORMAT, Garbage, HistoryCommit, HistoryDate, HistoryFile, Row, check_commit, location,
+    FORMAT, Found, Garbage, HistoryCommit, HistoryDate, HistoryFile, Row, check_commit, location,
 };
 use crate::{Date, Error, SourceId, TableName};
 
@@ -37,6 +37,11 @@ impl Sqlite {
                  source TEXT NOT NULL,
                  epoch INTEGER NOT NULL,
                  PRIMARY KEY (table_id, source)
+             );
+             -- A keyed table's key columns (§5.2), added after format 1 shipped, like `sources`.
+             CREATE TABLE IF NOT EXISTS table_keys (
+                 table_id INTEGER PRIMARY KEY REFERENCES tables (id),
+                 key TEXT NOT NULL
              );
              -- History (§8), added after format 1 shipped, like `sources`: which files hold
              -- each table's history, which dates each holds, and files replaced but not yet
@@ -96,6 +101,7 @@ impl Sqlite {
         branch: &str,
         name: &TableName,
         columns: &str,
+        key: Option<&str>,
     ) -> Result<Option<(i64, String)>, Error> {
         let tx = self.conn.transaction().map_err(sql)?;
         tx.execute(
@@ -111,22 +117,26 @@ impl Sqlite {
             params![location, id],
         )
         .map_err(sql)?;
+        if let Some(key) = key {
+            tx.execute(
+                "INSERT INTO table_keys (table_id, key) VALUES (?1, ?2)",
+                params![id, key],
+            )
+            .map_err(sql)?;
+        }
         tx.commit().map_err(sql)?;
         Ok(Some((id, location)))
     }
 
-    /// A table's id, location, and columns.
-    pub(crate) fn get(
-        &mut self,
-        branch: &str,
-        name: &TableName,
-    ) -> Result<Option<(i64, String, String)>, Error> {
+    /// A table's id, location, columns, and key columns.
+    pub(crate) fn get(&mut self, branch: &str, name: &TableName) -> Result<Option<Found>, Error> {
         self.conn
             .query_row(
-                "SELECT id, location, columns FROM tables
-                 WHERE branch = ?1 AND namespace = ?2 AND name = ?3",
+                "SELECT t.id, t.location, t.columns, k.key FROM tables t
+                 LEFT JOIN table_keys k ON k.table_id = t.id
+                 WHERE t.branch = ?1 AND t.namespace = ?2 AND t.name = ?3",
                 params![branch, name.namespace(), name.table()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(sql)
@@ -136,8 +146,9 @@ impl Sqlite {
         let mut statement = self
             .conn
             .prepare(
-                "SELECT id, namespace, name, location, columns FROM tables
-                 WHERE branch = ?1 ORDER BY namespace, name",
+                "SELECT t.id, t.namespace, t.name, t.location, t.columns, k.key FROM tables t
+                 LEFT JOIN table_keys k ON k.table_id = t.id
+                 WHERE t.branch = ?1 ORDER BY t.namespace, t.name",
             )
             .map_err(sql)?;
         statement
@@ -148,6 +159,7 @@ impl Sqlite {
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             })
             .map_err(sql)?
