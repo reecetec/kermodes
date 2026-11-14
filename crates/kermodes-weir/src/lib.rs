@@ -14,7 +14,7 @@ mod store;
 use std::fmt;
 use std::path::Path;
 
-pub use catalog::TableEntry;
+pub use catalog::{Garbage, HistoryCommit, HistoryDate, HistoryFile, TableEntry};
 pub use names::{Date, SourceId, TableName};
 pub use store::{BRANCH, Pace, Store, Subscriber, Writer, conform};
 

@@ -1,8 +1,8 @@
 //! The catalog (architecture.md §8.2): which tables exist, their IDs, storage locations, and
-//! columns, and each source's lease epoch (§7.4). Locally it is SQLite in the store's directory;
-//! in the cluster it is Postgres, shared by every weir (and later the control plane), so weirs
-//! agree on tables and epochs rise across them. Both backends hold the same rows and pass the
-//! same tests (`tests/catalog.rs`).
+//! columns, each source's lease epoch (§7.4), and which files hold each table's history (§8).
+//! Locally it is SQLite in the store's directory; in the cluster it is Postgres, shared by every
+//! weir (and later the control plane), so weirs agree on tables and epochs rise across them.
+//! Both backends hold the same rows and pass the same tests (`tests/catalog.rs`).
 
 mod postgres;
 mod sqlite;
@@ -14,7 +14,7 @@ use arrow::datatypes::{Field, Schema, SchemaRef};
 use kermodes_core::{parse_type, type_name};
 use serde_json::Value;
 
-use crate::{Error, SourceId, TableName};
+use crate::{Date, Error, SourceId, TableName};
 
 /// The catalog's format; a newer one is a migration, not a silent reinterpretation.
 const FORMAT: i64 = 1;
@@ -28,6 +28,47 @@ pub struct TableEntry {
     /// when the table is created (architecture.md §5.1).
     pub location: String,
     pub schema: SchemaRef,
+}
+
+/// A file of a table's history: its name within the table's location, the dates it holds, and
+/// its size.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryFile {
+    pub name: String,
+    pub first: Date,
+    pub last: Date,
+    pub rows: u64,
+    pub bytes: u64,
+}
+
+/// A date of a table's history in one of its files, with its rows and bytes there; a date past
+/// the target file size lies in several.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryDate {
+    pub date: Date,
+    pub file: String,
+    pub rows: u64,
+    pub bytes: u64,
+}
+
+/// One commit of a table's history: the whole dates written (each replacing what the history
+/// held for it; one with no rows in `dates` is removed), the files replaced, and the new files
+/// with their dates.
+#[derive(Clone, Debug, Default)]
+pub struct HistoryCommit {
+    pub written: Vec<Date>,
+    pub replaced: Vec<String>,
+    pub files: Vec<HistoryFile>,
+    pub dates: Vec<HistoryDate>,
+}
+
+/// A file replaced by a commit, deleted once no read can still be using it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Garbage {
+    pub table_id: i64,
+    /// The table's location, which the file's name is within.
+    pub location: String,
+    pub file: String,
 }
 
 pub(crate) enum Catalog {
@@ -143,6 +184,110 @@ impl Catalog {
             Self::Postgres(c) => c.epoch(table_id, source),
         }
     }
+
+    /// Every date of a table's history, by date then file.
+    pub(crate) fn history(&mut self, table_id: i64) -> Result<Vec<HistoryDate>, Error> {
+        match self {
+            Self::Sqlite(c) => c.history(table_id),
+            Self::Postgres(c) => c.history(table_id),
+        }
+    }
+
+    /// The files of a table's history holding any date from `first` to `last`, by first date.
+    pub(crate) fn history_files(
+        &mut self,
+        table_id: i64,
+        first: Date,
+        last: Date,
+    ) -> Result<Vec<HistoryFile>, Error> {
+        match self {
+            Self::Sqlite(c) => c.history_files(table_id, first, last),
+            Self::Postgres(c) => c.history_files(table_id, first, last),
+        }
+    }
+
+    /// Commits `commit` in one transaction, checked against the history as it is then
+    /// (`check_commit`); the replaced files become garbage as of `now` (seconds since the epoch).
+    pub(crate) fn commit_history(
+        &mut self,
+        table_id: i64,
+        commit: &HistoryCommit,
+        now: i64,
+    ) -> Result<(), Error> {
+        match self {
+            Self::Sqlite(c) => c.commit_history(table_id, commit, now),
+            Self::Postgres(c) => c.commit_history(table_id, commit, now),
+        }
+    }
+
+    /// Files replaced at or before `before` (seconds since the epoch), across every table.
+    pub(crate) fn garbage(&mut self, before: i64) -> Result<Vec<Garbage>, Error> {
+        match self {
+            Self::Sqlite(c) => c.garbage(before),
+            Self::Postgres(c) => c.garbage(before),
+        }
+    }
+
+    /// Forgets a garbage file once it is deleted.
+    pub(crate) fn forget_garbage(&mut self, garbage: &Garbage) -> Result<(), Error> {
+        match self {
+            Self::Sqlite(c) => c.forget_garbage(garbage),
+            Self::Postgres(c) => c.forget_garbage(garbage),
+        }
+    }
+}
+
+/// Whether `commit` may apply to a history holding `current` (every date, in its files) in
+/// `files`. A commit planned on a history that has since changed is `Busy`: plan it again. One
+/// that is wrong in itself is refused outright.
+fn check_commit(
+    current: &[HistoryDate],
+    files: &[String],
+    commit: &HistoryCommit,
+) -> Result<(), Error> {
+    let changed = |why: String| Error::Busy(format!("the history changed since the plan: {why}"));
+    for file in &commit.replaced {
+        if !files.contains(file) {
+            return Err(changed(format!("{file} is no longer in it")));
+        }
+    }
+    // Each date in one place: a date the commit touches leaves every file holding it, and a date
+    // a replaced file holds is written or rewritten, never lost.
+    for held in current {
+        let replaced = commit.replaced.contains(&held.file);
+        let touched =
+            commit.written.contains(&held.date) || commit.dates.iter().any(|d| d.date == held.date);
+        if touched && !replaced {
+            return Err(changed(format!(
+                "{} is also in {}, which the commit keeps",
+                held.date, held.file
+            )));
+        }
+        if replaced && !touched {
+            return Err(Error::Catalog(format!(
+                "a commit replacing {} must rewrite its date {}",
+                held.file, held.date
+            )));
+        }
+    }
+    for date in &commit.dates {
+        let file = commit.files.iter().find(|f| f.name == date.file);
+        if !file.is_some_and(|f| f.first <= date.date && date.date <= f.last) {
+            return Err(Error::Catalog(format!(
+                "{} of a commit is not within a file it adds ({})",
+                date.date, date.file
+            )));
+        }
+    }
+    for file in &commit.files {
+        if files.contains(&file.name) {
+            return Err(Error::Catalog(format!(
+                "{} is already in the history",
+                file.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn location(branch: &str, name: &TableName, id: i64) -> String {

@@ -11,12 +11,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
-use crate::catalog::{Catalog, TableEntry};
+use crate::catalog::{Catalog, Garbage, HistoryCommit, HistoryDate, HistoryFile, TableEntry};
 use crate::partition::Partition;
 use crate::{Date, Error, SourceId, TableName};
 
@@ -117,6 +117,40 @@ impl Store {
         lock(&self.catalog)
             .get(&self.branch, name)?
             .ok_or_else(|| Error::NotFound(format!("no table {name}; create it first")))
+    }
+
+    /// Every date of `name`'s history (§8), by date then file.
+    pub fn history(&self, name: &TableName) -> Result<Vec<HistoryDate>, Error> {
+        let id = self.table(name)?.id;
+        lock(&self.catalog).history(id)
+    }
+
+    /// The files of `name`'s history holding any date from `first` to `last`, by first date.
+    pub fn history_files(
+        &self,
+        name: &TableName,
+        first: Date,
+        last: Date,
+    ) -> Result<Vec<HistoryFile>, Error> {
+        let id = self.table(name)?.id;
+        lock(&self.catalog).history_files(id, first, last)
+    }
+
+    /// Commits a write of `name`'s history in one transaction (§8.2). `Busy` when the history
+    /// changed since the commit was planned: plan it again.
+    pub fn commit_history(&self, name: &TableName, commit: &HistoryCommit) -> Result<(), Error> {
+        let id = self.table(name)?.id;
+        lock(&self.catalog).commit_history(id, commit, unix_seconds())
+    }
+
+    /// History files replaced at least `grace` ago, which no read can still be using.
+    pub fn history_garbage(&self, grace: Duration) -> Result<Vec<Garbage>, Error> {
+        lock(&self.catalog).garbage(unix_seconds() - grace.as_secs() as i64)
+    }
+
+    /// Forgets a garbage file once it is deleted.
+    pub fn forget_garbage(&self, garbage: &Garbage) -> Result<(), Error> {
+        lock(&self.catalog).forget_garbage(garbage)
     }
 
     /// A writer for `source`'s rows of `name`, holding the source's lease (§7.4) until it is
@@ -415,4 +449,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .expect("kermodes store poisoned by an earlier panic")
+}
+
+fn unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }

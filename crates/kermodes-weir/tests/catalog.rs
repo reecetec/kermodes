@@ -6,9 +6,12 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
+use std::time::Duration;
 
 use arrow::datatypes::{DataType, Field, Schema};
-use kermodes_weir::{Error, SourceId, Store, TableName};
+use kermodes_weir::{
+    Date, Error, HistoryCommit, HistoryDate, HistoryFile, SourceId, Store, TableName,
+};
 
 struct TempDir(PathBuf);
 
@@ -158,4 +161,161 @@ fn weirs_sharing_a_postgres_catalog_agree() {
     assert_eq!(a.writer(&name, &feed, false).unwrap().epoch(), 1);
     assert_eq!(b.writer(&name, &feed, false).unwrap().epoch(), 2);
     assert_eq!(b.source_state(&name, &feed).unwrap().1, Some(2));
+}
+
+fn date(text: &str) -> Date {
+    Date::parse(text).unwrap()
+}
+
+/// A history file named `name` holding `first` to `last`, ten bytes a row.
+fn file(name: &str, first: &str, last: &str, rows: u64) -> HistoryFile {
+    HistoryFile {
+        name: name.into(),
+        first: date(first),
+        last: date(last),
+        rows,
+        bytes: rows * 10,
+    }
+}
+
+fn on(day: &str, file: &str, rows: u64) -> HistoryDate {
+    HistoryDate {
+        date: date(day),
+        file: file.into(),
+        rows,
+        bytes: rows * 10,
+    }
+}
+
+/// A commit writing `written` as the new file `name`, replacing `replaced`.
+fn commit(written: &[&str], replaced: &[&str], name: &str, dates: &[(&str, u64)]) -> HistoryCommit {
+    let rows = dates.iter().map(|(_, rows)| rows).sum();
+    let (first, last) = (dates[0].0, dates[dates.len() - 1].0);
+    HistoryCommit {
+        written: written.iter().map(|d| date(d)).collect(),
+        replaced: replaced.iter().map(|f| f.to_string()).collect(),
+        files: vec![file(name, first, last, rows)],
+        dates: dates
+            .iter()
+            .map(|&(day, rows)| on(day, name, rows))
+            .collect(),
+    }
+}
+
+/// History commits through either catalog: dates move between files in one commit; a commit
+/// planned on a history that has since changed is `Busy`; one that would lose a date is refused
+/// outright; refused commits change nothing; replaced files wait as garbage until forgotten; and
+/// the history outlives the process.
+#[test]
+fn both_catalogs_commit_history_checked_against_what_it_holds() {
+    for backend in backends() {
+        let dir = TempDir::new();
+        let store = open(&dir, &backend);
+        store.create_table(&ticks(), &schema()).unwrap();
+        assert!(store.history(&ticks()).unwrap().is_empty());
+
+        let first = commit(&["2026-11-01"], &[], "a", &[("2026-11-01", 1)]);
+        store.commit_history(&ticks(), &first).unwrap();
+        // The next small date joins it in a new pack.
+        let pack = commit(
+            &["2026-11-02"],
+            &["a"],
+            "b",
+            &[("2026-11-01", 1), ("2026-11-02", 1)],
+        );
+        store.commit_history(&ticks(), &pack).unwrap();
+        assert_eq!(store.history(&ticks()).unwrap(), pack.dates);
+        let after = |first: &str| {
+            store
+                .history_files(&ticks(), date(first), date("2026-11-30"))
+                .unwrap()
+        };
+        assert_eq!(after("2026-11-02"), pack.files);
+        assert!(after("2026-11-03").is_empty());
+
+        // Planned when `a` was the file before 2026-11-05: `a` is gone.
+        let stale = commit(&["2026-11-05"], &["a"], "c", &[("2026-11-05", 1)]);
+        // Planned when 2026-11-01 was in no file: `b` now holds it.
+        let twice = commit(
+            &["2026-11-05"],
+            &[],
+            "f",
+            &[("2026-11-01", 1), ("2026-11-05", 1)],
+        );
+        // Writing 2026-11-01 beside `b`, which holds it.
+        let beside = commit(&["2026-11-01"], &[], "d", &[("2026-11-01", 5)]);
+        // Replacing `b` while rewriting only 2026-11-02 would lose 2026-11-01.
+        let lossy = commit(&["2026-11-02"], &["b"], "e", &[("2026-11-02", 1)]);
+        let cases = [
+            ("stale", &stale),
+            ("twice", &twice),
+            ("beside", &beside),
+            ("lossy", &lossy),
+        ];
+        for (case, refused) in cases.map(|(case, c)| (case, store.commit_history(&ticks(), c))) {
+            match (case, refused) {
+                ("stale" | "twice" | "beside", Err(Error::Busy(_)))
+                | ("lossy", Err(Error::Catalog(_))) => {}
+                (case, other) => panic!("{case}: {other:?}"),
+            }
+        }
+        assert_eq!(store.history(&ticks()).unwrap(), pack.dates);
+
+        let garbage = store.history_garbage(Duration::ZERO).unwrap();
+        let files: Vec<&str> = garbage.iter().map(|g| g.file.as_str()).collect();
+        assert_eq!(files, ["a"]);
+        assert!(
+            store
+                .history_garbage(Duration::from_secs(3600))
+                .unwrap()
+                .is_empty()
+        );
+        store.forget_garbage(&garbage[0]).unwrap();
+        assert!(store.history_garbage(Duration::ZERO).unwrap().is_empty());
+
+        drop(store);
+        assert_eq!(open(&dir, &backend).history(&ticks()).unwrap(), pack.dates);
+    }
+}
+
+/// Two weirs committing to one table's history at once through a shared catalog: one commit
+/// wins, the other is told the history changed, never a broken history or a database error.
+#[test]
+fn racing_history_commits_on_a_shared_catalog_one_wins() {
+    let Some(url) = postgres() else { return };
+    let (a_dir, b_dir) = (TempDir::new(), TempDir::new());
+    let a = Arc::new(Store::open_with_catalog(&a_dir.0, &url, "prod").unwrap());
+    let b = Arc::new(Store::open_with_catalog(&b_dir.0, &url, "prod").unwrap());
+
+    for i in 0..20 {
+        let name = TableName::parse(&format!("md.h{i}")).unwrap();
+        a.create_table(&name, &schema()).unwrap();
+        let first = commit(&["2026-11-01"], &[], "a", &[("2026-11-01", 1)]);
+        a.commit_history(&name, &first).unwrap();
+        let start = Arc::new(Barrier::new(2));
+        let racers: Vec<_> = [(a.clone(), "b"), (b.clone(), "c")]
+            .into_iter()
+            .map(|(store, file)| {
+                let (name, start) = (name.clone(), start.clone());
+                std::thread::spawn(move || {
+                    let pack = commit(
+                        &["2026-11-02"],
+                        &["a"],
+                        file,
+                        &[("2026-11-01", 1), ("2026-11-02", 1)],
+                    );
+                    start.wait();
+                    store.commit_history(&name, &pack)
+                })
+            })
+            .collect();
+        let results: Vec<_> = racers.into_iter().map(|r| r.join().unwrap()).collect();
+        let won = results.iter().filter(|r| r.is_ok()).count();
+        let busy = results
+            .iter()
+            .filter(|r| matches!(r, Err(Error::Busy(_))))
+            .count();
+        assert_eq!((won, busy), (1, 1), "md.h{i}: {results:?}");
+        assert_eq!(a.history(&name).unwrap().len(), 2);
+    }
 }
