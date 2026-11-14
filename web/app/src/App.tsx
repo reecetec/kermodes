@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Moon,
-  PawPrint,
   Search,
   Sun,
   Table2,
@@ -28,6 +27,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip';
+import { Logo } from '@/components/Logo';
 import { cn } from '@/lib/utils';
 
 const THEME_KEY = 'kermodes-theme';
@@ -96,32 +96,44 @@ function ConnectionPill({
   );
 }
 
+/** Whether the server has a store, and so a catalog: one without answers 404 */
+function useHasCatalog(): boolean {
+  const [has, setHas] = useState(false);
+  useEffect(() => {
+    let live = true;
+    fetch('/api/catalog')
+      .then(response => live && setHas(response.status !== 404))
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, []);
+  return has;
+}
+
 function TopBar({
   connection,
   themeName,
   onToggleTheme,
   page,
   onPage,
-  hasDeployments,
+  pages,
 }: {
   connection: KermodesConnection;
   themeName: GridThemeName;
   onToggleTheme: () => void;
   page: Page;
   onPage: (page: Page) => void;
-  hasDeployments: boolean;
+  pages: readonly Page[];
 }) {
   return (
     <header className="flex h-12 shrink-0 items-center gap-3 border-b bg-sidebar px-4">
-      <div className="flex size-7 items-center justify-center rounded-md bg-primary text-primary-foreground shadow-sm">
-        <PawPrint className="size-4" />
+      <div className="flex items-center gap-2">
+        <Logo className="size-6" />
+        <span className="text-[15px] font-semibold tracking-tight">Kermodes</span>
       </div>
-      <span className="text-[15px] font-semibold tracking-tight">Kermodes</span>
       <nav className="flex items-center gap-1">
-        {(hasDeployments
-          ? (['deployments', 'catalog', 'tables'] as const)
-          : (['catalog', 'tables'] as const)
-        ).map(name => (
+        {pages.map(name => (
           <Button
             key={name}
             variant={page === name ? 'secondary' : 'ghost'}
@@ -265,6 +277,12 @@ export default function App({ connection }: { connection: KermodesConnection }) 
   const theme = gridThemes[themeName];
   // Deployments is the main tab wherever a controller reports them, until someone picks a tab.
   const hasDeployments = connection.pages.includes(DEPLOYMENTS_VIEW);
+  const hasCatalog = useHasCatalog();
+  const pages: Page[] = [
+    ...(hasDeployments ? (['deployments'] as const) : []),
+    ...(hasCatalog ? (['catalog'] as const) : []),
+    'tables',
+  ];
   const [picked, setPicked] = useState<Page | null>(null);
   const page: Page = picked ?? (hasDeployments ? 'deployments' : 'tables');
 
@@ -325,7 +343,7 @@ export default function App({ connection }: { connection: KermodesConnection }) 
           onToggleTheme={toggleTheme}
           page={page}
           onPage={setPicked}
-          hasDeployments={hasDeployments}
+          pages={pages}
         />
         {page === 'deployments' && <DeploymentsPage connection={connection} />}
         {page === 'catalog' && (
