@@ -65,6 +65,13 @@ spec:
               port: http
             periodSeconds: 10
             failureThreshold: 6
+          # On rollout the gateway (Envoy) drops the old pod a moment after Kubernetes does; until
+          # then it still sends it requests. Serving on for a few seconds before stopping keeps
+          # those from meeting a closed port ("upstream connect error").
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
           resources:
             {{- toYaml .Values.ui.resources | nindent 12 }}
           securityContext:
