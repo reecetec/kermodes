@@ -314,7 +314,11 @@ pub fn with_date_column(schema: &Schema) -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
-fn dated(schema: &SchemaRef, date: Date, batch: &RecordBatch) -> Result<RecordBatch, Error> {
+pub(crate) fn dated(
+    schema: &SchemaRef,
+    date: Date,
+    batch: &RecordBatch,
+) -> Result<RecordBatch, Error> {
     let mut columns: Vec<ArrayRef> = vec![Arc::new(Date32Array::from_value(
         date.days(),
         batch.num_rows(),

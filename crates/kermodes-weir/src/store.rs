@@ -260,6 +260,22 @@ impl Store {
         }
     }
 
+    /// The past dates weir still holds rows of for `name`: not yet merged, or merged and not yet
+    /// dropped. Reads of history take them from weir, so it has no gap (§8.4).
+    pub fn past_dates(&self, name: &TableName) -> Result<Vec<Date>, Error> {
+        let log = self.log(name)?;
+        let state = lock(&log.state);
+        let mut dates: Vec<Date> = state
+            .partitions
+            .iter()
+            .filter(|(_, partition)| partition.rows() > 0)
+            .filter_map(|((day, _), _)| Date::parse(day).ok())
+            .filter(|&date| past(date).is_ok())
+            .collect();
+        dates.dedup();
+        Ok(dates)
+    }
+
     /// The rows and stream bytes weir holds of a past `date` of `name`, over every source.
     pub fn date_rows(&self, name: &TableName, date: Date) -> Result<(u64, u64), Error> {
         past(date)?;

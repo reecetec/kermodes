@@ -97,6 +97,10 @@ impl fmt::Display for SourceId {
 pub struct Date(i32);
 
 impl Date {
+    /// The first and last dates `YYYY-MM-DD` writes: 0001-01-01 and 9999-12-31.
+    pub const MIN: Date = Date(-719_162);
+    pub const MAX: Date = Date(2_932_896);
+
     /// The date of a UTC instant in nanoseconds since the epoch.
     pub fn of_ns(ns: i64) -> Self {
         Self(ns.div_euclid(86_400_000_000_000) as i32)
@@ -206,5 +210,7 @@ mod tests {
             assert!(Date::parse(bad).is_err(), "{bad}");
         }
         assert_eq!(Date::parse("2024-02-29").unwrap().days(), 19_782);
+        assert_eq!(Date::parse("0001-01-01").unwrap(), Date::MIN);
+        assert_eq!(Date::parse("9999-12-31").unwrap(), Date::MAX);
     }
 }

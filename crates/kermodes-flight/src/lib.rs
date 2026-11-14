@@ -15,10 +15,11 @@
 //!   `last_seq` `{"table", "source"}` → `{"last_seq", "epoch"}`. A writer asks for it once its
 //!   `DoPut` holds the lease, so nothing can write between the answer and its first batch.
 //! - History (§8), dates as `YYYY-MM-DD`: `date_rows` `{"table", "date"}` → `{"rows", "bytes"}`;
-//!   `history` `{"table"}` → dates; `history_files` `{"table", "first", "last"}` → files;
-//!   `commit_history` `{"table", "written", "replaced", "files", "dates"}`; `drop_date`
-//!   `{"table", "date"}`; `history_garbage` `{"grace_secs"}` → garbage; `forget_garbage`
-//!   garbage. Each mirrors the `Store` method of its name.
+//!   `past_dates` `{"table"}` → dates; `history` `{"table"}` → dates in files;
+//!   `history_files` `{"table", "first", "last"}` → files; `commit_history`
+//!   `{"table", "written", "replaced", "files", "dates"}`; `drop_date` `{"table", "date"}`;
+//!   `history_garbage` `{"grace_secs"}` → garbage; `forget_garbage` garbage. Each mirrors the
+//!   `Store` method of its name.
 
 #![forbid(unsafe_code)]
 

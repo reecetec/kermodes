@@ -19,6 +19,7 @@ pub trait Weir {
         date: Date,
         each: &mut dyn FnMut(RecordBatch) -> Result<(), Error>,
     ) -> Result<(), Error>;
+    fn past_dates(&self, name: &TableName) -> Result<Vec<Date>, Error>;
     fn history(&self, name: &TableName) -> Result<Vec<HistoryDate>, Error>;
     fn history_files(
         &self,
@@ -48,6 +49,10 @@ impl Weir for Store {
         each: &mut dyn FnMut(RecordBatch) -> Result<(), Error>,
     ) -> Result<(), Error> {
         Store::read_date(self, name, date, each)
+    }
+
+    fn past_dates(&self, name: &TableName) -> Result<Vec<Date>, Error> {
+        Store::past_dates(self, name)
     }
 
     fn history(&self, name: &TableName) -> Result<Vec<HistoryDate>, Error> {
@@ -96,6 +101,10 @@ impl Weir for Client {
         each: &mut dyn FnMut(RecordBatch) -> Result<(), Error>,
     ) -> Result<(), Error> {
         Client::read_date(self, name, date, each)
+    }
+
+    fn past_dates(&self, name: &TableName) -> Result<Vec<Date>, Error> {
+        Client::past_dates(self, name)
     }
 
     fn history(&self, name: &TableName) -> Result<Vec<HistoryDate>, Error> {

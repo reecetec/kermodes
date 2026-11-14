@@ -368,6 +368,11 @@ impl FlightService for Service {
                 let (rows, bytes) = blocking(move || store.date_rows(&name, date)).await?;
                 json!({"rows": rows, "bytes": bytes})
             }
+            "past_dates" => {
+                let name = table_name(&command(&action.body)?)?;
+                let dates = blocking(move || store.past_dates(&name)).await?;
+                json!(dates.iter().map(Date::to_string).collect::<Vec<_>>())
+            }
             "history" => {
                 let name = table_name(&command(&action.body)?)?;
                 let held = blocking(move || store.history(&name)).await?;
@@ -433,6 +438,7 @@ impl FlightService for Service {
                 "date_rows",
                 "{table, date}: rows and bytes weir holds of a past date",
             ),
+            ("past_dates", "{table}: past dates weir still holds rows of"),
             (
                 "history",
                 "{table}: every date of its history, in its files",

@@ -22,8 +22,9 @@ use tonic::Streaming;
 use tonic::transport::Channel;
 
 use crate::{
-    MAX_WRITE_BYTES, columns_json, commit_json, error_from_status, garbage_from_json, garbage_json,
-    history_date_from_json, history_file_from_json, list_from_json, schema_from_json,
+    MAX_WRITE_BYTES, columns_json, commit_json, date_from_json, error_from_status,
+    garbage_from_json, garbage_json, history_date_from_json, history_file_from_json,
+    list_from_json, schema_from_json,
 };
 
 /// Connected to a store's Flight server. Calls block until the server answers. Clones share the
@@ -184,6 +185,12 @@ impl Client {
             }
         }
         Ok(())
+    }
+
+    /// The past dates weir still holds rows of for `name`.
+    pub fn past_dates(&self, name: &TableName) -> Result<Vec<Date>, Error> {
+        let dates = self.action("past_dates", json!({"table": name.to_string()}))?;
+        list_from_json(&dates, date_from_json)
     }
 
     /// Every date of `name`'s history, by date then file.

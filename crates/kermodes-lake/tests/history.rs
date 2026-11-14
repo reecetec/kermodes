@@ -1,5 +1,6 @@
-//! Merging past dates from a real store into a real history directory: rows move whole, small
-//! dates share a file, a re-run changes nothing, and weir never drops what history lacks.
+//! History of a real store in a real directory. Merging: rows move whole, small dates share a
+//! file, a re-run changes nothing, weir never drops what history lacks. Reading: only the dates
+//! asked for, unmerged ones from weir.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,8 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch};
-use arrow::datatypes::{DataType, Field, Int64Type, Schema};
-use kermodes_lake::{Lake, Merged, collect_garbage, merge};
+use arrow::datatypes::{DataType, Date32Type, Field, Int64Type, Schema};
+use kermodes_lake::{History, Lake, Merged, Weir, collect_garbage, merge, read_history};
 use kermodes_weir::{Date, Error, SourceId, Store, TableName};
 
 struct TempDir(PathBuf);
@@ -176,6 +177,9 @@ fn a_merge_cut_short_after_its_commit_finishes_by_dropping() {
     drop(store);
     let store = store_with(&root, &[(d(1), &[("a", &[1, 2])])]);
     assert_eq!(store.date_rows(&ticks(), d(1)).unwrap().0, 2);
+    // In both places: a read takes it from history alone.
+    let read = read_history(&store, &lake, &ticks(), None, None).unwrap();
+    assert_eq!((rows(&read).len(), read.explain.weir_dates), (2, 0));
 
     assert_eq!(
         merge(&store, &lake, &ticks(), d(1)).unwrap(),
@@ -230,4 +234,91 @@ fn a_merge_over_flight_moves_dates_the_same() {
         merge(&client, &lake, &ticks(), today()),
         Err(Error::Busy(_))
     ));
+}
+
+/// Each row read: its `Date` (as days) and its `n`.
+fn rows(history: &History) -> Vec<(i32, i64)> {
+    let mut rows = Vec::new();
+    for batch in &history.batches {
+        let dates = batch.column(0).as_primitive::<Date32Type>();
+        let n = batch.column(1).as_primitive::<Int64Type>();
+        rows.extend(
+            dates
+                .values()
+                .iter()
+                .copied()
+                .zip(n.values().iter().copied()),
+        );
+    }
+    rows
+}
+
+/// Reads of history take only the dates asked for: from files, only those dates' row groups;
+/// past dates not merged yet from weir, so there is no gap. The same in-process and over Flight.
+#[test]
+fn history_reads_only_the_dates_asked_for() {
+    let dir = TempDir::new();
+    let store = Arc::new(store_with(
+        &dir.0.join("store"),
+        &[
+            (d(1), &[("a", &[1, 2, 3]), ("b", &[4, 5])]),
+            (d(2), &[("a", &[6, 7])]),
+            (d(3), &[("a", &[8, 9])]),
+        ],
+    ));
+    let lake = Lake::open(dir.0.join("lake").to_str().unwrap()).unwrap();
+    merge(&*store, &lake, &ticks(), d(1)).unwrap();
+    merge(&*store, &lake, &ticks(), d(2)).unwrap();
+    let server = kermodes_flight::serve(store.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+    let client = kermodes_flight::Client::connect(&format!("grpc://{}", server.addr())).unwrap();
+
+    let (one, two, three) = (d(1).days(), d(2).days(), d(3).days());
+    for weir in [&*store as &dyn Weir, &client] {
+        let read = |first, last| read_history(weir, &lake, &ticks(), first, last).unwrap();
+
+        let all = read(None, None);
+        let mut expected: Vec<(i32, i64)> = [1, 2, 3, 4, 5].map(|n| (one, n)).to_vec();
+        expected.extend([(two, 6), (two, 7), (three, 8), (three, 9)]);
+        let mut got = rows(&all);
+        got.sort_unstable();
+        assert_eq!(got, expected);
+        assert!(
+            rows(&all).is_sorted_by_key(|&(date, _)| date),
+            "in date order"
+        );
+        assert_eq!(
+            (
+                all.explain.files,
+                all.explain.row_groups,
+                all.explain.weir_dates
+            ),
+            ((1, 1), (2, 2), 1)
+        );
+
+        let second = read(Some(d(2)), Some(d(2)));
+        assert_eq!(rows(&second), [(two, 6), (two, 7)]);
+        assert_eq!(
+            (
+                second.explain.files,
+                second.explain.row_groups,
+                second.explain.weir_dates
+            ),
+            ((1, 1), (1, 2), 0)
+        );
+        assert!(second.explain.bytes.0 < second.explain.bytes.1);
+        assert!(
+            second
+                .explain
+                .to_string()
+                .starts_with("1 of 1 files, 1 of 2 row groups"),
+            "{}",
+            second.explain
+        );
+
+        let third = read(Some(d(3)), None);
+        assert_eq!(rows(&third), [(three, 8), (three, 9)]);
+        assert_eq!((third.explain.files, third.explain.weir_dates), ((0, 1), 1));
+
+        assert!(read(Some(d(4)), None).batches.is_empty());
+    }
 }
