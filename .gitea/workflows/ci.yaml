@@ -3,12 +3,10 @@ name: CI
 on:
   workflow_dispatch:
   pull_request:
+  # Every green push to master is a release (the release job below).
   push:
     branches:
       - master
-    # A release: v<version>, where every version in the repository says <version>.
-    tags:
-      - "v*"
 
 permissions:
   contents: read
@@ -109,10 +107,12 @@ jobs:
         if: always()
         run: sccache --show-stats
 
-  # Builds the release's one image and its chart, once; Kargo promotes them from the registry.
+  # Every green push to master is released: the build's version is 0.4.<run number>, stamped into
+  # this checkout only (the repository says 0.0.0). It builds the one image and its chart, once;
+  # Kargo promotes them from the registry.
   release:
     needs: [rust, python]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: arc
     container:
       image: git.rcolclough.com/rcolclough/buildah-ci:stable-node20
@@ -132,14 +132,13 @@ jobs:
         with:
           set-safe-directory: true
 
-      - name: Check the tag matches every version
+      - name: Stamp the version
         id: version
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          grep -qx "version = \"$VERSION\"" pyproject.toml
+          VERSION="0.4.${{ github.run_number }}"
+          sed -i "s/^version = \"0.0.0\"$/version = \"$VERSION\"/" Cargo.toml pyproject.toml
           grep -qx "version = \"$VERSION\"" Cargo.toml
-          grep -qx "version: $VERSION" deploy/helm/kermodes/Chart.yaml
-          grep -qx "appVersion: \"$VERSION\"" deploy/helm/kermodes/Chart.yaml
+          grep -qx "version = \"$VERSION\"" pyproject.toml
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Log in to the registry
@@ -171,5 +170,5 @@ jobs:
           curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" | tar -xz -C /tmp
           HELM=/tmp/linux-amd64/helm
           echo "${{ secrets.REGISTRY_TOKEN }}" | $HELM registry login "$REGISTRY" --username "$REGISTRY_USER" --password-stdin
-          $HELM package deploy/helm/kermodes --destination /tmp/chart
+          $HELM package deploy/helm/kermodes --version "$VERSION" --app-version "$VERSION" --destination /tmp/chart
           $HELM push "/tmp/chart/kermodes-$VERSION.tgz" "$CHARTS"

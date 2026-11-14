@@ -2,7 +2,8 @@ apiVersion: v2
 name: kermodes
 description: Live and historical tables on Arrow. weir (the ingest store) and an engine serving the web UI.
 type: application
-# Released together with the image: CI packages the chart with the release's version as both
-# `version` and `appVersion`, and the image tag defaults to `appVersion`.
-version: 0.3.12
-appVersion: "0.3.12"
+# Released together with the image: CI packages the chart with the build's version (0.4.<run
+# number>) as both `version` and `appVersion`, and the image tag defaults to `appVersion`. The
+# repository's 0.0.0 is never published.
+version: 0.0.0
+appVersion: "0.0.0"
