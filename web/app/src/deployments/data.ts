@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { tableFromIPC } from 'apache-arrow';
-import type { KermodesConnection } from '@kermodes/client';
-import { toBytes } from '@kermodes/grid';
+import { toBytes, type KermodesConnection } from '@kermodes/client';
 import { type Component, type Deployment, type Project, componentUsage, key } from './model';
 
 /** The view of `sys.deployments` the UI's server publishes for this page: each deployment's newest row */

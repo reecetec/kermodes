@@ -14,6 +14,7 @@
     "react": "^19.0.0"
   },
   "dependencies": {
+    "@kermodes/client": "workspace:*",
     "apache-arrow": "^21.0.0",
     "classnames": "^2.5.1",
     "memoize-one": "^6.0.0"

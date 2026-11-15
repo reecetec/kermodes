@@ -18,12 +18,8 @@ import {
   vectorFromArray,
 } from 'apache-arrow';
 import theme from './GridTheme';
-import ViewportGridModel, {
-  changedCells,
-  FLASH_DURATION_MS,
-  type RowWindow,
-  type ViewportColumn,
-} from './ViewportGridModel';
+import { type ViewportColumn } from '@kermodes/client';
+import ViewportGridModel, { changedCells, FLASH_DURATION_MS, type RowWindow } from './ViewportGridModel';
 
 const KEYS = BigUint64Array.of(BigInt(11), BigInt(12));
 

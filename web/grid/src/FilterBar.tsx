@@ -1,7 +1,8 @@
 import React from 'react';
 import type GridMetrics from './GridMetrics';
 import { type DraggingColumn } from './mouse-handlers/GridColumnMoveMouseHandler';
-import { isNumericType, type ViewportColumn } from './ViewportGridModel';
+import { type ViewportColumn } from '@kermodes/client';
+import { isNumericType } from './ViewportGridModel';
 
 /** Height of the quick filter bar under the column headers */
 export const FILTER_BAR_HEIGHT = 26;

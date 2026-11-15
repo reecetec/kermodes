@@ -1,4 +1,4 @@
-import { type ViewerState } from './ViewerChannel';
+import { type ViewerState } from '@kermodes/client';
 
 /**
  * What covers a viewer's rows when they are not current (docs/theme.md, "Live data states"):

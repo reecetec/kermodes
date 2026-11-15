@@ -1,4 +1,4 @@
-import { type SortKey } from './ViewportGridModel';
+import { type SortKey } from '@kermodes/client';
 
 /**
  * The sort after clicking the header of `column`. Each click cycles the column

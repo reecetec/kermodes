@@ -43,9 +43,6 @@
     "client": {
       "name": "@kermodes/client",
       "version": "0.0.0",
-      "dependencies": {
-        "@kermodes/grid": "workspace:*",
-      },
       "devDependencies": {
         "@types/bun": "^1.4.0",
         "typescript": "^5.9.0",
@@ -74,6 +71,7 @@
       "name": "@kermodes/grid",
       "version": "0.0.0",
       "dependencies": {
+        "@kermodes/client": "workspace:*",
         "apache-arrow": "^21.0.0",
         "classnames": "^2.5.1",
         "memoize-one": "^6.0.0",
@@ -95,7 +93,6 @@
       "version": "0.0.0",
       "dependencies": {
         "@kermodes/client": "workspace:*",
-        "@kermodes/grid": "workspace:*",
         "apache-arrow": "^21.0.0",
       },
       "devDependencies": {
@@ -114,6 +111,7 @@
       "name": "@kermodes/widget",
       "version": "0.0.0",
       "dependencies": {
+        "@kermodes/client": "workspace:*",
         "@kermodes/grid": "workspace:*",
         "@kermodes/theme": "workspace:*",
         "apache-arrow": "^21.0.0",

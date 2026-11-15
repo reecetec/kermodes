@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, jest } from 'bun:test';
-import { type ViewerBuffer, type ViewerReply } from '@kermodes/grid';
+import { type ViewerBuffer, type ViewerReply } from './protocol';
 import { parseFrame } from './frame';
 import { KermodesConnection, type SocketLike } from './connection';
 

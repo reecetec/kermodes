@@ -2,7 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import GridRange from './GridRange';
 import { GridUtils } from './GridUtils';
 import { copyText, copyValue, planCopy, toTsv } from './copy';
-import { type ViewportColumn } from './ViewportGridModel';
+import { type ViewportColumn } from '@kermodes/client';
 
 const COLUMNS: ViewportColumn[] = [
   { name: 'sym', type: 'utf8' },

@@ -1,5 +1,5 @@
 import { DataType, type Table } from 'apache-arrow';
-import type { SortKey, ViewerState } from '@kermodes/grid';
+import type { SortKey, ViewerState } from '@kermodes/client';
 
 /** A row as `useTable` gives it: column name to a plain JavaScript value */
 export type TableRow = Record<string, unknown>;

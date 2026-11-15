@@ -5,7 +5,7 @@ import {
   type ViewerRequest,
   type ViewerState,
   type ViewportColumn,
-} from '@kermodes/grid';
+} from './protocol';
 import { parseFrame } from './frame';
 
 /** A table the session publishes */

@@ -10,9 +10,6 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },
-  "dependencies": {
-    "@kermodes/grid": "workspace:*"
-  },
   "devDependencies": {
     "@types/bun": "^1.4.0",
     "typescript": "^5.9.0"

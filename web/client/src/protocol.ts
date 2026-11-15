@@ -1,4 +1,14 @@
-import { type SortKey, type ViewportColumn } from './ViewportGridModel';
+/** A column of the viewed table, as the engine names its type */
+export type ViewportColumn = {
+  name: string;
+  type: string;
+};
+
+/** One key of the table's sort, as the engine is asked for it */
+export type SortKey = {
+  column: string;
+  descending: boolean;
+};
 
 /** What the engine side keeps in sync with the viewer */
 export type ViewerState = {

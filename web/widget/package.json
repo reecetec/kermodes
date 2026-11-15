@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@kermodes/client": "workspace:*",
     "@kermodes/grid": "workspace:*",
     "@kermodes/theme": "workspace:*",
     "apache-arrow": "^21.0.0",

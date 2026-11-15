@@ -14,7 +14,7 @@ import {
   tableToIPC,
   vectorFromArray,
 } from 'apache-arrow';
-import type { SortKey, ViewerRequest, ViewerState } from '@kermodes/grid';
+import type { SortKey, ViewerRequest, ViewerState } from '@kermodes/client';
 import widget, { type WidgetModel } from '../src/index';
 
 const params = new URLSearchParams(location.search);

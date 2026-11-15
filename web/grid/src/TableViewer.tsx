@@ -14,7 +14,8 @@ import { type GridTheme } from './GridTheme';
 import GridUtils, { type GridPoint } from './GridUtils';
 import { type EventHandlerResult } from './EventHandlerResult';
 import { selectionToRanges } from './RangedSelection';
-import ViewportGridModel, { type SortKey } from './ViewportGridModel';
+import { toBytes, toKeys, type SortKey, type ViewerChannel, type ViewerState } from '@kermodes/client';
+import ViewportGridModel from './ViewportGridModel';
 import {
   TableViewerMetricCalculator,
   TableViewerRenderer,
@@ -36,12 +37,6 @@ import {
   planCopy,
   writeClipboard,
 } from './copy';
-import {
-  toBytes,
-  toKeys,
-  type ViewerChannel,
-  type ViewerState,
-} from './ViewerChannel';
 import { viewerCover, type Cover } from './cover';
 import { shownValue, type ShownValue } from './cellValue';
 import ValuePopover, { type CellRect } from './ValuePopover';

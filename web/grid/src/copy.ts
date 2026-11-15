@@ -1,10 +1,7 @@
 import GridRange from './GridRange';
 import { type VisibleIndex } from './GridMetrics';
-import {
-  formatValue,
-  isNumericType,
-  type ViewportColumn,
-} from './ViewportGridModel';
+import { type ViewportColumn } from '@kermodes/client';
+import { formatValue, isNumericType } from './ViewportGridModel';
 
 /** The most rows one copy takes; bigger selections copy their first rows */
 export const COPY_ROW_LIMIT = 100_000;

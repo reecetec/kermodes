@@ -1,4 +1,5 @@
-import { isNumericType, type SortKey } from './ViewportGridModel';
+import { type SortKey } from '@kermodes/client';
+import { isNumericType } from './ViewportGridModel';
 
 /** What a menu item does; the viewer carries it out */
 export type MenuAction =

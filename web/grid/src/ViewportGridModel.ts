@@ -2,18 +2,7 @@ import { type Table, type Vector } from 'apache-arrow';
 import GridModel from './GridModel';
 import { type ModelIndex } from './GridMetrics';
 import { type GridColor, type GridTheme, type NullableGridColor } from './GridTheme';
-
-/** A column of the viewed table, as the engine names its type */
-export type ViewportColumn = {
-  name: string;
-  type: string;
-};
-
-/** One key of the table's sort, as the engine is asked for it */
-export type SortKey = {
-  column: string;
-  descending: boolean;
-};
+import { type SortKey, type ViewportColumn } from '@kermodes/client';
 
 /** How long a changed or copied cell stays highlighted */
 export const FLASH_DURATION_MS = 600;

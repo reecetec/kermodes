@@ -8,8 +8,13 @@ import {
   type ReactNode,
 } from 'react';
 import { tableFromIPC, type Table } from 'apache-arrow';
-import { KermodesConnection, type SocketView, type TableInfo } from '@kermodes/client';
-import { toBytes, type ViewportColumn } from '@kermodes/grid';
+import {
+  KermodesConnection,
+  toBytes,
+  type SocketView,
+  type TableInfo,
+  type ViewportColumn,
+} from '@kermodes/client';
 import {
   rowRange,
   sortKeys,

@@ -30,7 +30,6 @@ export * from './mouse-handlers';
 export * from './errors';
 export { injectGridStyles } from './GridStyles';
 export * from './ViewportGridModel';
-export * from './ViewerChannel';
 export { TableViewer, type TableViewerProps } from './TableViewer';
 export { TableViewerMetricCalculator, TableViewerRenderer } from './TableViewerGrid';
 export * from './FilterBar';

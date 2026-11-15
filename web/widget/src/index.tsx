@@ -1,16 +1,14 @@
 /// <reference types="vite/client" />
 import { useLayoutEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import { TableViewer, gridThemeOf, type GridTheme } from '@kermodes/grid';
 import {
-  TableViewer,
-  gridThemeOf,
-  type GridTheme,
   type ViewerBuffer,
   type ViewerChannel,
   type ViewerReply,
   type ViewerRequest,
   type ViewerState,
-} from '@kermodes/grid';
+} from '@kermodes/client';
 import tokens from '@kermodes/theme/tokens.css?inline';
 
 const SCOPE = 'kermodes-widget';

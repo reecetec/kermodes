@@ -1,4 +1,4 @@
-import { type ViewerReply } from '@kermodes/grid';
+import { type ViewerReply } from './protocol';
 
 /** A binary frame's header: the viewer reply plus the view it is for */
 export type FrameHeader = ViewerReply & { view: number };
