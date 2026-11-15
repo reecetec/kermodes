@@ -49,6 +49,9 @@ use tokio::sync::{oneshot, watch};
 const CYCLE_WAIT: Duration = Duration::from_millis(500);
 /// How long the controller may take to answer the programs page.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often each connection is pinged: proxies end connections idle for minutes (the cluster's
+/// Envoy after five), and a hidden tab's paused views or a table that does not tick send nothing.
+const KEEPALIVE: Duration = Duration::from_secs(30);
 /// How often the server refreshes the stored tables it lists and lets go of tables no view
 /// shows.
 const MAINTAIN_EVERY: Duration = Duration::from_secs(2);
@@ -656,6 +659,8 @@ async fn connection(mut socket: WebSocket, shared: Arc<Shared>) {
     let mut cycles = shared.cycles.subscribe();
     let mut catalog = shared.catalog.subscribe();
     let mut outgoing = vec![tables(&shared)];
+    let mut keepalive =
+        tokio::time::interval_at(tokio::time::Instant::now() + KEEPALIVE, KEEPALIVE);
     loop {
         for message in outgoing.drain(..) {
             if socket.send(message).await.is_err() {
@@ -698,6 +703,9 @@ async fn connection(mut socket: WebSocket, shared: Arc<Shared>) {
             Ok(()) = catalog.changed() => {
                 catalog.borrow_and_update();
                 outgoing.push(tables(&shared));
+            },
+            _ = keepalive.tick() => {
+                outgoing.push(Message::Ping(Default::default()));
             },
         }
     }
