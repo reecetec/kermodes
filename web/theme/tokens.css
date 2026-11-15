@@ -1,0 +1,111 @@
+/*
+ * Kermodes design tokens (docs/theme.md): every colour and primitive of the UI, the notebook
+ * grid, and any app built on Kermodes. Components name tokens, never values.
+ *
+ * Dark is canonical; light redefines every colour under [data-theme='light'], on <html> or any
+ * subtree. Translucent colours are 8-digit hex: the grid reads tokens into space-separated
+ * colour lists, where rgb(… / …) would split.
+ */
+
+:root,
+[data-theme='dark'] {
+  color-scheme: dark;
+
+  /* Surfaces, darkest first: content, chrome, raised groups, overlays */
+  --background: #121214;
+  --sidebar: #19191c;
+  --muted: #1d1d20;
+  --card: #1a1a1d;
+  --popover: #262629;
+  --secondary: #2a2a2e;
+  /* Fills that work on any surface: a row under the pointer, alternate grid rows */
+  --accent: #ffffff0f;
+  --stripe: #ffffff05;
+
+  /* Text: three roles. faint is below 4.5:1 on purpose: disabled text and placeholders only */
+  --foreground: #f2f2f4;
+  --muted-foreground: #a1a1a7;
+  --faint-foreground: #6c6c72;
+
+  /* Lines: dividers are hairlines; a control's edge holds 3:1 */
+  --border: #ffffff17;
+  --input: #737379;
+
+  /* The one accent: the current place, the primary action, focus, selection */
+  --primary: #7aa7ff;
+  --primary-foreground: #0b1220;
+  --ring: #7aa7ff;
+  --selection: #7aa7ff38;
+  --flash: #7aa7ff59;
+
+  /* States: the word carries the meaning, the colour confirms it */
+  --success: #62cc94;
+  --warning: #e6b85c;
+  --destructive: #ff8f86;
+
+  /* Data: numbers by sign and dates by type, after Deephaven, toned to the palette */
+  --positive: #8dd6a0;
+  --negative: #ff9b94;
+  --date: #e5c07b;
+  --null: #ffffff0a;
+
+  --scrollbar: #ffffff2e;
+  --scrollbar-hover: #ffffff4d;
+  --shadow: #00000080;
+
+  --card-foreground: var(--foreground);
+  --popover-foreground: var(--foreground);
+  --secondary-foreground: var(--foreground);
+  --accent-foreground: var(--foreground);
+  --sidebar-foreground: var(--foreground);
+}
+
+[data-theme='light'] {
+  color-scheme: light;
+
+  --background: #ffffff;
+  --sidebar: #f5f5f7;
+  --muted: #f3f3f5;
+  --card: #ffffff;
+  --popover: #ffffff;
+  --secondary: #ebebee;
+  --accent: #0000000b;
+  --stripe: #00000005;
+
+  --foreground: #1d1d1f;
+  --muted-foreground: #6b6b70;
+  --faint-foreground: #a1a1a6;
+
+  --border: #0000001a;
+  --input: #86868b;
+
+  --primary: #2a5fd0;
+  --primary-foreground: #ffffff;
+  --ring: #2a5fd0;
+  --selection: #2a5fd026;
+  --flash: #2a5fd040;
+
+  --success: #1b7a4a;
+  --warning: #8a5a00;
+  --destructive: #c03a2b;
+
+  --positive: #1b7a4a;
+  --negative: #c03a2b;
+  --date: #8a5a00;
+  --null: #0000000a;
+
+  --scrollbar: #00000033;
+  --scrollbar-hover: #00000052;
+  --shadow: #0000002e;
+}
+
+/* Theme-independent primitives */
+:root {
+  --radius: 0.5rem;
+  --font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, 'Liberation Mono',
+    monospace;
+  --duration-fast: 150ms;
+  --duration-base: 200ms;
+  --ease-out: cubic-bezier(0.2, 0, 0, 1);
+}

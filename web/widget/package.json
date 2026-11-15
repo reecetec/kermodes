@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@kermodes/grid": "workspace:*",
+    "@kermodes/theme": "workspace:*",
     "apache-arrow": "^21.0.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"

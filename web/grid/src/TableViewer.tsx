@@ -673,33 +673,18 @@ export function TableViewer({
             theme.scrollBarSize +
             2
         );
-  const chromeFont = theme.font.replace(/^\S+/, '11px');
 
   return (
     // eslint-disable-next-line jsx-a11y/no-static-element-interactions
     <div
+      className="kermodes-viewer"
       onKeyDown={handleKeyDown}
-      style={{
-        display: 'flex',
-        flexDirection: 'column',
-        width: '100%',
-        height: gridHeight == null ? '100%' : undefined,
-        border: `1px solid ${theme.headerSeparatorColor}`,
-        borderRadius: 4,
-        overflow: 'hidden',
-        background: theme.backgroundColor,
-      }}
+      style={{ height: gridHeight == null ? '100%' : undefined }}
     >
       <div
         ref={containerRef}
-        style={{
-          position: 'relative',
-          display: 'flex',
-          flex: gridHeight == null ? '1 1 0' : undefined,
-          height: gridHeight,
-          minHeight: 0,
-          overflow: 'hidden',
-        }}
+        className="kermodes-viewer-body"
+        style={{ flex: gridHeight == null ? '1 1 0' : undefined, height: gridHeight }}
       >
         <Grid
           ref={gridRef}
@@ -715,30 +700,13 @@ export function TableViewer({
           <FilterBar
             cells={cells}
             top={theme.columnHeaderHeight}
-            theme={theme}
             filters={draft}
             errors={state.filter_errors}
             onChange={handleFilterChange}
           />
         )}
         {toast != null && (
-          <div
-            key={toast.id}
-            role="status"
-            style={{
-              position: 'absolute',
-              right: 12 + theme.scrollBarSize,
-              bottom: 10 + theme.scrollBarSize,
-              padding: '4px 10px',
-              borderRadius: 4,
-              font: chromeFont,
-              color: theme.textColor,
-              background: theme.headerBackgroundColor,
-              border: `1px solid ${theme.selectionOutlineColor}`,
-              boxShadow: `0 2px 8px ${theme.shadowColor}`,
-              pointerEvents: 'none',
-            }}
-          >
+          <div key={toast.id} role="status" className="kermodes-toast">
             {toast.text}
           </div>
         )}
@@ -747,8 +715,6 @@ export function TableViewer({
             x={menu.x}
             y={menu.y}
             sections={menu.sections}
-            theme={theme}
-            font={theme.font.replace(/^\S+/, '12px')}
             onPick={action => runMenuAction(action, menu.column, menu.row)}
             onClose={closeMenu}
           />
@@ -769,35 +735,14 @@ export function TableViewer({
           />
         )}
       </div>
-      <div
-        style={{
-          display: 'flex',
-          gap: 12,
-          padding: '3px 8px',
-          font: chromeFont,
-          color: theme.headerColor,
-          background: theme.headerBackgroundColor,
-          borderTop: `1px solid ${theme.headerSeparatorColor}`,
-          fontVariantNumeric: 'tabular-nums',
-        }}
-      >
+      <div className="kermodes-viewer-footer">
         <button
           type="button"
+          className="kermodes-footer-button"
           title={`Quick filters (⌘F). ${FILTER_SYNTAX}`}
           aria-pressed={isFilterBarShown}
+          data-active={hasFilters}
           onClick={() => setIsFilterBarShown(shown => !shown)}
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 4,
-            padding: 0,
-            border: 'none',
-            background: 'transparent',
-            font: 'inherit',
-            color:
-              isFilterBarShown || hasFilters ? theme.selectionOutlineColor : theme.headerColor,
-            cursor: 'pointer',
-          }}
         >
           <FilterIcon color="currentColor" />
           {hasFilters ? 'Filtered' : 'Filter'}
@@ -805,9 +750,7 @@ export function TableViewer({
         <span>
           {rowCount.toLocaleString('en-US')} {rowCount === 1 ? 'row' : 'rows'}
         </span>
-        <span style={{ marginLeft: 'auto' }}>
-          {isUpdating ? 'updating…' : state.status}
-        </span>
+        <span>{isUpdating ? 'updating…' : state.status}</span>
       </div>
     </div>
   );

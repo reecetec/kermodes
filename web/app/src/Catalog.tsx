@@ -148,7 +148,8 @@ export function CatalogPage({ onOpen }: { onOpen: (table: string) => void }) {
   const { value: catalog, error } = usePolled('/api/catalog', 10_000, parseCatalog);
   const [query, setQuery] = useState('');
   const [selected, setSelected] = useState<string | null>(null);
-  const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
+  // Namespaces start folded, so the page opens as an overview of namespaces and their totals
+  const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
   const search = useRef<HTMLInputElement>(null);
   const close = useCallback(() => setSelected(null), []);
 
@@ -180,7 +181,7 @@ export function CatalogPage({ onOpen }: { onOpen: (table: string) => void }) {
   }, [detail, close]);
 
   const toggle = (namespace: string) =>
-    setCollapsed(current => {
+    setExpanded(current => {
       const next = new Set(current);
       if (!next.delete(namespace)) next.add(namespace);
       return next;
@@ -267,7 +268,7 @@ export function CatalogPage({ onOpen }: { onOpen: (table: string) => void }) {
             </thead>
             <tbody>
               {groups.map(group => {
-                const open = query !== '' || !collapsed.has(group.namespace);
+                const open = query !== '' || expanded.has(group.namespace);
                 return [
                   <tr
                     key={group.namespace}

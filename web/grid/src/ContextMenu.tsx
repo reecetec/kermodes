@@ -1,5 +1,4 @@
 import React, { Fragment, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { type GridTheme } from './GridTheme';
 import { type MenuAction, type MenuItem } from './menuItems';
 
 export type ContextMenuProps = {
@@ -7,8 +6,6 @@ export type ContextMenuProps = {
   x: number;
   y: number;
   sections: MenuItem[][];
-  theme: GridTheme;
-  font: string;
   onPick: (action: MenuAction) => void;
   onClose: () => void;
 };
@@ -21,8 +18,6 @@ export function ContextMenu({
   x,
   y,
   sections,
-  theme,
-  font,
   onPick,
   onClose,
 }: ContextMenuProps): React.ReactElement {
@@ -80,36 +75,16 @@ export function ContextMenu({
       ref={ref}
       role="menu"
       tabIndex={-1}
+      className="kermodes-menu"
       onKeyDown={handleKeyDown}
       onContextMenu={event => event.preventDefault()}
-      style={
-        {
-          position: 'absolute',
-          ...position,
-          zIndex: 10,
-          minWidth: 200,
-          padding: '4px 0',
-          font,
-          color: theme.textColor,
-          background: theme.headerBackgroundColor,
-          border: `1px solid ${theme.headerSeparatorColor}`,
-          borderRadius: 6,
-          boxShadow: `0 4px 16px ${theme.shadowColor}`,
-          outline: 'none',
-          '--kermodes-menu-hover': theme.selectionColor,
-        } as React.CSSProperties
-      }
+      style={position}
     >
       {sections.map((section, i) => (
         // Sections are rebuilt with the menu and never reorder
         // eslint-disable-next-line react/no-array-index-key
         <Fragment key={i}>
-          {i > 0 && (
-            <div
-              role="separator"
-              style={{ height: 1, margin: '4px 0', background: theme.headerSeparatorColor }}
-            />
-          )}
+          {i > 0 && <div role="separator" className="kermodes-menu-separator" />}
           {section.map(item => (
             <button
               key={item.label}
@@ -120,22 +95,9 @@ export function ContextMenu({
                 onClose();
                 onPick(item.action);
               }}
-              style={{
-                display: 'flex',
-                width: '100%',
-                gap: 24,
-                padding: '4px 12px',
-                border: 'none',
-                background: 'transparent',
-                color: 'inherit',
-                font: 'inherit',
-                textAlign: 'left',
-                cursor: 'default',
-                whiteSpace: 'nowrap',
-              }}
             >
-              <span style={{ flex: 1 }}>{item.label}</span>
-              {item.hint != null && <span style={{ color: theme.headerColor }}>{item.hint}</span>}
+              <span>{item.label}</span>
+              {item.hint != null && <span className="kermodes-menu-hint">{item.hint}</span>}
             </button>
           ))}
         </Fragment>

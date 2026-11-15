@@ -1,7 +1,10 @@
 import { createRoot } from 'react-dom/client';
 import { KermodesConnection } from '@kermodes/client';
-import App from './App';
+import App, { applyTheme, savedTheme } from './App';
 import './index.css';
+
+// Before the first render, so the grid's first theme reads the saved tokens
+applyTheme(savedTheme());
 
 const socketUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
 

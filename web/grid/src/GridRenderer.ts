@@ -962,13 +962,25 @@ export class GridRenderer {
     this.drawRowHeaders(context, state);
   }
 
-  /** Background of the bar between the headers and the rows that holds the filter inputs */
+  /**
+   * The row between the headers and the cells that holds the filter inputs: a header-coloured
+   * band divided like the columns below it, so each input reads as a cell of the grid.
+   */
   drawFilterBar(
     context: CanvasRenderingContext2D,
     state: GridRenderState
   ): void {
     const { metrics, theme } = state;
-    const { gridY, columnHeaderHeight, columnHeaderMaxDepth, width } = metrics;
+    const {
+      gridX,
+      gridY,
+      columnHeaderHeight,
+      columnHeaderMaxDepth,
+      width,
+      visibleColumns,
+      allColumnXs,
+      allColumnWidths,
+    } = metrics;
     const top = columnHeaderHeight * columnHeaderMaxDepth;
     if (gridY <= top) {
       return;
@@ -979,6 +991,14 @@ export class GridRenderer {
     context.beginPath();
     context.moveTo(0, gridY - 0.5);
     context.lineTo(width, gridY - 0.5);
+    if (theme.gridColumnColor != null) {
+      for (const column of visibleColumns) {
+        const x =
+          gridX + getOrThrow(allColumnXs, column) + getOrThrow(allColumnWidths, column) + 0.5;
+        context.moveTo(x, top);
+        context.lineTo(x, gridY);
+      }
+    }
     context.stroke();
   }
 

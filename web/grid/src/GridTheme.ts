@@ -133,135 +133,108 @@ export type GridTheme = {
   floatingDividerInnerColor: GridColor;
 };
 
-const FONT_FAMILY =
-  '"Fira Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif';
+/** A design token's value by name, without the leading `--` (web/theme/tokens.css) */
+export type TokenReader = (name: string) => string;
 
 /**
- * Dark theme, after the default dark theme of the Deephaven web UI: near-black
- * background, subtle zebra rows, a muted header and a blue accent selection.
+ * The grid's look from the design tokens (docs/theme.md), so the canvas draws with the same
+ * colours and fonts as the page around it: cells in the mono for aligned figures, headers in
+ * the sans.
  */
-export const darkTheme: GridTheme = Object.freeze({
-  allowColumnResize: true,
-  allowRowResize: false,
-  autoSelectRow: false,
-  autoSelectColumn: false,
-  autoSizeColumns: true,
-  autoSizeRows: true,
-  backgroundColor: '#1a171a',
-  textColor: '#f0f0ee',
-  nullBackgroundColor: '#ffffff0a',
-  cellHorizontalPadding: 6,
-  headerHorizontalPadding: 6,
-  font: `12px ${FONT_FAMILY}`,
-  gridColumnColor: '#2d2a2e',
-  gridRowColor: null,
-  headerBackgroundColor: '#211f22',
-  headerSeparatorColor: '#373438',
-  headerSeparatorHoverColor: '#929192',
-  headerSeparatorHandleSize: 5,
-  headerHiddenSeparatorSize: 5,
-  headerHiddenSeparatorHoverColor: '#4c7dee',
-  headerColor: '#c0bfbf',
-  headerFont: `600 12px ${FONT_FAMILY}`,
-  columnHoverBackgroundColor: null,
-  rowHoverBackgroundColor: '#2d2a2e',
-  selectedRowHoverBackgroundColor: '#34303a',
-  cursorRowBackgroundColor: '#4c7dee26',
-  rowBackgroundColors: '#1a171a #211f22',
-  minScrollHandleSize: 50,
-  scrollBarBackgroundColor: '#1a171a',
-  scrollBarHoverBackgroundColor: '#211f22',
-  scrollBarCasingColor: '#1a171a',
-  scrollBarCornerColor: '#1a171a',
-  scrollBarColor: '#403e41',
-  scrollBarHoverColor: '#5b5a5c',
-  scrollBarActiveColor: '#929192',
-  scrollBarSize: 10,
-  scrollBarHoverSize: 14,
-  scrollBarCasingWidth: 1,
-  scrollSnapToColumn: false,
-  scrollSnapToRow: false,
-  activeCellSelectionBorderWidth: 2,
-  selectionColor: '#4c7dee33',
-  selectionOutlineColor: '#4c7dee',
-  selectionOutlineCasingColor: '#1a171a',
-  reorderOffset: 2,
-  shadowBlur: 8,
-  shadowColor: '#000000',
-  flashColor: '#4c7dee99',
-  errorColor: '#f95d84',
-  positiveNumberColor: '#ace97e',
-  negativeNumberColor: '#f85e85',
-  zeroNumberColor: '#fad459',
-  dateColor: '#fad459',
-  scrollBarSelectionTick: true,
-  scrollBarSelectionTickColor: '#4c7dee66',
-  scrollBarActiveSelectionTickColor: '#4c7deecc',
+export function gridTheme(token: TokenReader): GridTheme {
+  const sans = token('font-sans');
+  const mono = token('font-mono');
+  const background = token('background');
+  const muted = token('muted');
+  const border = token('border');
+  const primary = token('primary');
+  return {
+    allowColumnResize: true,
+    allowRowResize: false,
+    autoSelectRow: false,
+    autoSelectColumn: false,
+    autoSizeColumns: true,
+    autoSizeRows: true,
+    backgroundColor: background,
+    textColor: token('foreground'),
+    nullBackgroundColor: token('null'),
+    cellHorizontalPadding: 8,
+    headerHorizontalPadding: 8,
+    font: `12px ${mono}`,
+    gridColumnColor: border,
+    gridRowColor: null,
+    headerBackgroundColor: muted,
+    headerSeparatorColor: border,
+    headerSeparatorHoverColor: token('muted-foreground'),
+    headerSeparatorHandleSize: 5,
+    headerHiddenSeparatorSize: 5,
+    headerHiddenSeparatorHoverColor: primary,
+    headerColor: token('muted-foreground'),
+    headerFont: `500 12px ${sans}`,
+    columnHoverBackgroundColor: null,
+    rowHoverBackgroundColor: token('accent'),
+    selectedRowHoverBackgroundColor: token('selection'),
+    cursorRowBackgroundColor: token('accent'),
+    rowBackgroundColors: `${background} ${token('stripe')}`,
+    minScrollHandleSize: 50,
+    scrollBarBackgroundColor: background,
+    scrollBarHoverBackgroundColor: muted,
+    scrollBarCasingColor: background,
+    scrollBarCornerColor: background,
+    scrollBarColor: token('scrollbar'),
+    scrollBarHoverColor: token('scrollbar-hover'),
+    scrollBarActiveColor: token('muted-foreground'),
+    scrollBarSize: 10,
+    scrollBarHoverSize: 12,
+    scrollBarCasingWidth: 0,
+    scrollSnapToColumn: false,
+    scrollSnapToRow: false,
+    activeCellSelectionBorderWidth: 2,
+    selectionColor: token('selection'),
+    selectionOutlineColor: primary,
+    selectionOutlineCasingColor: background,
+    reorderOffset: 2,
+    shadowBlur: 8,
+    shadowColor: token('shadow'),
+    flashColor: token('flash'),
+    errorColor: token('destructive'),
+    positiveNumberColor: token('positive'),
+    negativeNumberColor: token('negative'),
+    zeroNumberColor: token('muted-foreground'),
+    dateColor: token('date'),
+    scrollBarSelectionTick: true,
+    scrollBarSelectionTickColor: token('selection'),
+    scrollBarActiveSelectionTickColor: primary,
 
-  rowHeight: 20,
-  columnWidth: 100,
-  minColumnWidth: 55,
-  maxColumnWidth: 600,
-  columnHeaderHeight: 28,
-  rowHeaderWidth: 0,
-  rowFooterWidth: 0,
+    rowHeight: 22,
+    columnWidth: 100,
+    minColumnWidth: 55,
+    maxColumnWidth: 600,
+    columnHeaderHeight: 30,
+    rowHeaderWidth: 0,
+    rowFooterWidth: 0,
 
-  headerResizeSnapThreshold: 10,
-  headerResizeHiddenSnapThreshold: 8,
+    headerResizeSnapThreshold: 10,
+    headerResizeHiddenSnapThreshold: 8,
 
-  floatingGridColumnColor: '#2d2a2e',
-  floatingGridRowColor: null,
-  floatingRowBackgroundColors: '#211f22 #2d2a2e',
-  floatingDividerOuterColor: '#000000',
-  floatingDividerInnerColor: '#5b5a5c',
-});
+    floatingGridColumnColor: border,
+    floatingGridRowColor: null,
+    floatingRowBackgroundColors: `${muted} ${muted}`,
+    floatingDividerOuterColor: border,
+    floatingDividerInnerColor: border,
+  };
+}
 
-/** Light theme, after the default light theme of the Deephaven web UI. */
-export const lightTheme: GridTheme = Object.freeze({
-  ...darkTheme,
-  backgroundColor: '#ffffff',
-  textColor: '#1a171a',
-  nullBackgroundColor: '#0000000a',
-  gridColumnColor: '#e6e5e6',
-  headerBackgroundColor: '#f4f4f4',
-  headerSeparatorColor: '#dcdbdc',
-  headerSeparatorHoverColor: '#787679',
-  headerHiddenSeparatorHoverColor: '#2f5bc4',
-  cursorRowBackgroundColor: '#2f5bc41a',
-  headerColor: '#4a474b',
-  rowHoverBackgroundColor: '#eceff8',
-  selectedRowHoverBackgroundColor: '#dfe6f7',
-  rowBackgroundColors: '#ffffff #f7f7f7',
-  scrollBarBackgroundColor: '#ffffff',
-  scrollBarHoverBackgroundColor: '#f4f4f4',
-  scrollBarCasingColor: '#ffffff',
-  scrollBarCornerColor: '#ffffff',
-  scrollBarColor: '#cfcecf',
-  scrollBarHoverColor: '#a8a7a9',
-  scrollBarActiveColor: '#787679',
-  selectionColor: '#2f5bc426',
-  selectionOutlineColor: '#2f5bc4',
-  selectionOutlineCasingColor: '#ffffff',
-  shadowColor: '#00000066',
-  flashColor: '#2f5bc466',
-  errorColor: '#d0204b',
-  positiveNumberColor: '#008f5d',
-  negativeNumberColor: '#ea3829',
-  zeroNumberColor: '#7326d3',
-  dateColor: '#7326d3',
-  scrollBarSelectionTickColor: '#2f5bc466',
-  scrollBarActiveSelectionTickColor: '#2f5bc4cc',
-  floatingGridColumnColor: '#e6e5e6',
-  floatingRowBackgroundColors: '#f7f7f7 #eeeeee',
-  floatingDividerOuterColor: '#dcdbdc',
-  floatingDividerInnerColor: '#a8a7a9',
-});
+/** The grid's theme from the tokens in effect at `element`, which must be in the document */
+export function gridThemeOf(element: Element): GridTheme {
+  const style = getComputedStyle(element);
+  return gridTheme(name => style.getPropertyValue(`--${name}`).trim());
+}
 
-export type GridThemeName = 'dark' | 'light';
+/**
+ * Geometry and behaviour for a grid given no theme; its colours are the token names, so a host
+ * that forgets to pass `gridThemeOf(...)` draws nothing rather than a second palette.
+ */
+const baseTheme: GridTheme = Object.freeze(gridTheme(name => name));
 
-export const gridThemes: Readonly<Record<GridThemeName, GridTheme>> = {
-  dark: darkTheme,
-  light: lightTheme,
-};
-
-export default darkTheme;
+export default baseTheme;

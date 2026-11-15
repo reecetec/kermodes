@@ -1198,6 +1198,8 @@ namespaces).
 
 - React + TypeScript, Vite, Bun (package manager, scripts, tests), shadcn/ui on Tailwind CSS,
   lucide icons, React Router — juicebear's web baseline plus shadcn.
+- Visual design: [theme.md](theme.md). `@kermodes/theme` (`web/theme`) holds the design tokens
+  that the UI, the notebook grid, and apps built on Kermodes all draw from.
 - `@kermodes/client`: TypeScript package speaking the delta protocol over WebSocket and decoding Arrow
   IPC with `apache-arrow`. Used by the UI and any other TypeScript consumer.
 - Ticking and large tables: the table viewer (§15.3). Lists of things (deployments, the

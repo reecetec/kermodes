@@ -12,6 +12,7 @@
   "dependencies": {
     "@kermodes/client": "workspace:*",
     "@kermodes/grid": "workspace:*",
+    "@kermodes/theme": "workspace:*",
     "@radix-ui/react-scroll-area": "^1.4.0",
     "@radix-ui/react-slot": "^1.5.0",
     "@radix-ui/react-tabs": "^1.2.1",

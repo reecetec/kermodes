@@ -11,3 +11,6 @@ node_modules/
 
 # The table viewer bundle, built from web/ (bun run build) and shipped in the wheel.
 python/kermodes/static/
+
+# Local secrets (API keys for tools); never committed.
+.env

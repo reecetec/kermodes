@@ -17,7 +17,7 @@ import {
   tableToIPC,
   vectorFromArray,
 } from 'apache-arrow';
-import { darkTheme } from './GridTheme';
+import theme from './GridTheme';
 import ViewportGridModel, {
   changedCells,
   FLASH_DURATION_MS,
@@ -72,7 +72,7 @@ describe('ViewportGridModel', () => {
     expect(model.columnCount).toBe(COLUMNS.length);
     expect(model.textForColumnHeader(4)).toBe('sym');
     expect(model.textForCell(1, 0)).toBe('');
-    expect(model.backgroundColorForCell(1, 0, darkTheme)).toBeNull();
+    expect(model.backgroundColorForCell(1, 0, theme)).toBeNull();
   });
 
   it('formats the window rows by column type', () => {
@@ -108,34 +108,31 @@ describe('ViewportGridModel', () => {
     model.setWindow(10, twoRows(), KEYS);
 
     expect(model.textForCell(4, 11)).toBe('');
-    expect(model.backgroundColorForCell(4, 11, darkTheme)).toBe(
-      darkTheme.nullBackgroundColor
-    );
-    expect(model.backgroundColorForCell(4, 10, darkTheme)).toBeNull();
+    expect(model.backgroundColorForCell(4, 11, theme)).toBe(theme.nullBackgroundColor);
+    expect(model.backgroundColorForCell(4, 10, theme)).toBeNull();
     expect(model.textForCell(4, 9)).toBe('');
     expect(model.textForCell(4, 12)).toBe('');
-    expect(model.backgroundColorForCell(4, 12, darkTheme)).toBeNull();
+    expect(model.backgroundColorForCell(4, 12, theme)).toBeNull();
   });
 
   it('colours numbers by sign and dates, as Deephaven does', () => {
     const model = new ViewportGridModel(COLUMNS, 2);
     model.setWindow(0, twoRows(), KEYS);
-    const color = (column: number, row: number) =>
-      model.colorForCell(column, row, darkTheme);
+    const color = (column: number, row: number) => model.colorForCell(column, row, theme);
 
     expect([color(1, 0), color(1, 1)]).toEqual([
-      darkTheme.positiveNumberColor,
-      darkTheme.negativeNumberColor,
+      theme.positiveNumberColor,
+      theme.negativeNumberColor,
     ]);
     // int64 arrives as bigint; a null or NaN is no sign
     expect([color(2, 0), color(2, 1), color(3, 0), color(3, 1)]).toEqual([
-      darkTheme.positiveNumberColor,
-      darkTheme.textColor,
-      darkTheme.positiveNumberColor,
-      darkTheme.textColor,
+      theme.positiveNumberColor,
+      theme.textColor,
+      theme.positiveNumberColor,
+      theme.textColor,
     ]);
-    expect([color(5, 0), color(6, 0)]).toEqual([darkTheme.dateColor, darkTheme.dateColor]);
-    expect([color(0, 0), color(4, 0)]).toEqual([darkTheme.textColor, darkTheme.textColor]);
+    expect([color(5, 0), color(6, 0)]).toEqual([theme.dateColor, theme.dateColor]);
+    expect([color(0, 0), color(4, 0)]).toEqual([theme.textColor, theme.textColor]);
 
     const zeros = new ViewportGridModel(
       [
@@ -152,9 +149,10 @@ describe('ViewportGridModel', () => {
       }),
       BigUint64Array.of(BigInt(1))
     );
-    expect([zeros.colorForCell(0, 0, darkTheme), zeros.colorForCell(1, 0, darkTheme)]).toEqual(
-      [darkTheme.zeroNumberColor, darkTheme.zeroNumberColor]
-    );
+    expect([zeros.colorForCell(0, 0, theme), zeros.colorForCell(1, 0, theme)]).toEqual([
+      theme.zeroNumberColor,
+      theme.zeroNumberColor,
+    ]);
   });
 
   it('drops the window when the columns change', () => {

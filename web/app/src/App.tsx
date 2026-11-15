@@ -13,7 +13,7 @@ import {
   type TableInfo,
   type KermodesConnection,
 } from '@kermodes/client';
-import { TableViewer, gridThemes, type GridThemeName } from '@kermodes/grid';
+import { TableViewer, gridThemeOf } from '@kermodes/grid';
 import { CatalogPage } from '@/Catalog';
 import { DEPLOYMENTS_VIEW, DeploymentsPage } from '@/Deployments';
 import { Badge } from '@/components/ui/badge';
@@ -31,6 +31,8 @@ import { Logo } from '@/components/Logo';
 import { cn } from '@/lib/utils';
 
 const THEME_KEY = 'kermodes-theme';
+
+type ThemeName = 'dark' | 'light';
 
 type Tab = { key: string; view: SocketView };
 type Page = 'deployments' | 'catalog' | 'tables';
@@ -50,15 +52,28 @@ function useConnection(connection: KermodesConnection): void {
   );
 }
 
-function useThemeName(): [GridThemeName, () => void] {
-  const [name, setName] = useState<GridThemeName>(() =>
-    localStorage.getItem(THEME_KEY) === 'light' ? 'light' : 'dark'
-  );
-  useEffect(() => {
-    document.documentElement.classList.toggle('dark', name === 'dark');
-    localStorage.setItem(THEME_KEY, name);
+/** The saved theme, applied to <html> before the first render (docs/theme.md) */
+export function savedTheme(): ThemeName {
+  return localStorage.getItem(THEME_KEY) === 'light' ? 'light' : 'dark';
+}
+
+export function applyTheme(name: ThemeName): void {
+  document.documentElement.dataset.theme = name;
+  localStorage.setItem(THEME_KEY, name);
+}
+
+/**
+ * The theme and its toggle. The attribute changes before the state does, so the grid's
+ * `gridThemeOf` reads the new tokens in the same render.
+ */
+function useThemeName(): [ThemeName, () => void] {
+  const [name, setName] = useState<ThemeName>(savedTheme);
+  const toggle = useCallback(() => {
+    const next = name === 'dark' ? 'light' : 'dark';
+    applyTheme(next);
+    setName(next);
   }, [name]);
-  return [name, () => setName(current => (current === 'dark' ? 'light' : 'dark'))];
+  return [name, toggle];
 }
 
 const STATUS_LABEL: Record<ConnectionStatus, string> = {
@@ -121,7 +136,7 @@ function TopBar({
   home,
 }: {
   connection: KermodesConnection;
-  themeName: GridThemeName;
+  themeName: ThemeName;
   onToggleTheme: () => void;
   page: Page;
   onPage: (page: Page) => void;
@@ -293,7 +308,8 @@ export default function App({ connection }: { connection: KermodesConnection }) 
   const [themeName, toggleTheme] = useThemeName();
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [active, setActive] = useState<string | null>(null);
-  const theme = gridThemes[themeName];
+  // The canvas draws with the tokens in effect on <html>; recomputed when the theme flips
+  const theme = useMemo(() => gridThemeOf(document.documentElement), [themeName]);
   // Deployments is the main tab wherever a controller reports them, until someone picks a tab.
   const hasDeployments = connection.pages.includes(DEPLOYMENTS_VIEW);
   const hasCatalog = useHasCatalog();
@@ -414,7 +430,7 @@ export default function App({ connection }: { connection: KermodesConnection }) 
                       key={tab.key}
                       value={tab.key}
                       forceMount
-                      className="absolute inset-3 data-[state=inactive]:invisible"
+                      className="absolute inset-0 data-[state=inactive]:invisible"
                     >
                       <TableViewer channel={tab.view} theme={theme} />
                     </TabsContent>

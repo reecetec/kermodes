@@ -1,7 +1,6 @@
 import React from 'react';
 import type GridMetrics from './GridMetrics';
 import { type DraggingColumn } from './mouse-handlers/GridColumnMoveMouseHandler';
-import { type GridTheme } from './GridTheme';
 import { isNumericType, type ViewportColumn } from './ViewportGridModel';
 
 /** Height of the quick filter bar under the column headers */
@@ -75,17 +74,18 @@ export function filterCells(
 type FilterBarProps = {
   cells: readonly FilterCell[];
   top: number;
-  theme: GridTheme;
   filters: Readonly<Record<string, string>>;
   errors: Readonly<Record<string, string>>;
   onChange: (column: string, text: string) => void;
 };
 
-/** One text input per column under the headers, like Deephaven's quick filter bar */
+/**
+ * One text input per column under the headers, like Deephaven's quick filter bar. Each fills
+ * its column's cell of the band the renderer draws (`drawFilterBar`), short of the divider.
+ */
 export function FilterBar({
   cells,
   top,
-  theme,
   filters,
   errors,
   onChange,
@@ -101,27 +101,18 @@ export function FilterBar({
             type="text"
             spellCheck={false}
             aria-label={`Filter ${column.name}`}
+            aria-invalid={error != null}
             placeholder={filterPlaceholder(column.type)}
             title={error ?? FILTER_SYNTAX}
             value={filters[column.name] ?? ''}
             onChange={event => onChange(column.name, event.target.value)}
-            style={
-              {
-                position: 'absolute',
-                top: top + 3,
-                left: left + 2,
-                width: Math.max(0, width - 4),
-                height: FILTER_BAR_HEIGHT - 6,
-                font: theme.font.replace(/^\S+/, '11px'),
-                color: theme.textColor,
-                background: theme.backgroundColor,
-                border: `1px solid ${error == null ? theme.headerSeparatorColor : theme.errorColor}`,
-                boxShadow:
-                  error == null ? undefined : `0 0 0 1px ${theme.errorColor}`,
-                '--kermodes-placeholder': theme.headerSeparatorHoverColor,
-                '--kermodes-accent': theme.selectionOutlineColor,
-              } as React.CSSProperties
-            }
+            style={{
+              position: 'absolute',
+              top,
+              left,
+              width: Math.max(0, width - 1),
+              height: FILTER_BAR_HEIGHT - 1,
+            }}
           />
         );
       })}

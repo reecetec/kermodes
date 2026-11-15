@@ -11,6 +11,7 @@
       "dependencies": {
         "@kermodes/client": "workspace:*",
         "@kermodes/grid": "workspace:*",
+        "@kermodes/theme": "workspace:*",
         "@radix-ui/react-scroll-area": "^1.4.0",
         "@radix-ui/react-slot": "^1.5.0",
         "@radix-ui/react-tabs": "^1.2.1",
@@ -66,11 +67,15 @@
         "react": "^19.0.0",
       },
     },
+    "theme": {
+      "name": "@kermodes/theme",
+    },
     "widget": {
       "name": "@kermodes/widget",
       "version": "0.0.0",
       "dependencies": {
         "@kermodes/grid": "workspace:*",
+        "@kermodes/theme": "workspace:*",
         "apache-arrow": "^21.0.0",
         "react": "^19.0.0",
         "react-dom": "^19.0.0",
@@ -197,6 +202,8 @@
     "@kermodes/client": ["@kermodes/client@workspace:client"],
 
     "@kermodes/grid": ["@kermodes/grid@workspace:grid"],
+
+    "@kermodes/theme": ["@kermodes/theme@workspace:theme"],
 
     "@kermodes/widget": ["@kermodes/widget@workspace:widget"],
 

@@ -1,0 +1,9 @@
+{
+  "name": "@kermodes/theme",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./tokens.css": "./tokens.css",
+    "./tailwind.css": "./tailwind.css"
+  }
+}
