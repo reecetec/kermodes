@@ -9,8 +9,8 @@
       "name": "market",
       "version": "0.0.0",
       "dependencies": {
-        "@kermodes/react": "0.4.165",
-        "@kermodes/theme": "0.4.165",
+        "@kermodes/react": "0.3.13-dev.68.g32b767a",
+        "@kermodes/theme": "0.3.13-dev.68.g32b767a",
         "react": "^19.0.0",
         "react-dom": "^19.0.0",
       },
@@ -133,13 +133,13 @@
 
     "@jridgewell/trace-mapping": ["@jridgewell/trace-mapping@0.3.31", "", { "dependencies": { "@jridgewell/resolve-uri": "^3.1.0", "@jridgewell/sourcemap-codec": "^1.4.14" } }, "sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw=="],
 
-    "@kermodes/client": ["@kermodes/client@0.4.165", "https://git.rcolclough.com/api/packages/rcolclough/npm/%40kermodes%2Fclient/-/0.4.165/client-0.4.165.tgz", {}, "sha512-LYlDVlDbfhmZnXAIyZLIqjB83DIhXyCyQJnKt4rrmkQDWmkzewnFq89GzLgips90z1V5pVEEvLzJWyVPcZzrOA=="],
+    "@kermodes/client": ["@kermodes/client@0.3.13-dev.68.g32b767a", "", {}, "sha512-wRn7MyIfi20BBO0zYoOJLFIeH3A5f8mv+QQwBHt9VVxffiFPaIRZTApm6xC5ZybANgMO9nBQa380ZgEueL0LkQ=="],
 
-    "@kermodes/grid": ["@kermodes/grid@0.4.165", "https://git.rcolclough.com/api/packages/rcolclough/npm/%40kermodes%2Fgrid/-/0.4.165/grid-0.4.165.tgz", { "dependencies": { "@kermodes/client": "0.4.165", "apache-arrow": "^21.0.0", "classnames": "^2.5.1", "memoize-one": "^6.0.0" }, "peerDependencies": { "react": "^19.0.0" } }, "sha512-9TfLSFz/f/EmGd0SL1siKX4bjVspWgnu2b7zzzCKB/ridTwxpQYvcs7BI+YW2cDYWql4WiGc9IkvTxgZk+GYbg=="],
+    "@kermodes/grid": ["@kermodes/grid@0.3.13-dev.68.g32b767a", "", { "dependencies": { "@kermodes/client": "0.3.13-dev.68.g32b767a", "apache-arrow": "^21.0.0", "classnames": "^2.5.1", "memoize-one": "^6.0.0" }, "peerDependencies": { "react": "^19.0.0" } }, "sha512-Sb85AlDIPp1im8vnjHnsf0XZMj/oZXI5qYWePjwczCI6D01PnkdXcOOUTuZVv6gSLSi9Ie5GJjBLUnnEaJT0Vg=="],
 
-    "@kermodes/react": ["@kermodes/react@0.4.165", "https://git.rcolclough.com/api/packages/rcolclough/npm/%40kermodes%2Freact/-/0.4.165/react-0.4.165.tgz", { "dependencies": { "@kermodes/client": "0.4.165", "@kermodes/grid": "0.4.165", "apache-arrow": "^21.0.0" }, "peerDependencies": { "react": "^19.0.0" } }, "sha512-xx/p6QHFo0AM5y+57XgvK7GQmn99WTioaZRQJtYWbi+8lBAGvYae+xnJsZ43l+6SoT48h+Y6nvjSgDOL05QWZw=="],
+    "@kermodes/react": ["@kermodes/react@0.3.13-dev.68.g32b767a", "", { "dependencies": { "@kermodes/client": "0.3.13-dev.68.g32b767a", "@kermodes/grid": "0.3.13-dev.68.g32b767a", "apache-arrow": "^21.0.0" }, "peerDependencies": { "react": "^19.0.0" } }, "sha512-vx3Ikzpd+F2v0vKiJ8QpJhIlqKFlXGOqZej5t1K8WZbhTQyMWQaZWkPTlUxK6Q3ESbOXSeIM/ZgmUdraGz6jmw=="],
 
-    "@kermodes/theme": ["@kermodes/theme@0.4.165", "https://git.rcolclough.com/api/packages/rcolclough/npm/%40kermodes%2Ftheme/-/0.4.165/theme-0.4.165.tgz", {}, "sha512-+VqaIb0Pd0GavdjPHH34NbzAqQ2UiYgbwC0En6+0k9kkNmNCNC6xQyB0yDscKd7+k8bK5HjlAX/I/6mcg/IPIg=="],
+    "@kermodes/theme": ["@kermodes/theme@0.3.13-dev.68.g32b767a", "", {}, "sha512-ijMZhz4GYWx0hCp3caCqwEo7NJzpUZ2dhdNQNZlSCD5gQZfh2tUOWFpptOwQzTek2LcXOVtImKjBlSCL+VVG1g=="],
 
     "@rolldown/pluginutils": ["@rolldown/pluginutils@1.0.0-rc.3", "", {}, "sha512-eybk3TjzzzV97Dlj5c+XrBFW57eTNhzod66y9HrBlzJ6NsCrWCp/2kaPS3K9wJmurBC0Tdw4yPjXKZqlznim3Q=="],
 
