@@ -109,6 +109,29 @@ jobs:
         if: always()
         run: sccache --show-stats
 
+  # The packages apps build on (@kermodes/client, react, theme), at the release's version, to
+  # Gitea's npm registry: an app pins the version of the platform it was built against.
+  packages:
+    needs: [rust, python]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: arc
+    container:
+      image: git.rcolclough.com/rcolclough/kermodes-ci:rust1.98.1-bun1.4.2-sccache0.19.0
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          set-safe-directory: true
+
+      - name: Publish the web packages
+        working-directory: web
+        env:
+          NPM_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          bun install --frozen-lockfile
+          bun publish.ts "0.4.${{ github.run_number }}" https://git.rcolclough.com/api/packages/rcolclough/npm/
+
   # Every green push to master is released: the build's version is 0.4.<run number>, stamped into
   # this checkout only (the repository says 0.0.0). It builds the one image and its chart, once;
   # Kargo promotes them from the registry.

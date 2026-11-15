@@ -8,6 +8,7 @@ __pycache__/
 .ruff_cache/
 node_modules/
 /web/**/dist/
+/web/.publish/
 
 # The table viewer bundle, built from web/ (bun run build) and shipped in the wheel.
 python/kermodes/static/
