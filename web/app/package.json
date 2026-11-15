@@ -13,6 +13,7 @@
     "@kermodes/client": "workspace:*",
     "@kermodes/grid": "workspace:*",
     "@kermodes/theme": "workspace:*",
+    "@radix-ui/react-popover": "^1.3.1",
     "@radix-ui/react-scroll-area": "^1.4.0",
     "@radix-ui/react-select": "^2.4.1",
     "@radix-ui/react-slot": "^1.5.0",

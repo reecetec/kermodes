@@ -1263,8 +1263,8 @@ namespaces).
   so an upgrade reads as Rolling out rather than Degraded, then how many of its pods are ready.
   The lake has no pods: the controller lists one object of its store (at most every 30 s, within
   2 s) and reads its merge Jobs, so it reads Unreachable, Merge failed, Merge overdue (due an
-  hour with no Job), Merging, or Healthy, with why; its size and newest merged date come from
-  `/api/catalog`.
+  hour with no Job), Merging, or Running like every part that is fine, with why; its size and
+  newest merged date come from `/api/catalog`.
   Each pod's disks come from the component itself, not the node (no kubelet access): weir's
   volume from its `stats` action; each Postgres instance's databases and WAL from its CNPG
   metrics, its data volume's size from its claim. One that cannot be read in two seconds shows

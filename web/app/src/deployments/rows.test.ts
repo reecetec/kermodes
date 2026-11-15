@@ -145,7 +145,7 @@ describe('lakeRow', () => {
   });
 
   it('takes the lake out of the components it arrives with', () => {
-    const check = { name: 'lake', status: 'Healthy', instances: [], warning: null, warning_ns: null };
+    const check = { name: 'lake', status: 'Running', instances: [], warning: null, warning_ns: null };
     const keys = tableRows([], [postgres, check], catalog).map(r => r.key);
     expect(keys).toEqual(['system/postgres', 'system/lake']);
   });

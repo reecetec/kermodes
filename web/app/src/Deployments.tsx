@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, Play, RotateCcw, Rocket, Search, Square, X } from 'lucide-react';
 import type { KermodesConnection } from '@kermodes/client';
+import { Clipped } from '@/components/Clipped';
 import { ListColGroup, ListHeader } from '@/components/ListHeader';
 import { type ListSort, type SortValue, nextSort, sortRows, useColumnWidths } from '@/components/list';
 import { SidePanel } from '@/components/SidePanel';
@@ -363,8 +364,8 @@ export function DeploymentsPage({ connection }: { connection: KermodesConnection
                       r.project === SYSTEM && 'bg-muted/25'
                     )}
                   >
-                    <td className="truncate pr-3 pl-2 font-mono font-medium" title={r.name}>
-                      {r.name}
+                    <td className="pr-3 pl-2">
+                      <Clipped value={r.name} label="Name" className="font-mono font-medium" />
                     </td>
                     <td className="truncate pr-3 text-muted-foreground">{r.project}</td>
                     <td className="truncate pr-3 text-muted-foreground">{r.kind}</td>
@@ -382,7 +383,7 @@ export function DeploymentsPage({ connection }: { connection: KermodesConnection
                           )}
                         </>
                       ) : (
-                        <span className="font-mono text-xs">{r.revision ?? '—'}</span>
+                        <Clipped value={r.revision ?? '—'} label="Revision" className="font-mono text-xs" />
                       )}
                     </td>
                     <td className="pr-3">
@@ -411,14 +412,14 @@ export function DeploymentsPage({ connection }: { connection: KermodesConnection
                     </td>
                     <td className={cn('pr-3 tabular-nums', r.restarts > 0 && 'text-warning')}>{r.restarts}</td>
                     <td className="pr-3 tabular-nums">{ago(r.started)}</td>
-                    <td className="truncate pr-3 text-xs text-muted-foreground" title={r.node ?? undefined}>
-                      {r.node ?? '—'}
+                    <td className="pr-3">
+                      <Clipped value={r.node ?? '—'} label="Node" className="text-xs text-muted-foreground" />
                     </td>
-                    <td className="truncate pr-2 text-xs" title={r.warning ?? undefined}>
+                    <td className="pr-2">
                       {r.warning == null ? (
-                        <span className="text-muted-foreground">—</span>
+                        <span className="text-xs text-muted-foreground">—</span>
                       ) : (
-                        <span className="text-destructive">{r.warning}</span>
+                        <Clipped value={r.warning} label="Warning" className="text-xs text-destructive" />
                       )}
                     </td>
                   </tr>

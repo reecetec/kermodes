@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown, ChevronRight, Search, Table2, X } from 'lucide-react';
+import { Clipped } from '@/components/Clipped';
 import { ListColGroup, ListHeader } from '@/components/ListHeader';
 import { useColumnWidths } from '@/components/list';
 import { SidePanel } from '@/components/SidePanel';
@@ -303,12 +304,19 @@ export function CatalogPage({ onOpen }: { onOpen: (table: string) => void }) {
                               isSelected && 'bg-accent'
                             )}
                           >
-                            <td className="truncate py-1 pr-4 pl-8 font-mono text-[13px]" title={t.table}>
-                              {t.table.slice(group.namespace.length + 1)}
+                            <td className="py-1 pr-4 pl-8">
+                              <Clipped
+                                value={t.table.slice(group.namespace.length + 1)}
+                                label="Table"
+                                className="font-mono text-[13px]"
+                              />
                             </td>
-                            <td className="truncate py-1 pr-4 text-xs text-muted-foreground">
-                              {t.kind}
-                              {t.key.length > 0 && ` · ${t.key.join(', ')}`}
+                            <td className="py-1 pr-4">
+                              <Clipped
+                                value={t.key.length > 0 ? `${t.kind} · ${t.key.join(', ')}` : t.kind}
+                                label="Kind"
+                                className="text-xs text-muted-foreground"
+                              />
                             </td>
                             <TotalsCells t={totals([t], today)} />
                             <td className="py-1 pr-4 text-right tabular-nums">{t.columns.length}</td>

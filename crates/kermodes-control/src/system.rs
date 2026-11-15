@@ -177,7 +177,8 @@ pub fn lake_status(
     if jobs.iter().any(|j| j.active) {
         return ("Merging".into(), None);
     }
-    ("Healthy".into(), None)
+    // Fine reads the same word as every other part that is fine
+    ("Running".into(), None)
 }
 
 /// An image reference's tag (`registry/name:0.4.131` → `0.4.131`), without a digest; `None`
@@ -223,8 +224,8 @@ mod tests {
             &'a str,
         );
         let cases: Vec<Case> = vec![
-            (&Ok(()), vec![], &[], "Healthy"),
-            (&Ok(()), vec![job(false, false)], &[], "Healthy"),
+            (&Ok(()), vec![], &[], "Running"),
+            (&Ok(()), vec![job(false, false)], &[], "Running"),
             (&Ok(()), vec![job(true, false)], &[], "Merging"),
             (&Ok(()), vec![job(true, false)], &overdue, "Merge overdue"),
             (

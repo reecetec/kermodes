@@ -36,3 +36,4 @@ export { TableViewerMetricCalculator, TableViewerRenderer } from './TableViewerG
 export * from './FilterBar';
 export * from './sorting';
 export * from './copy';
+export * from './cellValue';

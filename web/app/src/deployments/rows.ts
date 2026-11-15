@@ -6,7 +6,6 @@ export type Tone = 'ok' | 'busy' | 'bad' | 'idle';
 
 const TONES: Record<string, Tone> = {
   Running: 'ok',
-  Healthy: 'ok',
   Merging: 'busy',
   Unchecked: 'idle',
   'Rolling out': 'busy',
