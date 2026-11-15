@@ -158,6 +158,36 @@ impl Row {
             event_ns: observed.and_then(|o| o.warning.as_ref().map(|(_, at)| *at)),
         }
     }
+
+    /// `app` of `project`: its build status, the commit it serves while `latest` is the
+    /// newest, and why its newest build failed. It has no pods: the UI's server serves it.
+    pub fn app(
+        project: &str,
+        app: &str,
+        status: &str,
+        served: Option<&str>,
+        latest: &str,
+        warning: Option<String>,
+    ) -> Self {
+        Self {
+            project: project.into(),
+            name: app.into(),
+            kind: "app".into(),
+            status: status.into(),
+            update: "auto".into(),
+            commit: served.map(str::to_owned),
+            available: (served != Some(latest)).then(|| latest.to_owned()),
+            node: None,
+            started_ns: None,
+            restarts: 0,
+            cpu: 0.0,
+            cpu_limit: 0.0,
+            memory: 0,
+            memory_limit: 0,
+            event: warning,
+            event_ns: None,
+        }
+    }
 }
 
 pub static TABLE: LazyLock<TableName> =

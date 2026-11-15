@@ -1,7 +1,7 @@
 //! The controller's HTTP surface: code snapshots for runs' init containers, the sync webhook any
-//! git host can call (§11.3), projects' status, and each deployment's events, logs, rollouts,
-//! and restarts. It is reachable only inside its namespace until the gateway authenticates
-//! callers (§16.4); the web UI reaches it through its own server.
+//! git host can call (§11.3), projects' status, each deployment's events, logs, rollouts, and
+//! restarts, and the files of built apps. It is reachable only inside its namespace until the
+//! gateway authenticates callers (§16.4); the web UI reaches it through its own server.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,6 +13,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 
+use crate::artifacts;
 use crate::plan;
 use crate::run::{self, Controller};
 use crate::system;
@@ -37,9 +38,80 @@ pub async fn serve(controller: Arc<Controller>, listener: tokio::net::TcpListene
         )
         .route("/api/deployments/{project}/{resource}/stop", post(stop))
         .route("/api/deployments/{project}/{resource}/start", post(start))
+        .route("/apps/{project}/{app}/", get(app_page))
+        .route("/apps/{project}/{app}/{*path}", get(app_path))
         .with_state(controller);
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("kermodes control: the HTTP server stopped: {e}");
+    }
+}
+
+async fn app_page(
+    State(controller): State<Arc<Controller>>,
+    Path((project, app)): Path<(String, String)>,
+) -> Response {
+    served_app(&controller, &project, &app, "").await
+}
+
+async fn app_path(
+    State(controller): State<Arc<Controller>>,
+    Path((project, app, path)): Path<(String, String, String)>,
+) -> Response {
+    served_app(&controller, &project, &app, &path).await
+}
+
+/// A file of the build of `app` that is served: the newest that finished.
+async fn served_app(controller: &Controller, project: &str, app: &str, path: &str) -> Response {
+    let Some(store) = &controller.artifacts else {
+        return (StatusCode::NOT_FOUND, "this platform builds no apps").into_response();
+    };
+    let builds = match controller.state.lock().await.builds(project).await {
+        Ok(builds) => builds,
+        Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+    };
+    let Some(commit) = plan::served_build(app, &builds) else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("{project} has no built app `{app}`"),
+        )
+            .into_response();
+    };
+    let files = match store.app(&plan::app_object(project, app, commit)).await {
+        Ok(files) => files,
+        Err(e) => return (StatusCode::BAD_GATEWAY, e).into_response(),
+    };
+    let Some((name, file)) = artifacts::app_file(&files, path) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    // Vite names what it builds under assets/ by content; the page and anything else may
+    // change with the next build.
+    let cache = if name.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    (
+        [
+            (header::CONTENT_TYPE, content_type(name)),
+            (header::CACHE_CONTROL, cache),
+        ],
+        file.clone(),
+    )
+        .into_response()
+}
+
+fn content_type(name: &str) -> &'static str {
+    match name.rsplit_once('.').map(|(_, extension)| extension) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js" | "mjs") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json" | "map") => "application/json",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("ico") => "image/x-icon",
+        Some("woff2") => "font/woff2",
+        Some("wasm") => "application/wasm",
+        _ => "application/octet-stream",
     }
 }
 
@@ -55,6 +127,21 @@ fn deployment(
     plan::object_name(project, resource).map_err(|e| (StatusCode::BAD_REQUEST, e))
 }
 
+/// Whether `name` is an app of `project` at its newest deployable commit.
+async fn is_app(controller: &Controller, project: &str, name: &str) -> bool {
+    let latest = controller
+        .state
+        .lock()
+        .await
+        .latest_discovered(project)
+        .await;
+    latest
+        .ok()
+        .flatten()
+        .and_then(|c| crate::manifest::Manifest::parse(c.manifest.as_deref()?).ok())
+        .is_some_and(|m| m.apps.iter().any(|app| app.name == name))
+}
+
 async fn events(
     State(controller): State<Arc<Controller>>,
     Path((project, resource)): Path<(String, String)>,
@@ -63,13 +150,17 @@ async fn events(
         Ok(name) => name,
         Err(refused) => return refused.into_response(),
     };
+    // An app has no pods of its own to have events.
+    if is_app(&controller, &project, &resource).await {
+        return axum::Json(Vec::<serde_json::Value>::new()).into_response();
+    }
     match controller.kube.events(&name).await {
         Ok(events) => axum::Json(events).into_response(),
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
     }
 }
 
-/// The serving run's last `tail` lines (default 300, at most 5,000).
+/// The serving run's last `tail` lines (default 300, at most 5,000); an app's newest build's.
 async fn logs(
     State(controller): State<Arc<Controller>>,
     Path((project, resource)): Path<(String, String)>,
@@ -84,7 +175,12 @@ async fn logs(
         .and_then(|t| t.parse::<i64>().ok())
         .unwrap_or(300)
         .clamp(1, 5_000);
-    match controller.kube.logs(&name, tail).await {
+    let log = if is_app(&controller, &project, &resource).await {
+        controller.kube.build_log(&project, &resource, tail).await
+    } else {
+        controller.kube.logs(&name, tail).await
+    };
+    match log {
         Ok(text) => text.into_response(),
         Err(e) => (StatusCode::NOT_FOUND, e).into_response(),
     }

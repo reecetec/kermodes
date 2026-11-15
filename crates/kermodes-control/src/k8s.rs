@@ -476,6 +476,32 @@ impl Kube {
             .map_err(|e| format!("cannot read {serving}'s log: {e}"))
     }
 
+    /// The last `tail` lines of the log of `app`'s newest build in `project`.
+    pub async fn build_log(&self, project: &str, app: &str, tail: i64) -> Result<String, String> {
+        let selector = format!("kermodes.io/project={project},kermodes.io/app={app}");
+        let mut pods = self
+            .pods
+            .list(&ListParams::default().labels(&selector))
+            .await
+            .map_err(|e| format!("cannot list {app}'s builds: {e}"))?
+            .items;
+        pods.sort_by_key(|p| p.metadata.creation_timestamp.as_ref().map(|t| t.0));
+        let newest = pods
+            .last()
+            .and_then(|p| p.metadata.name.clone())
+            .ok_or_else(|| format!("{app} has no build from the last day"))?;
+        let params = LogParams {
+            container: Some("build".into()),
+            tail_lines: Some(tail),
+            timestamps: true,
+            ..LogParams::default()
+        };
+        self.pods
+            .logs(&newest, &params)
+            .await
+            .map_err(|e| format!("cannot read {newest}'s log: {e}"))
+    }
+
     async fn pods_of(&self, name: &str) -> Result<Vec<Pod>, String> {
         Ok(self
             .pods
@@ -703,21 +729,8 @@ impl Kube {
         }
         let deadline = Instant::now() + DISCOVERY_DEADLINE;
         loop {
-            let status = self
-                .jobs
-                .get(&name)
-                .await
-                .map_err(|e| format!("cannot read job {name}: {e}"))?
-                .status
-                .unwrap_or_default();
-            if status.succeeded.unwrap_or(0) > 0 {
-                return self.log(&name).await;
-            }
-            if status.failed.unwrap_or(0) > 0 {
-                let log = self.log(&name).await.unwrap_or_default();
-                let tail: Vec<&str> = log.lines().rev().take(5).collect();
-                let tail: Vec<&str> = tail.into_iter().rev().collect();
-                return Err(format!("discovery failed: {}", tail.join("\n")));
+            if let Some(outcome) = self.job_outcome(&name, "discover").await? {
+                return outcome.map_err(|tail| format!("discovery failed: {tail}"));
             }
             if Instant::now() > deadline {
                 return Err("discovery took longer than 6 minutes".into());
@@ -726,7 +739,47 @@ impl Kube {
         }
     }
 
-    async fn log(&self, job: &str) -> Result<String, String> {
+    /// How the Job `name` ended: nothing while it runs; `container`'s log once it succeeded, or
+    /// the log's last lines once it failed. A Job that is gone (expired, or deleted) failed.
+    pub async fn job_outcome(
+        &self,
+        name: &str,
+        container: &str,
+    ) -> Result<Option<Result<String, String>>, String> {
+        let Some(job) = self
+            .jobs
+            .get_opt(name)
+            .await
+            .map_err(|e| format!("cannot read job {name}: {e}"))?
+        else {
+            return Ok(Some(Err(format!("its Job {name} is gone"))));
+        };
+        let status = job.status.unwrap_or_default();
+        if status.succeeded.unwrap_or(0) > 0 {
+            return self.log(name, container).await.map(|log| Some(Ok(log)));
+        }
+        if status.failed.unwrap_or(0) > 0 {
+            let log = self.log(name, container).await.unwrap_or_default();
+            let tail: Vec<&str> = log.lines().rev().take(5).collect();
+            let tail: Vec<&str> = tail.into_iter().rev().collect();
+            let reason = if tail.is_empty() {
+                // Stopped before it wrote anything: its deadline, or its pod never started.
+                status
+                    .conditions
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|c| c.type_ == "Failed")
+                    .and_then(|c| c.message)
+                    .unwrap_or_else(|| "it failed without a log".into())
+            } else {
+                tail.join("\n")
+            };
+            return Ok(Some(Err(reason)));
+        }
+        Ok(None)
+    }
+
+    async fn log(&self, job: &str, container: &str) -> Result<String, String> {
         let pods = self
             .pods
             .list(&ListParams::default().labels(&format!("job-name={job}")))
@@ -739,7 +792,7 @@ impl Kube {
             .next()
             .ok_or_else(|| format!("job {job} has no pod"))?;
         let params = LogParams {
-            container: Some("discover".into()),
+            container: Some(container.into()),
             ..LogParams::default()
         };
         self.pods

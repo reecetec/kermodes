@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+mod artifacts;
 mod browse;
 mod git;
 mod http;

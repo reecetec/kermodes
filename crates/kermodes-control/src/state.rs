@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use tokio_postgres::{Client, NoTls};
 
+use crate::plan;
+
 /// Held while creating the controller's tables, so replicas starting together do not collide.
 const SCHEMA_LOCK: i64 = 0x6b6d_5f63_6f6e_7472; // "km_contr"
 
@@ -67,7 +69,16 @@ impl State {
                  PRIMARY KEY (project, resource)
              );
              ALTER TABLE kermodes_control_deployed
-                 ADD COLUMN IF NOT EXISTS stopped BOOLEAN NOT NULL DEFAULT false;",
+                 ADD COLUMN IF NOT EXISTS stopped BOOLEAN NOT NULL DEFAULT false;
+             CREATE TABLE IF NOT EXISTS kermodes_control_builds (
+                 project TEXT NOT NULL,
+                 app TEXT NOT NULL,
+                 commit TEXT NOT NULL,
+                 started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                 built BOOLEAN NOT NULL DEFAULT false,
+                 error TEXT,
+                 PRIMARY KEY (project, app, commit)
+             );",
         )
         .await
         .map_err(sql)?;
@@ -302,6 +313,96 @@ impl State {
         Ok(())
     }
 
+    /// A project's app builds, newest commit first. The built files are in the artifacts store,
+    /// at `plan::app_object(project, app, commit)`; this records only how each build went.
+    pub async fn builds(&mut self, project: &str) -> Result<Vec<plan::BuildRecord>, String> {
+        Ok(self
+            .client()
+            .await?
+            .query(
+                "SELECT b.app, b.commit, b.built, b.error
+                 FROM kermodes_control_builds b
+                 JOIN kermodes_control_commits c ON c.project = b.project AND c.commit = b.commit
+                 WHERE b.project = $1
+                 ORDER BY c.synced_at DESC, b.app",
+                &[&project],
+            )
+            .await
+            .map_err(sql)?
+            .iter()
+            .map(|row| plan::BuildRecord {
+                app: row.get(0),
+                commit: row.get(1),
+                state: match (row.get::<_, bool>(2), row.get::<_, Option<String>>(3)) {
+                    (true, _) => plan::Build::Built,
+                    (false, Some(error)) => plan::Build::Failed(error),
+                    (false, None) => plan::Build::Building,
+                },
+            })
+            .collect())
+    }
+
+    /// Records that `app` of `project` is building at `commit`.
+    pub async fn start_build(
+        &mut self,
+        project: &str,
+        app: &str,
+        commit: &str,
+    ) -> Result<(), String> {
+        self.client()
+            .await?
+            .execute(
+                "INSERT INTO kermodes_control_builds (project, app, commit) VALUES ($1, $2, $3)
+                 ON CONFLICT DO NOTHING",
+                &[&project, &app, &commit],
+            )
+            .await
+            .map_err(sql)?;
+        Ok(())
+    }
+
+    /// Records how a build ended: built, or why not.
+    pub async fn finish_build(
+        &mut self,
+        project: &str,
+        app: &str,
+        commit: &str,
+        result: &Result<(), String>,
+    ) -> Result<(), String> {
+        let (built, error) = match result {
+            Ok(()) => (true, None),
+            Err(e) => (false, Some(e.as_str())),
+        };
+        self.client()
+            .await?
+            .execute(
+                "UPDATE kermodes_control_builds SET built = $4, error = $5
+                 WHERE project = $1 AND app = $2 AND commit = $3",
+                &[&project, &app, &commit, &built, &error],
+            )
+            .await
+            .map_err(sql)?;
+        Ok(())
+    }
+
+    pub async fn remove_build(
+        &mut self,
+        project: &str,
+        app: &str,
+        commit: &str,
+    ) -> Result<(), String> {
+        self.client()
+            .await?
+            .execute(
+                "DELETE FROM kermodes_control_builds
+                 WHERE project = $1 AND app = $2 AND commit = $3",
+                &[&project, &app, &commit],
+            )
+            .await
+            .map_err(sql)?;
+        Ok(())
+    }
+
     /// Asks the leader, whichever replica it is, to sync now (the push webhook).
     pub async fn request_sync(&mut self) -> Result<(), String> {
         self.client()
@@ -364,7 +465,7 @@ pub(crate) async fn test_database(name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::State;
+    use super::{State, plan};
 
     /// A commit that fails discovery is never what a project runs: the newest deployable commit
     /// stays the one before it.
@@ -436,6 +537,38 @@ mod tests {
         assert_eq!(
             state.snapshot("ticker", "b").await.unwrap().as_deref(),
             Some(&b"tar b"[..])
+        );
+
+        // Builds list newest commit first, by when the commit synced: what decides which
+        // build an app serves.
+        state.start_build("ticker", "market", "a").await.unwrap();
+        state
+            .finish_build("ticker", "market", "a", &Ok(()))
+            .await
+            .unwrap();
+        state.start_build("ticker", "market", "b").await.unwrap();
+        state.start_build("ticker", "market", "b").await.unwrap();
+        let why = "vite: Could not resolve './Missing'".to_owned();
+        state
+            .finish_build("ticker", "market", "b", &Err(why.clone()))
+            .await
+            .unwrap();
+        let record = |commit: &str, state| plan::BuildRecord {
+            app: "market".into(),
+            commit: commit.into(),
+            state,
+        };
+        assert_eq!(
+            state.builds("ticker").await.unwrap(),
+            [
+                record("b", plan::Build::Failed(why)),
+                record("a", plan::Build::Built)
+            ]
+        );
+        state.remove_build("ticker", "market", "b").await.unwrap();
+        assert_eq!(
+            state.builds("ticker").await.unwrap(),
+            [record("a", plan::Build::Built)]
         );
 
         state.set_deployed("ticker", "ticks", "a").await.unwrap();

@@ -8,6 +8,15 @@ use serde::Deserialize;
 pub struct Manifest {
     pub project: String,
     pub resources: Vec<Resource>,
+    /// The project's apps (`apps/<name>/`), built per commit and served at
+    /// `/apps/<project>/<name>/`; manifests from before apps have none.
+    #[serde(default)]
+    pub apps: Vec<App>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct App {
+    pub name: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]

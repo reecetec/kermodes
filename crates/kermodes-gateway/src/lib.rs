@@ -668,9 +668,10 @@ async fn app_slash(UrlPath((project, name)): UrlPath<(String, String)>) -> Respo
     axum::response::Redirect::permanent(&format!("/apps/{project}/{name}/")).into_response()
 }
 
-/// A request for an app, passed to its dev server with its path and query as they came (the
-/// dev server serves under `/apps/<project>/<name>/`), and the answer passed back. A
-/// WebSocket (Vite's hot reload) is connected through, with the subprotocol it asks for.
+/// A request for an app. One a development server runs (`kermodes dev`) passes to its dev
+/// server with its path and query as they came (it serves under `/apps/<project>/<name>/`),
+/// WebSockets too (Vite's hot reload), with the subprotocol asked for. Any other is a built
+/// app's file, which the controller serves.
 async fn app_proxy(State(shared): State<Arc<Shared>>, request: HttpRequest) -> Response {
     let uri = request.uri();
     let app = uri.path().strip_prefix("/apps/").and_then(|rest| {
@@ -681,7 +682,10 @@ async fn app_proxy(State(shared): State<Arc<Shared>>, request: HttpRequest) -> R
         return StatusCode::NOT_FOUND.into_response();
     };
     let Some(upstream) = shared.apps().get(&(project, name)).cloned() else {
-        return (StatusCode::NOT_FOUND, "no such app").into_response();
+        if request.method() != Method::GET {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        return to_control(&shared, Method::GET, uri.path()).await;
     };
     let target = format!(
         "{upstream}{}",

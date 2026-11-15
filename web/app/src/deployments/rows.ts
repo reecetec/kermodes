@@ -7,6 +7,7 @@ export type Tone = 'ok' | 'busy' | 'bad' | 'idle';
 const TONES: Record<string, Tone> = {
   Running: 'ok',
   Merging: 'busy',
+  Building: 'busy',
   Unchecked: 'idle',
   'Rolling out': 'busy',
   Starting: 'busy',
@@ -60,6 +61,8 @@ export function versionOf(component: Component): string {
 }
 
 export function deploymentRow(d: Deployment): Row {
+  // An app has no pods: the UI's server serves what its build produced.
+  const runs = d.kind !== 'app';
   return {
     key: key(d),
     name: d.name,
@@ -67,10 +70,10 @@ export function deploymentRow(d: Deployment): Row {
     kind: d.kind,
     status: d.status,
     revision: d.commit,
-    cpu: d.cpu,
-    cpuLimit: d.cpu_limit,
-    memory: d.memory,
-    memoryLimit: d.memory_limit,
+    cpu: runs ? d.cpu : null,
+    cpuLimit: runs ? d.cpu_limit : null,
+    memory: runs ? d.memory : null,
+    memoryLimit: runs ? d.memory_limit : null,
     disks: [],
     restarts: d.restarts,
     started: d.started,
@@ -79,6 +82,10 @@ export function deploymentRow(d: Deployment): Row {
     source: { type: 'deployment', deployment: d },
   };
 }
+
+/** Where an app built on Kermodes is served */
+export const appUrl = (row: Pick<Row, 'project' | 'name'>) =>
+  `/apps/${encodeURIComponent(row.project)}/${encodeURIComponent(row.name)}/`;
 
 /** A part of the platform as one row: its pods' use summed, and its primary's disks (the first pod's if none is) */
 export function componentRow(c: Component): Row {

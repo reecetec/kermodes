@@ -20,7 +20,7 @@ use kermodes_weir::Date;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::manifest::{Resource, Rollout, Update};
+use crate::manifest::{App, Resource, Rollout, Update};
 
 /// Where history goes, as a merge Job needs it (§8.1): `KERMODES_HISTORY`, the S3 endpoint, and
 /// the Secret holding `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` for that bucket alone.
@@ -458,6 +458,219 @@ fn pod_security() -> Value {
     })
 }
 
+/// The artifacts store, where builds put what they produce: an S3 bucket of its own
+/// (`s3://kermodes-artifacts`), its keys in the controller's environment as
+/// `KERMODES_ARTIFACTS_ACCESS_KEY_ID` and `KERMODES_ARTIFACTS_SECRET_ACCESS_KEY`. Build Jobs never
+/// hold them: each uploads to a presigned URL for its one object.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Artifacts {
+    pub url: String,
+    pub endpoint: String,
+}
+
+/// How apps build: an image with Bun, and a Secret whose keys become each build's environment
+/// (the registry tokens a project's `.npmrc` names).
+#[derive(Clone, Debug, Deserialize)]
+pub struct Builds {
+    pub image: String,
+    #[serde(default)]
+    pub secret: Option<String>,
+}
+
+/// How one build of an app stands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Build {
+    Building,
+    Built,
+    Failed(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuildRecord {
+    pub app: String,
+    pub commit: String,
+    pub state: Build,
+}
+
+/// Where `app`'s build at `commit` is kept in the artifacts store: a tar of its files.
+pub fn app_object(project: &str, app: &str, commit: &str) -> String {
+    format!("apps/{project}/{app}/{commit}.tar")
+}
+
+/// What to do with a project's app builds.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct BuildPlan {
+    /// Apps to build at the newest deployable commit.
+    pub start: Vec<String>,
+    /// Builds no longer needed, as (app, commit).
+    pub remove: Vec<(String, String)>,
+}
+
+/// When `latest` is the project's newest deployable commit and `apps` what it declares: each
+/// app with no build at `latest` builds. Builds go when nothing can use them: those of apps the
+/// commit no longer has, and finished ones older than the build an app serves. A build still
+/// running stays until it ends. `builds` are newest commit first.
+pub fn builds_due(apps: &[App], latest: &str, builds: &[BuildRecord]) -> BuildPlan {
+    let declared = |name: &str| apps.iter().any(|app| app.name == name);
+    let start = apps
+        .iter()
+        .filter(|app| {
+            !builds
+                .iter()
+                .any(|b| b.app == app.name && b.commit == latest)
+        })
+        .map(|app| app.name.clone())
+        .collect();
+    let mut remove = Vec::new();
+    for (index, build) in builds.iter().enumerate() {
+        if build.state == Build::Building {
+            continue;
+        }
+        let superseded = builds[..index]
+            .iter()
+            .any(|newer| newer.app == build.app && newer.state == Build::Built);
+        if !declared(&build.app) || superseded {
+            remove.push((build.app.clone(), build.commit.clone()));
+        }
+    }
+    BuildPlan { start, remove }
+}
+
+/// The commit whose build of `app` is served: its newest finished one.
+pub fn served_build<'a>(app: &str, builds: &'a [BuildRecord]) -> Option<&'a str> {
+    builds
+        .iter()
+        .find(|b| b.app == app && b.state == Build::Built)
+        .map(|b| b.commit.as_str())
+}
+
+/// How `app` reads in the Deployments tab: Running once its build at `latest` is served,
+/// Building until then, Build failed (with why) if it failed; an earlier build serves meanwhile.
+pub fn app_status(
+    app: &str,
+    latest: &str,
+    builds: &[BuildRecord],
+) -> (&'static str, Option<String>) {
+    match builds.iter().find(|b| b.app == app && b.commit == latest) {
+        Some(BuildRecord {
+            state: Build::Built,
+            ..
+        }) => ("Running", None),
+        Some(BuildRecord {
+            state: Build::Failed(error),
+            ..
+        }) => ("Build failed", Some(error.clone())),
+        _ => ("Building", None),
+    }
+}
+
+/// The Job that builds `app` at the target's commit: the commit's code, `bun install
+/// --frozen-lockfile` where its lockfile is (the project, when it is a workspace of apps and
+/// shared packages, else the app), Vite's build under the app's address, and a tar of the
+/// output uploaded to `upload`, a presigned URL for its one object.
+pub fn build_job(target: &Target, app: &str, builds: &Builds, upload: &str) -> Job {
+    // Project code runs here, with no credentials but the build Secret's.
+    const SCRIPT: &str = r#"set -eu
+mkdir -p /work/home /work/tmp
+cp -R "$PROJECT_DIR" /work/project
+cd /work/project
+if [ -f package.json ]; then root=.; else root="apps/$APP"; fi
+(cd "$root" && bun install --frozen-lockfile)
+cd "apps/$APP"
+bun run build --base "/apps/$PROJECT/$APP/" --outDir /work/out --emptyOutDir
+tar -C /work/out -cf /work/app.tar .
+bun -e 'const r = await fetch(process.env.UPLOAD, { method: "PUT", body: Bun.file("/work/app.tar") });
+if (!r.ok) { console.error(`upload refused: ${r.status} ${await r.text()}`); process.exit(1); }'
+echo "built $APP"
+"#;
+    let name = build_job_name(&target.project, app, &target.commit);
+    let mut build = json!({
+        "name": "build",
+        "image": builds.image,
+        "command": ["sh", "-c", SCRIPT],
+        "env": [
+            {"name": "PROJECT", "value": target.project},
+            {"name": "APP", "value": app},
+            {"name": "PROJECT_DIR", "value": project_dir(target)},
+            {"name": "UPLOAD", "value": upload},
+            {"name": "HOME", "value": "/work/home"},
+            {"name": "TMPDIR", "value": "/work/tmp"},
+            {"name": "BUN_INSTALL_CACHE_DIR", "value": "/work/cache"},
+        ],
+        // Vite's build of a dashboard: about a gigabyte at its peak.
+        "resources": {
+            "requests": {"cpu": "1", "memory": "2Gi"},
+            "limits": {"cpu": "2", "memory": "2Gi"},
+        },
+        "volumeMounts": [
+            {"name": "code", "mountPath": "/code", "readOnly": true},
+            {"name": "work", "mountPath": "/work"},
+        ],
+        "securityContext": container_security(),
+    });
+    if let Some(secret) = &builds.secret {
+        build["envFrom"] = json!([{"secretRef": {"name": secret}}]);
+    }
+    let mut spec = pod(target, vec![snapshot(target)], vec![build], "Never");
+    spec["volumes"]
+        .as_array_mut()
+        .expect("a pod's volumes are a list")
+        .push(json!({"name": "work", "emptyDir": {}}));
+    let object = json!({
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": name,
+            "labels": {
+                "app.kubernetes.io/component": "build",
+                "app.kubernetes.io/managed-by": "kermodes-control",
+                "kermodes.io/project": target.project,
+                "kermodes.io/app": app,
+                "kermodes.io/commit": target.commit,
+            },
+        },
+        "spec": {
+            "backoffLimit": 0,
+            // Its log says why a build failed for a day.
+            "ttlSecondsAfterFinished": 86_400,
+            "activeDeadlineSeconds": BUILD_DEADLINE_SECONDS,
+            "template": {
+                // The app's logs are its newest build's: its pods are found by these.
+                "metadata": {"labels": {
+                    "app.kubernetes.io/component": "build",
+                    "kermodes.io/project": target.project,
+                    "kermodes.io/app": app,
+                }},
+                "spec": spec,
+            },
+        },
+    });
+    serde_json::from_value(object).expect("a Job built from known fields")
+}
+
+/// How long a build may run; its upload URL lasts as long.
+pub const BUILD_DEADLINE_SECONDS: u64 = 1_200;
+
+/// One Job per app and commit, a DNS label: `{project}-{app}-build-{commit}-{hash}`, the names
+/// shortened to fit and told apart by a hash of all three.
+pub fn build_job_name(project: &str, app: &str, commit: &str) -> String {
+    let short = |name: &str| name.replace('_', "-").chars().take(18).collect::<String>();
+    // FNV-1a: stable across Rust versions, unlike the standard hasher.
+    let hash = [project, app, commit]
+        .iter()
+        .flat_map(|s| s.bytes().chain([0]))
+        .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        });
+    format!(
+        "{}-{}-build-{}-{:06x}",
+        short(project),
+        short(app),
+        &commit[..commit.len().min(12)],
+        hash & 0xff_ffff
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -800,5 +1013,133 @@ mod tests {
             .clone()
             .unwrap();
         assert_eq!(secret.name, "kermodes-history");
+    }
+
+    fn record(app: &str, commit: &str, state: Build) -> BuildRecord {
+        BuildRecord {
+            app: app.into(),
+            commit: commit.into(),
+            state,
+        }
+    }
+
+    fn apps(names: &[&str]) -> Vec<App> {
+        names
+            .iter()
+            .map(|name| App {
+                name: (*name).into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn each_app_builds_once_per_commit_and_old_builds_go_once_superseded() {
+        let failed = || Build::Failed("bun install: lockfile out of date".into());
+        // Newest commit first, as the state lists them.
+        let builds = [
+            record("market", "c3", Build::Building),
+            record("market", "c2", Build::Built),
+            record("blotter", "c2", failed()),
+            record("market", "c1", Build::Built),
+            record("blotter", "c1", Build::Built),
+            record("retired", "c1", Build::Built),
+        ];
+        let plan = builds_due(&apps(&["market", "blotter"]), "c3", &builds);
+        // market is building c3 already; blotter has nothing at c3 yet.
+        assert_eq!(plan.start, ["blotter"]);
+        // market c1 is older than the c2 it serves; retired is no longer declared. blotter's
+        // c1 still serves, its failed c2 says why it is not newer, and c3 is still building.
+        assert_eq!(
+            plan.remove,
+            [
+                ("market".to_owned(), "c1".to_owned()),
+                ("retired".to_owned(), "c1".to_owned())
+            ]
+        );
+
+        assert_eq!(served_build("market", &builds), Some("c2"));
+        assert_eq!(served_build("blotter", &builds), Some("c1"));
+        assert_eq!(app_status("market", "c3", &builds), ("Building", None));
+        assert_eq!(
+            app_status("blotter", "c2", &builds),
+            (
+                "Build failed",
+                Some("bun install: lockfile out of date".into())
+            )
+        );
+        // Not started yet: about to build.
+        assert_eq!(app_status("blotter", "c3", &builds), ("Building", None));
+
+        // Once c3 builds, it is served and c2 goes.
+        let mut done = builds.to_vec();
+        done[0].state = Build::Built;
+        assert_eq!(served_build("market", &done), Some("c3"));
+        assert_eq!(app_status("market", "c3", &done), ("Running", None));
+        assert!(
+            builds_due(&apps(&["market", "blotter"]), "c3", &done)
+                .remove
+                .contains(&("market".to_owned(), "c2".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_build_job_is_named_validly_runs_restricted_and_holds_only_its_upload_url() {
+        let name = build_job_name(&"p".repeat(63), &"a".repeat(63), "4e0ea58b88651c2fd8f9");
+        assert!(
+            name.len() <= 63 && name.ends_with(char::is_alphanumeric),
+            "{name}"
+        );
+        assert_ne!(
+            build_job_name("ticker", "market", "c1"),
+            build_job_name("ticker", "market", "c2")
+        );
+
+        let builds = Builds {
+            image: "oven/bun:1".into(),
+            secret: None,
+        };
+        let job = build_job(&target("4e0ea58b"), "market", &builds, "https://s3/signed");
+        let pod = job.spec.unwrap().template.spec.unwrap();
+        assert_eq!(pod.security_context.unwrap().run_as_non_root, Some(true));
+        let build = &pod.containers[0];
+        let security = build.security_context.clone().unwrap();
+        assert_eq!(security.read_only_root_filesystem, Some(true));
+        assert_eq!(security.allow_privilege_escalation, Some(false));
+        let env: BTreeMap<String, String> = build
+            .env
+            .clone()
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.name, e.value.unwrap_or_default()))
+            .collect();
+        assert_eq!(env["UPLOAD"], "https://s3/signed");
+        assert_eq!(env["APP"], "market");
+        // No Secret unless one is configured: the upload URL is its only reach.
+        assert!(build.env_from.is_none());
+        // The code and a writable work directory; the root filesystem stays read-only.
+        let mounts: Vec<&str> = build
+            .volume_mounts
+            .iter()
+            .flatten()
+            .map(|m| m.mount_path.as_str())
+            .collect();
+        assert_eq!(mounts, ["/code", "/work"]);
+
+        let with_secret = Builds {
+            secret: Some("kermodes-build".into()),
+            ..builds
+        };
+        let job = build_job(
+            &target("4e0ea58b"),
+            "market",
+            &with_secret,
+            "https://s3/signed",
+        );
+        let build = &job.spec.unwrap().template.spec.unwrap().containers[0];
+        let secret = build.env_from.clone().unwrap()[0]
+            .secret_ref
+            .clone()
+            .unwrap();
+        assert_eq!(secret.name, "kermodes-build");
     }
 }

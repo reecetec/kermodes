@@ -13,12 +13,13 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
+use crate::artifacts::Artifacts;
 use crate::browse;
 use crate::git::{self, Credentials, Repository};
 use crate::k8s::Kube;
 use crate::leader::{Leadership, Wake};
 use crate::manifest::{Manifest, Update};
-use crate::plan::{self, Decision, Target};
+use crate::plan::{self, Build, Decision, Target};
 use crate::report;
 use crate::state::{Commit, State};
 use crate::system;
@@ -51,6 +52,11 @@ pub struct Config {
     /// Where history goes; without it, nothing is merged.
     #[serde(default)]
     pub history: Option<plan::History>,
+    /// Where builds put what they produce, and how apps build; without both, apps are not built.
+    #[serde(default)]
+    pub artifacts: Option<plan::Artifacts>,
+    #[serde(default)]
+    pub builds: Option<plan::Builds>,
 }
 
 fn poll_seconds() -> u64 {
@@ -83,6 +89,7 @@ pub struct Controller {
     pub config: Config,
     pub state: Mutex<State>,
     pub kube: Kube,
+    pub artifacts: Option<Artifacts>,
     /// Per project, the mainline head last seen leaving the project's directory as it was, so
     /// it is not fetched again at every poll.
     unchanged: Mutex<HashMap<String, String>>,
@@ -185,9 +192,11 @@ pub fn run_blocking(config: Config) -> Result<(), String> {
 /// Runs the controller until SIGTERM or SIGINT: the HTTP API at once, and the loops whenever this
 /// replica leads.
 pub async fn run(config: Config) -> Result<(), String> {
+    let artifacts = config.artifacts.as_ref().map(Artifacts::open).transpose()?;
     let controller = Arc::new(Controller {
         state: Mutex::new(State::open(&config.database).await?),
         kube: Kube::connect(&config.namespace).await?,
+        artifacts,
         config,
         unchanged: Mutex::new(HashMap::new()),
         lake_probe: Mutex::new(None),
@@ -227,6 +236,7 @@ async fn lead(controller: &Controller) -> String {
         () = move_off_cordoned(controller) => unreachable!("moves until stopped"),
         () = merge_forever(controller) => unreachable!("merges until stopped"),
         () = report_forever(controller) => unreachable!("reports until stopped"),
+        () = build_forever(controller) => unreachable!("builds until stopped"),
     }
 }
 
@@ -263,6 +273,106 @@ async fn merge_once(controller: &Controller, history: &plan::History) -> Result<
         );
         controller.kube.start(&job).await?;
         eprintln!("kermodes control: merging {table} {date}");
+    }
+    Ok(())
+}
+
+/// How often the leader settles finished builds and starts due ones.
+const BUILD_EVERY: Duration = Duration::from_secs(5);
+
+/// Builds each project's apps at its newest deployable commit and keeps what is served
+/// (`plan::builds_due`), every few seconds.
+async fn build_forever(controller: &Controller) {
+    let (Some(artifacts), Some(builds)) = (&controller.artifacts, &controller.config.builds) else {
+        return std::future::pending().await;
+    };
+    loop {
+        for project in &controller.config.projects {
+            if let Err(e) = build_once(controller, artifacts, builds, project).await {
+                eprintln!("kermodes control: {}: building apps: {e}", project.name);
+            }
+        }
+        tokio::time::sleep(BUILD_EVERY).await;
+    }
+}
+
+async fn build_once(
+    controller: &Controller,
+    artifacts: &Artifacts,
+    config: &plan::Builds,
+    project: &ProjectConfig,
+) -> Result<(), String> {
+    let (latest, records) = {
+        let mut state = controller.state.lock().await;
+        (
+            state.latest_discovered(&project.name).await?,
+            state.builds(&project.name).await?,
+        )
+    };
+    let Some(latest) = latest else { return Ok(()) };
+    let manifest = Manifest::parse(latest.manifest.as_deref().unwrap_or_default())?;
+    // A build ends with its Job; what it uploaded is what makes it built.
+    for record in records.iter().filter(|r| r.state == Build::Building) {
+        let job = plan::build_job_name(&project.name, &record.app, &record.commit);
+        let Some(outcome) = controller.kube.job_outcome(&job, "build").await? else {
+            continue;
+        };
+        let object = plan::app_object(&project.name, &record.app, &record.commit);
+        let result = match outcome {
+            Ok(_) if artifacts.exists(&object).await? => Ok(()),
+            Ok(_) => Err("the build ended without uploading what it built".into()),
+            Err(why) => Err(why),
+        };
+        match &result {
+            Ok(()) => eprintln!(
+                "kermodes control: {}: built {} at {}",
+                project.name, record.app, record.commit
+            ),
+            Err(e) => eprintln!(
+                "kermodes control: {}: building {} at {} failed: {e}",
+                project.name, record.app, record.commit
+            ),
+        }
+        controller
+            .state
+            .lock()
+            .await
+            .finish_build(&project.name, &record.app, &record.commit, &result)
+            .await?;
+    }
+    let records = controller.state.lock().await.builds(&project.name).await?;
+    let due = plan::builds_due(&manifest.apps, &latest.commit, &records);
+    for app in &due.start {
+        let object = plan::app_object(&project.name, app, &latest.commit);
+        let ttl = Duration::from_secs(plan::BUILD_DEADLINE_SECONDS + 300);
+        let upload = artifacts.upload_url(&object, ttl).await?;
+        // Recorded first: a Job that never starts then reads as gone, and the build as failed.
+        controller
+            .state
+            .lock()
+            .await
+            .start_build(&project.name, app, &latest.commit)
+            .await?;
+        let target = target(controller, project, &latest.commit);
+        controller
+            .kube
+            .start(&plan::build_job(&target, app, config, &upload))
+            .await?;
+        eprintln!(
+            "kermodes control: {}: building {app} at {}",
+            project.name, latest.commit
+        );
+    }
+    for (app, commit) in &due.remove {
+        artifacts
+            .delete(&plan::app_object(&project.name, app, commit))
+            .await?;
+        controller
+            .state
+            .lock()
+            .await
+            .remove_build(&project.name, app, commit)
+            .await?;
     }
     Ok(())
 }
@@ -308,6 +418,24 @@ async fn report_once(controller: &Controller) -> Result<RecordBatch, String> {
                 &latest.commit,
                 stopped.contains(&resource.name),
                 observed.get(&name),
+            ));
+        }
+        let builds = controller.state.lock().await.builds(&project.name).await?;
+        let builds_apps = controller.artifacts.is_some() && controller.config.builds.is_some();
+        for app in &manifest.apps {
+            let (status, warning) = if builds_apps {
+                plan::app_status(&app.name, &latest.commit, &builds)
+            } else {
+                let why = "this platform builds no apps: it has no artifacts store or builder";
+                ("Not built", Some(why.to_owned()))
+            };
+            rows.push(report::Row::app(
+                &project.name,
+                &app.name,
+                status,
+                plan::served_build(&app.name, &builds),
+                &latest.commit,
+                warning,
             ));
         }
     }

@@ -44,6 +44,21 @@ history:
   endpoint: ""  # the S3 endpoint inside the cluster, e.g. http://rustfs-svc.rustfs.svc.cluster.local:9000
   secretName: ""
 
+# Where builds put what they produce (architecture.md §10.6): apps' built files, an S3 bucket of
+# its own. The Secret holds AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY for that bucket alone;
+# only the controller holds them, and build Jobs upload to presigned URLs.
+artifacts:
+  url: ""  # s3://kermodes-artifacts
+  endpoint: ""
+  secretName: ""
+
+# How the controller builds projects' apps (apps/<name>/): Bun's image runs `bun install` and
+# Vite's build. The Secret's keys become each build's environment: the registry tokens a
+# project's .npmrc names (KERMODES_NPM_TOKEN for @kermodes/*).
+builds:
+  image: oven/bun:1.4
+  secretName: ""
+
 imagePullSecrets: []
 
 weir:

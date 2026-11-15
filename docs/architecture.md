@@ -1219,7 +1219,17 @@ namespaces).
   and an app pins the version it was built against like any dependency; a project's `.npmrc`
   names the registry and the environment variable holding its token. Under `kermodes dev` the
   UI's server passes `/apps/<project>/<name>/` (WebSockets too, for hot reload) to the app's dev
-  server, lists the apps at `/api/apps`, and links them from its top bar.
+  server, lists the apps at `/api/apps`, and links them from its top bar. In the cluster, the
+  controller builds each app at every deployable commit of its project in a Job (`builds.image`,
+  Bun): the commit's code, `bun install --frozen-lockfile` where the lockfile is, and Vite's
+  build under the app's address, uploaded as a tar to a presigned URL in the artifacts store, a
+  bucket of its own whose keys only the controller holds. The build's environment is the
+  `builds.secretName` Secret's: read-only registry tokens, since builds run project code.
+  Postgres records only how each build went. The newest finished build is served, through the
+  UI's server, by the controller, which keeps its files in memory; a failed build leaves the one
+  before it serving. Builds older than the one served are deleted. Each app is a row of the
+  Deployments tab: Building, Running, or Build failed with why, the commit it serves, and its
+  name a link to it; its logs are its newest build's.
   `examples/ticker/apps/market` is one: a quote board, the newest ticks, and two figures.
 - Ticking and large tables: the table viewer (§15.3). Lists of things (deployments, the
   catalog) are plain tables with fixed column widths, so values changing or a panel opening
