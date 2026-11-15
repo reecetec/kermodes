@@ -1,12 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import {
-  Moon,
-  Search,
-  Sun,
-  Table2,
-  TableProperties,
-  X,
-} from 'lucide-react';
+import { LoaderCircle, Moon, Search, Sun, Table2, TableProperties, X } from 'lucide-react';
 import {
   type ConnectionStatus,
   type SocketView,
@@ -16,7 +9,6 @@ import {
 import { TableViewer, gridThemeOf } from '@kermodes/grid';
 import { CatalogPage } from '@/Catalog';
 import { DEPLOYMENTS_VIEW, DeploymentsPage } from '@/Deployments';
-import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -76,36 +68,42 @@ function useThemeName(): [ThemeName, () => void] {
   return [name, toggle];
 }
 
-const STATUS_LABEL: Record<ConnectionStatus, string> = {
-  open: 'Connected',
-  connecting: 'Connecting…',
-  closed: 'Reconnecting…',
-};
+/** How long the socket may be away before the top bar says so: a page load connects sooner */
+const NOTICE_DELAY_MS = 600;
 
-function ConnectionPill({
+/**
+ * Nothing while connected (docs/theme.md: normal looks normal); a quiet notice with a spinner
+ * once the socket has been away for a moment. Open views dim on their own meanwhile.
+ */
+function ConnectionNotice({
   status,
   error,
 }: {
   status: ConnectionStatus;
   error: string | null;
 }) {
+  const [isShown, setIsShown] = useState(false);
+  useEffect(() => {
+    if (status === 'open') {
+      setIsShown(false);
+      return undefined;
+    }
+    const timer = setTimeout(() => setIsShown(true), NOTICE_DELAY_MS);
+    return () => clearTimeout(timer);
+  }, [status]);
+  if (!isShown) {
+    return null;
+  }
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <span className="inline-flex items-center gap-2 rounded-full border px-2.5 py-1 text-xs text-muted-foreground">
-          <span
-            className={cn(
-              'size-2 rounded-full',
-              status === 'open' && 'bg-success shadow-[0_0_6px] shadow-success/60',
-              status === 'connecting' && 'animate-pulse bg-warning',
-              status === 'closed' && 'animate-pulse bg-destructive'
-            )}
-          />
-          {STATUS_LABEL[status]}
+        <span role="status" className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+          <LoaderCircle className="size-3.5 animate-spin" />
+          {status === 'connecting' ? 'Connecting' : 'Reconnecting'}
         </span>
       </TooltipTrigger>
       <TooltipContent side="bottom">
-        {error ?? `${location.host} · live table updates over WebSocket`}
+        {error ?? `Live updates resume when ${location.host} answers`}
       </TooltipContent>
     </Tooltip>
   );
@@ -179,7 +177,7 @@ function TopBar({
         ))}
       </nav>
       <div className="ml-auto flex items-center gap-2">
-        <ConnectionPill status={connection.status} error={connection.lastError} />
+        <ConnectionNotice status={connection.status} error={connection.lastError} />
         <Tooltip>
           <TooltipTrigger asChild>
             <Button
@@ -218,21 +216,18 @@ function Sidebar({
   return (
     <aside className="flex w-72 shrink-0 flex-col border-r bg-sidebar">
       <div className="space-y-3 p-3">
-        <div className="flex items-center justify-between px-1">
-          <span className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
-            Published tables
-          </span>
-          <Badge variant="secondary" className="tabular-nums">
-            {tables.length}
-          </Badge>
+        <div className="flex items-baseline justify-between px-1">
+          <span className="text-sm font-medium">Tables</span>
+          <span className="text-xs text-muted-foreground tabular-nums">{tables.length}</span>
         </div>
         <div className="relative">
-          <Search className="pointer-events-none absolute top-2.5 left-2.5 size-4 text-muted-foreground" />
+          <Search className="pointer-events-none absolute top-2 left-2.5 size-4 text-muted-foreground" />
           <Input
             value={query}
             onChange={event => setQuery(event.target.value)}
-            placeholder="Filter tables…"
-            className="h-9 pl-8"
+            placeholder="Search"
+            aria-label="Search tables"
+            className="h-8 pl-8"
           />
         </div>
       </div>
@@ -243,14 +238,15 @@ function Sidebar({
               <button
                 type="button"
                 onClick={() => onOpen(table.name)}
+                aria-current={activeTable === table.name ? 'true' : undefined}
                 className={cn(
-                  'group flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left transition-colors hover:bg-accent',
-                  activeTable === table.name && 'bg-accent'
+                  'group flex w-full items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left transition-colors hover:bg-accent',
+                  activeTable === table.name && 'bg-secondary hover:bg-secondary'
                 )}
               >
                 <Table2
                   className={cn(
-                    'size-4 shrink-0 text-muted-foreground group-hover:text-foreground',
+                    'size-4 shrink-0 text-muted-foreground',
                     activeTable === table.name && 'text-primary'
                   )}
                 />
@@ -263,22 +259,16 @@ function Sidebar({
                     {table.columns.length === 1 ? 'column' : 'columns'}
                   </span>
                 </span>
-                {table.refreshing && (
-                  <Badge variant="success" className="gap-1.5 px-1.5">
-                    <span className="size-1.5 animate-pulse rounded-full bg-success" />
-                    ticking
-                  </Badge>
-                )}
               </button>
             </li>
           ))}
           {shown.length === 0 && (
             <li className="px-3 py-8 text-center text-sm text-muted-foreground">
               {!isConnected
-                ? 'Waiting for the session…'
+                ? 'Waiting for the server'
                 : tables.length === 0
-                  ? 'No tables published yet.'
-                  : 'No table matches.'}
+                  ? 'No tables yet'
+                  : 'No table matches'}
             </li>
           )}
         </ul>

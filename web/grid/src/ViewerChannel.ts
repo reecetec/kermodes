@@ -4,6 +4,7 @@ import { type SortKey, type ViewportColumn } from './ViewportGridModel';
 export type ViewerState = {
   columns: ViewportColumn[];
   row_count: number;
+  // "loading…" while a live table catches up with its store, "static", or "ticking · …"
   status: string;
   // Sort keys in priority order
   sort: SortKey[];
@@ -13,6 +14,11 @@ export type ViewerState = {
   filter_errors: Record<string, string>;
   // The highest sort or filter `request` number the rows reflect
   applied: number;
+  // Why the rows shown are not current (a failed table, a lost connection), until the server
+  // answers for the view again; hosts without failures to report leave it out
+  error?: string | null;
+  // Whether the view comes back by itself: a reconnect, or the store restarting
+  retrying?: boolean;
 };
 
 /** Messages from the viewer to the engine side */

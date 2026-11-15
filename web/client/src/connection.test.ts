@@ -177,7 +177,21 @@ describe('KermodesConnection', () => {
     expect([...(received[0][2][0] as Uint8Array)]).toEqual([9]);
 
     sockets[0].receive(JSON.stringify({ type: 'error', view: trades.id, message: 'the table is gone' }));
-    expect(trades.state().status).toBe('the table is gone');
+    expect(trades.state()).toMatchObject({ error: 'the table is gone', retrying: false });
+    // The server answering for the view again clears it
+    sockets[0].receive(
+      JSON.stringify({
+        type: 'state',
+        view: trades.id,
+        row_count: 42,
+        status: 'ticking · cycle 4',
+        sort: [],
+        filters: {},
+        filter_errors: {},
+        applied: 0,
+      })
+    );
+    expect(trades.state()).toMatchObject({ error: null, retrying: false, row_count: 42 });
     sockets[0].receive(JSON.stringify({ type: 'error', view: null, message: 'not JSON' }));
     expect(connection.lastError).toBe('not JSON');
   });
@@ -216,7 +230,7 @@ describe('KermodesConnection', () => {
 
     sockets[0].drop();
     expect(connection.status).toBe('closed');
-    expect(view.state().status).toContain('reconnecting');
+    expect(view.state()).toMatchObject({ error: 'Reconnecting', retrying: true });
 
     jest.advanceTimersByTime(1);
     expect(sockets).toHaveLength(2);
@@ -269,7 +283,7 @@ describe('KermodesConnection', () => {
     expect(opens()).toBe(1);
 
     sockets[0].receive(JSON.stringify(ended));
-    expect(view.state().status).toContain('retrying');
+    expect(view.state()).toMatchObject({ error: 'weir restarted', retrying: true });
     jest.advanceTimersByTime(1);
     expect(opens()).toBe(2);
     // Opened with its sort, as before it ended.

@@ -4,6 +4,8 @@ import type { KermodesConnection } from '@kermodes/client';
 import { SidePanel } from '@/components/SidePanel';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Switch } from '@/components/ui/switch';
 import { cn } from '@/lib/utils';
 import type { Catalog } from '@/catalog/model';
 import {
@@ -118,6 +120,9 @@ function Actions({ row, onDone }: { row: Row | null; onDone: (error: string | nu
   );
 }
 
+/** Radix reserves the empty value, so "any" travels as this and is '' outside the menu */
+const ANY = '__any';
+
 function Choice({
   label,
   value,
@@ -130,22 +135,26 @@ function Choice({
   onChange: (value: string) => void;
 }) {
   return (
-    <select
-      aria-label={label}
-      value={value}
-      onChange={event => onChange(event.target.value)}
-      className={cn(
-        'h-8 rounded-md border bg-background px-2 text-xs',
-        value === '' ? 'text-muted-foreground' : 'text-foreground'
-      )}
+    <Select
+      value={value === '' ? ANY : value}
+      onValueChange={next => onChange(next === ANY ? '' : next)}
     >
-      <option value="">{label}: any</option>
-      {options.map(o => (
-        <option key={o} value={o}>
-          {o}
-        </option>
-      ))}
-    </select>
+      <SelectTrigger
+        size="sm"
+        aria-label={label}
+        className={cn(value === '' ? 'text-muted-foreground' : 'text-foreground')}
+      >
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        <SelectItem value={ANY}>{label}: any</SelectItem>
+        {options.map(o => (
+          <SelectItem key={o} value={o}>
+            {label}: {o}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
   );
 }
 
@@ -269,11 +278,10 @@ export function DeploymentsPage({ connection }: { connection: KermodesConnection
           <Choice label="Status" value={filters.status} options={choices(rows, 'status')} onChange={status => set({ status })} />
           <Choice label="Kind" value={filters.kind} options={choices(rows, 'kind')} onChange={kind => set({ kind })} />
           <Choice label="Node" value={filters.node} options={choices(rows, 'node')} onChange={node => set({ node })} />
-          <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <input
-              type="checkbox"
+          <label className="flex items-center gap-2 text-xs text-muted-foreground">
+            <Switch
               checked={filters.hideStopped}
-              onChange={event => set({ hideStopped: event.target.checked })}
+              onCheckedChange={hideStopped => set({ hideStopped })}
             />
             Hide stopped
           </label>

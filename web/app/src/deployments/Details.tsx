@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { cn } from '@/lib/utils';
 import { totals, utcDate } from '@/catalog/model';
@@ -210,6 +211,9 @@ function ComponentSummary({ c }: { c: Component }) {
   );
 }
 
+/** Radix reserves the empty value: "a ready one" travels as this and is '' outside the menu */
+const ANY_POD = '__ready';
+
 function ComponentLogs({ c, path }: { c: Component; path: string }) {
   const [pod, setPod] = useState('');
   return (
@@ -217,19 +221,23 @@ function ComponentLogs({ c, path }: { c: Component; path: string }) {
       {c.instances.length > 1 && (
         <div className="flex items-center gap-2 border-b px-3 py-2 text-xs text-muted-foreground">
           Pod
-          <select
-            value={pod}
-            onChange={event => setPod(event.target.value)}
-            className="rounded-md border bg-background px-2 py-1 font-mono text-xs text-foreground"
+          <Select
+            value={pod === '' ? ANY_POD : pod}
+            onValueChange={next => setPod(next === ANY_POD ? '' : next)}
           >
-            <option value="">a ready one</option>
-            {c.instances.map(i => (
-              <option key={i.pod} value={i.pod}>
-                {i.pod}
-                {i.role != null ? ` (${i.role})` : ''}
-              </option>
-            ))}
-          </select>
+            <SelectTrigger size="sm" aria-label="Pod" className="font-mono text-foreground">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={ANY_POD}>a ready one</SelectItem>
+              {c.instances.map(i => (
+                <SelectItem key={i.pod} value={i.pod} className="font-mono">
+                  {i.pod}
+                  {i.role != null ? ` (${i.role})` : ''}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </div>
       )}
       <Logs

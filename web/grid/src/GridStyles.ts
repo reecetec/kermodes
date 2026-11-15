@@ -81,6 +81,29 @@ const GRID_CSS = `
   font: 12px var(--font-sans); color: var(--popover-foreground); background: var(--popover);
   border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 8px 24px var(--shadow);
 }
+
+.kermodes-cover { position: absolute; left: 0; right: 0; bottom: 0; pointer-events: none; }
+.kermodes-cover-dim {
+  display: flex; align-items: center; justify-content: center;
+  background: color-mix(in srgb, var(--background) 60%, transparent);
+}
+.kermodes-cover-failed {
+  display: flex; align-items: center; justify-content: center; padding: 24px;
+  background: var(--background); text-align: center; pointer-events: auto;
+}
+.kermodes-cover-failed > div { max-width: 420px; }
+.kermodes-cover-title { margin: 0 0 4px; font: 500 13px var(--font-sans); color: var(--foreground); }
+.kermodes-cover-detail { margin: 0; font: 12px var(--font-sans); color: var(--muted-foreground); }
+.kermodes-busy {
+  display: flex; align-items: center; gap: 8px; padding: 6px 12px;
+  font: 12px var(--font-sans); color: var(--muted-foreground); background: var(--popover);
+  border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 8px 24px var(--shadow);
+}
+.kermodes-skeleton-bar {
+  position: absolute; height: 8px; border-radius: 4px; background: var(--secondary);
+}
+@keyframes kermodes-spin { to { transform: rotate(360deg); } }
+.kermodes-spinner { animation: kermodes-spin 0.8s linear infinite; }
 `;
 
 export function injectGridStyles(doc: Document = document): void {

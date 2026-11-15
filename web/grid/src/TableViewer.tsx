@@ -42,6 +42,7 @@ import {
   type ViewerChannel,
   type ViewerState,
 } from './ViewerChannel';
+import { viewerCover, type Cover } from './cover';
 
 const FILTER_DEBOUNCE_MS = 250;
 const TOAST_MS = 1600;
@@ -242,6 +243,71 @@ function FilterIcon({ color }: { color: string }): React.ReactElement {
   );
 }
 
+function Spinner(): React.ReactElement {
+  return (
+    <svg className="kermodes-spinner" width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
+      <circle cx="8" cy="8" r="6.5" fill="none" stroke="currentColor" strokeOpacity="0.25" strokeWidth="1.75" />
+      <path d="M8 1.5a6.5 6.5 0 0 1 6.5 6.5" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+const SKELETON_ROWS = 16;
+
+/** What covers the rows when they are not current (`viewerCover`), under the headers */
+function ViewerCover({
+  cover,
+  top,
+  rowHeight,
+  cells,
+}: {
+  cover: NonNullable<Cover>;
+  top: number;
+  rowHeight: number;
+  cells: readonly FilterCell[];
+}): React.ReactElement {
+  if (cover.kind === 'skeleton') {
+    return (
+      <div className="kermodes-cover" style={{ top }} aria-busy="true" aria-label="Loading rows">
+        {Array.from({ length: SKELETON_ROWS }, (_, row) =>
+          cells.map((cell, column) => (
+            <div
+              // Fixed placeholders that never reorder
+              // eslint-disable-next-line react/no-array-index-key
+              key={`${row}:${column}`}
+              className="kermodes-skeleton-bar"
+              style={{
+                top: row * rowHeight + (rowHeight - 8) / 2,
+                left: cell.left + 8,
+                // Varied, but the same on every render, so nothing moves
+                width: Math.max(12, (cell.width - 16) * (0.45 + ((row * 7 + column * 3) % 5) * 0.1)),
+              }}
+            />
+          ))
+        )}
+      </div>
+    );
+  }
+  if (cover.kind === 'failed') {
+    return (
+      <div className="kermodes-cover kermodes-cover-failed" style={{ top }} role="alert">
+        <div>
+          <p className="kermodes-cover-title">This table cannot be shown</p>
+          <p className="kermodes-cover-detail">{cover.message}</p>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="kermodes-cover kermodes-cover-dim" style={{ top }} aria-busy="true">
+      <span className="kermodes-busy" role="status">
+        <Spinner />
+        {cover.label}
+      </span>
+    </div>
+  );
+}
+
 export type TableViewerProps = {
   channel: ViewerChannel;
   theme: GridTheme;
@@ -286,6 +352,8 @@ export function TableViewer({
   // The sort last asked for, shown in the header while it is pending
   const askedSort = useRef<readonly SortKey[] | null>(null);
   const [isUpdating, setIsUpdating] = useState(false);
+  // Whether any rows have arrived: until then the body shows skeleton rows
+  const [hasRows, setHasRows] = useState(false);
   const [cells, setCells] = useState<readonly FilterCell[]>([]);
   const cellsKey = useRef('');
 
@@ -334,6 +402,7 @@ export function TableViewer({
         if (header.type === 'rows') {
           model.setRowCount(header.total);
           model.setWindow(header.start, table, toKeys(buffers[1]));
+          setHasRows(true);
         } else if (header.type === 'fetched') {
           fetcher.receive(header.id, table);
         }
@@ -662,6 +731,7 @@ export function TableViewer({
 
   const filterBarHeight = isFilterBarShown ? FILTER_BAR_HEIGHT : 0;
   const hasFilters = Object.values(state.filters).some(text => text.trim() !== '');
+  const cover = viewerCover(state, hasRows, isUpdating);
   const gridHeight =
     maxGridHeight == null
       ? undefined
@@ -719,19 +789,12 @@ export function TableViewer({
             onClose={closeMenu}
           />
         )}
-        {isUpdating && (
-          <div
-            data-testid="updating"
-            style={{
-              position: 'absolute',
-              left: 0,
-              right: 0,
-              top: theme.columnHeaderHeight + filterBarHeight,
-              bottom: 0,
-              background: theme.backgroundColor,
-              opacity: 0.6,
-              pointerEvents: 'none',
-            }}
+        {cover != null && (
+          <ViewerCover
+            cover={cover}
+            top={theme.columnHeaderHeight + filterBarHeight}
+            rowHeight={theme.rowHeight}
+            cells={cells}
           />
         )}
       </div>
@@ -747,10 +810,12 @@ export function TableViewer({
           <FilterIcon color="currentColor" />
           {hasFilters ? 'Filtered' : 'Filter'}
         </button>
-        <span>
-          {rowCount.toLocaleString('en-US')} {rowCount === 1 ? 'row' : 'rows'}
-        </span>
-        <span>{isUpdating ? 'updating…' : state.status}</span>
+        {/* A live table still loading has no count worth reading yet */}
+        {hasRows && !state.status.startsWith('loading') && (
+          <span>
+            {rowCount.toLocaleString('en-US')} {rowCount === 1 ? 'row' : 'rows'}
+          </span>
+        )}
       </div>
     </div>
   );

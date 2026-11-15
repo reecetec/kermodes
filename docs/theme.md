@@ -119,4 +119,5 @@ or into another's tabs, and the layout is kept per browser. The grid fills its p
 ## Checks
 
 - `web/theme/tokens.test.ts`: every colour token is defined in both themes, as hex.
+- `web/app/src/controls.test.ts`: no native select, checkbox, or radio in the app.
 - Verify a design change in a browser, in both themes, and look at it.

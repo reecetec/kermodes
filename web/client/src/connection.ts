@@ -327,7 +327,7 @@ export class KermodesConnection {
       this.socket = null;
       this.status = 'closed';
       this.views.forEach(view =>
-        view.update({ status: 'disconnected · reconnecting…' })
+        view.update({ error: 'Reconnecting', retrying: true })
       );
       this.notify();
       if (!this.isClosed) {
@@ -369,9 +369,17 @@ export class KermodesConnection {
       }
       case 'state': {
         const { row_count, status, sort, filters, filter_errors, applied } = message;
-        this.views
-          .get(message.view)
-          ?.update({ row_count, status, sort, filters, filter_errors, applied });
+        // The server answering for the view means it is current again
+        this.views.get(message.view)?.update({
+          row_count,
+          status,
+          sort,
+          filters,
+          filter_errors,
+          applied,
+          error: null,
+          retrying: false,
+        });
         break;
       }
       case 'error': {
@@ -379,11 +387,11 @@ export class KermodesConnection {
         if (view == null) {
           this.lastError = message.message;
           this.notify();
-        } else if (message.retry) {
-          view.update({ status: `${message.message} · retrying…` });
-          this.retry(view);
         } else {
-          view.update({ status: message.message });
+          view.update({ error: message.message, retrying: message.retry === true });
+          if (message.retry) {
+            this.retry(view);
+          }
         }
         break;
       }
