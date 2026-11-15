@@ -26,7 +26,16 @@ def market(db):
         "vwap = notional / volume",
     )
     board = day.select(
-        "sym", "last", "change", "change_pct", "open", "low", "high", "vwap", "volume", "trades"
+        "sym",
+        "last",
+        "change",
+        "change_pct",
+        "open",
+        "low",
+        "high",
+        "vwap",
+        "volume",
+        "trades",
     )
     # Every symbol, biggest gain first: a ticking sort orders how its rows are read.
     movers = board.select("sym", "last", "change_pct").sort("change_pct desc")
