@@ -10,8 +10,8 @@
     "test": "bun test"
   },
   "dependencies": {
-    "@kermodes/react": "0.4.156",
-    "@kermodes/theme": "0.4.156",
+    "@kermodes/react": "0.4.165",
+    "@kermodes/theme": "0.4.165",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
