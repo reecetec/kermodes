@@ -9,6 +9,8 @@ export type MenuAction =
   | { type: 'edit-filter'; column: string }
   | { type: 'clear-filters' }
   | { type: 'copy-cell' }
+  // Open the cell's whole value in a popover
+  | { type: 'show-value' }
   | { type: 'copy-selection'; header: boolean }
   | { type: 'copy-text'; text: string };
 
@@ -65,7 +67,10 @@ export function contextMenu(target: MenuTarget, view: MenuView): MenuItem[][] {
     ];
   }
 
-  const copies: MenuItem[] = [{ label: 'Copy cell', action: { type: 'copy-cell' }, hint: '⌘-click' }];
+  const copies: MenuItem[] = [
+    { label: 'Show value', action: { type: 'show-value' } },
+    { label: 'Copy cell', action: { type: 'copy-cell' }, hint: '⌘-click' },
+  ];
   if (view.isSelectionWide) {
     copies.push(
       { label: 'Copy selection', action: { type: 'copy-selection', header: false }, hint: '⌘C' },

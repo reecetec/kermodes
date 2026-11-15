@@ -43,6 +43,8 @@ import {
   type ViewerState,
 } from './ViewerChannel';
 import { viewerCover, type Cover } from './cover';
+import { shownValue, type ShownValue } from './cellValue';
+import ValuePopover, { type CellRect } from './ValuePopover';
 
 const FILTER_DEBOUNCE_MS = 250;
 const TOAST_MS = 1600;
@@ -130,6 +132,39 @@ class CopyCellMouseHandler extends GridMouseHandler {
     this.onCopyCell(column, row);
     return true;
   }
+}
+
+/** Tells the viewer which cell the pointer is over, for the expand button; never handles events */
+class HoverCellMouseHandler extends GridMouseHandler {
+  constructor(private readonly onHover: (cell: { column: VisibleIndex; row: number } | null) => void) {
+    super(850);
+  }
+
+  onMove(gridPoint: GridPoint): EventHandlerResult {
+    const { column, row } = gridPoint;
+    this.onHover(column == null || row == null ? null : { column, row });
+    return false;
+  }
+
+  onLeave(): EventHandlerResult {
+    this.onHover(null);
+    return false;
+  }
+}
+
+function ExpandIcon(): React.ReactElement {
+  return (
+    <svg width="10" height="10" viewBox="0 0 16 16" aria-hidden="true">
+      <path
+        d="M9 2h5v5M14 2 9 7M7 14H2V9M2 14l5-5"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.75"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
 }
 
 /**
@@ -436,9 +471,18 @@ export function TableViewer({
     };
   }, [model, viewport]);
 
+  // Where the view was scrolled to when it last drew: it is called on every draw, not only on
+  // scrolls, so a scroll is when this changes
+  const scrolledTo = useRef('');
   const handleViewChanged = useCallback(
     (metrics: GridMetrics) => {
       viewport.onViewChanged(metrics);
+      const scroll = `${metrics.top}:${metrics.topOffset}:${metrics.left}:${metrics.leftOffset}`;
+      if (scroll !== scrolledTo.current) {
+        scrolledTo.current = scroll;
+        // The cells under a still pointer moved: the expand button goes until it moves again
+        setHovered(null);
+      }
       const next = filterCells(
         metrics,
         model.columns,
@@ -588,6 +632,90 @@ export function TableViewer({
     };
   }, [copyCellHandler]);
 
+  // The cell under the pointer, and the cell whose whole value is open
+  const [hovered, setHovered] = useState<{ column: VisibleIndex; row: number } | null>(null);
+  const [opened, setOpened] = useState<{
+    rect: CellRect;
+    column: string;
+    type: string;
+    value: ShownValue;
+  } | null>(null);
+  // The pointer moving from a cell onto its expand button leaves the canvas: keep the button
+  const isOverExpand = useRef(false);
+  const hoverHandler = useMemo(
+    () =>
+      new HoverCellMouseHandler(cell => {
+        if (cell != null) {
+          setHovered(current =>
+            current?.column === cell.column && current.row === cell.row ? current : cell
+          );
+        } else {
+          window.setTimeout(() => !isOverExpand.current && setHovered(null), 80);
+        }
+      }),
+    []
+  );
+  const measure = useMemo(() => document.createElement('canvas').getContext('2d'), []);
+
+  /** Where a visible cell is drawn, relative to the viewer's body */
+  const cellRect = useCallback((column: VisibleIndex, row: number): CellRect | null => {
+    const metrics = gridRef.current?.metrics;
+    const x = metrics?.visibleColumnXs.get(column);
+    const y = metrics?.visibleRowYs.get(row);
+    const width = metrics?.visibleColumnWidths.get(column);
+    const height = metrics?.visibleRowHeights.get(row);
+    if (metrics == null || x == null || y == null || width == null || height == null) {
+      return null;
+    }
+    return { x: metrics.gridX + x, y: metrics.gridY + y, width, height };
+  }, []);
+
+  /** Whether a cell is worth expanding: its text is cut off, or it holds JSON */
+  const isExpandable = useCallback(
+    (column: VisibleIndex, row: number, width: number): boolean => {
+      const grid = gridRef.current;
+      if (grid == null || measure == null) {
+        return false;
+      }
+      const modelColumn = GridUtils.getModelIndex(column, grid.state.movedColumns);
+      const value = model.valueAt(modelColumn, row);
+      if (value == null) {
+        return false;
+      }
+      if (shownValue(model.columns[modelColumn].type, value).isJson) {
+        return true;
+      }
+      measure.font = theme.font;
+      const text = model.textForCell(modelColumn, row);
+      return measure.measureText(text).width > width - 2 * theme.cellHorizontalPadding;
+    },
+    [model, measure, theme]
+  );
+
+  const showValue = useCallback(
+    (column: VisibleIndex, row: number) => {
+      const grid = gridRef.current;
+      const rect = cellRect(column, row);
+      if (grid == null || rect == null) {
+        return;
+      }
+      const modelColumn = GridUtils.getModelIndex(column, grid.state.movedColumns);
+      const value = model.valueAt(modelColumn, row);
+      if (value === undefined) {
+        return;
+      }
+      const { name, type } = model.columns[modelColumn];
+      setOpened({ rect, column: name, type, value: shownValue(type, value) });
+    },
+    [model, cellRect]
+  );
+  const closeValue = useCallback(() => setOpened(null), []);
+  const expandAt = hovered == null ? null : cellRect(hovered.column, hovered.row);
+  const expand =
+    hovered != null && expandAt != null && isExpandable(hovered.column, hovered.row, expandAt.width)
+      ? { ...hovered, rect: expandAt }
+      : null;
+
   const [menu, setMenu] = useState<{
     x: number;
     y: number;
@@ -668,6 +796,11 @@ export function TableViewer({
             copyCell(column, row);
           }
           break;
+        case 'show-value':
+          if (row != null) {
+            showValue(column, row);
+          }
+          break;
         case 'copy-selection':
           copySelection(action.header).catch((error: Error) =>
             showToast(`Copy failed: ${error.message}`)
@@ -681,7 +814,7 @@ export function TableViewer({
           break;
       }
     },
-    [sortBy, sendFilters, copyCell, copySelection, showToast]
+    [sortBy, sendFilters, copyCell, showValue, copySelection, showToast]
   );
 
   const mouseHandlers = useMemo(
@@ -695,9 +828,10 @@ export function TableViewer({
         sortBy(nextSort(model.sortKeys, model.columns[modelColumn].name, additive));
       }),
       copyCellHandler,
+      hoverHandler,
       new ContextMenuMouseHandler(openMenu),
     ],
-    [model, sortBy, copyCellHandler, openMenu]
+    [model, sortBy, copyCellHandler, hoverHandler, openMenu]
   );
 
   const handleKeyDown = useCallback(
@@ -773,6 +907,43 @@ export function TableViewer({
             filters={draft}
             errors={state.filter_errors}
             onChange={handleFilterChange}
+          />
+        )}
+        {expand != null && opened == null && (
+          <button
+            type="button"
+            className="kermodes-cell-expand"
+            aria-label="Show value"
+            title="Show value"
+            style={{
+              left: expand.rect.x + expand.rect.width - 20,
+              top: expand.rect.y + (expand.rect.height - 16) / 2,
+            }}
+            onMouseEnter={() => {
+              isOverExpand.current = true;
+            }}
+            onMouseLeave={() => {
+              isOverExpand.current = false;
+              setHovered(null);
+            }}
+            onClick={() => showValue(expand.column, expand.row)}
+          >
+            <ExpandIcon />
+          </button>
+        )}
+        {opened != null && (
+          <ValuePopover
+            cell={opened.rect}
+            column={opened.column}
+            type={opened.type}
+            value={opened.value}
+            onCopy={text =>
+              writeClipboard(text).then(
+                () => showToast('Copied the value'),
+                (error: Error) => showToast(`Copy failed: ${error.message}`)
+              )
+            }
+            onClose={closeValue}
           />
         )}
         {toast != null && (

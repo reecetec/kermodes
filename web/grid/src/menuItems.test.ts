@@ -82,10 +82,11 @@ describe('contextMenu', () => {
     });
   });
 
-  it('copies the selection only when it is more than the clicked cell', () => {
+  it('shows a cell whole, and copies the selection only when it is more than the clicked cell', () => {
     const target = cell('utf8', 'AAPL', 'AAPL');
-    expect(labels(contextMenu(target, VIEW))[0]).toEqual(['Copy cell']);
+    expect(labels(contextMenu(target, VIEW))[0]).toEqual(['Show value', 'Copy cell']);
     expect(labels(contextMenu(target, { ...VIEW, isSelectionWide: true }))[0]).toEqual([
+      'Show value',
       'Copy cell',
       'Copy selection',
       'Copy selection with headers',

@@ -104,6 +104,29 @@ const GRID_CSS = `
 }
 @keyframes kermodes-spin { to { transform: rotate(360deg); } }
 .kermodes-spinner { animation: kermodes-spin 0.8s linear infinite; }
+
+.kermodes-cell-expand {
+  position: absolute; z-index: 5; display: flex; align-items: center; justify-content: center;
+  width: 16px; height: 16px; padding: 0; border: 1px solid var(--border); border-radius: 4px;
+  background: var(--popover); color: var(--muted-foreground); cursor: pointer;
+}
+.kermodes-cell-expand:hover { color: var(--foreground); border-color: var(--input); }
+.kermodes-value {
+  position: absolute; z-index: 11; display: flex; flex-direction: column; width: 480px;
+  max-width: calc(100% - 8px); outline: none; font: 12px var(--font-sans);
+  color: var(--popover-foreground); background: var(--popover); border: 1px solid var(--border);
+  border-radius: 10px; box-shadow: 0 8px 24px var(--shadow);
+}
+.kermodes-value-head {
+  display: flex; align-items: center; gap: 8px; padding: 6px 8px 6px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.kermodes-value-name { font-family: var(--font-mono); color: var(--foreground); }
+.kermodes-value-type { flex: 1; color: var(--muted-foreground); }
+.kermodes-value-text {
+  margin: 0; padding: 10px 12px; max-height: 320px; overflow: auto; user-select: text;
+  font: 12px/1.5 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere;
+}
 `;
 
 export function injectGridStyles(doc: Document = document): void {
