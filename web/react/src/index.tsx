@@ -11,10 +11,11 @@ import { tableFromIPC, type Table } from 'apache-arrow';
 import {
   KermodesConnection,
   toBytes,
-  type SocketView,
+  type ViewerChannel,
   type TableInfo,
   type ViewportColumn,
 } from '@kermodes/client';
+import type { Connection } from './connection';
 import {
   rowRange,
   sortKeys,
@@ -24,6 +25,8 @@ import {
   type TableStatus,
 } from './rows';
 
+export type { Connection } from './connection';
+export { fakeKermodes, type FakeKermodes } from './fake';
 export {
   rowRange,
   sortKeys,
@@ -33,7 +36,7 @@ export {
   type TableStatus,
 } from './rows';
 
-const ConnectionContext = createContext<KermodesConnection | null>(null);
+const ConnectionContext = createContext<Connection | null>(null);
 
 /** The page's own server: `ws(s)://<host>/ws`, as an app served by Kermodes reaches it */
 function sameOrigin(): string {
@@ -42,16 +45,26 @@ function sameOrigin(): string {
 
 /**
  * One connection to a Kermodes server for everything inside it, reconnecting by itself. `url`
- * is the server's WebSocket (`wss://kermodes.example.com/ws`); by default the page's own.
+ * is the server's WebSocket (`wss://kermodes.example.com/ws`); by default the page's own. Tests
+ * pass `connection` instead: `fakeKermodes`.
  */
-export function KermodesProvider({ url, children }: { url?: string; children: ReactNode }) {
-  const connection = useMemo(() => new KermodesConnection(url ?? sameOrigin()), [url]);
-  useEffect(() => () => connection.close(), [connection]);
+export function KermodesProvider({
+  url,
+  connection: given,
+  children,
+}: {
+  url?: string;
+  connection?: Connection;
+  children: ReactNode;
+}) {
+  const connection = useMemo(() => given ?? new KermodesConnection(url ?? sameOrigin()), [given, url]);
+  // Closed here only if made here
+  useEffect(() => (given == null ? () => connection.close() : undefined), [connection, given]);
   return <ConnectionContext.Provider value={connection}>{children}</ConnectionContext.Provider>;
 }
 
 /** The connection of the nearest `KermodesProvider` */
-export function useKermodes(): KermodesConnection {
+export function useKermodes(): Connection {
   const connection = useContext(ConnectionContext);
   if (connection == null) {
     throw new Error('useKermodes needs a KermodesProvider around it');
@@ -116,7 +129,7 @@ export function useTable<Row extends TableRow = TableRow>(
     status: 'loading',
     error: null,
   });
-  const view = useRef<SocketView | null>(null);
+  const view = useRef<(ViewerChannel & { close(): void }) | null>(null);
   // The range asked for, read when rows or a new total arrive
   const range = useRef({ offset, limit, last });
   range.current = { offset, limit, last };

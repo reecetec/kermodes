@@ -1213,7 +1213,9 @@ namespaces).
   connection, the page's own server by default) and `useTable(name, { sort, filters, offset,
   limit } | { last })`: the asked rows as plain objects, kept current, with the total, columns,
   and a status (loading, live, static, reconnecting, failed). Only those rows travel; `last`
-  follows an append table's end by position, so the server holds nothing to sort. Apps style
+  follows an append table's end by position, so the server holds nothing to sort. An app's
+  tests give `KermodesProvider` a `fakeKermodes({ table: rows })` connection: the rows reach
+  `useTable` through the same Arrow decoding, in the order given, and `set` ticks them. Apps style
   themselves with `@kermodes/theme`'s Tailwind preset. Each release publishes
   `@kermodes/client`, `react`, and `theme` at its version to the npm registry (`web/publish.ts`),
   and an app pins the version it was built against like any dependency; a project's `.npmrc`
