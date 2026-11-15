@@ -46,9 +46,12 @@ export function Market() {
         <section>
           <h2 className="mb-3 text-sm text-muted-foreground">Latest ticks</h2>
           <ol className="overflow-hidden rounded-lg border bg-card">
-            {[...tape.rows].reverse().map(t => (
+            {/* By position: at 100 ticks a second every update replaces all the rows, so rows
+                keyed by tick would all be torn down and rebuilt four times a second (flashing);
+                these keep their elements and change their text, as a tape runs. */}
+            {[...tape.rows].reverse().map((t, position) => (
               <li
-                key={`${t.ts.getTime()}:${t.sym}:${t.size}`}
+                key={position}
                 className="grid grid-cols-[4rem_1fr_3rem_6.5rem] items-baseline gap-2 border-b px-3 py-1.5 font-mono text-[12px] tabular-nums last:border-b-0"
               >
                 <span>{t.sym}</span>
