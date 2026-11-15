@@ -1,5 +1,5 @@
 image:
-  repository: git.rcolclough.com/rcolclough/kermodes
+  repository: ghcr.io/reecetec/kermodes
   # Defaults to the chart's appVersion: a chart release runs the image released with it.
   tag: ""
   pullPolicy: IfNotPresent
@@ -41,7 +41,7 @@ control:
 # AWS_SECRET_ACCESS_KEY for that bucket alone.
 history:
   url: ""  # s3://kermodes-history
-  endpoint: ""  # the S3 endpoint inside the cluster, e.g. http://rustfs-svc.rustfs.svc.cluster.local:9000
+  endpoint: ""  # the S3 endpoint inside the cluster, e.g. http://minio.minio.svc.cluster.local:9000
   secretName: ""
 
 # Where builds put what they produce (architecture.md §10.6): apps' built files, an S3 bucket of

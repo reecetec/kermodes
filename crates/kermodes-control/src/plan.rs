@@ -1214,7 +1214,7 @@ mod tests {
     fn a_merge_job_is_named_validly_runs_restricted_and_reaches_only_the_history_bucket() {
         let history = History {
             url: "s3://kermodes-history".into(),
-            endpoint: "http://rustfs:9000".into(),
+            endpoint: "http://minio:9000".into(),
             secret: "kermodes-history".into(),
         };
         let table = "research_desk.a_very_long_table_name_for_options_quotes";
@@ -1421,8 +1421,8 @@ mod tests {
     fn a_commit_waits_for_its_checks_and_fails_with_them() {
         let commit = "4e0ea58b";
         assert_eq!(
-            status_url("https://git.rcolclough.com/rcolclough/kermodes.git", commit).unwrap(),
-            "https://git.rcolclough.com/api/v1/repos/rcolclough/kermodes/commits/4e0ea58b/status"
+            status_url("https://git.example.com/acme/kermodes.git", commit).unwrap(),
+            "https://git.example.com/api/v1/repos/acme/kermodes/commits/4e0ea58b/status"
         );
         assert_eq!(
             status_url("https://github.com/acme/desk", commit).unwrap(),

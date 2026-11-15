@@ -483,13 +483,13 @@ outlive what Kubernetes believes.
 
 ### 7.5 Durability
 
-- Initial: single writer per internal partition on a Longhorn PVC (replicated block storage).
-  weir is a StatefulSet with one replica; draining its node is a brief outage (§17.1).
-- Later: copy sealed segments to S3 (rustfs) so node loss costs at most the open segment (§17).
-- Once weir replicates itself (§17), its volumes become local and unreplicated (Longhorn single
-  replica, or local disks): Longhorn's replicas under weir's own would add network round-trips
-  to every acknowledged write and triple the storage. The switch lands with replication, never
-  before, and measured acknowledgement latency on both storage classes decides it.
+- Initial: single writer per internal partition on a replicated PVC (block storage such as
+  Longhorn). weir is a StatefulSet with one replica; draining its node is a brief outage (§17.1).
+- Later: copy sealed segments to object storage so node loss costs at most the open segment (§17).
+- Once weir replicates itself (§17), its volumes become local and unreplicated (a single-replica
+  storage class, or local disks): the storage's replicas under weir's own would add network
+  round-trips to every acknowledged write and triple the storage. The switch lands with
+  replication, never before, and measured acknowledgement latency on both storage classes decides it.
 - Retention: intraday partitions are deleted N days after their merge validates.
 
 ## 8. Historical store
@@ -501,7 +501,7 @@ date is one catalog transaction, and weir deletes its copy only after that commi
 ### 8.1 Layout
 
 Parquet files written by Kermodes to object storage through `object_store`: at
-`KERMODES_HISTORY` (`s3://kermodes-history` on rustfs in the cluster, credentials from the `AWS_*`
+`KERMODES_HISTORY` (`s3://kermodes-history` in the cluster, credentials from the `AWS_*`
 variables of a user scoped to that bucket), or in `lake` beside a local store. Table locations
 begin with their branch, so one bucket holds every branch's history.
 
@@ -779,7 +779,7 @@ names tables `ns.table`; the branch comes from where it runs.
   `kermodes diff`, comparisons in a notebook, reads a grant allows.
 - One install hosts every branch. Worker classes, quotas, and optionally node pools keep
   non-prod work off prod's resources. A separate install is for upgrading the platform itself
-  (Kargo promotes it through its own staging) or for isolation a regulator demands.
+  (promoted through its own staging install) or for isolation a regulator demands.
 
 Postgres holds the catalog, what is deployed where and from which commit, run history, and audit.
 It never holds the only copy of a managed resource's definition.
@@ -841,7 +841,7 @@ def edges(db): ...
 ```
 
 ```python
-s = km.connect().session(env="sportsflow@main", worker_class="medium", memory="8Gi")
+s = km.connect().session(env="strategy@main", worker_class="medium", memory="8Gi")
 ```
 
 - **Worker classes** are admin-defined presets (memory, CPU, GPU, node selector, priority, maximum
@@ -893,11 +893,11 @@ machine against live production data; the cluster runs what is merged.
 A project is a directory in a git repository on any host (one repository may hold several).
 
 ```
-sportsflow/
+strategy/
   kermodes.toml          project name, owned namespaces, mainline, test config
   pyproject.toml      Python dependencies (kermodes + project deps)
   uv.lock             → environment (§10.6)
-  src/sportsflow/
+  src/strategy/
     kermodes_app.py      resource declarations: tables, ingesters, deployments, jobs, features, models
     ...
   package.json        optional: a Bun workspace of apps/* and shared packages/*, one bun.lock
@@ -907,13 +907,13 @@ sportsflow/
 
 ```toml
 [project]
-name = "sportsflow"
-entry = "sportsflow.kermodes_app"       # module whose decorators declare resources
-namespaces = ["sports"]              # namespaces this project owns
+name = "strategy"
+entry = "strategy.kermodes_app"       # module whose decorators declare resources
+namespaces = ["strat"]               # namespaces this project owns
 mainline = "main"                    # merged commits deploy to prod (§11.3)
 
 [sources]                            # code from other repositories, mounted on PYTHONPATH (§11.7)
-quant = { git = "https://git.rcolclough.com/rcolclough/quant-lib", rev = "main", path = "src" }
+quant = { git = "https://github.com/acme/quant-lib", rev = "main", path = "src" }
 
 [reads."md.ticks"]                   # a consumer contract, checked by md's plan (§5.4)
 columns = { sym = "utf8", price = "float64", ts = "timestamp" }
@@ -1052,8 +1052,8 @@ def book(db): ...
 - Jobs run the newest artifact at their next trigger; a running attempt finishes on the artifact it
   started with.
 - Node drains move runs the same way (§17.1).
-- Kargo continues to promote the Kermodes platform itself (Helm chart); Kermodes deploys user
-  projects.
+- The platform itself (the Helm chart) is promoted by the cluster's own delivery (Argo CD,
+  Kargo, or `helm upgrade`); Kermodes deploys user projects.
 
 ### 11.5 Preview and shadow deployments
 
@@ -1110,7 +1110,7 @@ them with the fixed artifact on the replay clock, committing each date atomicall
 
 A model version is:
 
-- artifact URI (S3/rustfs);
+- artifact URI (object storage);
 - flavor: `onnx`, `sklearn`, `torch`, `python`;
 - input/output Arrow schemas (signature);
 - feature-view references and versions;
@@ -1216,7 +1216,7 @@ namespaces).
 ### 15.2 Web UI
 
 - React + TypeScript, Vite, Bun (package manager, scripts, tests), shadcn/ui on Tailwind CSS,
-  lucide icons, React Router — juicebear's web baseline plus shadcn.
+  lucide icons, React Router.
 - Visual design: [theme.md](theme.md). `@kermodes/theme` (`web/theme`) holds the design tokens
   that the UI, the notebook grid, and apps built on Kermodes all draw from.
 - `@kermodes/client`: TypeScript package speaking the delta protocol over WebSocket and decoding Arrow
@@ -1411,7 +1411,7 @@ host it: Kubernetes (§16.1–16.5) and local (§16.6).
   controller creates those at runtime.
 - External dependencies are values: Postgres (a Secret with its connection URI; the reference
   deployment uses a CloudNativePG cluster's `<cluster>-app` Secret, the cluster defined beside
-  Kermodes' values), S3 endpoint and bucket (rustfs), OCI registry for environment images, git
+  Kermodes' values), an S3-compatible endpoint and bucket, OCI registry for environment images, git
   hosts, OIDC issuer.
 
 ### 16.2 Controller
@@ -1435,7 +1435,7 @@ host it: Kubernetes (§16.1–16.5) and local (§16.6).
 - Desired state is git (resource definitions, by commit) and Postgres (what is deployed where,
   runs, audit). Kubernetes holds only native objects the controller derives from it, labelled
   `kermodes.io/project`, `kermodes.io/resource`, and `kermodes.io/commit`; there is no custom
-  resource. `kubectl get deploy -l kermodes.io/project=sportsflow` shows what runs.
+  resource. `kubectl get deploy -l kermodes.io/project=strategy` shows what runs.
 - Status flows back as tables: the controller writes `sys.deployments`, `sys.task_runs`, and
   `sys.pipeline_runs`. Built: every 5 s the leader appends one row per deployment to
   `sys.deployments` (its source `control`): project, name, kind, status, update policy, the
@@ -1488,8 +1488,8 @@ host it: Kubernetes (§16.1–16.5) and local (§16.6).
 | kermodes-control | Deployment, 2+ replicas (chart) | Postgres (CNPG) |
 | kermodes-gateway | Deployment (chart) | — |
 | Workers | Deployment per resource (controller) | Optional PVC cache |
-| Merge, jobs, pipeline stages, environment builds | `batch/v1` Job | rustfs, OCI registry |
-| Lake | Parquet in a rustfs bucket | catalog in Postgres |
+| Merge, jobs, pipeline stages, environment builds | `batch/v1` Job | object storage, OCI registry |
+| Lake | Parquet in an object storage bucket | catalog in Postgres |
 
 Telemetry: OpenTelemetry traces to Tempo, logs to Loki, metrics to Prometheus (§16.7); platform
 state stays in `sys.*` tables.
@@ -1569,7 +1569,7 @@ failure; `plan` warns when a non-replayable source has no replicated ack.
 | Engine deployments | Rollouts and drains replace runs without downtime (§11.4, §17.1); a crash restarts and rebuilds from weir and history, so recovery time = rebuild time | State checkpoints; hot standby (`replicas=2`) with input-driven (deterministic) cycles |
 | Sessions | Lost with the pod | — |
 | Control plane, gateway | 2+ replicas | — |
-| Postgres, lake | CNPG replicas; rustfs | — |
+| Postgres, lake | CNPG replicas; the object store's replication | — |
 
 ### 17.1 Planned disruption
 
@@ -1605,7 +1605,7 @@ down until its replacement has rebuilt. Kermodes moves runs before they are evic
 | Columnar memory and kernels | `arrow` (one major version across the workspace) |
 | RPC | `arrow-flight` (tonic, HTTP/2) |
 | Historical files | `parquet` |
-| Object storage | `object_store` (S3 / rustfs, local filesystem) |
+| Object storage | `object_store` (S3-compatible, local filesystem) |
 | Query frontends | Python table API and SQL (`sqlparser` for parsing), both compiled to the Kermodes plan (§9.3, §9.8) |
 | Catalog and control-plane DB | Postgres via `postgres` / `tokio-postgres` (cluster); SQLite via `rusqlite` (local) |
 | Inference | ONNX Runtime via `ort`; Python sidecar for other flavors |
@@ -1681,12 +1681,12 @@ Verified against maturin 1.16, PyO3 0.30, and uv.
 | M5 | den: register sklearn LinearRegression → ONNX → `predict`; torch MLP; aliases, shadow mode | Live prediction; swap champion without restart |
 | M6 | forage: feature views, training sets, online `last_by`, served-feature logging | Toy sportsbook: simulated games + odds → form features → live win probability vs implied odds |
 | M7 | Managed Postgres and CDC (§6.3), set up from the web UI | Toy sportsbook's bets and wallets in Postgres, ticking in Kermodes next to the odds |
-| M8 | Port juicebear sportsflow as a Kermodes project | Real data |
+| M8 | A real project end to end: live feeds, history, models, and apps | Real data |
 
 ## 21. Open questions
 
 1. Latency target per event (assumed 100 ms–1 s cycles).
-2. Peak rows/sec and live state size for juicebear — validates single-process deployments.
+2. Peak rows/sec and live state size for a production project — validates single-process deployments.
 3. Derived-state checkpointing: replay from start of day vs periodic engine snapshots.
 4. weir placement policy once sharded: hashing vs explicit assignment (deferred; §17 keeps it
    additive).

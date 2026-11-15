@@ -98,7 +98,7 @@ pub fn with_op(
 
 /// Where a store's history files live: a local directory, or `s3://bucket[/prefix]` with
 /// credentials and endpoint from the usual `AWS_*` variables (`AWS_ENDPOINT`, and
-/// `AWS_ALLOW_HTTP=true` for rustfs inside the cluster).
+/// `AWS_ALLOW_HTTP=true` for a store served over plain HTTP inside the cluster).
 pub struct Lake {
     store: Arc<dyn ObjectStore>,
     runtime: Runtime,

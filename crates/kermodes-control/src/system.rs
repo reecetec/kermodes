@@ -323,7 +323,7 @@ mod tests {
     fn an_images_tag_is_its_version() {
         let cases = [
             (
-                "git.rcolclough.com/rcolclough/kermodes:0.4.131",
+                "registry.example.com/acme/kermodes:0.4.131",
                 Some("0.4.131"),
             ),
             (

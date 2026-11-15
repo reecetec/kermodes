@@ -80,18 +80,18 @@ mod tests {
         let cases: &[(&str, &str, Option<u32>, Option<&str>)] = &[
             // Gitea (and any host that is not GitHub or GitLab), with credentials in the URL.
             (
-                "https://bot:token@git.rcolclough.com/rcolclough/kermodes.git",
+                "https://bot:token@git.example.com/acme/kermodes.git",
                 "examples/ticker/src/ticker/app.py",
                 Some(12),
                 Some(
-                    "https://git.rcolclough.com/rcolclough/kermodes/src/commit/abc123/examples/ticker/src/ticker/app.py#L12",
+                    "https://git.example.com/acme/kermodes/src/commit/abc123/examples/ticker/src/ticker/app.py#L12",
                 ),
             ),
             (
-                "https://git.rcolclough.com/rcolclough/kermodes",
+                "https://git.example.com/acme/kermodes",
                 "",
                 None,
-                Some("https://git.rcolclough.com/rcolclough/kermodes/src/commit/abc123"),
+                Some("https://git.example.com/acme/kermodes/src/commit/abc123"),
             ),
             (
                 "git@github.com:org/repo.git",
