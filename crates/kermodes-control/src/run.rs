@@ -70,6 +70,9 @@ pub struct ProjectConfig {
     pub branch: String,
     #[serde(default)]
     pub path: String,
+    /// Deploy only commits whose checks (CI) passed, as the git host's commit status says.
+    #[serde(default)]
+    pub checks: bool,
 }
 
 impl Config {
@@ -96,6 +99,10 @@ pub struct Controller {
     /// The lake's last probe and when it ran, so a page polling the components reaches the
     /// store at most every `LAKE_PROBE_EVERY`.
     lake_probe: Mutex<Option<(Instant, Result<(), String>)>>,
+    /// Per project, the head last found waiting for its checks, so the wait is logged once.
+    waiting: Mutex<HashMap<String, String>>,
+    /// Requests to the git host's API: commit statuses.
+    http: reqwest::Client,
 }
 
 /// How long a probe of the lake's store stands, and how long one may take.
@@ -200,6 +207,8 @@ pub async fn run(config: Config) -> Result<(), String> {
         config,
         unchanged: Mutex::new(HashMap::new()),
         lake_probe: Mutex::new(None),
+        waiting: Mutex::new(HashMap::new()),
+        http: reqwest::Client::new(),
     });
     let listener = tokio::net::TcpListener::bind(&controller.config.listen)
         .await
@@ -517,6 +526,23 @@ async fn sync(controller: &Controller, project: &ProjectConfig) -> Result<(), St
         .await?;
     let pending = match known {
         None => {
+            let checks = if project.checks {
+                commit_checks(controller, project, &head).await?
+            } else {
+                plan::Checks::Passed
+            };
+            if checks == plan::Checks::Pending {
+                // Looked at again at the next poll; nothing is fetched or recorded meanwhile.
+                let mut waiting = controller.waiting.lock().await;
+                if waiting.insert(project.name.clone(), head.clone()).as_ref() != Some(&head) {
+                    eprintln!(
+                        "kermodes control: {}: {head} waits for its checks",
+                        project.name
+                    );
+                }
+                drop(waiting);
+                return reconcile(controller, project).await;
+            }
             let scratch = tempdir()?;
             let snapshot = tokio::task::spawn_blocking(move || {
                 let result = git::snapshot(&repo, credentials.as_ref(), &scratch);
@@ -551,6 +577,25 @@ async fn sync(controller: &Controller, project: &ProjectConfig) -> Result<(), St
                 "kermodes control: {}: synced {}",
                 project.name, snapshot.commit
             );
+            // Recorded as a commit that cannot deploy, as one whose discovery failed is.
+            if let plan::Checks::Failed(why) = checks {
+                eprintln!(
+                    "kermodes control: {}: {} not deployable: {why}",
+                    project.name, snapshot.commit
+                );
+                controller
+                    .state
+                    .lock()
+                    .await
+                    .discovered(
+                        &project.name,
+                        &snapshot.commit,
+                        &controller.config.image,
+                        &Err(why),
+                    )
+                    .await?;
+                return reconcile(controller, project).await;
+            }
             Some(snapshot.commit)
         }
         // Discovery was interrupted (the controller restarted): run it again.
@@ -573,6 +618,38 @@ async fn sync(controller: &Controller, project: &ProjectConfig) -> Result<(), St
             .await?;
     }
     reconcile(controller, project).await
+}
+
+/// How `commit`'s checks stand, from the git host's combined commit status, read with the
+/// project's git credentials.
+async fn commit_checks(
+    controller: &Controller,
+    project: &ProjectConfig,
+    commit: &str,
+) -> Result<plan::Checks, String> {
+    let url = plan::status_url(&project.url, commit)?;
+    let mut request = controller
+        .http
+        .get(&url)
+        .header("accept", "application/json")
+        .header("user-agent", "kermodes-control");
+    if let Some(credentials) = controller.config.credentials() {
+        request = request.basic_auth(credentials.username, Some(credentials.password));
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| format!("cannot read {commit}'s checks: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("{url} answered {}", response.status()));
+    }
+    let text = response
+        .text()
+        .await
+        .map_err(|e| format!("cannot read {commit}'s checks: {e}"))?;
+    let status: Value =
+        serde_json::from_str(&text).map_err(|e| format!("{url} sent no status: {e}"))?;
+    Ok(plan::checks_of(&status))
 }
 
 async fn discover(

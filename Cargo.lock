@@ -1532,6 +1532,7 @@ dependencies = [
  "kermodes-weir",
  "kube",
  "object_store",
+ "reqwest",
  "ring",
  "serde",
  "serde_json",
