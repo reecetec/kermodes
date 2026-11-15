@@ -839,7 +839,8 @@ async fn connection(mut socket: WebSocket, shared: Arc<Shared>) {
     let mut poll = tokio::time::interval(POLL_EVERY);
     loop {
         for message in outgoing.drain(..) {
-            if socket.send(message).await.is_err() {
+            if let Err(e) = socket.send(message).await {
+                eprintln!("kermodes ui: a connection ended: cannot send: {e}");
                 return;
             }
         }
@@ -848,7 +849,11 @@ async fn connection(mut socket: WebSocket, shared: Arc<Shared>) {
                 Some(Ok(Message::Text(text))) => {
                     outgoing = handle(&shared, &mut views, &text).await;
                 }
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+                Some(Ok(Message::Close(_))) | None => return,
+                Some(Err(e)) => {
+                    eprintln!("kermodes ui: a connection ended: {e}");
+                    return;
+                }
                 Some(Ok(_)) => {}
             },
             Ok(()) = cycles.changed() => {
