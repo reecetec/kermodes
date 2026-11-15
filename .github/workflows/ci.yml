@@ -1,0 +1,216 @@
+name: CI
+
+# Every push and pull request is checked. Every green push to master is a release candidate
+# (architecture.md §16.1): built once, labelled by ci/version, its image and chart pushed to GHCR,
+# and its wheels and npm tarballs kept as this run's artifacts. release.yml publishes the npm
+# packages under `dev`, and a tag later releases the candidate as it is.
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # A newer push to a pull request replaces its run; every master push finishes, as a candidate.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: kermodes
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      # The Postgres catalog's and the controller's tests run against it.
+      KERMODES_TEST_POSTGRES: postgres://postgres:kermodes@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v6
+      # The toolchain rust-toolchain.toml names.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # Dependencies (arrow's kernels above all) optimised: the engine's oracle tests run in half
+      # the time.
+      - name: Run Rust tests
+        run: cargo test --workspace --locked --config 'profile.dev.package."*".opt-level=3'
+
+      - name: Check for a second arrow-rs major
+        run: |
+          if cargo tree --workspace --locked --duplicates --edges normal | grep -E '^arrow'; then
+            echo "arrow-rs crates appear at more than one version" >&2
+            exit 1
+          fi
+
+  python:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: 0.13.7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Build the Python package
+        run: uv sync --locked
+
+      - name: Check the web packages and UI (web/)
+        working-directory: web
+        run: |
+          bun install --frozen-lockfile
+          bun run typecheck
+          bun test
+          bun run build
+
+      # As a project's own CI checks its apps: against the published @kermodes/* packages it pins.
+      - name: Check the example project's apps (examples/ticker)
+        working-directory: examples/ticker
+        run: |
+          bun install --frozen-lockfile
+          bun run typecheck
+          bun run test
+
+      - name: Run Ruff
+        run: |
+          uv run --no-sync ruff check
+          uv run --no-sync ruff format --check
+
+      - name: Run ty
+        run: uv run --no-sync ty check
+
+      - name: Run Python tests
+        run: uv run --no-sync pytest
+
+  # The candidate's wheels: the abi3 extension (Python 3.12 and later) for each platform, with the
+  # web app it serves. Built once; the image installs the x86_64 one, and a release publishes them.
+  wheels:
+    if: github.event_name != 'pull_request'
+    strategy:
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, target: x86_64, manylinux: "2_28" }
+          - { runner: ubuntu-24.04-arm, target: aarch64, manylinux: "2_28" }
+          - { runner: macos-15, target: aarch64-apple-darwin, manylinux: "" }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - id: version
+        run: ci/version >> "$GITHUB_OUTPUT"
+      - name: Stamp the version
+        env:
+          PEP440: ${{ steps.version.outputs.pep440 }}
+        run: |
+          sed -i.orig "s/^version = \"0.0.0\"$/version = \"$PEP440\"/" pyproject.toml
+          grep -qx "version = \"$PEP440\"" pyproject.toml
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Build the web app the wheel serves
+        working-directory: web
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          rust-toolchain: "1.98.1"
+          args: --release --locked --out dist
+      - uses: actions/upload-artifact@v5
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist/*.whl
+          retention-days: 90
+          if-no-files-found: error
+
+  candidate:
+    needs: [rust, python, wheels]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+      CHARTS: oci://ghcr.io/${{ github.repository_owner }}/charts
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - id: version
+        run: ci/version >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v5
+        with:
+          name: wheels-x86_64
+          path: dist
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and push the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ steps.version.outputs.semver }}
+          build-args: |
+            IMAGE_CREATED=${{ github.event.head_commit.timestamp }}
+            IMAGE_REVISION=${{ github.sha }}
+            IMAGE_SOURCE=${{ github.server_url }}/${{ github.repository }}
+            IMAGE_VERSION=${{ steps.version.outputs.semver }}
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.3.0
+      - name: Push the chart
+        env:
+          VERSION: ${{ steps.version.outputs.semver }}
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
+          helm package deploy/helm/kermodes --version "$VERSION" --app-version "$VERSION" --destination candidate/chart
+          helm push "candidate/chart/kermodes-$VERSION.tgz" "$CHARTS"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Pack the web packages
+        working-directory: web
+        run: |
+          bun install --frozen-lockfile
+          bun pack.ts "${{ steps.version.outputs.semver }}"
+          mkdir -p ../candidate/npm && mv .publish/*.tgz ../candidate/npm/
+
+      - run: echo "${{ steps.version.outputs.semver }}" > candidate/version
+      - uses: actions/upload-artifact@v5
+        with:
+          name: candidate
+          path: candidate/
+          retention-days: 90
+          if-no-files-found: error

@@ -53,8 +53,8 @@ artifacts:
   secretName: ""
 
 # How the controller builds projects' apps (apps/<name>/): Bun's image runs `bun install` and
-# Vite's build. The Secret's keys become each build's environment: the registry tokens a
-# project's .npmrc names (KERMODES_NPM_TOKEN for @kermodes/*).
+# Vite's build. The Secret's keys become each build's environment: the tokens for private
+# registries a project's .npmrc names.
 builds:
   image: oven/bun:1.4
   secretName: ""

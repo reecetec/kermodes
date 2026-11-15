@@ -33,4 +33,5 @@ uv run pytest
 cargo test --workspace
 ```
 
-The CI gate is `.gitea/workflows/ci.yaml`.
+The CI gate is `.github/workflows/ci.yml`; releases are `.github/workflows/release.yml`
+(architecture.md §16.1).

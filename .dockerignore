@@ -1,12 +1,3 @@
-.git/
-target/
-.venv/
-.kermodes/
-**/node_modules/
-**/__pycache__/
-**/.pytest_cache/
-**/.ruff_cache/
-web/**/dist/
-python/kermodes/static/
-python/kermodes/*.so
-examples/
+# The image installs a built wheel (Dockerfile); nothing else enters the build context.
+*
+!dist/*.whl

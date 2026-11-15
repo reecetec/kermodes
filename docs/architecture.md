@@ -1237,10 +1237,10 @@ namespaces).
   (§15.3) on the provider's connection, in the page's theme; with `follow` it starts at the end
   and stays there as rows arrive, which needs no sort. It is its own entry, so an app that does
   not show one does not carry the grid. Apps style themselves with `@kermodes/theme`'s Tailwind
-  preset. Each release publishes `@kermodes/client`, `grid`, `react`, and `theme` at its
-  version to the npm registry (`web/publish.ts`),
-  and an app pins the version it was built against like any dependency; a project's `.npmrc`
-  names the registry and the environment variable holding its token. Under `kermodes dev` the
+  preset. Every candidate publishes `@kermodes/client`, `grid`, `react`, and `theme` to npm under
+  the `dev` tag and every release under `latest` (§16.1, `web/pack.ts`), and an app pins the
+  version it was built against like any dependency; a project's `.npmrc` names any private
+  registry and the environment variable holding its token. Under `kermodes dev` the
   UI's server passes `/apps/<project>/<name>/` (WebSockets too, for hot reload) to the app's dev
   server, lists the apps at `/api/apps`, and links them from its top bar. In the cluster, the
   controller builds each app at every deployable commit of its project in a Job (`builds.image`,
@@ -1393,26 +1393,32 @@ host it: Kubernetes (§16.1–16.5) and local (§16.6).
 
 ### 16.1 Packaging
 
-- Helm chart `kermodes` in this repo (`deploy/helm/kermodes`), published to the Gitea OCI registry
-  (`oci://git.rcolclough.com/rcolclough/charts`), plus one image, `kermodes:<version>` (Python
+- Helm chart `kermodes` in this repo (`deploy/helm/kermodes`), published to
+  `oci://ghcr.io/reecetec/charts/kermodes`, plus one image, `ghcr.io/reecetec/kermodes` (Python
   slim + the `kermodes` wheel, web app included; the root `Dockerfile`), which runs every role and
-  is the base for environment images.
-- Every green push to `master` is a release. CI stamps the build's version, `0.4.<run number>`, into
-  its checkout (the repository says `0.0.0`), then builds the image and the chart once and pushes
-  both; there are no version commits or tags, and the image's revision label names the commit.
-  The chart's image tag defaults to its `appVersion`, so a chart version runs the image released
-  with it.
-- The Argo CD repo pins a chart version in an umbrella chart (`components/kermodes/helm/`, values in
-  its `values.yaml`); Kargo promotes a release by updating that pin.
+  is the base for environment images. The chart's image tag defaults to its `appVersion`, so a
+  chart version runs the image built with it.
+- Every green push to `master` is a release candidate, built once (`.github/workflows/ci.yml`):
+  wheels for Linux (x86_64, aarch64) and macOS (arm64), the image from the x86_64 wheel, the
+  chart, and the npm packages apps build on (`web/pack.ts`). Its version comes from git alone
+  (`ci/version`): a pre-release of the version after the last release tag, counting commits since
+  it and naming the commit, `0.5.1-dev.12.g8bd8306` (`0.5.1.dev12+g8bd8306` for Python). The image
+  and chart go to GHCR and the npm packages to npm under the `dev` tag; the wheels stay with the
+  CI run. A cluster that runs mainline follows the chart's pre-releases; one that runs releases
+  follows the plain versions.
+- A release is a tag `vX.Y.Z` on a commit whose candidate passed (`.github/workflows/release.yml`).
+  Nothing is rebuilt: the candidate's image gains the tags `X.Y.Z` and `latest`, and its wheels,
+  npm packages, and chart are relabelled `X.Y.Z` (`ci/relabel.py`, which fails if anything but
+  version metadata would change) and published to PyPI, npm under `latest`, and GHCR. The tag
+  chooses the number; a candidate's label only orders it.
 - The chart installs weir (a StatefulSet on a PVC, reachable only from its namespace until Flight
   has authentication), `kermodes ui` (a Deployment, with an optional Gateway API route), and,
   with `control.enabled`, `kermodes control` with its ServiceAccount and namespaced Role. It
   grows to `kermodes-gateway` and config. It does not contain workers, ingesters, or jobs; the
   controller creates those at runtime.
-- External dependencies are values: Postgres (a Secret with its connection URI; the reference
-  deployment uses a CloudNativePG cluster's `<cluster>-app` Secret, the cluster defined beside
-  Kermodes' values), an S3-compatible endpoint and bucket, OCI registry for environment images, git
-  hosts, OIDC issuer.
+- External dependencies are values: Postgres (a Secret with its connection URI, such as a
+  CloudNativePG cluster's `<cluster>-app` Secret), an S3-compatible endpoint and bucket, OCI
+  registry for environment images, git hosts, OIDC issuer.
 
 ### 16.2 Controller
 

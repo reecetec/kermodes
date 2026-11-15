@@ -1,8 +1,9 @@
-// Publishes the packages apps build on (@kermodes/client, @kermodes/react, @kermodes/theme) at
-// the release's version: `bun publish.ts <version> <registry> [--dry-run]`, the token in
-// NPM_TOKEN. The workspace imports their src/; what is published is a copy in .publish/ built
-// for apps: JavaScript with its dependencies left to the app's bundler, type declarations, and
-// a manifest stamped with the version, its workspace dependencies pinned to it.
+// Packs the packages apps build on (@kermodes/client, grid, react, theme) at a build's version:
+// `bun pack.ts <version>` writes .publish/kermodes-<name>-<version>.tgz. The workspace imports
+// their src/; what is packed is a copy built for apps: JavaScript with its dependencies left to
+// the app's bundler, type declarations, and a manifest stamped with the version, its workspace
+// dependencies pinned to it. CI packs once per build; .github/workflows/release.yml publishes
+// those tarballs (a release relabels them first, ci/relabel.py).
 import { $ } from 'bun';
 import { cp, mkdir, rm } from 'node:fs/promises';
 import path from 'node:path';
@@ -15,15 +16,21 @@ type Manifest = {
   exports?: Record<string, string>;
 };
 
-const [version, registry] = Bun.argv.slice(2);
-const dryRun = Bun.argv.includes('--dry-run');
-if (version == null || registry == null || !/^\d+\.\d+\.\d+$/.test(version)) {
-  throw new Error('usage: bun publish.ts <version> <registry> [--dry-run]');
+const [version] = Bun.argv.slice(2);
+// SemVer, with a candidate's pre-release label (ci/version)
+if (version == null || !/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(version)) {
+  throw new Error('usage: bun pack.ts <version>');
 }
 const web = import.meta.dir;
 const staging = path.join(web, '.publish');
 await rm(staging, { recursive: true, force: true });
 
+// npm checks a package's provenance against the repository it names
+const repository = (dir: string) => ({
+  type: 'git',
+  url: 'git+https://github.com/reecetec/kermodes.git',
+  directory: `web/${dir}`,
+});
 const read = async (dir: string) =>
   (await Bun.file(path.join(web, dir, 'package.json')).json()) as Manifest;
 const pinned = (deps: Record<string, string> | undefined) =>
@@ -102,6 +109,7 @@ async function build(
         name: manifest.name,
         version,
         license: manifest.license,
+        repository: repository(dir),
         type: 'module',
         main: './dist/index.js',
         types: './dist/index.d.ts',
@@ -132,6 +140,7 @@ async function copy(dir: string, files: string[]) {
         name: manifest.name,
         version,
         license: 'Apache-2.0',
+        repository: repository(dir),
         type: 'module',
         exports: manifest.exports,
         files,
@@ -154,12 +163,6 @@ const react = await build(
 );
 const theme = await copy('theme', ['tokens.css', 'tailwind.css']);
 
-const host = registry.replace(/^https?:/, '');
 for (const out of [client, grid, react, theme]) {
-  await Bun.write(
-    path.join(out, '.npmrc'),
-    `@kermodes:registry=${registry}\n${host}:_authToken=\${NPM_TOKEN}\n`
-  );
-  // A rerun of a release finds its version there already
-  await $`bun publish --tolerate-republish ${dryRun ? ['--dry-run'] : []}`.cwd(out);
+  await $`bun pm pack --destination ${staging} --quiet`.cwd(out);
 }

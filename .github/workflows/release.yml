@@ -1,0 +1,136 @@
+name: Release
+
+# Everything Kermodes publishes, from candidates CI built (architecture.md §16.1). One workflow,
+# because npm and PyPI trust one workflow file per package for publishing without tokens:
+#
+# - after each green CI run on master: the candidate's npm packages under the `dev` tag, so apps
+#   can pin a build before it is released;
+# - on a tag vX.Y.Z: the tagged commit's candidate, released as it is. Its wheels, npm tarballs,
+#   and chart are relabelled X.Y.Z (ci/relabel.py, which fails if anything but version metadata
+#   would change), its image gains the tags X.Y.Z and latest, and the wheels go to PyPI.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [master]
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: read
+
+jobs:
+  dev:
+    if: >-
+      github.event_name == 'workflow_run' && github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: candidate
+          path: candidate
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      # npm 11.5 and later publish with the workflow's identity (trusted publishing).
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Publish the npm packages under dev
+        run: |
+          VERSION=$(cat candidate/version)
+          # Dependencies first; a rerun skips what it already published.
+          for name in client grid react theme; do
+            if [ -z "$(npm view "@kermodes/$name@$VERSION" version 2>/dev/null)" ]; then
+              npm publish "candidate/npm/kermodes-$name-$VERSION.tgz" --tag dev --access public
+            fi
+          done
+
+  release:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+      packages: write
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      IMAGE: ghcr.io/${{ github.repository }}
+      CHARTS: oci://ghcr.io/${{ github.repository_owner }}/charts
+    steps:
+      - uses: actions/checkout@v6
+      - name: Find the tagged commit's candidate
+        id: candidate
+        run: |
+          RUN=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$GITHUB_SHA" \
+            --event push --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          if [ -z "$RUN" ]; then
+            echo "$GITHUB_REF_NAME is on $GITHUB_SHA, which has no green CI run on master to release" >&2
+            exit 1
+          fi
+          gh run download "$RUN" --repo "$GITHUB_REPOSITORY" --dir candidate
+          echo "run=$RUN" >> "$GITHUB_OUTPUT"
+          echo "version=$(cat candidate/candidate/version)" >> "$GITHUB_OUTPUT"
+
+      - name: Relabel the candidate's files
+        run: python3 ci/relabel.py "${GITHUB_REF_NAME#v}" candidate release
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Tag the candidate's image
+        run: |
+          docker buildx imagetools create \
+            --tag "$IMAGE:${GITHUB_REF_NAME#v}" --tag "$IMAGE:latest" \
+            "$IMAGE:${{ steps.candidate.outputs.version }}"
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.3.0
+      - name: Push the chart
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
+          helm push "release/kermodes-${GITHUB_REF_NAME#v}.tgz" "$CHARTS"
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Publish the npm packages
+        run: |
+          for name in client grid react theme; do
+            npm publish "release/kermodes-$name-${GITHUB_REF_NAME#v}.tgz" --tag latest --access public
+          done
+
+      - name: Create the GitHub release
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/*.whl --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Candidate ${{ steps.candidate.outputs.version }}, built and checked by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/${{ steps.candidate.outputs.run }}."
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: pypi
+          path: release/*.whl
+          if-no-files-found: error
+
+  pypi:
+    needs: release
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: pypi
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1

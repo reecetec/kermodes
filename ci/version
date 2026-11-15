@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# The version of the build at HEAD, from git alone: `ci/version` prints `semver=` and `pep440=`
+# lines (for $GITHUB_OUTPUT). Every mainline build is a release candidate labelled as a
+# pre-release of the version after the last release tag:
+#
+#   last tag v0.5.0, 12 commits on, at 8bd8306...  ->  0.5.1-dev.12.g8bd8306  (0.5.1.dev12+g8bd8306)
+#
+# A pre-release sorts before its release (0.5.0-dev.12 < 0.5.0), so candidates after 0.5.0 are
+# labelled towards 0.5.1: newer candidates are always greater. The label is not a promise; a tag
+# chooses the release's number, and the release relabels the candidate's files (ci/relabel).
+# Needs the full history and tags (fetch-depth: 0).
+set -euo pipefail
+
+describe() {
+    git describe --tags --long --match 'v[0-9]*.[0-9]*.[0-9]*' --exclude 'v*-*' "$1"
+}
+
+sha=$(git rev-parse HEAD)
+if base=$(describe HEAD 2>/dev/null); then
+    tag=${base%-*}
+    count=${tag##*-}
+    tag=${tag%-*}
+    # A commit that is itself a release keeps the label it had before its tag: CI never names a
+    # build with a release's number.
+    if [ "$count" = 0 ]; then
+        if parent=$(describe HEAD^ 2>/dev/null); then
+            tag=${parent%-*}
+            count=$(( ${tag##*-} + 1 ))
+            tag=${tag%-*}
+        else
+            tag=v0.0.0
+            count=$(git rev-list --count HEAD)
+        fi
+    fi
+else
+    tag=v0.0.0
+    count=$(git rev-list --count HEAD)
+fi
+
+IFS=. read -r major minor patch <<<"${tag#v}"
+next="$major.$minor.$((patch + 1))"
+echo "semver=$next-dev.$count.g${sha:0:7}"
+echo "pep440=$next.dev$count+g${sha:0:7}"
