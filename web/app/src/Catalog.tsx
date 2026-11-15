@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown, ChevronRight, Search, Table2, X } from 'lucide-react';
+import { ListColGroup, ListHeader } from '@/components/ListHeader';
+import { useColumnWidths } from '@/components/list';
 import { SidePanel } from '@/components/SidePanel';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -25,17 +27,18 @@ const parseCatalog = (r: Response) => r.json() as Promise<Catalog>;
 const count = (n: number) => n.toLocaleString();
 const size = (n: number) => (n === 0 ? '—' : bytes(n));
 
-/** Widths fixed so that values changing, or the panel opening, never move a column */
-const COLUMNS: { label: string; width: string; numeric?: boolean }[] = [
-  { label: 'Table', width: 'w-[16rem]' },
-  { label: 'Kind', width: 'w-[8rem]' },
-  { label: 'Rows today', width: 'w-[8rem]', numeric: true },
-  { label: 'In weir', width: 'w-[7rem]', numeric: true },
-  { label: 'Lake rows', width: 'w-[9rem]', numeric: true },
-  { label: 'In lake', width: 'w-[7.5rem]', numeric: true },
-  { label: 'Dates', width: 'w-[13rem]' },
-  { label: 'Columns', width: 'w-[6rem]', numeric: true },
+/** Widths in px, fixed so that values changing, or the panel opening, never move a column */
+const COLUMNS: { label: string; width: number; numeric?: boolean }[] = [
+  { label: 'Table', width: 256 },
+  { label: 'Kind', width: 128 },
+  { label: 'Rows today', width: 128, numeric: true },
+  { label: 'In weir', width: 112, numeric: true },
+  { label: 'Lake rows', width: 144, numeric: true },
+  { label: 'In lake', width: 120, numeric: true },
+  { label: 'Dates', width: 208 },
+  { label: 'Columns', width: 96, numeric: true },
 ];
+const DEFAULT_WIDTHS = COLUMNS.map(c => c.width);
 
 function dateRange(t: Totals) {
   if (t.first == null) return '—';
@@ -152,7 +155,7 @@ export function CatalogPage({ onOpen }: { onOpen: (table: string) => void }) {
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
   const search = useRef<HTMLInputElement>(null);
   const close = useCallback(() => setSelected(null), []);
-
+  const [widths, setWidth] = useColumnWidths('catalog', DEFAULT_WIDTHS);
   const today = utcDate(new Date());
   const tables = catalog?.tables ?? [];
   const shown = useMemo(
@@ -248,24 +251,17 @@ export function CatalogPage({ onOpen }: { onOpen: (table: string) => void }) {
           </p>
         )}
         <div className="min-h-0 flex-1 overflow-auto rounded-md border">
-          <table className="w-full min-w-[75rem] table-fixed text-sm">
-            <colgroup>
-              {COLUMNS.map(c => (
-                <col key={c.label} className={c.width} />
-              ))}
-            </colgroup>
-            <thead className="sticky top-0 z-10 bg-background">
-              <tr className="text-left text-xs text-muted-foreground shadow-[inset_0_-1px_0_var(--border)]">
-                {COLUMNS.map(c => (
-                  <th
-                    key={c.label}
-                    className={cn('py-2 pr-4 font-medium first:pl-3', c.numeric && 'text-right')}
-                  >
-                    {c.label}
-                  </th>
-                ))}
-              </tr>
-            </thead>
+          <table
+            className="table-fixed text-sm"
+            style={{ width: widths.reduce((sum, w) => sum + w, 0) }}
+          >
+            <ListColGroup widths={widths} />
+            <ListHeader
+              columns={COLUMNS}
+              widths={widths}
+              onResize={setWidth}
+              cellClassName="py-2 pr-4 first:pl-3"
+            />
             <tbody>
               {groups.map(group => {
                 const open = query !== '' || expanded.has(group.namespace);

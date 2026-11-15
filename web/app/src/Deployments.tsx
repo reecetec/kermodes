@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, Play, RotateCcw, Rocket, Search, Square, X } from 'lucide-react';
 import type { KermodesConnection } from '@kermodes/client';
+import { ListColGroup, ListHeader } from '@/components/ListHeader';
+import { type ListSort, type SortValue, nextSort, sortRows, useColumnWidths } from '@/components/list';
 import { SidePanel } from '@/components/SidePanel';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -35,21 +37,33 @@ export { DEPLOYMENTS_VIEW };
 
 const parseCatalog = (r: Response) => r.json() as Promise<Catalog>;
 
-/** Widths fixed so that values changing, or the panel resizing, never move a column */
-const COLUMNS: { label: string; width: string }[] = [
-  { label: 'Name', width: 'w-[15rem]' },
-  { label: 'Project', width: 'w-[8rem]' },
-  { label: 'Kind', width: 'w-[7rem]' },
-  { label: 'Status', width: 'w-[8.5rem]' },
-  { label: 'Revision', width: 'w-[8.5rem]' },
-  { label: 'CPU', width: 'w-[8.5rem]' },
-  { label: 'Memory', width: 'w-[8.5rem]' },
-  { label: 'Disk', width: 'w-[12rem]' },
-  { label: 'Restarts', width: 'w-[4.5rem]' },
-  { label: 'Up', width: 'w-[5.5rem]' },
-  { label: 'Node', width: 'w-[8rem]' },
-  { label: 'Last warning', width: 'w-[18rem]' },
+/**
+ * The columns, their widths in px (fixed, so values changing or the panel resizing never move
+ * a column; a person may drag them), and what each sorts by.
+ */
+const COLUMNS: { label: string; width: number; numeric?: boolean; value: (r: Row) => SortValue }[] = [
+  { label: 'Name', width: 240, value: r => r.name },
+  { label: 'Project', width: 128, value: r => r.project },
+  { label: 'Kind', width: 112, value: r => r.kind },
+  { label: 'Status', width: 136, value: r => r.status },
+  { label: 'Revision', width: 136, value: r => r.revision },
+  { label: 'CPU', width: 136, value: r => r.cpu },
+  { label: 'Memory', width: 136, value: r => r.memory },
+  {
+    label: 'Disk',
+    width: 192,
+    value: r => {
+      const disk = fullest(r.disks);
+      return disk == null ? null : disk.size == null ? disk.used : disk.used / disk.size;
+    },
+  },
+  { label: 'Restarts', width: 72, value: r => r.restarts },
+  // Longest up first when descending: the earliest start
+  { label: 'Up', width: 88, value: r => (r.started == null ? null : -r.started) },
+  { label: 'Node', width: 128, value: r => r.node },
+  { label: 'Last warning', width: 288, value: r => r.warning },
 ];
+const DEFAULT_WIDTHS = COLUMNS.map(c => c.width);
 
 const TONE_LABEL: Record<Tone, string> = {
   ok: 'running',
@@ -185,7 +199,17 @@ export function DeploymentsPage({ connection }: { connection: KermodesConnection
     () => tableRows(deployments, system.components, catalog),
     [deployments, system.components, catalog]
   );
-  const shown = useMemo(() => rows.filter(r => matches(r, filters)), [rows, filters]);
+  const [sort, setSort] = useState<ListSort>(null);
+  const [widths, setWidth] = useColumnWidths('deployments', DEFAULT_WIDTHS);
+  const shown = useMemo(
+    () =>
+      sortRows(
+        rows.filter(r => matches(r, filters)),
+        sort,
+        (r, column) => COLUMNS[column].value(r)
+      ),
+    [rows, filters, sort]
+  );
   const tally = counts(rows);
   const row = rows.find(r => r.key === selected) ?? null;
   const filtered = JSON.stringify(filters) !== JSON.stringify(NO_FILTERS);
@@ -310,21 +334,19 @@ export function DeploymentsPage({ connection }: { connection: KermodesConnection
           </div>
         ))}
         <div className="min-h-0 flex-1 overflow-auto rounded-md border">
-          <table className="w-full min-w-[112rem] table-fixed text-[13px]">
-            <colgroup>
-              {COLUMNS.map(c => (
-                <col key={c.label} className={c.width} />
-              ))}
-            </colgroup>
-            <thead className="sticky top-0 z-10 bg-background">
-              <tr className="text-left text-xs text-muted-foreground shadow-[inset_0_-1px_0_var(--border)]">
-                {COLUMNS.map(c => (
-                  <th key={c.label} className="h-7 pr-3 font-medium first:pl-2">
-                    {c.label}
-                  </th>
-                ))}
-              </tr>
-            </thead>
+          <table
+            className="table-fixed text-[13px]"
+            style={{ width: widths.reduce((sum, w) => sum + w, 0) }}
+          >
+            <ListColGroup widths={widths} />
+            <ListHeader
+              columns={COLUMNS}
+              widths={widths}
+              onResize={setWidth}
+              sort={sort}
+              onSort={column => setSort(current => nextSort(current, column))}
+              cellClassName="h-7 pr-3 first:pl-2"
+            />
             <tbody>
               {shown.map(r => {
                 const isSelected = r.key === selected;
