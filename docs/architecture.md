@@ -889,6 +889,8 @@ sportsflow/
   src/sportsflow/
     kermodes_app.py      resource declarations: tables, ingesters, deployments, jobs, features, models
     ...
+  package.json        optional: a Bun workspace of apps/* and shared packages/*, one bun.lock
+  apps/market/        an app: TypeScript, served at /apps/<project>/market/ (§15.2)
   tests/              pytest: unit tests on km.local(), replay tests on pinned history
 ```
 
@@ -936,9 +938,11 @@ flowchart LR
 - `kermodes run <resource>` runs one deployment, ingester, or job from the working tree in a local
   process. `kermodes dev --project <dir>` (or in a directory with `kermodes.toml`) also runs the
   whole project on the local platform (§16.6): each resource in its own process, restarted when
-  it dies, and rolled onto every saved change as the cluster rolls a commit (§11.4): the new run
-  starts, becomes ready, then the old one stops and hands over its sources. Discovery and runs
-  compile the project from source each time, never from cached bytecode.
+  it dies, and rolled onto every saved change to its Python as the cluster rolls a commit
+  (§11.4): the new run starts, becomes ready, then the old one stops and hands over its sources.
+  Discovery and runs compile the project from source each time, never from cached bytecode.
+  Each app gets `bun install` and its Vite dev server, behind the UI's server at the address it
+  has in the cluster, so edits reload in the page at once.
 - Inputs, in increasing realism:
   - synthetic sources declared in the project (`@km.source` generators) for tests and demos;
   - `kermodes data pull sports.odds --dates 2026-11-01..2026-11-07` copies Parquet partitions from the
@@ -1201,17 +1205,22 @@ namespaces).
 - Visual design: [theme.md](theme.md). `@kermodes/theme` (`web/theme`) holds the design tokens
   that the UI, the notebook grid, and apps built on Kermodes all draw from.
 - `@kermodes/client`: TypeScript package speaking the delta protocol over WebSocket and decoding Arrow
-  IPC with `apache-arrow`. Used by the UI and any other TypeScript consumer.
+  IPC with `apache-arrow`, and the protocol's types. Used by the UI, the grid, and apps.
 - Apps built on Kermodes: Python computes and publishes tables; a TypeScript frontend of any
-  components shows them. `@kermodes/react` (`web/react`) gives `KermodesProvider` (one
+  components shows them. An app is a directory of the project, `apps/<name>/` with a
+  `package.json` whose `dev` and `build` scripts run Vite; Kermodes gives Vite the app's address,
+  `/apps/<project>/<name>/`, as its base. `@kermodes/react` gives `KermodesProvider` (one
   connection, the page's own server by default) and `useTable(name, { sort, filters, offset,
   limit } | { last })`: the asked rows as plain objects, kept current, with the total, columns,
   and a status (loading, live, static, reconnecting, failed). Only those rows travel; `last`
   follows an append table's end by position, so the server holds nothing to sort. Apps style
-  themselves with `@kermodes/theme`'s Tailwind preset. `kermodes ui --apps DIR` (and `kermodes
-  dev --apps`) serves each built app in `DIR` at `/apps/<name>/` behind the same server, lists
-  them at `/api/apps`, and the UI links them from its top bar. `web/examples/market` is one: a
-  quote board, the newest ticks, and two figures from three live tables.
+  themselves with `@kermodes/theme`'s Tailwind preset. Each release publishes
+  `@kermodes/client`, `react`, and `theme` at its version to the npm registry (`web/publish.ts`),
+  and an app pins the version it was built against like any dependency; a project's `.npmrc`
+  names the registry and the environment variable holding its token. Under `kermodes dev` the
+  UI's server passes `/apps/<project>/<name>/` (WebSockets too, for hot reload) to the app's dev
+  server, lists the apps at `/api/apps`, and links them from its top bar.
+  `examples/ticker/apps/market` is one: a quote board, the newest ticks, and two figures.
 - Ticking and large tables: the table viewer (§15.3). Lists of things (deployments, the
   catalog) are plain tables with fixed column widths, so values changing or a panel opening
   never moves a column, and details open in a panel docked beside or below the list.

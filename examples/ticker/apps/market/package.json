@@ -1,8 +1,7 @@
 {
-  "name": "@kermodes/example-market",
+  "name": "market",
   "version": "0.0.0",
   "private": true,
-  "license": "Apache-2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,8 +9,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@kermodes/react": "workspace:*",
-    "@kermodes/theme": "workspace:*",
+    "@kermodes/react": "0.4.153",
+    "@kermodes/theme": "0.4.153",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },

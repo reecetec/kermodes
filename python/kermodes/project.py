@@ -19,7 +19,8 @@ Declarations::
         ...
 
 Discovery imports the entry module and returns a `Project`; its manifest is the JSON the platform
-plans and deploys from (`kermodes manifest`).
+plans and deploys from (`kermodes manifest`). Apps are the directories of `apps/` holding a
+`package.json`, each served at `/apps/<project>/<name>/` (architecture.md §15.2).
 """
 
 import importlib
@@ -180,6 +181,7 @@ class Project:
     namespaces: tuple[str, ...]
     mainline: str
     resources: dict[str, Resource] = field(default_factory=dict)
+    apps: tuple[str, ...] = ()
 
     def resource(self, name: str) -> Resource:
         try:
@@ -200,6 +202,7 @@ class Project:
             "resources": [
                 _spec(r, self.entry, self.root) for r in self.resources.values()
             ],
+            "apps": [{"name": app, "path": f"apps/{app}"} for app in self.apps],
         }
 
 
@@ -258,7 +261,13 @@ def discover(root: str | Path = ".") -> Project:
                     f"only namespaces {list(namespaces)} (kermodes.toml)"
                 )
         resources[resource.name] = resource
-    return Project(name, root, entry, namespaces, mainline, resources)
+    apps = tuple(sorted(p.parent.name for p in (root / "apps").glob("*/package.json")))
+    for app in apps:
+        if not _NAME.fullmatch(app):
+            raise KermodesError(
+                f"app name `{app}` (apps/{app}) must match {_NAME.pattern}"
+            )
+    return Project(name, root, entry, namespaces, mainline, resources, apps)
 
 
 def run(resource: Resource, db: Session, ready: Path | None = None) -> None:

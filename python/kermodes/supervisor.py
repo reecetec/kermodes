@@ -1,17 +1,23 @@
-"""Runs a project's resources locally (`kermodes dev --project`), as the cluster does
-(architecture.md §11.2, §16.6): each resource in its own process, restarted when it dies, and
-rolled on every change to the project's files. A roll starts the new run, waits until it is
-ready, then stops the old one, so a writer hands its source over (§7.4) without a gap."""
+"""Runs a project locally (`kermodes dev --project`), as the cluster does (architecture.md
+§11.2, §16.6): each resource in its own process, restarted when it dies, and rolled on every
+change to the project's Python. A roll starts the new run, waits until it is ready, then stops
+the old one, so a writer hands its source over (§7.4) without a gap. Each app runs its own dev
+server (Vite, with hot reload) behind the UI's server at `/apps/<project>/<name>/`, where it
+has the address it has in the cluster."""
 
 import json
 import os
+import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from kermodes._native import Server
 
 READY_TIMEOUT = 60.0
 """How long a new run may take to become ready before its roll fails and the old run stays."""
@@ -45,14 +51,38 @@ class Run:
         self.ready.unlink(missing_ok=True)
 
 
+@dataclass
+class App:
+    """An app's dev server, and the manifests and lockfile it was installed from."""
+
+    process: subprocess.Popen
+    deps: dict[Path, float]
+
+    def stop(self) -> None:
+        # Its own process group: `bun run` starts Vite, which starts esbuild.
+        if self.process.poll() is None:
+            os.killpg(self.process.pid, signal.SIGTERM)
+            try:
+                self.process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.process.pid, signal.SIGKILL)
+                self.process.wait()
+
+
 class Supervisor:
-    def __init__(self, project: Path, server: str) -> None:
-        """Starts nothing: the first `tick` starts the project's resources, once the caller
-        holds this supervisor and so can stop what it starts."""
+    def __init__(self, project: Path, server: str, ui: Server | None = None) -> None:
+        """Starts nothing: the first `tick` starts the project's resources and, behind `ui`,
+        its apps, once the caller holds this supervisor and so can stop what it starts."""
         self.project = project.resolve()
         self.server = server
+        self.ui = ui
         self.runs: dict[str, Run] = {}
         self.specs: dict[str, dict] = {}
+        self.apps: dict[str, App] = {}
+        # Apps whose install failed, with the dependency files it failed on: tried again when
+        # they change.
+        self.failed: dict[str, dict[Path, float]] = {}
+        self.name = ""
         self.files: dict[Path, float] = {}
         self.restarts: dict[str, float] = {}
         self._dir = Path(tempfile.mkdtemp(prefix="kermodes-dev-"))
@@ -82,6 +112,24 @@ class Supervisor:
                 # Back off a crashing resource rather than spin on it.
                 self.restarts[name] = time.monotonic() + 2
                 self.runs[name] = self._start(name)
+        for name, app in list(self.apps.items()):
+            if app.deps != self._deps(name):
+                print(
+                    f"kermodes dev: app {name}'s dependencies changed; reinstalling",
+                    flush=True,
+                )
+                self._restart_app(name)
+            elif (
+                app.process.poll() is not None
+                and time.monotonic() >= self.restarts.get(f"app {name}", 0)
+            ):
+                print(f"kermodes dev: app {name} exited; restarting", flush=True)
+                self.restarts[f"app {name}"] = time.monotonic() + 2
+                self._restart_app(name)
+        for name, deps in list(self.failed.items()):
+            if deps != self._deps(name):
+                del self.failed[name]
+                self._start_app(name)
 
     def sync(self) -> None:
         """Discovers the project and rolls its resources onto the working tree."""
@@ -96,11 +144,90 @@ class Supervisor:
         for name in specs:
             self._roll(name)
         self.specs = specs
+        self.name = manifest["project"]
+        if self.ui is not None:
+            apps = {app["name"] for app in manifest.get("apps", [])}
+            for name in set(self.apps) - apps:
+                print(f"kermodes dev: app {name} removed; stopping it", flush=True)
+                self._stop_app(name)
+            for name in sorted(apps - set(self.apps)):
+                self._start_app(name)
 
     def stop(self) -> None:
         for run in self.runs.values():
             run.stop()
         self.runs.clear()
+        for name in list(self.apps):
+            self._stop_app(name)
+
+    def _start_app(self, name: str) -> None:
+        """Installs the app's dependencies and starts its dev server behind the UI's server."""
+        assert self.ui is not None
+        bun = shutil.which("bun")
+        if bun is None:
+            print(f"kermodes dev: app {name} needs Bun (https://bun.sh)", flush=True)
+            return
+        deps = self._deps(name)
+        installed = subprocess.run(
+            [bun, "install"],
+            cwd=self._js_root(name),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if installed.returncode != 0:
+            last = (installed.stderr.strip().splitlines() or ["(no output)"])[-1]
+            print(f"kermodes dev: app {name}: bun install failed: {last}", flush=True)
+            self.failed[name] = deps
+            return
+        # A free port for Vite; it serves under the address the app has in the cluster.
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        base = f"/apps/{self.name}/{name}/"
+        process = subprocess.Popen(
+            [bun, "run", "dev", "--port", str(port), "--strictPort"]
+            + ["--host", "127.0.0.1", "--base", base],
+            cwd=self.project / "apps" / name,
+            start_new_session=True,
+        )
+        self.apps[name] = App(process, deps)
+        self.ui.serve_app(self.name, name, f"http://127.0.0.1:{port}")
+        print(
+            f"kermodes dev: app {name} at {self.ui.url.rstrip('/')}{base}", flush=True
+        )
+
+    def _stop_app(self, name: str) -> None:
+        app = self.apps.pop(name, None)
+        if app is not None:
+            app.stop()
+        if self.ui is not None:
+            self.ui.stop_app(self.name, name)
+
+    def _restart_app(self, name: str) -> None:
+        self._stop_app(name)
+        self._start_app(name)
+
+    def _js_root(self, name: str) -> Path:
+        """Where the app's dependencies install: the project, when it is a workspace of its
+        apps and shared packages, else the app's own directory."""
+        return (
+            self.project
+            if (self.project / "package.json").exists()
+            else self.project / "apps" / name
+        )
+
+    def _deps(self, name: str) -> dict[Path, float]:
+        app = self.project / "apps" / name
+        return {
+            path: path.stat().st_mtime
+            for path in {
+                self._js_root(name) / "package.json",
+                self._js_root(name) / "bun.lock",
+                app / "package.json",
+            }
+            if path.exists()
+        }
 
     def _roll(self, name: str) -> None:
         old = self.runs.get(name)
@@ -166,9 +293,19 @@ class Supervisor:
         return json.loads(result.stdout)
 
     def _files(self) -> dict[Path, float]:
-        return {
-            path: path.stat().st_mtime
-            for pattern in ("kermodes.toml", "**/*.py")
-            for path in self.project.glob(pattern)
-            if "__pycache__" not in path.parts
-        }
+        """The project's Python and its kermodes.toml. Apps reload themselves, and dependency
+        directories are never walked."""
+        files = {}
+        for directory, subdirectories, names in os.walk(self.project):
+            subdirectories[:] = [
+                d
+                for d in subdirectories
+                if not d.startswith(".")
+                and d not in ("node_modules", "__pycache__")
+                and not (directory == str(self.project) and d == "apps")
+            ]
+            for name in names:
+                if name.endswith(".py") or name == "kermodes.toml":
+                    path = Path(directory, name)
+                    files[path] = path.stat().st_mtime
+        return files

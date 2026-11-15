@@ -412,17 +412,15 @@ impl Session {
 
     /// Serves this session's published tables to the web UI on `host:port` (port 0 picks a
     /// free one): the app at `server.url`, tables published with `server.publish(name, table)`,
-    /// the programs of `control`, `kermodes control`'s URL, if given, and the apps built on
-    /// Kermodes in `apps`, a directory of them, each at `/apps/<name>/`.
+    /// and the programs of `control`, `kermodes control`'s URL, if given.
     /// Local use: there is no authentication, so it listens on 127.0.0.1 unless told otherwise.
-    #[pyo3(signature = (port=0, host="127.0.0.1", control=None, apps=None))]
+    #[pyo3(signature = (port=0, host="127.0.0.1", control=None))]
     fn serve(
         &self,
         py: Python<'_>,
         port: u16,
         host: &str,
         control: Option<String>,
-        apps: Option<PathBuf>,
     ) -> PyResult<Server> {
         let addr: SocketAddr = format!("{host}:{port}")
             .parse()
@@ -456,7 +454,7 @@ impl Session {
             }
         });
         let server = py
-            .detach(|| kermodes_gateway::serve(session, addr, app, apps, control, stored))
+            .detach(|| kermodes_gateway::serve(session, addr, app, control, stored))
             .map_err(|e| PyValueError::new_err(format!("cannot listen on {addr}: {e}")))?;
         Ok(Server(Mutex::new(server)))
     }
@@ -1154,6 +1152,17 @@ impl Server {
     /// Removes `name` from the web UI; whether it was published.
     fn unpublish(&self, py: Python<'_>, name: &str) -> bool {
         py.detach(|| self.lock().unpublish(name))
+    }
+
+    /// Serves the app `name` of `project`, which a development server runs at `upstream`
+    /// (`http://127.0.0.1:5173`), at `/apps/<project>/<name>/`, hot reload and all.
+    fn serve_app(&self, project: &str, name: &str, upstream: &str) {
+        self.lock().serve_app(project, name, upstream);
+    }
+
+    /// Stops serving the app `name` of `project`; whether it was served.
+    fn stop_app(&self, project: &str, name: &str) -> bool {
+        self.lock().stop_app(project, name)
     }
 
     /// Published names, in order.

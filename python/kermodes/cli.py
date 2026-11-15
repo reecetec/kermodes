@@ -41,11 +41,6 @@ def main(argv: list[str] | None = None) -> None:
         "--flight-port", type=int, help="Flight port (default: --port + 1)"
     )
     dev.add_argument("--project", type=Path, help="the project to run")
-    dev.add_argument(
-        "--apps",
-        type=Path,
-        help="a directory of built apps, each served at /apps/<name>/",
-    )
 
     weir = commands.add_parser(
         "weir",
@@ -87,12 +82,6 @@ def main(argv: list[str] | None = None) -> None:
         "--control",
         default=os.environ.get("KERMODES_CONTROL"),
         help="kermodes control's URL, for the programs page (default: $KERMODES_CONTROL)",
-    )
-    ui.add_argument(
-        "--apps",
-        type=Path,
-        default=os.environ.get("KERMODES_APPS"),
-        help="a directory of built apps, each served at /apps/<name>/ (default: $KERMODES_APPS)",
     )
 
     ingest = commands.add_parser("ingest", help="run a built-in connector into a table")
@@ -214,12 +203,11 @@ def main(argv: list[str] | None = None) -> None:
             args.port,
             args.flight_port or args.port + 1,
             project,
-            args.apps,
         )
     elif args.command == "weir":
         run_weir(args.data_dir, args.host, args.port, args.catalog, args.branch)
     elif args.command == "ui":
-        run_ui(args.server, args.host, args.port, args.control, args.apps)
+        run_ui(args.server, args.host, args.port, args.control)
     elif args.command == "ingest":
         run_websocket(
             args.url,
@@ -303,16 +291,11 @@ def run_resource(
 
 
 def run_dev(
-    data_dir: Path,
-    host: str,
-    port: int,
-    flight_port: int,
-    project: Path | None,
-    apps: Path | None = None,
+    data_dir: Path, host: str, port: int, flight_port: int, project: Path | None
 ) -> None:
     session = km.local(data_dir)
     flight = session.serve_store(port=flight_port, host=host)
-    ui = session.serve(port=port, host=host, apps=apps)
+    ui = session.serve(port=port, host=host)
     print(
         f"kermodes dev: {data_dir.resolve()}\n"
         f"  web UI   {ui.url}\n"
@@ -321,7 +304,7 @@ def run_dev(
     )
     supervisor = None
     try:
-        supervisor = Supervisor(project, flight.url) if project else None
+        supervisor = Supervisor(project, flight.url, ui) if project else None
         # The UI's server lists the store's tables and opens each while it is viewed.
         while True:
             if supervisor:
@@ -353,20 +336,14 @@ def run_weir(
         pass
 
 
-def run_ui(
-    server: str | None,
-    host: str,
-    port: int,
-    control: str | None,
-    apps: Path | None = None,
-) -> None:
+def run_ui(server: str | None, host: str, port: int, control: str | None) -> None:
     """Serves the web UI over a store server until stopped. It waits for the store to start;
     after that it serves throughout, so a page never fails to load. The server lists the
     store's tables and opens each only while the app views it; this keeps the Deployments
     tab's view of `sys.deployments`, which goes while the store is away (a restart, an
-    upgrade) and comes back with it. Apps built on Kermodes in `apps` are served beside it."""
+    upgrade) and comes back with it."""
     session = connect_when_up(server, "kermodes ui")
-    ui = session.serve(port=port, host=host, control=control, apps=apps)
+    ui = session.serve(port=port, host=host, control=control)
     print(f"kermodes ui: {ui.url}", flush=True)
     deployments: km.Table | None = None
     away = False

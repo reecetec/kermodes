@@ -105,7 +105,6 @@ async fn the_app_lists_opens_filters_and_follows_published_tables() {
         None,
         None,
         None,
-        None,
     )
     .unwrap();
     server.publish("book", &book);
@@ -216,7 +215,6 @@ async fn the_app_is_served_from_its_directory_only() {
         Some(app.clone()),
         None,
         None,
-        None,
     )
     .unwrap();
     let get = |path: &str| {
@@ -249,20 +247,35 @@ async fn the_app_is_served_from_its_directory_only() {
     std::fs::remove_dir_all(app).unwrap();
 }
 
+/// An app's dev server (`kermodes dev`) is reached through the gateway at the app's address:
+/// requests with their path and query, and its hot-reload WebSocket with its subprotocol.
 #[tokio::test(flavor = "multi_thread")]
-async fn apps_built_on_kermodes_are_served_under_their_names() {
-    let apps = std::env::temp_dir().join(format!("kermodes-gateway-apps-{}", std::process::id()));
-    std::fs::create_dir_all(apps.join("market/assets")).unwrap();
-    std::fs::write(apps.join("market/index.html"), "<!doctype html>market").unwrap();
-    std::fs::write(apps.join("market/assets/app.js"), "export {}").unwrap();
-    // A directory without a page is not an app yet
-    std::fs::create_dir_all(apps.join("unbuilt")).unwrap();
-    std::fs::write(apps.join("secret.txt"), "not served").unwrap();
+async fn an_apps_dev_server_is_reached_through_the_gateway() {
+    use axum::extract::ws::{Message as Ws, WebSocketUpgrade};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    // Stands in for Vite: says what it was asked, and echoes on a socket only with its protocol
+    let dev = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dev_url = format!("http://{}", dev.local_addr().unwrap());
+    let hmr = |ws: WebSocketUpgrade| async move {
+        ws.protocols(["vite-hmr"])
+            .on_upgrade(|mut socket| async move {
+                while let Some(Ok(Ws::Text(text))) = socket.recv().await {
+                    let echo = format!("echo {}", text.as_str());
+                    if socket.send(Ws::text(echo)).await.is_err() {
+                        break;
+                    }
+                }
+            })
+    };
+    let router = axum::Router::new()
+        .route("/apps/ticker/market/hmr", axum::routing::get(hmr))
+        .fallback(|uri: axum::http::Uri| async move { format!("dev server: {uri}") });
+    tokio::spawn(async move { axum::serve(dev, router).await.unwrap() });
+
     let server = kermodes_gateway::serve(
         Session::new(),
         "127.0.0.1:0".parse().unwrap(),
         None,
-        Some(apps.clone()),
         None,
         None,
     )
@@ -280,30 +293,61 @@ async fn apps_built_on_kermodes_are_served_under_their_names() {
             response
         }
     };
-    let listed = get("/api/apps").await;
-    assert!(listed.ends_with(r#"["market"]"#), "{listed}");
-    let page = get("/apps/market/").await;
+    // Not an app until a dev server runs it
     assert!(
-        page.starts_with("HTTP/1.1 200") && page.ends_with("market"),
+        get("/apps/ticker/market/")
+            .await
+            .starts_with("HTTP/1.1 404")
+    );
+
+    server.serve_app("ticker", "market", &dev_url);
+    let listed = get("/api/apps").await;
+    assert!(
+        listed.ends_with(r#"[{"name":"market","project":"ticker"}]"#),
+        "{listed}"
+    );
+    let page = get("/apps/ticker/market/src/main.tsx?t=1").await;
+    assert!(
+        page.starts_with("HTTP/1.1 200")
+            && page.ends_with("dev server: /apps/ticker/market/src/main.tsx?t=1"),
         "{page}"
     );
-    let script = get("/apps/market/assets/app.js").await;
-    assert!(script.contains("text/javascript"), "{script}");
     // Relative assets resolve under the page only with its trailing slash
-    let bare = get("/apps/market").await;
+    let bare = get("/apps/ticker/market").await;
     assert!(
-        bare.starts_with("HTTP/1.1 308") && bare.contains("location: /apps/market/"),
+        bare.starts_with("HTTP/1.1 308") && bare.contains("location: /apps/ticker/market/"),
         "{bare}"
     );
     for outside in [
-        "/apps/market/../secret.txt",
-        "/apps/market/%2e%2e/secret.txt",
-        "/apps/%2e%2e/market/index.html",
-        "/apps/unbuilt/",
+        "/apps/ticker/other/",
+        "/apps/%2e%2e/market/",
+        "/apps/ticker/",
     ] {
         assert!(get(outside).await.starts_with("HTTP/1.1 404"), "{outside}");
     }
-    std::fs::remove_dir_all(apps).unwrap();
+
+    let mut request = format!("ws://{}/apps/ticker/market/hmr", server.addr())
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("sec-websocket-protocol", "vite-hmr".parse().unwrap());
+    let (mut socket, response) = tokio_tungstenite::connect_async(request).await.unwrap();
+    assert_eq!(response.headers()["sec-websocket-protocol"], "vite-hmr");
+    socket.send(Message::text("update")).await.unwrap();
+    let echoed = tokio::time::timeout(Duration::from_secs(10), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(echoed, Message::text("echo update"));
+
+    assert!(server.stop_app("ticker", "market"));
+    assert!(
+        get("/apps/ticker/market/")
+            .await
+            .starts_with("HTTP/1.1 404")
+    );
 }
 
 /// The controller's API is reachable only through the routes the app uses, with names checked
@@ -335,7 +379,6 @@ async fn only_the_apps_controller_routes_reach_the_controller() {
     let server = kermodes_gateway::serve(
         Session::new(),
         "127.0.0.1:0".parse().unwrap(),
-        None,
         None,
         Some(url),
         None,
@@ -420,7 +463,6 @@ async fn stored_tables_are_open_only_while_viewed() {
     let server = kermodes_gateway::serve(
         session.clone(),
         "127.0.0.1:0".parse().unwrap(),
-        None,
         None,
         None,
         Some(stored),
@@ -591,7 +633,6 @@ async fn stored_append_tables_are_shown_by_position() {
     let server = kermodes_gateway::serve(
         session.clone(),
         "127.0.0.1:0".parse().unwrap(),
-        None,
         None,
         None,
         Some(stored),

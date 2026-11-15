@@ -1,0 +1,8 @@
+{
+  "name": "ticker",
+  "private": true,
+  "workspaces": ["apps/*"],
+  "scripts": {
+    "typecheck": "bun run --filter '*' typecheck"
+  }
+}

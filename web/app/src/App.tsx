@@ -122,17 +122,24 @@ function useHasCatalog(): boolean {
   return has;
 }
 
-/** The apps built on Kermodes this server serves at `/apps/<name>/` (`--apps`) */
-function useApps(): string[] {
-  const [apps, setApps] = useState<string[]>([]);
+type DevApp = { project: string; name: string };
+
+/** The apps `kermodes dev` runs behind this server, at `/apps/<project>/<name>/`; each starts
+ * once its dependencies install, so they are asked for again every few seconds */
+function useApps(): DevApp[] {
+  const [apps, setApps] = useState<DevApp[]>([]);
   useEffect(() => {
     let live = true;
-    fetch('/api/apps')
-      .then(response => (response.ok ? (response.json() as Promise<string[]>) : []))
-      .then(names => live && setApps(names))
-      .catch(() => {});
+    const load = () =>
+      fetch('/api/apps')
+        .then(response => (response.ok ? (response.json() as Promise<DevApp[]>) : []))
+        .then(next => live && setApps(current => (JSON.stringify(current) === JSON.stringify(next) ? current : next)))
+        .catch(() => {});
+    void load();
+    const timer = setInterval(load, 5_000);
     return () => {
       live = false;
+      clearInterval(timer);
     };
   }, []);
   return apps;
@@ -191,8 +198,12 @@ function TopBar({
           </Button>
         ))}
         {apps.length > 0 && <span className="mx-1 h-4 w-px bg-border" aria-hidden />}
-        {apps.map(name => (
-          <a key={name} href={`/apps/${name}/`} className={buttonVariants({ variant: 'ghost', size: 'sm' })}>
+        {apps.map(({ project, name }) => (
+          <a
+            key={`${project}/${name}`}
+            href={`/apps/${project}/${name}/`}
+            className={buttonVariants({ variant: 'ghost', size: 'sm' })}
+          >
             {name}
           </a>
         ))}

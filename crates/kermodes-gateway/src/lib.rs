@@ -32,12 +32,13 @@ use std::time::{Duration, Instant};
 use arrow::datatypes::SchemaRef;
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path as UrlPath, RawQuery, State};
-use axum::http::{Method, StatusCode, header};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{FromRequestParts, Path as UrlPath, RawQuery, Request as HttpRequest, State};
+use axum::http::{HeaderMap, HeaderName, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use http_body_util::Full;
+use axum::routing::{any, get};
+use futures_util::{SinkExt, StreamExt};
+use http_body_util::{BodyExt, Full};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
@@ -117,8 +118,10 @@ struct Shared {
     cycles: watch::Sender<u64>,
     /// The built web app (`index.html` and its assets), if any.
     app: Option<PathBuf>,
-    /// Apps built on Kermodes, each a directory with an `index.html`, served at `/apps/<name>/`.
-    apps: Option<PathBuf>,
+    /// Apps a development server runs (`serve_app`): each one's dev server, by project and name.
+    apps: Mutex<BTreeMap<(String, String), String>>,
+    /// Requests to the controller and to apps' dev servers.
+    client: Client<HttpConnector, Full<Bytes>>,
     /// `kermodes control`, whose API the programs page reads through this server.
     control: Option<Control>,
     stored: Option<Stored>,
@@ -133,7 +136,6 @@ struct Shared {
 
 struct Control {
     url: String,
-    client: Client<HttpConnector, Full<Bytes>>,
 }
 
 /// A stored table open for views: how many hold it, and since when none has.
@@ -192,6 +194,12 @@ impl Shared {
             .expect("kermodes gateway views poisoned by an earlier panic")
     }
 
+    fn apps(&self) -> MutexGuard<'_, BTreeMap<(String, String), String>> {
+        self.apps
+            .lock()
+            .expect("kermodes gateway apps poisoned by an earlier panic")
+    }
+
     fn listed(&self) -> MutexGuard<'_, Vec<Listed>> {
         self.listed
             .lock()
@@ -216,14 +224,12 @@ impl Shared {
     }
 }
 
-/// Serves `session` on `addr` (port 0 picks a free one), with the web app in `app`, the apps
-/// built on Kermodes in `apps` (each a directory, at `/apps/<name>/`), the programs of
-/// `control` (`kermodes control`'s URL), and the tables of `stored`, if there are.
+/// Serves `session` on `addr` (port 0 picks a free one), with the web app in `app`, the programs
+/// of `control` (`kermodes control`'s URL), and the tables of `stored`, if there are.
 pub fn serve(
     session: Session,
     addr: SocketAddr,
     app: Option<PathBuf>,
-    apps: Option<PathBuf>,
     control: Option<String>,
     stored: Option<Stored>,
 ) -> io::Result<Server> {
@@ -236,10 +242,10 @@ pub fn serve(
         catalog: watch::Sender::new(0),
         cycles: watch::Sender::new(0),
         app,
-        apps,
+        apps: Mutex::new(BTreeMap::new()),
+        client: Client::builder(TokioExecutor::new()).build_http(),
         control: control.map(|url| Control {
             url: url.trim_end_matches('/').to_owned(),
-            client: Client::builder(TokioExecutor::new()).build_http(),
         }),
         stored,
         listed: Mutex::new(Vec::new()),
@@ -279,9 +285,9 @@ pub fn serve(
             get(deployment_get).post(deployment_post),
         )
         .route("/api/apps", get(apps_list))
-        .route("/apps/{name}", get(app_slash))
-        .route("/apps/{name}/", get(app_index))
-        .route("/apps/{name}/{*path}", get(app_file))
+        .route("/apps/{project}/{name}", get(app_slash))
+        .route("/apps/{project}/{name}/", any(app_proxy))
+        .route("/apps/{project}/{name}/{*path}", any(app_proxy))
         .route("/", get(index))
         .route("/{*path}", get(asset))
         .with_state(shared.clone());
@@ -340,6 +346,24 @@ impl Server {
     pub fn publish_view(&self, name: &str, table: &Table) {
         self.shared.views().insert(name.to_owned(), table.clone());
         self.shared.catalog.send_modify(|v| *v += 1);
+    }
+
+    /// Serves the app `name` of `project`, which a development server runs at `upstream`
+    /// (`http://127.0.0.1:5173`), at `/apps/<project>/<name>/`: requests and WebSockets (hot
+    /// reload) pass to it, path and all, so its page reaches this server's `/ws` as its own.
+    pub fn serve_app(&self, project: &str, name: &str, upstream: &str) {
+        let upstream = upstream.trim_end_matches('/').to_owned();
+        self.shared
+            .apps()
+            .insert((project.to_owned(), name.to_owned()), upstream);
+    }
+
+    /// Stops serving the app `name` of `project`; whether it was served.
+    pub fn stop_app(&self, project: &str, name: &str) -> bool {
+        self.shared
+            .apps()
+            .remove(&(project.to_owned(), name.to_owned()))
+            .is_some()
     }
 
     /// Stops serving: open connections close, and published tables are let go.
@@ -582,7 +606,7 @@ async fn to_control(shared: &Shared, method: Method, path: &str) -> Response {
         .uri(format!("{}{path}", control.url))
         .body(Full::new(Bytes::new()))
         .expect("a request from a parsed URL");
-    match tokio::time::timeout(CONTROL_TIMEOUT, control.client.request(request)).await {
+    match tokio::time::timeout(CONTROL_TIMEOUT, shared.client.request(request)).await {
         Ok(Ok(response)) => {
             let (parts, body) = response.into_parts();
             Response::from_parts(parts, Body::new(body))
@@ -626,60 +650,173 @@ async fn file(shared: &Shared, path: &Path) -> Response {
     }
 }
 
-/// The apps under `--apps` that are built: directories holding an `index.html`, by name.
+/// The apps this server runs dev servers for, by project and name.
 async fn apps_list(State(shared): State<Arc<Shared>>) -> Response {
-    let mut names = Vec::new();
-    if let Some(dir) = &shared.apps
-        && let Ok(mut entries) = tokio::fs::read_dir(dir).await
-    {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let built = tokio::fs::try_exists(entry.path().join("index.html")).await;
-            if let (true, Ok(name)) = (built.unwrap_or(false), entry.file_name().into_string()) {
-                names.push(name);
-            }
-        }
-    }
-    names.sort();
-    axum::Json(names).into_response()
+    let apps: Vec<Value> = shared
+        .apps()
+        .keys()
+        .map(|(project, name)| json!({"project": project, "name": name}))
+        .collect();
+    axum::Json(apps).into_response()
 }
 
 /// An app's page needs the trailing slash, so its relative assets resolve under it.
-async fn app_slash(UrlPath(name): UrlPath<String>) -> Response {
-    if !is_plain(Path::new(&name)) {
+async fn app_slash(UrlPath((project, name)): UrlPath<(String, String)>) -> Response {
+    if !plain(&project) || !plain(&name) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    axum::response::Redirect::permanent(&format!("/apps/{name}/")).into_response()
+    axum::response::Redirect::permanent(&format!("/apps/{project}/{name}/")).into_response()
 }
 
-async fn app_index(State(shared): State<Arc<Shared>>, UrlPath(name): UrlPath<String>) -> Response {
-    app_served(&shared, &name, "index.html").await
-}
-
-async fn app_file(
-    State(shared): State<Arc<Shared>>,
-    UrlPath((name, path)): UrlPath<(String, String)>,
-) -> Response {
-    app_served(&shared, &name, &path).await
-}
-
-/// A file of the app `name`, read on every request so a rebuild is served at once.
-async fn app_served(shared: &Shared, name: &str, path: &str) -> Response {
-    let (name, path) = (Path::new(name), Path::new(path));
-    let Some(apps) = &shared.apps else {
+/// A request for an app, passed to its dev server with its path and query as they came (the
+/// dev server serves under `/apps/<project>/<name>/`), and the answer passed back. A
+/// WebSocket (Vite's hot reload) is connected through, with the subprotocol it asks for.
+async fn app_proxy(State(shared): State<Arc<Shared>>, request: HttpRequest) -> Response {
+    let uri = request.uri();
+    let app = uri.path().strip_prefix("/apps/").and_then(|rest| {
+        let mut parts = rest.splitn(3, '/');
+        Some((parts.next()?.to_owned(), parts.next()?.to_owned()))
+    });
+    let Some((project, name)) = app.filter(|(project, name)| plain(project) && plain(name)) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    // One app's directory, and only plain relative paths inside it.
-    if name.components().count() != 1 || !is_plain(name) || !is_plain(path) {
-        return StatusCode::NOT_FOUND.into_response();
+    let Some(upstream) = shared.apps().get(&(project, name)).cloned() else {
+        return (StatusCode::NOT_FOUND, "no such app").into_response();
+    };
+    let target = format!(
+        "{upstream}{}",
+        uri.path_and_query().map_or(uri.path(), |p| p.as_str())
+    );
+    let (mut parts, body) = request.into_parts();
+    let wants_socket = parts
+        .headers
+        .get(header::UPGRADE)
+        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
+    if wants_socket {
+        return match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+            Ok(ws) => app_socket(ws, &parts.headers, &target).await,
+            Err(rejection) => rejection.into_response(),
+        };
     }
-    match tokio::fs::read(apps.join(name).join(path)).await {
-        Ok(bytes) => ([(header::CONTENT_TYPE, content_type(path))], bytes).into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    let Ok(body) = body.collect().await.map(|b| b.to_bytes()) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let mut forwarded = axum::http::Request::builder()
+        .method(parts.method)
+        .uri(&target);
+    for (name, value) in &parts.headers {
+        if name != header::HOST && !hop_by_hop(name) {
+            forwarded = forwarded.header(name, value);
+        }
+    }
+    let Ok(forwarded) = forwarded.body(Full::new(body)) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    match shared.client.request(forwarded).await {
+        Ok(response) => {
+            let (parts, body) = response.into_parts();
+            Response::from_parts(parts, Body::new(body))
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            format!("the app's dev server at {upstream} did not answer: {e}"),
+        )
+            .into_response(),
     }
 }
 
-fn is_plain(path: &Path) -> bool {
-    path.components().all(|c| matches!(c, Component::Normal(_)))
+/// Headers about one connection, which a proxy does not pass on.
+fn hop_by_hop(name: &HeaderName) -> bool {
+    [
+        header::CONNECTION,
+        header::PROXY_AUTHENTICATE,
+        header::PROXY_AUTHORIZATION,
+        header::TE,
+        header::TRAILER,
+        header::TRANSFER_ENCODING,
+        header::UPGRADE,
+    ]
+    .contains(name)
+        || name.as_str() == "keep-alive"
+}
+
+async fn app_socket(ws: WebSocketUpgrade, headers: &HeaderMap, target: &str) -> Response {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let Ok(mut request) = target.replacen("http", "ws", 1).into_client_request() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if let Some(protocols) = headers.get(header::SEC_WEBSOCKET_PROTOCOL) {
+        request
+            .headers_mut()
+            .insert(header::SEC_WEBSOCKET_PROTOCOL, protocols.clone());
+    }
+    let (upstream, response) = match tokio_tungstenite::connect_async(request).await {
+        Ok(connected) => connected,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("the app's dev server refused the WebSocket: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let chosen = response
+        .headers()
+        .get(header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let ws = match chosen {
+        Some(protocol) => ws.protocols([protocol]),
+        None => ws,
+    };
+    ws.on_upgrade(move |socket| relay(socket, upstream))
+}
+
+type Upstream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Passes messages both ways until either side closes.
+async fn relay(mut browser: WebSocket, mut upstream: Upstream) {
+    use tokio_tungstenite::tungstenite::{Message as Up, protocol::CloseFrame as UpClose};
+    loop {
+        tokio::select! {
+            message = browser.recv() => {
+                let Some(Ok(message)) = message else { break };
+                let closing = matches!(message, Message::Close(_));
+                let message = match message {
+                    Message::Text(text) => Up::text(text.as_str()),
+                    Message::Binary(bytes) => Up::Binary(bytes),
+                    Message::Ping(bytes) => Up::Ping(bytes),
+                    Message::Pong(bytes) => Up::Pong(bytes),
+                    Message::Close(frame) => Up::Close(frame.map(|f| UpClose {
+                        code: f.code.into(),
+                        reason: f.reason.as_str().into(),
+                    })),
+                };
+                if upstream.send(message).await.is_err() || closing {
+                    break;
+                }
+            }
+            message = upstream.next() => {
+                let Some(Ok(message)) = message else { break };
+                let closing = matches!(message, Up::Close(_));
+                let message = match message {
+                    Up::Text(text) => Message::text(text.as_str()),
+                    Up::Binary(bytes) => Message::Binary(bytes),
+                    Up::Ping(bytes) => Message::Ping(bytes),
+                    Up::Pong(bytes) => Message::Pong(bytes),
+                    Up::Close(frame) => Message::Close(frame.map(|f| CloseFrame {
+                        code: f.code.into(),
+                        reason: f.reason.as_str().into(),
+                    })),
+                    Up::Frame(_) => continue,
+                };
+                if browser.send(message).await.is_err() || closing {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 fn content_type(path: &Path) -> &'static str {

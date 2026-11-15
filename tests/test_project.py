@@ -80,6 +80,24 @@ def test_a_project_declares_ingesters_and_deployments(tmp_path):
     ]
 
 
+def test_a_projects_apps_are_its_app_directories_with_a_package(tmp_path):
+    make_project(tmp_path, "")
+    for name in ("market", "blotter"):
+        (tmp_path / "apps" / name).mkdir(parents=True)
+        (tmp_path / "apps" / name / "package.json").write_text("{}")
+    # Not an app until it has a package.json
+    (tmp_path / "apps" / "notes").mkdir()
+    assert project.discover(tmp_path).manifest()["apps"] == [
+        {"name": "blotter", "path": "apps/blotter"},
+        {"name": "market", "path": "apps/market"},
+    ]
+
+    (tmp_path / "apps" / "Bad Name").mkdir()
+    (tmp_path / "apps" / "Bad Name" / "package.json").write_text("{}")
+    with pytest.raises(km.KermodesError, match="app name `Bad Name`"):
+        project.discover(tmp_path)
+
+
 @pytest.mark.parametrize(
     "app",
     [
