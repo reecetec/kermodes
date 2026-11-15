@@ -138,6 +138,8 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           rust-toolchain: "1.98.1"
+          # Compiled objects in the Actions cache, so a push rebuilds only what changed.
+          sccache: "true"
           args: --release --locked --out dist
       - uses: actions/upload-artifact@v5
         with:
