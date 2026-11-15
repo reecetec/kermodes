@@ -14,6 +14,7 @@ import type { Catalog } from '@/catalog/model';
 import {
   DEPLOYMENTS_VIEW,
   usePolled,
+  useArtifacts,
   useComponents,
   useDeployments,
   useProjects,
@@ -184,6 +185,7 @@ export function DeploymentsPage({ connection }: { connection: KermodesConnection
   const projects = useProjects();
   const system = useComponents();
   const catalog = usePolled('/api/catalog', 30_000, parseCatalog).value;
+  const artifacts = useArtifacts();
   const [selected, setSelected] = useState<string | null>(null);
   const [filters, setFilters] = useState<Filters>(NO_FILTERS);
   const [error, setError] = useState<string | null>(null);
@@ -202,8 +204,8 @@ export function DeploymentsPage({ connection }: { connection: KermodesConnection
   }, [projects]);
   const failed = projects.filter(p => p.failed != null);
   const rows = useMemo(
-    () => tableRows(deployments, system.components, catalog),
-    [deployments, system.components, catalog]
+    () => tableRows(deployments, system.components, catalog, artifacts),
+    [deployments, system.components, catalog, artifacts]
   );
   const [sort, setSort] = useState<ListSort>(null);
   const [widths, setWidth] = useColumnWidths('deployments', DEFAULT_WIDTHS);

@@ -6,7 +6,16 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { cn } from '@/lib/utils';
 import { totals, utcDate } from '@/catalog/model';
-import { type Component, type Deployment, type Instance, ago, bytes, cores } from './model';
+import {
+  type Artifacts,
+  type Component,
+  type Deployment,
+  type Instance,
+  ago,
+  bytes,
+  cores,
+  isUnused,
+} from './model';
 import { Commit, DiskUse, Events, Field, Logs, StatusFill } from './parts';
 import type { Row } from './rows';
 
@@ -93,6 +102,8 @@ function tabsOf(row: Row, source: string | null): { name: string; content: React
     }
     case 'lake':
       return [{ name: 'summary', content: <LakeSummary row={row} /> }];
+    case 'artifacts':
+      return [{ name: 'summary', content: <ArtifactsSummary row={row} /> }];
   }
 }
 
@@ -290,6 +301,69 @@ function LakeSummary({ row }: { row: Row }) {
       <p className="py-2 text-xs text-muted-foreground">
         Each past date is merged from weir into the lake every night; the controller checks the
         store answers every 30 seconds. The Catalog tab has every date.
+      </p>
+    </div>
+  );
+}
+
+/**
+ * What the artifacts store holds: each app build and environment with its size and what uses
+ * it, and a button deleting what nothing does.
+ */
+function ArtifactsSummary({ row }: { row: Row }) {
+  const given = row.source.type === 'artifacts' ? row.source.artifacts : null;
+  // Fetched again right after a delete, rather than at the next poll
+  const [fresh, setFresh] = useState<Artifacts | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState<string | null>(null);
+  const artifacts = fresh ?? given;
+  if (artifacts == null) {
+    return <p className="px-3 py-2 text-sm text-muted-foreground">{row.warning ?? 'Not listed yet'}</p>;
+  }
+  const unused = artifacts.objects.filter(isUnused);
+  const unusedBytes = unused.reduce((sum, o) => sum + o.size, 0);
+  const prune = async () => {
+    setBusy(true);
+    const response = await fetch('/api/artifacts/prune', { method: 'POST' }).catch(e => e as Error);
+    if (response instanceof Error || !response.ok) {
+      setDone(response instanceof Error ? String(response) : await response.text());
+    } else {
+      const { deleted, freed } = (await response.json()) as { deleted: number; freed: number };
+      setDone(`Deleted ${deleted}, ${bytes(freed)} freed`);
+      const listed = await fetch('/api/artifacts').catch(() => null);
+      if (listed?.ok) setFresh((await listed.json()) as Artifacts);
+    }
+    setBusy(false);
+  };
+  return (
+    <div className="px-3 py-1">
+      <Field label="Status">{row.status}</Field>
+      {row.warning != null && <Field label="Why">{row.warning}</Field>}
+      <Field label="Size">{bytes(artifacts.size)}</Field>
+      <Field label="Unused">{unused.length === 0 ? 'Nothing' : `${unused.length}, ${bytes(unusedBytes)}`}</Field>
+      <div className="flex items-center gap-2 py-2">
+        <Button size="sm" variant="outline" disabled={busy || unused.length === 0} onClick={() => void prune()}>
+          Delete unused
+        </Button>
+        {done != null && <span className="text-xs text-muted-foreground">{done}</span>}
+      </div>
+      {artifacts.objects.map(o => (
+        <div key={o.object} className="border-b py-1.5 text-sm">
+          <div className="flex justify-between gap-2">
+            <span className="min-w-0 truncate font-mono text-[13px]" title={o.object}>
+              {o.object}
+            </span>
+            <span className="shrink-0 tabular-nums">{bytes(o.size)}</span>
+          </div>
+          <div className="text-xs text-muted-foreground">
+            {o.building ? 'building' : o.uses.length > 0 ? o.uses.join(' · ') : 'unused'}
+          </div>
+        </div>
+      ))}
+      <p className="py-2 text-xs text-muted-foreground">
+        App builds and environments, built per commit. An old app build goes once a newer one
+        serves; environments stay for each project's five newest commits, so rolling back is
+        quick. Delete unused keeps only what serves or runs now: rolling back then rebuilds.
       </p>
     </div>
   );

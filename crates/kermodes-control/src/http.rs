@@ -41,6 +41,8 @@ pub async fn serve(controller: Arc<Controller>, listener: tokio::net::TcpListene
         .route("/apps/{project}/{app}/", get(app_page))
         .route("/apps/{project}/{app}/{*path}", get(app_path))
         .route("/environments/{key}", get(environment))
+        .route("/api/artifacts", get(artifacts))
+        .route("/api/artifacts/prune", post(prune_artifacts))
         .with_state(controller);
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("kermodes control: the HTTP server stopped: {e}");
@@ -219,12 +221,34 @@ async fn logs(
 }
 
 /// The platform's own components: weir, Postgres, the controller, the web UI, and, with history
-/// configured, the lake.
+/// configured, the lake, and with an artifacts store, it.
 async fn components(State(controller): State<Arc<Controller>>) -> Response {
     match controller.kube.components(&controller.config.weir).await {
         Ok(mut components) => {
             components.extend(controller.lake().await);
+            components.extend(controller.artifacts_component().await);
             axum::Json(components).into_response()
+        }
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+    }
+}
+
+/// The artifacts store: its size, and each object with what it is for.
+async fn artifacts(State(controller): State<Arc<Controller>>) -> Response {
+    match controller.artifacts_report(false).await {
+        Ok(objects) => {
+            let size: u64 = objects.iter().map(|o| o.size).sum();
+            axum::Json(serde_json::json!({"size": size, "objects": objects})).into_response()
+        }
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+    }
+}
+
+/// Deletes what nothing uses in the artifacts store.
+async fn prune_artifacts(State(controller): State<Arc<Controller>>) -> Response {
+    match controller.prune_artifacts().await {
+        Ok((deleted, freed)) => {
+            axum::Json(serde_json::json!({"deleted": deleted, "freed": freed})).into_response()
         }
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
     }

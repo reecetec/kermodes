@@ -4,6 +4,7 @@ import type { Component, Deployment, Instance } from './model';
 import {
   NO_FILTERS,
   choices,
+  artifactsRow,
   componentRow,
   counts,
   lakeRow,
@@ -120,6 +121,26 @@ describe('componentRow', () => {
     expect(row.disks).toEqual([{ name: 'data', used: 7, size: 10 }]);
     expect(row.started).toBe(30_000);
     expect(row.node).toBe('2 nodes');
+  });
+});
+
+describe('artifactsRow', () => {
+  it('is the store as the controller lists it: its size, and what it holds', () => {
+    const store = { name: 'artifacts', status: 'Running', instances: [], warning: null, warning_ns: null };
+    const listed = {
+      size: 13_900_000,
+      objects: [
+        { object: 'environments/e1.tar', size: 13_480_000, kind: 'environment' as const, uses: ['ticker at c70e728'], building: false },
+        { object: 'apps/ticker/market/c7.tar', size: 420_000, kind: 'app' as const, uses: ['ticker/market, serving'], building: false },
+      ],
+    };
+    const row = artifactsRow(listed, store);
+    expect(row).toMatchObject({ project: 'system', kind: 'object store', status: 'Running' });
+    expect(row.revision).toBe('1 app build · 1 environment');
+    expect(row.disks).toEqual([{ name: 'artifacts', used: 13_900_000, size: null }]);
+    // One row for the store, not one among the parts with pods as well
+    const rows = tableRows([], [store], null, listed);
+    expect(rows.map(r => r.key)).toEqual(['system/artifacts']);
   });
 });
 

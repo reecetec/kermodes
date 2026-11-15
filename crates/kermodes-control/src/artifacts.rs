@@ -70,6 +70,22 @@ impl Artifacts {
             .map_err(|e| format!("cannot sign a download of {object}: {e}"))
     }
 
+    /// Every object in the store, with its size in bytes.
+    pub async fn list(&self) -> Result<Vec<(String, u64)>, String> {
+        use futures_util::TryStreamExt;
+        use object_store::ObjectStore;
+        let objects: Vec<object_store::ObjectMeta> = self
+            .s3
+            .list(None)
+            .try_collect()
+            .await
+            .map_err(|e| format!("cannot list the artifacts store: {e}"))?;
+        Ok(objects
+            .into_iter()
+            .map(|meta| (meta.location.to_string(), meta.size))
+            .collect())
+    }
+
     /// Whether `object` was uploaded.
     pub async fn exists(&self, object: &str) -> Result<bool, String> {
         match self.s3.head(&Path::from(object)).await {

@@ -28,6 +28,22 @@ export type Project = {
   resources: { name: string; source: string | null }[];
 };
 
+/** An object of the artifacts store (`/api/artifacts`) and what it is for */
+export type Artifact = {
+  object: string;
+  size: number;
+  kind: 'app' | 'environment' | 'other';
+  /** The app it serves, the commits that run on it; none for an unused one */
+  uses: string[];
+  /** Still building: never unused */
+  building: boolean;
+};
+
+/** The artifacts store: app builds and environments, and their total size */
+export type Artifacts = { size: number; objects: Artifact[] };
+
+export const isUnused = (a: Artifact) => a.uses.length === 0 && !a.building;
+
 /** One pod of a platform component (`/api/components`) */
 export type Instance = {
   pod: string;

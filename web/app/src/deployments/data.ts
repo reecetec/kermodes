@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { tableFromIPC } from 'apache-arrow';
 import { toBytes, type KermodesConnection } from '@kermodes/client';
-import { type Component, type Deployment, type Project, componentUsage, key } from './model';
+import { type Artifacts, type Component, type Deployment, type Project, componentUsage, key } from './model';
 
 /** The view of `sys.deployments` the UI's server publishes for this page: each deployment's newest row */
 export const DEPLOYMENTS_VIEW = 'deployments';
@@ -106,6 +106,13 @@ const parseComponents = (r: Response) => r.json() as Promise<Component[]>;
 /** The projects the controller syncs: their resources' code links, and commits that failed */
 export function useProjects(): Project[] {
   return usePolled('/api/projects', 10_000, parseProjects).value ?? [];
+}
+
+const parseArtifacts = (r: Response) => r.json() as Promise<Artifacts>;
+
+/** The artifacts store's objects and what each is for; null where there is none */
+export function useArtifacts(): Artifacts | null {
+  return usePolled('/api/artifacts', 30_000, parseArtifacts).value;
 }
 
 /** The platform's components, polled from the controller, and a short history of their usage */

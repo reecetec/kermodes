@@ -285,6 +285,8 @@ pub fn serve(
             get(deployment_get).post(deployment_post),
         )
         .route("/api/apps", get(apps_list))
+        .route("/api/artifacts", get(artifacts))
+        .route("/api/artifacts/prune", axum::routing::post(prune_artifacts))
         .route("/apps/{project}/{name}", get(app_slash))
         .route("/apps/{project}/{name}/", any(app_proxy))
         .route("/apps/{project}/{name}/{*path}", any(app_proxy))
@@ -501,6 +503,16 @@ async fn catalog(State(shared): State<Arc<Shared>>) -> Response {
 /// them: read from the controller, so the page can say weir is down while it is.
 async fn components(State(shared): State<Arc<Shared>>) -> Response {
     to_control(&shared, Method::GET, "/api/components").await
+}
+
+/// The artifacts store's size and what each object is for.
+async fn artifacts(State(shared): State<Arc<Shared>>) -> Response {
+    to_control(&shared, Method::GET, "/api/artifacts").await
+}
+
+/// Deletes what nothing uses in the artifacts store.
+async fn prune_artifacts(State(shared): State<Arc<Shared>>) -> Response {
+    to_control(&shared, Method::POST, "/api/artifacts/prune").await
 }
 
 /// A component's `events`, or `logs` (`?pod=` one of its pods, `?tail=` lines).

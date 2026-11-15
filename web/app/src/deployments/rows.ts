@@ -1,5 +1,13 @@
 import type { Catalog } from '@/catalog/model';
-import { type Component, type Deployment, type Disk, componentUsage, key, matchesSearch } from './model';
+import {
+  type Artifacts,
+  type Component,
+  type Deployment,
+  type Disk,
+  componentUsage,
+  key,
+  matchesSearch,
+} from './model';
 
 /** How a status reads at a glance: fine, changing, wrong, or not running by choice */
 export type Tone = 'ok' | 'busy' | 'bad' | 'idle';
@@ -45,7 +53,8 @@ export type Row = {
   source:
     | { type: 'deployment'; deployment: Deployment }
     | { type: 'component'; component: Component }
-    | { type: 'lake'; catalog: Catalog | null; component: Component | null };
+    | { type: 'lake'; catalog: Catalog | null; component: Component | null }
+    | { type: 'artifacts'; artifacts: Artifacts | null; component: Component | null };
 };
 
 const PARTS: Record<string, { name: string; kind: string }> = {
@@ -146,16 +155,48 @@ export function lakeRow(catalog: Catalog | null, component: Component | null): R
   };
 }
 
+/**
+ * The artifacts store as a row, with no pods of its own: whether the controller can list it,
+ * its size, and how many app builds and environments it holds.
+ */
+export function artifactsRow(artifacts: Artifacts | null, component: Component | null): Row {
+  const count = (kind: string) => artifacts?.objects.filter(o => o.kind === kind).length ?? 0;
+  const [apps, environments] = [count('app'), count('environment')];
+  const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? '' : 's'}`;
+  return {
+    key: `${SYSTEM}/artifacts`,
+    name: 'artifacts',
+    project: SYSTEM,
+    kind: 'object store',
+    status: component?.status ?? 'Unchecked',
+    revision:
+      artifacts == null ? null : `${plural(apps, 'app build')} · ${plural(environments, 'environment')}`,
+    cpu: null,
+    cpuLimit: null,
+    memory: null,
+    memoryLimit: null,
+    disks: artifacts == null ? [] : [{ name: 'artifacts', used: artifacts.size, size: null }],
+    restarts: 0,
+    started: null,
+    node: null,
+    warning: component?.warning ?? null,
+    source: { type: 'artifacts', artifacts, component },
+  };
+}
+
 /** Every row: the platform's parts first, in their order, then deployments by project and name */
 export function tableRows(
   deployments: readonly Deployment[],
   components: readonly Component[] | null,
-  catalog: Catalog | null
+  catalog: Catalog | null,
+  artifacts: Artifacts | null = null
 ): Row[] {
   const lake = components?.find(c => c.name === 'lake') ?? null;
+  const store = components?.find(c => c.name === 'artifacts') ?? null;
   const system = [
-    ...(components ?? []).filter(c => c !== lake).map(componentRow),
+    ...(components ?? []).filter(c => c !== lake && c !== store).map(componentRow),
     ...(catalog == null && lake == null ? [] : [lakeRow(catalog, lake)]),
+    ...(artifacts == null && store == null ? [] : [artifactsRow(artifacts, store)]),
   ];
   const others = deployments
     .map(deploymentRow)

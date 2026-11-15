@@ -3,7 +3,7 @@
 //! whose discovery fails is never rolled out; what runs keeps running. Every replica serves the
 //! HTTP API; only the leader (`leader`) runs the loops.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -103,6 +103,8 @@ pub struct Controller {
     /// The lake's last probe and when it ran, so a page polling the components reaches the
     /// store at most every `LAKE_PROBE_EVERY`.
     lake_probe: Mutex<Option<(Instant, Result<(), String>)>>,
+    /// The artifacts store's last listing and when it ran, likewise.
+    listing: Mutex<Option<(Instant, Listing)>>,
     /// Per project, the head last found waiting for its checks, so the wait is logged once.
     waiting: Mutex<HashMap<String, String>>,
     /// Requests to the git host's API: commit statuses.
@@ -115,7 +117,143 @@ const LAKE_PROBE_DEADLINE: Duration = Duration::from_secs(2);
 /// How long a merge may be due without a Job before the lake reads Merge overdue.
 const MERGE_OVERDUE_NS: i64 = 3_600_000_000_000;
 
+/// The artifacts store's objects with their sizes, or why it could not list them.
+type Listing = Result<Vec<(String, u64)>, String>;
+
 impl Controller {
+    /// The artifacts store as a component of the platform, when there is one: Running while it
+    /// lists, Unreachable with why when it does not.
+    pub async fn artifacts_component(&self) -> Option<system::Component> {
+        self.artifacts.as_ref()?;
+        let (status, warning) = match self.artifact_listing(false).await {
+            Ok(_) => ("Running".to_owned(), None),
+            Err(e) => ("Unreachable".to_owned(), Some(e)),
+        };
+        Some(system::Component {
+            name: "artifacts".into(),
+            status,
+            instances: Vec::new(),
+            warning,
+            warning_ns: None,
+        })
+    }
+
+    /// The store's objects, listed at most every `LAKE_PROBE_EVERY` unless `fresh`.
+    async fn artifact_listing(&self, fresh: bool) -> Result<Vec<(String, u64)>, String> {
+        let Some(store) = &self.artifacts else {
+            return Err("this platform has no artifacts store".into());
+        };
+        let mut last = self.listing.lock().await;
+        if let Some((at, listed)) = last.as_ref()
+            && !fresh
+            && at.elapsed() < LAKE_PROBE_EVERY
+        {
+            return listed.clone();
+        }
+        let listed = match tokio::time::timeout(Duration::from_secs(10), store.list()).await {
+            Ok(listed) => listed,
+            Err(_) => Err("the artifacts store did not answer within 10 s".into()),
+        };
+        *last = Some((Instant::now(), listed.clone()));
+        listed
+    }
+
+    /// Each object of the artifacts store and what it is for (`plan::artifacts`).
+    pub async fn artifacts_report(&self, fresh: bool) -> Result<Vec<plan::Artifact>, String> {
+        let objects = self.artifact_listing(fresh).await?;
+        let (uses, building) = self.artifact_uses().await?;
+        Ok(plan::artifacts(&objects, &uses, &building))
+    }
+
+    /// Deletes every object nothing uses (builds still running stay), and its record; how many
+    /// went and the bytes they took. Rolling back to a commit whose environment went builds it
+    /// again.
+    pub async fn prune_artifacts(&self) -> Result<(usize, u64), String> {
+        let Some(store) = &self.artifacts else {
+            return Err("this platform has no artifacts store".into());
+        };
+        let (mut count, mut freed) = (0, 0);
+        for artifact in self.artifacts_report(true).await? {
+            if !artifact.unused() {
+                continue;
+            }
+            store.delete(&artifact.object).await?;
+            let mut state = self.state.lock().await;
+            if let Some(rest) = artifact.object.strip_prefix("apps/")
+                && let Some(rest) = rest.strip_suffix(".tar")
+                && let [project, app, commit] = rest.split('/').collect::<Vec<_>>()[..]
+            {
+                state.remove_build(project, app, commit).await?;
+            } else if let Some(key) = artifact
+                .object
+                .strip_prefix("environments/")
+                .and_then(|rest| rest.strip_suffix(".tar"))
+            {
+                state.remove_environment(key).await?;
+            }
+            count += 1;
+            freed += artifact.size;
+        }
+        *self.listing.lock().await = None;
+        eprintln!("kermodes control: deleted {count} unused artifacts, {freed} bytes");
+        Ok((count, freed))
+    }
+
+    /// What uses each object: the build each app serves, and the environment each commit that
+    /// runs or is about to run on (under this platform); and the objects still building.
+    async fn artifact_uses(
+        &self,
+    ) -> Result<(BTreeMap<String, Vec<String>>, BTreeSet<String>), String> {
+        let (mut uses, mut building) = (BTreeMap::<String, Vec<String>>::new(), BTreeSet::new());
+        let mut state = self.state.lock().await;
+        for (key, environment) in state.environments().await? {
+            if environment == Build::Building {
+                building.insert(plan::environment_object(&key));
+            }
+        }
+        for project in &self.config.projects {
+            let Some(latest) = state.latest_discovered(&project.name).await? else {
+                continue;
+            };
+            let manifest = Manifest::parse(latest.manifest.as_deref().unwrap_or_default())?;
+            let builds = state.builds(&project.name).await?;
+            for app in &manifest.apps {
+                if let Some(commit) = plan::served_build(&app.name, &builds) {
+                    uses.entry(plan::app_object(&project.name, &app.name, commit))
+                        .or_default()
+                        .push(format!("{}/{}, serving", project.name, app.name));
+                }
+            }
+            for build in builds.iter().filter(|b| b.state == Build::Building) {
+                building.insert(plan::app_object(&project.name, &build.app, &build.commit));
+            }
+            let deployed = state.deployed(&project.name).await?;
+            let commits: BTreeSet<&str> = deployed
+                .values()
+                .map(String::as_str)
+                .chain([latest.commit.as_str()])
+                .collect();
+            for commit in commits {
+                let lock = if commit == latest.commit {
+                    latest.lock.clone()
+                } else {
+                    state
+                        .commit(&project.name, commit)
+                        .await?
+                        .and_then(|c| c.lock)
+                };
+                if let Some(lock) = lock {
+                    let key = plan::environment_key(&lock, &self.config.image);
+                    let short = &commit[..commit.len().min(7)];
+                    uses.entry(plan::environment_object(&key))
+                        .or_default()
+                        .push(format!("{} at {short}", project.name));
+                }
+            }
+        }
+        Ok((uses, building))
+    }
+
     /// The lake as a component of the platform, when history is configured: its store probed,
     /// its merges (`system::lake_status`).
     pub async fn lake(&self) -> Option<system::Component> {
@@ -211,6 +349,7 @@ pub async fn run(config: Config) -> Result<(), String> {
         config,
         unchanged: Mutex::new(HashMap::new()),
         lake_probe: Mutex::new(None),
+        listing: Mutex::new(None),
         waiting: Mutex::new(HashMap::new()),
         http: reqwest::Client::new(),
     });

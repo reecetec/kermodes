@@ -600,6 +600,53 @@ pub fn environment_job_name(key: &str) -> String {
     format!("environment-{key}")
 }
 
+/// An object of the artifacts store and what it is for.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Artifact {
+    pub object: String,
+    pub size: u64,
+    /// `app`, `environment`, or `other` (nothing Kermodes writes: an orphan).
+    pub kind: &'static str,
+    /// What uses it: an app it serves, the commits that run on it.
+    pub uses: Vec<String>,
+    /// Its build is still running: not unused, whatever uses it.
+    pub building: bool,
+}
+
+impl Artifact {
+    pub fn unused(&self) -> bool {
+        self.uses.is_empty() && !self.building
+    }
+}
+
+/// The store's `objects` (name and size) and what each is for: `uses` by object (the builds
+/// apps serve, the environments commits that run or are about to run on), `building` the
+/// objects whose builds are running. Biggest first.
+pub fn artifacts(
+    objects: &[(String, u64)],
+    uses: &BTreeMap<String, Vec<String>>,
+    building: &BTreeSet<String>,
+) -> Vec<Artifact> {
+    let mut artifacts: Vec<Artifact> = objects
+        .iter()
+        .map(|(object, size)| Artifact {
+            object: object.clone(),
+            size: *size,
+            kind: if object.starts_with("apps/") {
+                "app"
+            } else if object.starts_with("environments/") {
+                "environment"
+            } else {
+                "other"
+            },
+            uses: uses.get(object).cloned().unwrap_or_default(),
+            building: building.contains(object),
+        })
+        .collect();
+    artifacts.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.object.cmp(&b.object)));
+    artifacts
+}
+
 fn container_security() -> Value {
     json!({
         "allowPrivilegeEscalation": false,
@@ -1543,5 +1590,43 @@ mod tests {
             .template
             .spec
             .unwrap()
+    }
+
+    #[test]
+    fn what_nothing_uses_is_unused_unless_it_is_still_building() {
+        let objects = [
+            ("apps/ticker/market/c2.tar".to_owned(), 420),
+            ("apps/ticker/market/c1.tar".to_owned(), 410),
+            ("environments/e2.tar".to_owned(), 13_500_000),
+            ("environments/e3.tar".to_owned(), 13_600_000),
+            ("stray.bin".to_owned(), 7),
+        ];
+        let uses = BTreeMap::from([
+            (
+                "apps/ticker/market/c2.tar".to_owned(),
+                vec!["ticker/market, serving".to_owned()],
+            ),
+            (
+                "environments/e2.tar".to_owned(),
+                vec!["ticker at c2 (running)".to_owned()],
+            ),
+        ]);
+        let building = BTreeSet::from(["environments/e3.tar".to_owned()]);
+        let listed = artifacts(&objects, &uses, &building);
+        // Biggest first, each with what it is.
+        let kinds: Vec<(&str, &str, bool)> = listed
+            .iter()
+            .map(|a| (a.object.as_str(), a.kind, a.unused()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("environments/e3.tar", "environment", false),
+                ("environments/e2.tar", "environment", false),
+                ("apps/ticker/market/c2.tar", "app", false),
+                ("apps/ticker/market/c1.tar", "app", true),
+                ("stray.bin", "other", true),
+            ]
+        );
     }
 }

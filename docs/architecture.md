@@ -875,7 +875,10 @@ venv over the platform's own Python and Kermodes. Nothing is installed when a po
   never pass through the controller; the run is `/env/bin/python -m kermodes run`.
 - `kermodes dev` builds the same from the working tree, under the project's `.kermodes/`, and runs
   discovery and resources on it; a changed lock rebuilds and rolls.
-- Environments no project's five newest commits use under the running platform are deleted.
+- Environments no project's five newest commits use under the running platform are deleted, as
+  are app builds older than the one an app serves. The Deployments tab's `artifacts` row shows the
+  store's size, each object with what uses it (the app it serves, the commits that run on it),
+  and *Delete unused*, which keeps only what serves or runs now (`POST /api/artifacts/prune`).
 
 ## 11. Projects and delivery
 

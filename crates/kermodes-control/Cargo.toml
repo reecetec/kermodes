@@ -9,6 +9,8 @@ publish.workspace = true
 base64 = "0.22.1"
 arrow.workspace = true
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
+# Collecting the artifacts store's listing, a stream.
+futures-util = { version = "0.3.34", default-features = false }
 # HMAC for signed webhooks; already built for kube's TLS.
 ring = "0.17.14"
 kermodes-flight.workspace = true
