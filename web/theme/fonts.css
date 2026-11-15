@@ -1,0 +1,40 @@
+/*
+ * Fira Sans and Fira Mono, Latin, under the SIL Open Font License 1.1 (fonts/OFL.txt), from
+ * @fontsource 5.3.0. Bundled rather than depended on: a project's installed packages cannot
+ * resolve the theme's own dependencies, and the system face differs per machine. 116 KB.
+ */
+@font-face {
+  font-family: 'Fira Sans';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url(./fonts/fira-sans-latin-400-normal.woff2) format('woff2');
+}
+@font-face {
+  font-family: 'Fira Sans';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 500;
+  src: url(./fonts/fira-sans-latin-500-normal.woff2) format('woff2');
+}
+@font-face {
+  font-family: 'Fira Sans';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 600;
+  src: url(./fonts/fira-sans-latin-600-normal.woff2) format('woff2');
+}
+@font-face {
+  font-family: 'Fira Mono';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url(./fonts/fira-mono-latin-400-normal.woff2) format('woff2');
+}
+@font-face {
+  font-family: 'Fira Mono';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 500;
+  src: url(./fonts/fira-mono-latin-500-normal.woff2) format('woff2');
+}

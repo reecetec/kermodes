@@ -11,46 +11,7 @@
   }
 }
 
-/*
- * The Tables workspace's panels (dockview) on the tokens. Layered on dockview's light theme for
- * its geometry; every colour here is a token, and the page's colour scheme stays.
- */
-.dockview-theme-kermodes {
-  color-scheme: inherit;
-  --dv-group-view-background-color: var(--background);
-  --dv-tabs-and-actions-container-background-color: var(--sidebar);
-  --dv-tabs-and-actions-container-height: 36px;
-  --dv-tabs-and-actions-container-font-size: 12px;
-  --dv-activegroup-visiblepanel-tab-background-color: var(--background);
-  --dv-activegroup-visiblepanel-tab-color: var(--foreground);
-  --dv-activegroup-hiddenpanel-tab-background-color: var(--sidebar);
-  --dv-activegroup-hiddenpanel-tab-color: var(--muted-foreground);
-  --dv-inactivegroup-visiblepanel-tab-background-color: var(--background);
-  --dv-inactivegroup-visiblepanel-tab-color: var(--muted-foreground);
-  --dv-inactivegroup-hiddenpanel-tab-background-color: var(--sidebar);
-  --dv-inactivegroup-hiddenpanel-tab-color: var(--faint-foreground);
-  --dv-tab-divider-color: var(--border);
-  --dv-separator-border: var(--border);
-  --dv-paneview-header-border-color: var(--border);
-  --dv-paneview-active-outline-color: var(--ring);
-  --dv-drag-over-background-color: var(--selection);
-  --dv-drag-over-border-color: var(--primary);
-  --dv-edge-dock-indicator-color: var(--primary);
-  --dv-icon-hover-background-color: var(--accent);
-  --dv-sash-color: transparent;
-  --dv-active-sash-color: var(--primary);
-  --dv-tabs-container-scrollbar-color: var(--scrollbar);
-  --dv-scrollbar-background-color: var(--scrollbar);
-  --dv-floating-box-shadow: 0 8px 24px var(--shadow);
-  --dv-floating-border: 1px solid var(--border);
-  --dv-context-menu-background-color: var(--popover);
-  --dv-context-menu-color: var(--popover-foreground);
-}
-
 /* Tabs name tables, so they take the mono, as table names do everywhere */
 .dockview-theme-kermodes .dv-tab {
   font-family: var(--font-mono);
-}
-.dockview-theme-kermodes .dv-tabs-and-actions-container {
-  border-bottom: 1px solid var(--border);
 }

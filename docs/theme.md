@@ -86,9 +86,11 @@ it is `--primary-foreground` (`#0b1220`), since white on the light blue would no
 
 ## Type, space, shape, motion
 
-- **Type.** The system face (`--font-sans`: SF Pro on Apple devices, Segoe UI on Windows), so
-  the UI feels native and loads nothing. `--font-mono` for figures in the grid, identifiers, and
-  code. Weights 400 and 500, 600 at most. Sentence case everywhere; no uppercase tracked labels.
+- **Type.** Fira Sans (`--font-sans`) and Fira Mono (`--font-mono`), Latin, bundled with the
+  theme (`web/theme/fonts`, OFL), so a dashboard reads the same on every machine; the system
+  face stands in where they are not loaded (the notebook widget). The mono for figures in the
+  grid, identifiers, and code. Weights 400 and 500, 600 at most. Sentence case everywhere; no
+  uppercase tracked labels.
 - **Space.** A 4px grid. Grid rows are 22px and its header 30px; the filter row 26px.
 - **Radius.** `--radius` is 4px, for controls only (buttons, inputs, menus, badges). Panels,
   tables, and the grid have square edges: they meet other panels.
@@ -113,15 +115,16 @@ engine terms such as cycles.
 
 ## Layout
 
-The Tables page is panels (dockview): any table can be dragged beside, above, or below another,
-or into another's tabs, and the layout is kept per browser. The grid fills its panel.
+Pages are panels (dockview, on the tokens in `web/theme/layout.css`): a panel can be dragged
+beside, above, or below another, or into another's tabs, its edges dragged to resize, and the
+layout is kept per browser. Panels sit on a hairline of `--gutter` under a 28px strip of tabs
+(`--panel-header`). The grid fills its panel, with no border of its own.
 
-An app's page lays out the same way with `@kermodes/react`'s `Dashboard`, `Panel`, `Split`, and
-`Stats` (`web/theme/layout.css`, plain CSS, so a page that does not use Tailwind looks the same):
-the page is panels on a hairline of `--gutter`; each panel a 28px header (`--panel-header`) over
-content that fills it; splits a person drags, their sizes kept per browser; figures in a strip,
-small, in the mono, coloured only by sign. A `<Table>` in a panel fills it, with no border of its
-own.
+On the Tables page every open table is a panel. An app's page says where its panels start with
+`@kermodes/react`'s `Dashboard`, `Split`, and `Panel`; a person rearranges them from there, and a
+page whose panels change starts from the page again. Figures go in a `Stats` strip above: small,
+in the mono, coloured only by sign. The layout's styles are plain CSS, so a page that does not use
+Tailwind looks the same.
 
 ## Checks
 

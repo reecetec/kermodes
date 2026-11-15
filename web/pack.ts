@@ -125,13 +125,13 @@ async function build(
   return out;
 }
 
-/** A package of plain files, published as they are */
+/** A package of plain files and directories, published as they are */
 async function copy(dir: string, files: string[]) {
   const manifest = await read(dir);
   const out = path.join(staging, dir);
   await mkdir(out, { recursive: true });
   for (const file of files) {
-    await cp(path.join(web, dir, file), path.join(out, file));
+    await cp(path.join(web, dir, file), path.join(out, file), { recursive: true });
   }
   await Bun.write(
     path.join(out, 'package.json'),
@@ -161,7 +161,7 @@ const react = await build(
   { '.': 'src/index.tsx', './table': 'src/table.tsx' },
   { ...clientTypes, '@kermodes/grid': [path.join(grid, 'dist/index.d.ts')] }
 );
-const theme = await copy('theme', ['tokens.css', 'layout.css', 'tailwind.css']);
+const theme = await copy('theme', ['tokens.css', 'fonts.css', 'fonts', 'layout.css', 'tailwind.css']);
 
 for (const out of [client, grid, react, theme]) {
   await $`bun pm pack --destination ${staging} --quiet`.cwd(out);
