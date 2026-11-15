@@ -350,9 +350,8 @@ function ArtifactsSummary({ row }: { row: Row }) {
       {artifacts.objects.map(o => (
         <div key={o.object} className="border-b py-1.5 text-sm">
           <div className="flex justify-between gap-2">
-            <span className="min-w-0 truncate font-mono text-[13px]" title={o.object}>
-              {o.object}
-            </span>
+            {/* Wrapped, not truncated: the panel's scroll area grows to its widest line */}
+            <span className="min-w-0 font-mono text-[13px] break-all">{o.object}</span>
             <span className="shrink-0 tabular-nums">{bytes(o.size)}</span>
           </div>
           <div className="text-xs text-muted-foreground">
