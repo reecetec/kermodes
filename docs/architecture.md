@@ -492,7 +492,7 @@ outlive what Kubernetes believes.
   replication, never before, and measured acknowledgement latency on both storage classes decides it.
 - Retention: intraday partitions are deleted N days after their merge validates.
 
-## 8. Historical store
+## 8. Lake
 
 Correctness first, then storage and speed; no time travel. Each `(table, date)` is served from
 exactly one place: weir until the date is merged, the lake once the catalog says so. Moving a
@@ -500,10 +500,10 @@ date is one catalog transaction, and weir deletes its copy only after that commi
 
 ### 8.1 Layout
 
-Parquet files written by Kermodes to object storage through `object_store`: at
-`KERMODES_HISTORY` (`s3://kermodes-history` in the cluster, credentials from the `AWS_*`
-variables of a user scoped to that bucket), or in `lake` beside a local store. Table locations
-begin with their branch, so one bucket holds every branch's history.
+The lake: Parquet files written by Kermodes to object storage through `object_store`, at
+`KERMODES_LAKE` (`s3://kermodes-lake` in the cluster, credentials from the `AWS_*` variables of
+a user scoped to that bucket), or in `lake` beside a local store. Table locations begin with
+their branch, so one bucket holds every branch's history.
 
 ```
 {lake}/{location}/{first_date}-{file_id}.parquet      the catalog holds each file's date range
@@ -554,7 +554,7 @@ the only record of what history exists.
    would only race each other's commits); a date whose Job failed is retried once that Job
    expires, a day later, while later dates go ahead. The Job is `kermodes merge TABLE DATE` on
    the platform image, under the namespace's restricted pod security, with credentials for the
-   history bucket alone; it reaches weir by its Service. Locally, `kermodes merge` runs one by
+   lake's bucket alone; it reaches weir by its Service. Locally, `kermodes merge` runs one by
    hand.
 2. The Job reads `D` from weir over Flight and writes it per the plan (§8.1). Later: projecting
    every schema version present onto the table's current one by column ID (§5.4), and sorting by

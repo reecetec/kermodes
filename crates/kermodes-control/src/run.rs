@@ -51,9 +51,9 @@ pub struct Config {
     /// The projects to sync. Their git credentials are not configuration but labelled Secrets in
     /// the namespace (§11.7, `Kube::repository_secrets`).
     pub projects: Vec<ProjectConfig>,
-    /// Where history goes; without it, nothing is merged.
+    /// The lake; without it, nothing is merged.
     #[serde(default)]
-    pub history: Option<plan::History>,
+    pub lake: Option<plan::Lake>,
     /// Where builds put what they produce, and how apps build; without both, apps are not built.
     #[serde(default)]
     pub artifacts: Option<plan::Artifacts>,
@@ -245,11 +245,11 @@ impl Controller {
         Ok((uses, building))
     }
 
-    /// The lake as a component of the platform, when history is configured: its store probed,
-    /// its merges (`system::lake_status`).
+    /// The lake as a component of the platform, when there is one: its store probed, its merges
+    /// (`system::lake_status`).
     pub async fn lake(&self) -> Option<system::Component> {
-        let history = self.config.history.as_ref()?;
-        let probe = self.probe_lake(&history.url).await;
+        let lake = self.config.lake.as_ref()?;
+        let probe = self.probe_lake(&lake.url).await;
         let jobs = self.kube.merge_jobs().await.unwrap_or_default();
         // Without weir's dates, nothing can be overdue: weir down shows on its own row.
         let held = past_dates(self.config.weir.clone())
@@ -389,25 +389,25 @@ const MERGE_EVERY: Duration = Duration::from_secs(60);
 /// Starts a merge Job for each table's oldest past date weir still holds, as `plan::merges_due`
 /// says, once a minute (§8.3).
 async fn merge_forever(controller: &Controller) {
-    let Some(history) = &controller.config.history else {
+    let Some(lake) = &controller.config.lake else {
         return std::future::pending().await;
     };
     loop {
-        if let Err(e) = merge_once(controller, history).await {
+        if let Err(e) = merge_once(controller, lake).await {
             eprintln!("kermodes control: merging: {e}");
         }
         tokio::time::sleep(MERGE_EVERY).await;
     }
 }
 
-async fn merge_once(controller: &Controller, history: &plan::History) -> Result<(), String> {
+async fn merge_once(controller: &Controller, lake: &plan::Lake) -> Result<(), String> {
     let held = past_dates(controller.config.weir.clone()).await?;
     let jobs = controller.kube.merge_jobs().await?;
     let now = now_ns();
     for (table, date) in plan::merges_due(now, &held, &jobs) {
         let config = &controller.config;
         let job = plan::merge_job(
-            history,
+            lake,
             &config.image,
             &config.weir,
             &config.pull_secrets,

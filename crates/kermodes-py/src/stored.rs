@@ -15,7 +15,7 @@ use crate::{Fed, KermodesError, Table, Tables, engine_error, store_error};
 pub struct StoredTable {
     pub(crate) engine: kermodes_core::Session,
     pub(crate) tables: Tables,
-    /// The history store, or why there is none: needed only for dates before today.
+    /// The lake, or why there is none: needed only for dates before today.
     pub(crate) lake: Result<Arc<kermodes_lake::Lake>, String>,
     pub(crate) entry: TableEntry,
 }

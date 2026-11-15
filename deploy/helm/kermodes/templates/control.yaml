@@ -122,8 +122,8 @@ data:
         "pull_secrets" $pullSecrets
         "poll_seconds" .Values.control.pollSeconds
         "projects" .Values.control.projects }}
-    {{- with .Values.history.url }}
-    {{- $_ := set $config "history" (dict "url" . "endpoint" $.Values.history.endpoint "secret" $.Values.history.secretName) }}
+    {{- with .Values.lake.url }}
+    {{- $_ := set $config "lake" (dict "url" . "endpoint" $.Values.lake.endpoint "secret" $.Values.lake.secretName) }}
     {{- end }}
     {{- if .Values.artifacts.url }}
     {{- $_ := set $config "artifacts" (dict "url" .Values.artifacts.url "endpoint" .Values.artifacts.endpoint) }}
@@ -220,18 +220,18 @@ spec:
                   name: {{ . }}
                   key: secret
             {{- end }}
-            {{- if .Values.history.url }}
-            # The Deployments tab's lake row probes the history store as a merge Job reaches it.
+            {{- if .Values.lake.url }}
+            # The Deployments tab's lake row probes the lake as a merge Job reaches it.
             - name: AWS_ENDPOINT
-              value: {{ .Values.history.endpoint | quote }}
+              value: {{ .Values.lake.endpoint | quote }}
             - name: AWS_ALLOW_HTTP
-              value: {{ hasPrefix "http://" .Values.history.endpoint | quote }}
+              value: {{ hasPrefix "http://" .Values.lake.endpoint | quote }}
             - name: AWS_REGION
               value: us-east-1
             {{- end }}
             {{- with .Values.artifacts.secretName }}
-            # The artifacts bucket's keys under names of their own: the history store's take
-            # the standard AWS_* names.
+            # The artifacts bucket's keys under names of their own: the lake's take the standard
+            # AWS_* names.
             - name: KERMODES_ARTIFACTS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
@@ -243,10 +243,10 @@ spec:
                   name: {{ . }}
                   key: AWS_SECRET_ACCESS_KEY
             {{- end }}
-          {{- if and .Values.history.url .Values.history.secretName }}
+          {{- if and .Values.lake.url .Values.lake.secretName }}
           envFrom:
             - secretRef:
-                name: {{ .Values.history.secretName }}
+                name: {{ .Values.lake.secretName }}
           {{- end }}
           ports:
             - name: http

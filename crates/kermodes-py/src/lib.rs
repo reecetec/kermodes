@@ -700,18 +700,18 @@ impl Session {
         })
     }
 
-    /// History's files: at `KERMODES_HISTORY` (`s3://bucket/prefix` in the cluster), or in
-    /// `lake` beside a store this process owns.
+    /// The lake, history's files: at `KERMODES_LAKE` (`s3://bucket/prefix` in the cluster), or
+    /// in `lake` beside a store this process owns.
     fn lake(&self) -> PyResult<Arc<kermodes_lake::Lake>> {
         if let Some(lake) = self.lake.get() {
             return Ok(lake.clone());
         }
-        let url = match (std::env::var("KERMODES_HISTORY").ok(), self.stored()?) {
+        let url = match (std::env::var("KERMODES_LAKE").ok(), self.stored()?) {
             (Some(url), _) => url,
             (None, Tables::Local(store)) => store.root().join("lake").display().to_string(),
             (None, Tables::Remote(_)) => {
                 return Err(KermodesError::new_err(
-                    "history is in object storage: set KERMODES_HISTORY to where \
+                    "history is in the lake in object storage: set KERMODES_LAKE to where \
                      (s3://bucket/prefix)",
                 ));
             }

@@ -129,7 +129,7 @@ struct Open {
 
 impl Lake {
     pub fn open(url: &str) -> Result<Self, Error> {
-        let io = |e: object_store::Error| Error::Io(format!("history store {url}: {e}"));
+        let io = |e: object_store::Error| Error::Io(format!("lake {url}: {e}"));
         let store: Arc<dyn ObjectStore> = match url.strip_prefix("s3://") {
             Some(rest) => {
                 let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
@@ -144,8 +144,7 @@ impl Lake {
             }
             None => {
                 let dir = url.strip_prefix("file://").unwrap_or(url);
-                std::fs::create_dir_all(dir)
-                    .map_err(|e| Error::Io(format!("history store {dir}: {e}")))?;
+                std::fs::create_dir_all(dir).map_err(|e| Error::Io(format!("lake {dir}: {e}")))?;
                 Arc::new(LocalFileSystem::new_with_prefix(dir).map_err(io)?)
             }
         };
@@ -154,7 +153,7 @@ impl Lake {
             .thread_name("kermodes-lake")
             .enable_all()
             .build()
-            .map_err(|e| Error::Io(format!("cannot start the history store's runtime: {e}")))?;
+            .map_err(|e| Error::Io(format!("cannot start the lake's runtime: {e}")))?;
         Ok(Self { store, runtime })
     }
 
@@ -163,7 +162,7 @@ impl Lake {
     pub fn probe(&self) -> Result<(), Error> {
         self.runtime.block_on(async {
             match self.store.list(None).next().await {
-                Some(Err(e)) => Err(Error::Io(format!("history store: {e}"))),
+                Some(Err(e)) => Err(Error::Io(format!("lake: {e}"))),
                 _ => Ok(()),
             }
         })

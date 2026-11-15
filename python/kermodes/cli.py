@@ -186,9 +186,9 @@ def main(argv: list[str] | None = None) -> None:
 
     merge = commands.add_parser(
         "merge",
-        help="move a past date of a table from weir into its history",
-        description="Moves DATE of TABLE from weir into history (architecture.md §8.3): "
-        "written as Parquet beside the store or at $KERMODES_HISTORY, committed to the "
+        help="move a past date of a table from weir into the lake",
+        description="Moves DATE of TABLE from weir into the lake (architecture.md §8.3): "
+        "written as Parquet beside the store or at $KERMODES_LAKE, committed to the "
         "catalog, then dropped from weir. Running it again changes nothing. On a server's "
         "tables (--server, $KERMODES_URL, else kermodes dev) or a local store (--data-dir).",
     )

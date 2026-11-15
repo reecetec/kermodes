@@ -36,11 +36,11 @@ control:
     limits:
       memory: 512Mi
 
-# Where merged history goes (architecture.md §8): with a url, the controller merges each table's
-# past dates from weir into it, each date by a Job. The Secret holds AWS_ACCESS_KEY_ID and
-# AWS_SECRET_ACCESS_KEY for that bucket alone.
-history:
-  url: ""  # s3://kermodes-history
+# The lake: merged history, Parquet in an S3 bucket (architecture.md §8). With a url, the
+# controller merges each table's past dates from weir into it, each date by a Job. The Secret
+# holds AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY for that bucket alone.
+lake:
+  url: ""  # s3://kermodes-lake
   endpoint: ""  # the S3 endpoint inside the cluster, e.g. http://minio.minio.svc.cluster.local:9000
   secretName: ""
 

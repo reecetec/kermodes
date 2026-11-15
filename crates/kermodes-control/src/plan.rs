@@ -22,10 +22,10 @@ use serde_json::{Value, json};
 
 use crate::manifest::{App, Resource, Rollout, Update};
 
-/// Where history goes, as a merge Job needs it (§8.1): `KERMODES_HISTORY`, the S3 endpoint, and
-/// the Secret holding `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` for that bucket alone.
+/// The lake, as a merge Job needs it (§8.1): `KERMODES_LAKE`, the S3 endpoint, and the Secret
+/// holding `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` for that bucket alone.
 #[derive(Clone, Debug, Deserialize)]
-pub struct History {
+pub struct Lake {
     pub url: String,
     pub endpoint: String,
     pub secret: String,
@@ -81,10 +81,10 @@ pub fn merges_due(
     due
 }
 
-/// The Job that merges `date` of `table` from weir into history: `kermodes merge`, against weir
-/// over Flight, writing to the history bucket with that bucket's credentials alone.
+/// The Job that merges `date` of `table` from weir into the lake: `kermodes merge`, against weir
+/// over Flight, writing to the lake's bucket with that bucket's credentials alone.
 pub fn merge_job(
-    history: &History,
+    lake: &Lake,
     image: &str,
     weir: &str,
     pull_secrets: &[String],
@@ -97,12 +97,12 @@ pub fn merge_job(
         "args": ["merge", table, date.to_string(), "--server", weir],
         "env": [
             {"name": "PYTHONDONTWRITEBYTECODE", "value": "1"},
-            {"name": "KERMODES_HISTORY", "value": history.url},
-            {"name": "AWS_ENDPOINT", "value": history.endpoint},
-            {"name": "AWS_ALLOW_HTTP", "value": history.endpoint.starts_with("http://").to_string()},
+            {"name": "KERMODES_LAKE", "value": lake.url},
+            {"name": "AWS_ENDPOINT", "value": lake.endpoint},
+            {"name": "AWS_ALLOW_HTTP", "value": lake.endpoint.starts_with("http://").to_string()},
             {"name": "AWS_REGION", "value": "us-east-1"},
         ],
-        "envFrom": [{"secretRef": {"name": history.secret}}],
+        "envFrom": [{"secretRef": {"name": lake.secret}}],
         // A merge streams the date through: a 1.5 GB day took 6 s and little memory.
         "resources": {
             "requests": {"cpu": "1", "memory": "2Gi"},
@@ -1243,15 +1243,15 @@ mod tests {
     }
 
     #[test]
-    fn a_merge_job_is_named_validly_runs_restricted_and_reaches_only_the_history_bucket() {
-        let history = History {
-            url: "s3://kermodes-history".into(),
+    fn a_merge_job_is_named_validly_runs_restricted_and_reaches_only_the_lake_bucket() {
+        let lake = Lake {
+            url: "s3://kermodes-lake".into(),
             endpoint: "http://minio:9000".into(),
-            secret: "kermodes-history".into(),
+            secret: "kermodes-lake".into(),
         };
         let table = "research_desk.a_very_long_table_name_for_options_quotes";
         let job = merge_job(
-            &history,
+            &lake,
             "img:1",
             "grpc://kermodes-weir:8731",
             &["pull".into()],
@@ -1302,13 +1302,13 @@ mod tests {
             .into_iter()
             .map(|e| (e.name, e.value.unwrap_or_default()))
             .collect();
-        assert_eq!(env["KERMODES_HISTORY"], "s3://kermodes-history");
+        assert_eq!(env["KERMODES_LAKE"], "s3://kermodes-lake");
         assert_eq!(env["AWS_ALLOW_HTTP"], "true");
         let secret = merge.env_from.clone().unwrap()[0]
             .secret_ref
             .clone()
             .unwrap();
-        assert_eq!(secret.name, "kermodes-history");
+        assert_eq!(secret.name, "kermodes-lake");
     }
 
     fn record(app: &str, commit: &str, state: Build) -> BuildRecord {
