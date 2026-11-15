@@ -80,30 +80,47 @@ def test_a_project_declares_ingesters_and_deployments(tmp_path):
     ]
 
 
-def test_a_project_declares_its_apps_beside_its_resources(tmp_path):
+def test_a_project_declares_apps_as_resources_with_a_frontend(tmp_path):
     make_project(
         tmp_path,
         """
         import kermodes as km
 
-        market = km.app("market")
-        blotter = km.app("blotter", path="web/blotter")
+        @km.app()
+        def market(db):
+            return {}
+
+        @km.app(path="web/blotter", memory="1Gi")
+        def blotter(db):
+            pass
         """,
     )
     for path in ("apps/market", "web/blotter", "apps/notes"):
         (tmp_path / path).mkdir(parents=True)
         (tmp_path / path / "package.json").write_text("{}")
     # apps/notes is not declared, so it is not an app.
-    assert project.discover(tmp_path).manifest()["apps"] == [
+    assert project.discover(tmp_path).manifest()["resources"] == [
         {
             "name": "market",
-            "path": "apps/market",
+            "update": "auto",
+            "rollout": "rolling",
+            "cpu": "500m",
+            "memory": "512Mi",
             "defined_at": {"file": "src/ticker/app.py", "line": 4},
+            "kind": "app",
+            "function": "ticker.app:market",
+            "path": "apps/market",
         },
         {
             "name": "blotter",
+            "update": "auto",
+            "rollout": "rolling",
+            "cpu": "500m",
+            "memory": "1Gi",
+            "defined_at": {"file": "src/ticker/app.py", "line": 8},
+            "kind": "app",
+            "function": "ticker.app:blotter",
             "path": "web/blotter",
-            "defined_at": {"file": "src/ticker/app.py", "line": 5},
         },
     ]
 
@@ -111,10 +128,16 @@ def test_a_project_declares_its_apps_beside_its_resources(tmp_path):
 @pytest.mark.parametrize(
     ("app", "error"),
     [
-        ('km.app("market", path="apps/missing")', "not a directory of ticker"),
-        ('km.app("market", path="../elsewhere")', "not a directory of ticker"),
         (
-            'km.app("ticks")\n\n@km.deployment()\ndef ticks(db):\n    pass',
+            '@km.app(path="apps/missing")\ndef market(db): pass',
+            "not a directory of ticker",
+        ),
+        (
+            '@km.app(path="../elsewhere")\ndef market(db): pass',
+            "not a directory of ticker",
+        ),
+        (
+            "@km.app()\ndef ticks(db): pass\n\n@km.deployment(name='ticks')\ndef other(db): pass",
             "declares `ticks` twice",
         ),
     ],

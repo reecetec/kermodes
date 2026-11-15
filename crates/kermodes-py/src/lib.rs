@@ -412,22 +412,31 @@ impl Session {
 
     /// Serves this session's published tables to the web UI on `host:port` (port 0 picks a
     /// free one): the app at `server.url`, tables published with `server.publish(name, table)`,
-    /// and the programs of `control`, `kermodes control`'s URL, if given.
+    /// and the programs of `control`, `kermodes control`'s URL, if given. With `at`
+    /// (`/apps/<project>/<name>/`), it is an app's own server instead: everything under that
+    /// path, the app's built frontend from `app`, if given, and no programs.
     /// Local use: there is no authentication, so it listens on 127.0.0.1 unless told otherwise.
-    #[pyo3(signature = (port=0, host="127.0.0.1", control=None))]
+    #[pyo3(signature = (port=0, host="127.0.0.1", control=None, at=None, app=None))]
     fn serve(
         &self,
         py: Python<'_>,
         port: u16,
         host: &str,
         control: Option<String>,
+        at: Option<String>,
+        app: Option<PathBuf>,
     ) -> PyResult<Server> {
         let addr: SocketAddr = format!("{host}:{port}")
             .parse()
             .map_err(|e| PyValueError::new_err(format!("cannot listen on {host}:{port}: {e}")))?;
-        // The web app ships in the package (`bun run build` in web/ writes it there).
-        let package: PathBuf = py.import("kermodes")?.getattr("__file__")?.extract()?;
-        let app = package.parent().map(|dir| dir.join("static").join("app"));
+        let app = match &at {
+            Some(_) => app,
+            // The web app ships in the package (`bun run build` in web/ writes it there).
+            None => {
+                let package: PathBuf = py.import("kermodes")?.getattr("__file__")?.extract()?;
+                package.parent().map(|dir| dir.join("static").join("app"))
+            }
+        };
         let session = self.engine.clone();
         // The store's tables: append tables shown by position, keyed ones opened live while
         // the app views them.
@@ -454,7 +463,10 @@ impl Session {
             }
         });
         let server = py
-            .detach(|| kermodes_gateway::serve(session, addr, app, control, stored))
+            .detach(|| match &at {
+                Some(at) => kermodes_gateway::serve_at(session, addr, at, app, stored),
+                None => kermodes_gateway::serve(session, addr, app, control, stored),
+            })
             .map_err(|e| PyValueError::new_err(format!("cannot listen on {addr}: {e}")))?;
         Ok(Server(Mutex::new(server)))
     }
@@ -1154,10 +1166,11 @@ impl Server {
         py.detach(|| self.lock().unpublish(name))
     }
 
-    /// Serves the app `name` of `project`, which a development server runs at `upstream`
-    /// (`http://127.0.0.1:5173`), at `/apps/<project>/<name>/`, hot reload and all.
-    fn serve_app(&self, project: &str, name: &str, upstream: &str) {
-        self.lock().serve_app(project, name, upstream);
+    /// Serves the app `name` of `project` at `/apps/<project>/<name>/` as `kermodes dev` runs
+    /// it: its tables from its own process at `process`, everything else (pages, hot reload)
+    /// from its development server at `dev` (`http://127.0.0.1:5173`).
+    fn serve_app(&self, project: &str, name: &str, dev: &str, process: &str) {
+        self.lock().serve_app(project, name, dev, process);
     }
 
     /// Stops serving the app `name` of `project`; whether it was served.

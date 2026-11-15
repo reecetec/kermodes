@@ -18,9 +18,14 @@ Declarations::
         writer = db.writer("md.quotes", source="poller", wait=True)
         ...
 
+    @km.app()  # its frontend in apps/market/
+    def market(db):
+        return {"last": db.live_table("md.ticks").last_by("sym")}
+
 Discovery imports the entry module and returns a `Project`; its manifest is the JSON the platform
-plans and deploys from (`kermodes manifest`). `km.app` declares a TypeScript frontend in a
-directory of the project, served at `/apps/<project>/<name>/` (architecture.md §15.2).
+plans and deploys from (`kermodes manifest`). An app is a deployment with a frontend: its process
+runs its function and serves the frontend and the tables it returns at
+`/apps/<project>/<name>/` (architecture.md §15.2).
 """
 
 import importlib
@@ -33,7 +38,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from kermodes._native import KermodesError, Session
+from kermodes._native import KermodesError, Session, Table
 
 UPDATES = ("auto", "manual", "on_start")
 ROLLOUTS = ("rolling", "recreate")
@@ -102,34 +107,67 @@ class Deployment:
     defined_at: tuple[str, int] | None = None
 
 
-Resource = Ingester | Deployment
-
-
 @dataclass(frozen=True)
 class App:
-    """A TypeScript frontend in the project's directory `path` (one with a package.json whose
-    `dev` and `build` scripts run Vite), built per commit and served at
+    """A deployment with a frontend: `function(db)` runs in its own process, which serves the
+    TypeScript frontend in the project's directory `path` (one with a package.json whose `dev`
+    and `build` scripts run Vite) and the tables the function returns, at
     `/apps/<project>/<name>/`."""
 
     name: str
+    function: Callable[[Session], object]
+    function_name: str
     path: str
-    # Where it is declared: the file and line of the `app(...)` call.
+    update: Update = "auto"
+    rollout: Rollout = "rolling"
+    cpu: str = DEFAULT_CPU
+    memory: str = DEFAULT_MEMORY
     defined_at: tuple[str, int] | None = None
 
 
+Resource = Ingester | Deployment | App
+
+
 # What the module being discovered declares; `discover` empties it around each import.
-_declared: list[Resource | App] = []
+_declared: list[Resource] = []
 
 
-def app(name: str, *, path: str | None = None) -> App:
-    """Declares the app `name`, whose code is the project's directory `path` (`apps/<name>` by
-    default). Kermodes builds it at each commit and serves it beside the project's tables."""
-    caller = sys._getframe(1)
-    declared = App(
-        name, path or f"apps/{name}", (caller.f_code.co_filename, caller.f_lineno)
-    )
-    _declared.append(declared)
-    return declared
+def app(
+    name: str | None = None,
+    *,
+    path: str | None = None,
+    update: Update = "auto",
+    rollout: Rollout = "rolling",
+    cpu: float | str = DEFAULT_CPU,
+    memory: int | str = DEFAULT_MEMORY,
+) -> Callable[[Callable[[Session], object]], Callable[[Session], object]]:
+    """Declares the decorated `function(db)` as an app, named after it unless `name`, whose
+    frontend is the project's directory `path` (`apps/<name>` by default). Its process serves
+    the frontend and the tables the function returns (`{"name": table}`, or nothing), beside
+    the platform's; `cpu` and `memory` as for a deployment."""
+
+    def declare(function: Callable[[Session], object]) -> Callable[[Session], object]:
+        function_name = getattr(function, "__name__", None)
+        if function_name is None:
+            raise KermodesError("@km.app() decorates a function")
+        resource_name = name or function_name.replace("_", "-")
+        code = getattr(function, "__code__", None)
+        resource = App(
+            resource_name,
+            function,
+            function_name,
+            path or f"apps/{resource_name}",
+            update,
+            rollout,
+            _cpu(resource_name, cpu),
+            _memory(resource_name, memory),
+            None if code is None else (code.co_filename, code.co_firstlineno),
+        )
+        _check_policy(resource)
+        _declared.append(resource)
+        return function
+
+    return declare
 
 
 def ingester(
@@ -205,7 +243,6 @@ class Project:
     namespaces: tuple[str, ...]
     mainline: str
     resources: dict[str, Resource] = field(default_factory=dict)
-    apps: dict[str, App] = field(default_factory=dict)
 
     def resource(self, name: str) -> Resource:
         try:
@@ -215,6 +252,10 @@ class Project:
             raise KermodesError(
                 f"{self.name} declares no resource `{name}` (it has: {known})"
             ) from None
+
+    def app_path(self, name: str) -> str:
+        """Where the app `name` is served: `/apps/<project>/<name>/`."""
+        return f"/apps/{self.name}/{name}/"
 
     def manifest(self) -> dict:
         """The resolved declarations, as the platform plans and deploys them."""
@@ -226,7 +267,6 @@ class Project:
             "resources": [
                 _spec(r, self.entry, self.root) for r in self.resources.values()
             ],
-            "apps": [_app_spec(a, self.root) for a in self.apps.values()],
         }
 
 
@@ -270,14 +310,13 @@ def discover(root: str | Path = ".") -> Project:
         sys.path.remove(path)
 
     resources: dict[str, Resource] = {}
-    apps: dict[str, App] = {}
     for resource in declared:
         if not _NAME.fullmatch(resource.name):
             raise KermodesError(
                 f"resource name `{resource.name}` must match {_NAME.pattern}"
             )
         # One name per row of the Deployments tab, whatever it is.
-        if resource.name in resources or resource.name in apps:
+        if resource.name in resources:
             raise KermodesError(f"{name} declares `{resource.name}` twice")
         if isinstance(resource, App):
             directory = (root / resource.path).resolve()
@@ -289,8 +328,6 @@ def discover(root: str | Path = ".") -> Project:
                     f"app `{resource.name}`'s path {resource.path} is not a directory of "
                     f"{name} with a package.json"
                 )
-            apps[resource.name] = resource
-            continue
         if isinstance(resource, Ingester):
             namespace = resource.target.partition(".")[0]
             if namespace not in namespaces:
@@ -299,16 +336,34 @@ def discover(root: str | Path = ".") -> Project:
                     f"only namespaces {list(namespaces)} (kermodes.toml)"
                 )
         resources[resource.name] = resource
-    return Project(name, root, entry, namespaces, mainline, resources, apps)
+    return Project(name, root, entry, namespaces, mainline, resources)
 
 
-def run(resource: Resource, db: Session, ready: Path | None = None) -> None:
+@dataclass(frozen=True)
+class Serving:
+    """Where an app's process serves: its path (`/apps/<project>/<name>/`), address, and built
+    frontend (none under `kermodes dev`, where its dev server serves the pages)."""
+
+    path: str
+    host: str = "0.0.0.0"
+    port: int = 8080
+    frontend: Path | None = None
+
+
+def run(
+    resource: Resource,
+    db: Session,
+    ready: Path | None = None,
+    serving: Serving | None = None,
+) -> None:
     """Runs `resource` in this process until it fails or the process is stopped: an ingester's
-    connector, or a deployment's function and then its session.
+    connector, a deployment's function and then its session, or an app's function and then its
+    server (`serving`), with the tables the function returned.
 
     `ready` is created once the run can take over from a run it replaces (a rolling update): an
     ingester once it is connected to its feed, holding its source's lease or still waiting for
-    it; a deployment once its function starts, since the function may itself wait for a lease.
+    it; a deployment once its function starts, since the function may itself wait for a lease;
+    an app once it serves.
     """
     if ready is not None:
         ready.unlink(missing_ok=True)
@@ -334,6 +389,29 @@ def run(resource: Resource, db: Session, ready: Path | None = None) -> None:
             if ready is not None and stats.connected and not ready.exists():
                 ready.touch()
             time.sleep(0.2)
+    elif isinstance(resource, App):
+        if serving is None:
+            raise KermodesError(f"app `{resource.name}` needs where to serve")
+        tables = resource.function(db) or {}
+        if not isinstance(tables, dict) or not all(
+            isinstance(k, str) and isinstance(v, Table) for k, v in tables.items()
+        ):
+            raise KermodesError(
+                f"app `{resource.name}` returns its tables as {{name: table}}, or nothing"
+            )
+        server = db.serve(
+            port=serving.port,
+            host=serving.host,
+            at=serving.path,
+            app=serving.frontend,
+        )
+        for name, table in tables.items():
+            server.publish(name, table)
+        print(f"serving {resource.name} at {serving.path}", flush=True)
+        if ready is not None:
+            ready.touch()
+        while True:
+            time.sleep(3600)
     else:
         if ready is not None:
             ready.touch()
@@ -372,7 +450,7 @@ def _memory(name: str, memory: int | str) -> str:
     )
 
 
-def _defined_at(declared: Resource | App, root: Path) -> dict | None:
+def _defined_at(declared: Resource, root: Path) -> dict | None:
     """Where `declared` is, relative to the project, so the platform can link to it at any
     commit (§15.2)."""
     if declared.defined_at is None:
@@ -382,13 +460,6 @@ def _defined_at(declared: Resource | App, root: Path) -> dict | None:
     if not path.is_relative_to(root):
         return None
     return {"file": path.relative_to(root).as_posix(), "line": line}
-
-
-def _app_spec(app: App, root: Path) -> dict:
-    spec: dict = {"name": app.name, "path": app.path}
-    if (at := _defined_at(app, root)) is not None:
-        spec["defined_at"] = at
-    return spec
 
 
 def _spec(resource: Resource, entry: str, root: Path) -> dict:
@@ -412,6 +483,12 @@ def _spec(resource: Resource, entry: str, root: Path) -> dict:
                 "flush": resource.source.flush,
                 "max_rows": resource.source.max_rows,
             },
+        }
+    elif isinstance(resource, App):
+        spec |= {
+            "kind": "app",
+            "function": f"{entry}:{resource.function_name}",
+            "path": resource.path,
         }
     else:
         spec |= {

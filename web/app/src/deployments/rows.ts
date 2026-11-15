@@ -70,8 +70,6 @@ export function versionOf(component: Component): string {
 }
 
 export function deploymentRow(d: Deployment): Row {
-  // An app has no pods: the UI's server serves what its build produced.
-  const runs = d.kind !== 'app';
   return {
     key: key(d),
     name: d.name,
@@ -79,10 +77,10 @@ export function deploymentRow(d: Deployment): Row {
     kind: d.kind,
     status: d.status,
     revision: d.commit,
-    cpu: runs ? d.cpu : null,
-    cpuLimit: runs ? d.cpu_limit : null,
-    memory: runs ? d.memory : null,
-    memoryLimit: runs ? d.memory_limit : null,
+    cpu: d.cpu,
+    cpuLimit: d.cpu_limit,
+    memory: d.memory,
+    memoryLimit: d.memory_limit,
     disks: [],
     restarts: d.restarts,
     started: d.started,

@@ -42,6 +42,13 @@ rules:
   - apiGroups: [policy]
     resources: [poddisruptionbudgets]
     verbs: [get, list, create, update, patch, delete]
+  # Apps: a Service each, and an HTTPRoute on the platform's gateway.
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [get, list, create, update, patch, delete]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [httproutes]
+    verbs: [get, list, create, update, patch, delete]
   # sys.deployments: Warning events and metrics-server's usage of its runs.
   - apiGroups: [""]
     resources: [events]
@@ -118,6 +125,7 @@ data:
         "weir" (include "kermodes.weirUrl" .)
         "snapshots" (printf "http://%s:8732/snapshots" $name)
         "environments" (printf "http://%s:8732/environments" $name)
+        "app_builds" (printf "http://%s:8732/builds" $name)
         "listen" "0.0.0.0:8732"
         "pull_secrets" $pullSecrets
         "poll_seconds" .Values.control.pollSeconds
@@ -132,6 +140,9 @@ data:
     {{- $_ := set $builds "secret" . }}
     {{- end }}
     {{- $_ := set $config "builds" $builds }}
+    {{- end }}
+    {{- if .Values.ui.httpRoute.enabled }}
+    {{- $_ := set $config "routes" (dict "parent_refs" .Values.ui.httpRoute.parentRefs "hostnames" .Values.ui.httpRoute.hostnames) }}
     {{- end }}
     {{- $config | toPrettyJson | nindent 4 }}
 ---
@@ -176,8 +187,9 @@ spec:
         {{- include "kermodes.labels" . | nindent 8 }}
         app.kubernetes.io/component: control
       annotations:
-        # Roll the controller when its configuration changes.
-        checksum/config: {{ .Values.control | toJson | sha256sum }}
+        # Roll the controller when its configuration changes: everything control.json is made
+        # of (the image is the pod's own, so it rolls anyway).
+        checksum/config: {{ dict "control" .Values.control "lake" .Values.lake "artifacts" .Values.artifacts "builds" .Values.builds "routes" .Values.ui.httpRoute | toJson | sha256sum }}
     spec:
       serviceAccountName: {{ $name }}
       affinity:

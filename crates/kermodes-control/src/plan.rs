@@ -6,7 +6,8 @@
 //! git credentials, §11.7). Its pod template names the commit, so only a new commit changes it,
 //! and Kubernetes rolls it as the resource asks: start the new run, wait until it is ready, stop
 //! the old (§11.4). A PodDisruptionBudget keeps a drain from evicting a healthy run; the
-//! controller moves it instead, by the same rollout (§17.1).
+//! controller moves it instead, by the same rollout (§17.1). An app is such a Deployment that
+//! also serves its frontend, built per commit, behind a Service and an HTTPRoute of its own.
 //!
 //! Past dates weir still holds are merged into history by a Job each (§8.3): which to start, and
 //! what one looks like, are decided here too.
@@ -15,12 +16,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::batch::v1::Job;
+use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kermodes_weir::Date;
+use kube::api::DynamicObject;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::manifest::{App, Resource, Rollout, Update};
+use crate::manifest::{Resource, Rollout, Update};
 
 /// The lake, as a merge Job needs it (§8.1): `KERMODES_LAKE`, the S3 endpoint, and the Secret
 /// holding `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` for that bucket alone.
@@ -171,6 +174,9 @@ pub struct Target {
     pub snapshots: String,
     /// The controller's environment endpoint: `{environments}/{key}` sends to the environment.
     pub environments: String,
+    /// The controller's app build endpoint: `{app_builds}/{project}/{app}/{commit}` sends to the
+    /// app's built frontend, as a tar.
+    pub app_builds: String,
     /// The environment the commit runs on (`environment_key`), built from its lockfile; none
     /// runs it on the platform's Python alone.
     pub environment: Option<String>,
@@ -184,16 +190,24 @@ pub enum Decision {
     Apply,
     /// It runs the synced commit already.
     Current,
-    /// An update is available, waiting for someone to roll it out (`update="manual"`).
+    /// An update is available, waiting for someone to roll it out (`update="manual"`), or for
+    /// the build it needs (`awaited_build`); what runs keeps running.
     Hold,
 }
 
 /// A resource that never ran is applied whatever its policy; one that runs an older commit rolls
-/// at once (`auto`) or waits to be rolled out (`manual`).
-pub fn decide(update: Update, deployed: Option<&str>, synced: &str) -> Decision {
+/// at once (`auto`) or waits to be rolled out (`manual`). Neither rolls while `synced` has a build
+/// to wait for (`awaited_build`).
+pub fn decide(
+    update: Update,
+    deployed: Option<&str>,
+    synced: &str,
+    awaited: Option<&Build>,
+) -> Decision {
     match deployed {
-        None => Decision::Apply,
         Some(commit) if commit == synced => Decision::Current,
+        _ if awaited.is_some() => Decision::Hold,
+        None => Decision::Apply,
         Some(_) => match update {
             Update::Auto => Decision::Apply,
             Update::Manual | Update::OnStart => Decision::Hold,
@@ -241,12 +255,10 @@ fn selector(project: &str, resource: &str) -> Value {
 
 /// The Deployment that runs `resource` at the target's commit, with one run, or none while it is
 /// stopped: a stopped Deployment's template still follows commits, so starting it runs the
-/// right one without another rollout.
+/// right one without another rollout. An app's run also serves its frontend (`serve_app`).
 pub fn deployment(target: &Target, resource: &Resource, name: &str, stopped: bool) -> Deployment {
     let selector = selector(&target.project, &resource.name);
-    let mut labels = selector.clone();
-    labels["app.kubernetes.io/name"] = json!(name);
-    labels["app.kubernetes.io/managed-by"] = json!("kermodes-control");
+    let labels = object_labels(&target.project, &resource.name, name);
     let mut pod_labels = labels.clone();
     pod_labels["kermodes.io/commit"] = json!(target.commit);
     let strategy = match resource.rollout {
@@ -286,6 +298,10 @@ pub fn deployment(target: &Target, resource: &Resource, name: &str, stopped: boo
     });
     let mut init = vec![snapshot(target)];
     on_environment(target, &mut init, &mut run);
+    let mut spec = pod(target, init, vec![run], "Always");
+    if resource.app_path().is_some() {
+        serve_app(target, &resource.name, &mut spec);
+    }
     let object = json!({
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -303,11 +319,120 @@ pub fn deployment(target: &Target, resource: &Resource, name: &str, stopped: boo
             "progressDeadlineSeconds": 600,
             "template": {
                 "metadata": {"labels": pod_labels},
-                "spec": pod(target, init, vec![run], "Always"),
+                "spec": spec,
             },
         },
     });
     serde_json::from_value(object).expect("a Deployment built from known fields")
+}
+
+/// Where an app's process listens in its pod, and the port of its Service.
+const APP_PORT: u16 = 8080;
+const SERVICE_PORT: u16 = 80;
+
+/// Has an app's run serve its frontend from `/app`, which a last init container fills with the
+/// build of the target's commit (the controller sends it to the artifacts store), and its tables,
+/// on its port: at `/apps/<project>/<app>/`, the address its HTTPRoute sends there unchanged.
+fn serve_app(target: &Target, app: &str, pod: &mut Value) {
+    pod["initContainers"]
+        .as_array_mut()
+        .expect("a pod's init containers are a list")
+        .push(json!({
+            "name": "build",
+            "image": target.image,
+            "args": [
+                "fetch-snapshot",
+                format!("{}/{}/{app}/{}", target.app_builds, target.project, target.commit),
+                "/app",
+            ],
+            "volumeMounts": [{"name": "app", "mountPath": "/app"}],
+            "securityContext": container_security(),
+        }));
+    let run = &mut pod["containers"][0];
+    run["args"]
+        .as_array_mut()
+        .expect("a container's args are a list")
+        .extend(
+            [
+                "--host",
+                "0.0.0.0",
+                "--port",
+                &APP_PORT.to_string(),
+                "--app-dir",
+                "/app",
+            ]
+            .map(|arg| json!(arg)),
+        );
+    run["ports"] = json!([{"name": "http", "containerPort": APP_PORT}]);
+    run["volumeMounts"]
+        .as_array_mut()
+        .expect("a container's mounts are a list")
+        .push(json!({"name": "app", "mountPath": "/app", "readOnly": true}));
+    pod["volumes"]
+        .as_array_mut()
+        .expect("a pod's volumes are a list")
+        .push(json!({"name": "app", "emptyDir": {}}));
+}
+
+/// The labels of a resource's own objects: its project, itself, and its pods' name.
+fn object_labels(project: &str, resource: &str, name: &str) -> Value {
+    json!({
+        "kermodes.io/project": project,
+        "kermodes.io/resource": resource,
+        "app.kubernetes.io/name": name,
+        "app.kubernetes.io/managed-by": "kermodes-control",
+    })
+}
+
+/// The Service in front of an app's run: its port 80 to the run's `http`. A rolling rollout
+/// moves traffic as readiness does, so the new run takes over once it serves.
+pub fn service(project: &str, app: &str, name: &str) -> Service {
+    let object = json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": name, "labels": object_labels(project, app, name)},
+        "spec": {
+            "type": "ClusterIP",
+            "selector": {"app.kubernetes.io/name": name},
+            "ports": [{"name": "http", "port": SERVICE_PORT, "targetPort": "http"}],
+        },
+    });
+    serde_json::from_value(object).expect("a Service built from known fields")
+}
+
+/// The gateway the platform's routes attach to (the chart's `ui.httpRoute`): Gateway API
+/// `parentRefs`, passed through as written, and the hostnames they answer for.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Routes {
+    pub parent_refs: Vec<Value>,
+    #[serde(default)]
+    pub hostnames: Vec<String>,
+}
+
+/// The HTTPRoute that sends `/apps/<project>/<app>/` to an app's Service, with the path as it
+/// came: the app serves under it. Only Gateway API's core features, so any implementation takes
+/// it. None without a gateway to attach to: the app is then reachable inside the cluster only.
+pub fn http_route(
+    routes: Option<&Routes>,
+    project: &str,
+    app: &str,
+    name: &str,
+) -> Option<DynamicObject> {
+    let routes = routes?;
+    let object = json!({
+        "apiVersion": "gateway.networking.k8s.io/v1",
+        "kind": "HTTPRoute",
+        "metadata": {"name": name, "labels": object_labels(project, app, name)},
+        "spec": {
+            "parentRefs": routes.parent_refs,
+            "hostnames": routes.hostnames,
+            "rules": [{
+                "matches": [{"path": {"type": "PathPrefix", "value": format!("/apps/{project}/{app}/")}}],
+                "backendRefs": [{"name": name, "port": SERVICE_PORT}],
+            }],
+        },
+    });
+    Some(serde_json::from_value(object).expect("an HTTPRoute built from known fields"))
 }
 
 /// Stops a drain from evicting a resource's healthy run (§17.1). The drain waits while the
@@ -318,15 +443,7 @@ pub fn disruption_budget(project: &str, resource: &str, name: &str) -> PodDisrup
     let object = json!({
         "apiVersion": "policy/v1",
         "kind": "PodDisruptionBudget",
-        "metadata": {
-            "name": name,
-            "labels": {
-                "kermodes.io/project": project,
-                "kermodes.io/resource": resource,
-                "app.kubernetes.io/name": name,
-                "app.kubernetes.io/managed-by": "kermodes-control",
-            },
-        },
+        "metadata": {"name": name, "labels": object_labels(project, resource, name)},
         "spec": {
             "maxUnavailable": 0,
             "selector": {"matchLabels": selector(project, resource)},
@@ -607,7 +724,7 @@ pub struct Artifact {
     pub size: u64,
     /// `app`, `environment`, or `other` (nothing Kermodes writes: an orphan).
     pub kind: &'static str,
-    /// What uses it: an app it serves, the commits that run on it.
+    /// What uses it: the commits that run on it, or will next.
     pub uses: Vec<String>,
     /// Its build is still running: not unused, whatever uses it.
     pub building: bool,
@@ -619,9 +736,9 @@ impl Artifact {
     }
 }
 
-/// The store's `objects` (name and size) and what each is for: `uses` by object (the builds
-/// apps serve, the environments commits that run or are about to run on), `building` the
-/// objects whose builds are running. Biggest first.
+/// The store's `objects` (name and size) and what each is for: `uses` by object (the builds and
+/// the environments of commits that run or are about to run), `building` the objects whose
+/// builds are running. Biggest first.
 pub fn artifacts(
     objects: &[(String, u64)],
     uses: &BTreeMap<String, Vec<String>>,
@@ -714,14 +831,37 @@ pub struct BuildPlan {
     pub remove: Vec<(String, String)>,
 }
 
-/// When `latest` is the project's newest deployable commit and `apps` what it declares: each
-/// app with no build at `latest` builds. Builds go when nothing can use them: those of apps the
-/// commit no longer has, and finished ones older than the build an app serves. A build still
-/// running stays until it ends. `builds` are newest commit first.
-pub fn builds_due(apps: &[App], latest: &str, builds: &[BuildRecord]) -> BuildPlan {
-    let declared = |name: &str| apps.iter().any(|app| app.name == name);
-    let start = apps
+/// The builds a project's apps use, as (app, commit): the one each app's Deployment runs, which
+/// its pods fetch again whenever they start, and the one at `latest`, which it runs next.
+/// `deployed` is the commit each resource runs.
+pub fn builds_in_use(
+    resources: &[Resource],
+    latest: &str,
+    deployed: &BTreeMap<String, String>,
+) -> BTreeSet<(String, String)> {
+    let mut used = BTreeSet::new();
+    for app in resources.iter().filter(|r| r.app_path().is_some()) {
+        used.insert((app.name.clone(), latest.to_owned()));
+        if let Some(commit) = deployed.get(&app.name) {
+            used.insert((app.name.clone(), commit.clone()));
+        }
+    }
+    used
+}
+
+/// When `latest` is the project's newest deployable commit and `resources` what it declares:
+/// each app with no build at `latest` builds. Builds go when nothing uses them
+/// (`builds_in_use`); one still running stays until it ends, and a failed one at `latest` stays
+/// to say why, rather than build again.
+pub fn builds_due(
+    resources: &[Resource],
+    latest: &str,
+    deployed: &BTreeMap<String, String>,
+    builds: &[BuildRecord],
+) -> BuildPlan {
+    let start = resources
         .iter()
+        .filter(|r| r.app_path().is_some())
         .filter(|app| {
             !builds
                 .iter()
@@ -729,46 +869,41 @@ pub fn builds_due(apps: &[App], latest: &str, builds: &[BuildRecord]) -> BuildPl
         })
         .map(|app| app.name.clone())
         .collect();
-    let mut remove = Vec::new();
-    for (index, build) in builds.iter().enumerate() {
-        if build.state == Build::Building {
-            continue;
-        }
-        let superseded = builds[..index]
-            .iter()
-            .any(|newer| newer.app == build.app && newer.state == Build::Built);
-        if !declared(&build.app) || superseded {
-            remove.push((build.app.clone(), build.commit.clone()));
-        }
-    }
+    let used = builds_in_use(resources, latest, deployed);
+    let remove = builds
+        .iter()
+        .filter(|b| b.state != Build::Building)
+        .map(|b| (b.app.clone(), b.commit.clone()))
+        .filter(|build| !used.contains(build))
+        .collect();
     BuildPlan { start, remove }
 }
 
-/// The commit whose build of `app` is served: its newest finished one.
-pub fn served_build<'a>(app: &str, builds: &'a [BuildRecord]) -> Option<&'a str> {
-    builds
+/// The build `resource` waits for before it runs `commit`: an app's frontend at that commit,
+/// while it builds (or is about to) or once it failed, so its process never serves a page another
+/// commit built. Nothing else waits. `builds` are the project's; none where the platform builds
+/// no apps, so an app cannot run.
+pub fn awaited_build(
+    resource: &Resource,
+    commit: &str,
+    builds: Option<&[BuildRecord]>,
+) -> Option<Build> {
+    resource.app_path()?;
+    let Some(builds) = builds else {
+        return Some(Build::Failed(
+            "this platform builds no apps: it has no artifacts store or builder".into(),
+        ));
+    };
+    match builds
         .iter()
-        .find(|b| b.app == app && b.state == Build::Built)
-        .map(|b| b.commit.as_str())
-}
-
-/// How `app` reads in the Deployments tab: Running once its build at `latest` is served,
-/// Building until then, Build failed (with why) if it failed; an earlier build serves meanwhile.
-pub fn app_status(
-    app: &str,
-    latest: &str,
-    builds: &[BuildRecord],
-) -> (&'static str, Option<String>) {
-    match builds.iter().find(|b| b.app == app && b.commit == latest) {
+        .find(|b| b.app == resource.name && b.commit == commit)
+    {
         Some(BuildRecord {
             state: Build::Built,
             ..
-        }) => ("Running", None),
-        Some(BuildRecord {
-            state: Build::Failed(error),
-            ..
-        }) => ("Build failed", Some(error.clone())),
-        _ => ("Building", None),
+        }) => None,
+        Some(record) => Some(record.state.clone()),
+        None => Some(Build::Building),
     }
 }
 
@@ -844,12 +979,7 @@ echo "built $APP"
             "ttlSecondsAfterFinished": 86_400,
             "activeDeadlineSeconds": BUILD_DEADLINE_SECONDS,
             "template": {
-                // The app's logs are its newest build's: its pods are found by these.
-                "metadata": {"labels": {
-                    "app.kubernetes.io/component": "build",
-                    "kermodes.io/project": target.project,
-                    "kermodes.io/app": app,
-                }},
+                "metadata": {"labels": {"app.kubernetes.io/component": "build"}},
                 "spec": spec,
             },
         },
@@ -978,6 +1108,15 @@ mod tests {
             cpu: "250m".into(),
             memory: "1Gi".into(),
             defined_at: None,
+            path: None,
+        }
+    }
+
+    fn app(name: &str) -> Resource {
+        Resource {
+            kind: "app".into(),
+            path: Some(format!("apps/{name}")),
+            ..resource(name, Update::Auto, Rollout::Rolling)
         }
     }
 
@@ -990,6 +1129,7 @@ mod tests {
             weir: "grpc://kermodes-weir:8731".into(),
             snapshots: "http://kermodes-control:8732/snapshots".into(),
             environments: "http://kermodes-control:8732/environments".into(),
+            app_builds: "http://kermodes-control:8732/builds".into(),
             environment: None,
             pull_secrets: vec!["pull".into()],
         }
@@ -1010,11 +1150,105 @@ mod tests {
         ];
         for (update, deployed, synced, want) in cases {
             assert_eq!(
-                decide(update, deployed, synced),
+                decide(update, deployed, synced, None),
                 want,
                 "{update:?} {deployed:?} {synced}"
             );
         }
+    }
+
+    #[test]
+    fn an_app_rolls_only_onto_a_commit_whose_frontend_built() {
+        use Decision::*;
+        let failed = || Build::Failed("bun install: lockfile out of date".into());
+        let builds = [
+            record("market", "c4", failed()),
+            record("market", "c3", Build::Building),
+            record("market", "c2", Build::Built),
+        ];
+        let ticks = resource("ticks", Update::Auto, Rollout::Rolling);
+        let market = app("market");
+        let manual = Resource {
+            update: Update::Manual,
+            ..app("market")
+        };
+        let no_apps = "this platform builds no apps: it has no artifacts store or builder";
+        type Case<'a> = (
+            &'a Resource,
+            Option<&'a str>,
+            &'a str,
+            Option<&'a [BuildRecord]>,
+            Decision,
+            Option<Build>,
+        );
+        let cases: [Case; 9] = [
+            // (resource, deployed, synced, builds) -> (decision, what it waits for)
+            (&market, Some("c1"), "c2", Some(&builds), Apply, None),
+            (&market, None, "c2", Some(&builds), Apply, None),
+            // Building, or about to: the run it has keeps running; none starts meanwhile.
+            (
+                &market,
+                Some("c1"),
+                "c3",
+                Some(&builds),
+                Hold,
+                Some(Build::Building),
+            ),
+            (
+                &market,
+                Some("c1"),
+                "c5",
+                Some(&builds),
+                Hold,
+                Some(Build::Building),
+            ),
+            (
+                &market,
+                None,
+                "c3",
+                Some(&builds),
+                Hold,
+                Some(Build::Building),
+            ),
+            // Failed: held where it is, saying why.
+            (
+                &market,
+                Some("c2"),
+                "c4",
+                Some(&builds),
+                Hold,
+                Some(failed()),
+            ),
+            // Built, a manual app still waits to be rolled out.
+            (&manual, Some("c1"), "c2", Some(&builds), Hold, None),
+            // Nothing else waits for a build, whatever the builds say.
+            (&ticks, Some("c1"), "c3", None, Apply, None),
+            (
+                &market,
+                Some("c1"),
+                "c2",
+                None,
+                Hold,
+                Some(Build::Failed(no_apps.into())),
+            ),
+        ];
+        for (resource, deployed, synced, builds, decision, awaited) in cases {
+            let waits = awaited_build(resource, synced, builds);
+            assert_eq!(
+                (
+                    decide(resource.update, deployed, synced, waits.as_ref()),
+                    waits.clone()
+                ),
+                (decision, awaited),
+                "{} {deployed:?} {synced}",
+                resource.name
+            );
+        }
+        // What it runs stays current, even while a rebuild of it would fail.
+        assert_eq!(
+            decide(Update::Auto, Some("c4"), "c4", Some(&failed())),
+            Current
+        );
     }
 
     #[test]
@@ -1319,19 +1553,21 @@ mod tests {
         }
     }
 
-    fn apps(names: &[&str]) -> Vec<App> {
-        names
-            .iter()
-            .map(|name| App {
-                name: (*name).into(),
-                path: None,
-            })
-            .collect()
-    }
-
     #[test]
-    fn each_app_builds_once_per_commit_and_old_builds_go_once_superseded() {
+    fn each_app_builds_once_per_commit_and_a_build_goes_once_nothing_runs_it() {
         let failed = || Build::Failed("bun install: lockfile out of date".into());
+        let resources = [
+            app("market"),
+            app("blotter"),
+            resource("ticks", Update::Auto, Rollout::Rolling),
+        ];
+        let deployed = |market: &str| {
+            BTreeMap::from([
+                ("market".to_owned(), market.to_owned()),
+                ("blotter".to_owned(), "c1".to_owned()),
+                ("ticks".to_owned(), "c1".to_owned()),
+            ])
+        };
         // Newest commit first, as the state lists them.
         let builds = [
             record("market", "c3", Build::Building),
@@ -1341,42 +1577,40 @@ mod tests {
             record("blotter", "c1", Build::Built),
             record("retired", "c1", Build::Built),
         ];
-        let plan = builds_due(&apps(&["market", "blotter"]), "c3", &builds);
-        // market is building c3 already; blotter has nothing at c3 yet.
+        let plan = builds_due(&resources, "c3", &deployed("c1"), &builds);
+        // market is building c3 already; blotter has nothing at c3 yet; ticks is no app.
         assert_eq!(plan.start, ["blotter"]);
-        // market c1 is older than the c2 it serves; retired is no longer declared. blotter's
-        // c1 still serves, its failed c2 says why it is not newer, and c3 is still building.
+        // Each app's c1 runs and market's c3 is still building. market's c2 never ran and
+        // never will, blotter's failed c2 is no longer the newest, retired is not declared.
+        let pair = |app: &str, commit: &str| (app.to_owned(), commit.to_owned());
         assert_eq!(
             plan.remove,
             [
-                ("market".to_owned(), "c1".to_owned()),
-                ("retired".to_owned(), "c1".to_owned())
+                pair("market", "c2"),
+                pair("blotter", "c2"),
+                pair("retired", "c1")
             ]
         );
-
-        assert_eq!(served_build("market", &builds), Some("c2"));
-        assert_eq!(served_build("blotter", &builds), Some("c1"));
-        assert_eq!(app_status("market", "c3", &builds), ("Building", None));
+        let used = builds_in_use(&resources, "c3", &deployed("c1"));
         assert_eq!(
-            app_status("blotter", "c2", &builds),
-            (
-                "Build failed",
-                Some("bun install: lockfile out of date".into())
-            )
+            used,
+            BTreeSet::from([
+                pair("blotter", "c1"),
+                pair("blotter", "c3"),
+                pair("market", "c1"),
+                pair("market", "c3")
+            ])
         );
-        // Not started yet: about to build.
-        assert_eq!(app_status("blotter", "c3", &builds), ("Building", None));
 
-        // Once c3 builds, it is served and c2 goes.
+        // Once market runs c3, its c1 goes; blotter's failed c3 stays to say why, unbuilt.
         let mut done = builds.to_vec();
         done[0].state = Build::Built;
-        assert_eq!(served_build("market", &done), Some("c3"));
-        assert_eq!(app_status("market", "c3", &done), ("Running", None));
-        assert!(
-            builds_due(&apps(&["market", "blotter"]), "c3", &done)
-                .remove
-                .contains(&("market".to_owned(), "c2".to_owned()))
-        );
+        done.insert(1, record("blotter", "c3", failed()));
+        let plan = builds_due(&resources, "c3", &deployed("c3"), &done);
+        assert!(plan.start.is_empty());
+        assert!(plan.remove.contains(&pair("market", "c1")));
+        assert!(!plan.remove.contains(&pair("blotter", "c3")));
+        assert!(!plan.remove.contains(&pair("blotter", "c1")));
     }
 
     #[test]
@@ -1643,6 +1877,155 @@ mod tests {
         assert_eq!(security.read_only_root_filesystem, Some(true));
     }
 
+    #[test]
+    fn an_app_runs_with_its_commits_frontend_and_serves_on_its_port() {
+        let market = app("market");
+        let fetch = vec![
+            "fetch-snapshot".to_owned(),
+            "http://kermodes-control:8732/builds/ticker/market/c2".to_owned(),
+            "/app".to_owned(),
+        ];
+        let serving = [
+            "run",
+            "market",
+            "--project",
+            "/code/examples/ticker",
+            "--server",
+            "grpc://kermodes-weir:8731",
+            "--ready-file",
+            "/run/kermodes/ready",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "8080",
+            "--app-dir",
+            "/app",
+        ];
+        // (environment) -> init containers, in order: the frontend is fetched last.
+        let cases = [
+            (None, vec!["snapshot", "build"]),
+            (Some("e1"), vec!["snapshot", "environment", "build"]),
+        ];
+        for (environment, order) in cases {
+            let on = Target {
+                environment: environment.map(str::to_owned),
+                ..target("c2")
+            };
+            let pod = deployment_pod(&on, &market);
+            let init = pod.init_containers.clone().unwrap();
+            let names: Vec<&str> = init.iter().map(|c| c.name.as_str()).collect();
+            assert_eq!(names, order, "{environment:?}");
+            let build = init.last().unwrap();
+            assert_eq!(build.args.clone().unwrap(), fetch);
+            assert_eq!(build.volume_mounts.clone().unwrap()[0].mount_path, "/app");
+            let run = &pod.containers[0];
+            assert_eq!(run.args.clone().unwrap(), serving);
+            let ports: Vec<(Option<String>, i32)> = run
+                .ports
+                .iter()
+                .flatten()
+                .map(|p| (p.name.clone(), p.container_port))
+                .collect();
+            assert_eq!(ports, [(Some("http".to_owned()), 8080)]);
+            let frontend = run
+                .volume_mounts
+                .iter()
+                .flatten()
+                .find(|m| m.mount_path == "/app")
+                .unwrap();
+            assert_eq!(frontend.read_only, Some(true));
+            let volume = pod
+                .volumes
+                .iter()
+                .flatten()
+                .find(|v| v.name == "app")
+                .unwrap();
+            assert!(volume.empty_dir.is_some());
+        }
+        // A deployment fetches no frontend and listens nowhere.
+        let ticks = deployment_pod(
+            &target("c2"),
+            &resource("ticks", Update::Auto, Rollout::Rolling),
+        );
+        assert_eq!(ticks.init_containers.unwrap().len(), 1);
+        assert!(ticks.containers[0].ports.is_none());
+        assert_eq!(ticks.containers[0].args.clone().unwrap().len(), 8);
+        assert!(ticks.volumes.unwrap().iter().all(|v| v.name != "app"));
+    }
+
+    #[test]
+    fn an_app_is_reached_by_its_service_and_at_its_address_on_the_gateway() {
+        let pods = deployment(
+            &target("c2"),
+            &app("order_book"),
+            "ticker-order-book",
+            false,
+        )
+        .spec
+        .unwrap()
+        .template
+        .metadata
+        .unwrap()
+        .labels
+        .unwrap();
+        let spec = service("ticker", "order_book", "ticker-order-book")
+            .spec
+            .unwrap();
+        let selector = spec.selector.unwrap();
+        assert!(!selector.is_empty());
+        assert!(
+            selector.iter().all(|(k, v)| pods.get(k) == Some(v)),
+            "{selector:?}"
+        );
+        assert_eq!(spec.type_.as_deref(), Some("ClusterIP"));
+        let port = &spec.ports.unwrap()[0];
+        assert_eq!(
+            (port.port, port.target_port.clone()),
+            (
+                80,
+                Some(
+                    k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::String(
+                        "http".into()
+                    )
+                )
+            )
+        );
+
+        let routes = Routes {
+            parent_refs: vec![
+                json!({"name": "gw", "namespace": "gateway", "sectionName": "https"}),
+            ],
+            hostnames: vec!["k.example.com".into()],
+        };
+        let route = http_route(Some(&routes), "ticker", "order_book", "ticker-order-book").unwrap();
+        let types = route.types.clone().unwrap();
+        assert_eq!(
+            (types.api_version.as_str(), types.kind.as_str()),
+            ("gateway.networking.k8s.io/v1", "HTTPRoute")
+        );
+        let labels = route.metadata.labels.clone().unwrap();
+        assert_eq!(
+            (
+                labels["kermodes.io/project"].as_str(),
+                labels["kermodes.io/resource"].as_str()
+            ),
+            ("ticker", "order_book")
+        );
+        let spec = &route.data["spec"];
+        assert_eq!(spec["parentRefs"], json!(routes.parent_refs));
+        assert_eq!(spec["hostnames"], json!(["k.example.com"]));
+        // One rule: the app's address, by its own name, passed on unchanged to its Service.
+        assert_eq!(
+            spec["rules"],
+            json!([{
+                "matches": [{"path": {"type": "PathPrefix", "value": "/apps/ticker/order_book/"}}],
+                "backendRefs": [{"name": "ticker-order-book", "port": 80}],
+            }])
+        );
+        // No gateway configured, no route.
+        assert!(http_route(None, "ticker", "order_book", "ticker-order-book").is_none());
+    }
+
     fn deployment_pod(target: &Target, resource: &Resource) -> k8s_openapi::api::core::v1::PodSpec {
         deployment(target, resource, "ticker-ticks", false)
             .spec
@@ -1664,7 +2047,7 @@ mod tests {
         let uses = BTreeMap::from([
             (
                 "apps/ticker/market/c2.tar".to_owned(),
-                vec!["ticker/market, serving".to_owned()],
+                vec!["ticker/market at c2".to_owned()],
             ),
             (
                 "environments/e2.tar".to_owned(),

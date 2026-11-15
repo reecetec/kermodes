@@ -18,7 +18,7 @@ use crate::browse;
 use crate::git::{self, Credentials, Repository};
 use crate::k8s::Kube;
 use crate::leader::{Leadership, Wake};
-use crate::manifest::{Manifest, Update};
+use crate::manifest::{Manifest, Resource, Update};
 use crate::plan::{self, Build, Decision, Target};
 use crate::report;
 use crate::state::{Commit, State};
@@ -39,6 +39,14 @@ pub struct Config {
     /// store), a project with a lockfile cannot deploy.
     #[serde(default)]
     pub environments: Option<String>,
+    /// This controller's app build endpoint, as pods reach it; without it (and the artifacts
+    /// store and builder), apps cannot run.
+    #[serde(default)]
+    pub app_builds: Option<String>,
+    /// The gateway apps' HTTPRoutes attach to; without it, apps are reachable only inside the
+    /// cluster.
+    #[serde(default)]
+    pub routes: Option<plan::Routes>,
     /// Where the controller's HTTP API listens.
     pub listen: String,
     #[serde(default)]
@@ -112,6 +120,23 @@ const MERGE_OVERDUE_NS: i64 = 3_600_000_000_000;
 type Listing = Result<Vec<(String, u64)>, String>;
 
 impl Controller {
+    /// Whether this platform builds apps, and so can run them: an artifacts store, a builder,
+    /// and the endpoint pods fetch builds from.
+    fn builds_apps(&self) -> bool {
+        self.artifacts.is_some() && self.config.builds.is_some() && self.config.app_builds.is_some()
+    }
+
+    /// The build `resource` waits for before it runs `commit` (`plan::awaited_build`), of the
+    /// project's `builds`.
+    fn awaited_build(
+        &self,
+        resource: &Resource,
+        commit: &str,
+        builds: &[plan::BuildRecord],
+    ) -> Option<Build> {
+        plan::awaited_build(resource, commit, self.builds_apps().then_some(builds))
+    }
+
     /// The artifacts store as a component of the platform, when there is one: Running while it
     /// lists, Unreachable with why when it does not.
     pub async fn artifacts_component(&self) -> Option<system::Component> {
@@ -190,8 +215,9 @@ impl Controller {
         Ok((count, freed))
     }
 
-    /// What uses each object: the build each app serves, and the environment each commit that
-    /// runs or is about to run on (under this platform); and the objects still building.
+    /// What uses each object: the builds of the commit each app runs and the one it runs next,
+    /// and the environment each commit that runs or is about to run on (under this platform);
+    /// and the objects still building.
     async fn artifact_uses(
         &self,
     ) -> Result<(BTreeMap<String, Vec<String>>, BTreeSet<String>), String> {
@@ -208,17 +234,17 @@ impl Controller {
             };
             let manifest = Manifest::parse(latest.manifest.as_deref().unwrap_or_default())?;
             let builds = state.builds(&project.name).await?;
-            for app in &manifest.apps {
-                if let Some(commit) = plan::served_build(&app.name, &builds) {
-                    uses.entry(plan::app_object(&project.name, &app.name, commit))
-                        .or_default()
-                        .push(format!("{}/{}, serving", project.name, app.name));
-                }
+            let deployed = state.deployed(&project.name).await?;
+            for (app, commit) in plan::builds_in_use(&manifest.resources, &latest.commit, &deployed)
+            {
+                let short = &commit[..commit.len().min(7)];
+                uses.entry(plan::app_object(&project.name, &app, &commit))
+                    .or_default()
+                    .push(format!("{}/{app} at {short}", project.name));
             }
             for build in builds.iter().filter(|b| b.state == Build::Building) {
                 building.insert(plan::app_object(&project.name, &build.app, &build.commit));
             }
-            let deployed = state.deployed(&project.name).await?;
             let commits: BTreeSet<&str> = deployed
                 .values()
                 .map(String::as_str)
@@ -423,7 +449,7 @@ async fn merge_once(controller: &Controller, lake: &plan::Lake) -> Result<(), St
 /// How often the leader settles finished builds and starts due ones.
 const BUILD_EVERY: Duration = Duration::from_secs(5);
 
-/// Builds each project's apps at its newest deployable commit and keeps what is served
+/// Builds each project's apps at its newest deployable commit and keeps what runs
 /// (`plan::builds_due`), every few seconds.
 async fn build_forever(controller: &Controller) {
     let (Some(artifacts), Some(builds)) = (&controller.artifacts, &controller.config.builds) else {
@@ -579,16 +605,18 @@ async fn build_once(
     config: &plan::Builds,
     project: &ProjectConfig,
 ) -> Result<(), String> {
-    let (latest, records) = {
+    let (latest, records, deployed) = {
         let mut state = controller.state.lock().await;
         (
             state.latest_discovered(&project.name).await?,
             state.builds(&project.name).await?,
+            state.deployed(&project.name).await?,
         )
     };
     let Some(latest) = latest else { return Ok(()) };
     let manifest = Manifest::parse(latest.manifest.as_deref().unwrap_or_default())?;
     // A build ends with its Job; what it uploaded is what makes it built.
+    let mut built_any = false;
     for record in records.iter().filter(|r| r.state == Build::Building) {
         let job = plan::build_job_name(&project.name, &record.app, &record.commit);
         let Some(outcome) = controller.kube.job_outcome(&job, "build").await? else {
@@ -610,6 +638,7 @@ async fn build_once(
                 project.name, record.app, record.commit
             ),
         }
+        built_any |= result.is_ok();
         controller
             .state
             .lock()
@@ -617,8 +646,12 @@ async fn build_once(
             .finish_build(&project.name, &record.app, &record.commit, &result)
             .await?;
     }
+    // Its app rolls onto it at once, rather than at the next poll.
+    if built_any {
+        controller.state.lock().await.request_sync().await?;
+    }
     let records = controller.state.lock().await.builds(&project.name).await?;
-    let due = plan::builds_due(&manifest.apps, &latest.commit, &records);
+    let due = plan::builds_due(&manifest.resources, &latest.commit, &deployed, &records);
     for app in &due.start {
         let object = plan::app_object(&project.name, app, &latest.commit);
         let ttl = Duration::from_secs(plan::BUILD_DEADLINE_SECONDS + 300);
@@ -632,14 +665,14 @@ async fn build_once(
             .await?;
         let target = target(controller, project, &latest.commit, None);
         let path = manifest
-            .apps
+            .resources
             .iter()
             .find(|declared| &declared.name == app)
-            .map(|declared| declared.path())
+            .and_then(|declared| declared.app_path())
             .unwrap_or_default();
         controller
             .kube
-            .start(&plan::build_job(&target, app, &path, config, &upload))
+            .start(&plan::build_job(&target, app, path, config, &upload))
             .await?;
         eprintln!(
             "kermodes control: {}: building {app} at {}",
@@ -682,12 +715,13 @@ async fn report_once(controller: &Controller) -> Result<RecordBatch, String> {
     let observed = controller.kube.observe().await?;
     let mut rows = Vec::new();
     for project in &controller.config.projects {
-        let (latest, deployed, stopped) = {
+        let (latest, deployed, stopped, builds) = {
             let mut state = controller.state.lock().await;
             (
                 state.latest_discovered(&project.name).await?,
                 state.deployed(&project.name).await?,
                 state.stopped(&project.name).await?,
+                state.builds(&project.name).await?,
             )
         };
         let Some(latest) = latest else { continue };
@@ -701,24 +735,9 @@ async fn report_once(controller: &Controller) -> Result<RecordBatch, String> {
                 &latest.commit,
                 stopped.contains(&resource.name),
                 observed.get(&name),
-            ));
-        }
-        let builds = controller.state.lock().await.builds(&project.name).await?;
-        let builds_apps = controller.artifacts.is_some() && controller.config.builds.is_some();
-        for app in &manifest.apps {
-            let (status, warning) = if builds_apps {
-                plan::app_status(&app.name, &latest.commit, &builds)
-            } else {
-                let why = "this platform builds no apps: it has no artifacts store or builder";
-                ("Not built", Some(why.to_owned()))
-            };
-            rows.push(report::Row::app(
-                &project.name,
-                &app.name,
-                status,
-                plan::served_build(&app.name, &builds),
-                &latest.commit,
-                warning,
+                controller
+                    .awaited_build(resource, &latest.commit, &builds)
+                    .as_ref(),
             ));
         }
     }
@@ -1041,11 +1060,12 @@ async fn rediscover_if_stale(
 /// Brings a project's Deployments to its newest deployable commit, resource by resource.
 async fn reconcile(controller: &Controller, project: &ProjectConfig) -> Result<(), String> {
     rediscover_if_stale(controller, project).await?;
-    let (latest, deployed) = {
+    let (latest, deployed, builds) = {
         let mut state = controller.state.lock().await;
         (
             state.latest_discovered(&project.name).await?,
             state.deployed(&project.name).await?,
+            state.builds(&project.name).await?,
         )
     };
     let Some(latest) = latest else {
@@ -1088,7 +1108,10 @@ async fn reconcile(controller: &Controller, project: &ProjectConfig) -> Result<(
         let name = &names[&resource.name];
         let running = deployed.get(&resource.name).map(String::as_str);
         let is_stopped = stopped.contains(&resource.name);
-        match plan::decide(resource.update, running, &latest.commit) {
+        let awaited = controller.awaited_build(resource, &latest.commit, &builds);
+        // Whether a Deployment runs it, which an app's Service and route go with.
+        let mut runs = running.is_some();
+        match plan::decide(resource.update, running, &latest.commit, awaited.as_ref()) {
             Decision::Apply => {
                 let Some(environment) = runs_on(&latest.commit) else {
                     continue;
@@ -1101,6 +1124,7 @@ async fn reconcile(controller: &Controller, project: &ProjectConfig) -> Result<(
                 state
                     .set_deployed(&project.name, &resource.name, &latest.commit)
                     .await?;
+                runs = true;
                 eprintln!(
                     "kermodes control: {}: {} rolling to {}",
                     project.name, resource.name, latest.commit
@@ -1136,6 +1160,17 @@ async fn reconcile(controller: &Controller, project: &ProjectConfig) -> Result<(
                 name,
             ))
             .await?;
+        if resource.app_path().is_some() && runs {
+            let (project, app) = (&project.name, &resource.name);
+            controller
+                .kube
+                .apply_service(&plan::service(project, app, name))
+                .await?;
+            let route = plan::http_route(controller.config.routes.as_ref(), project, app, name);
+            if let Some(route) = route {
+                controller.kube.apply_route(&route).await?;
+            }
+        }
     }
     // Resources the commit no longer declares stop.
     let wanted: BTreeSet<&String> = names.values().collect();
@@ -1189,6 +1224,12 @@ pub async fn roll_out(
         Environment::Failed(why) => return Err(format!("its environment did not build: {why}")),
     };
     let mut state = controller.state.lock().await;
+    let builds = state.builds(project).await?;
+    match controller.awaited_build(declared, &latest.commit, &builds) {
+        None => {}
+        Some(Build::Failed(why)) => return Err(format!("its build failed: {why}")),
+        Some(_) => return Err(format!("{}'s build is still running", latest.commit)),
+    }
     let is_stopped = state.stopped(project).await?.contains(resource);
     controller
         .kube
@@ -1213,7 +1254,6 @@ pub async fn status(controller: &Controller) -> Result<Value, String> {
         let head = state.latest(&project.name).await?;
         let latest = state.latest_discovered(&project.name).await?;
         let deployed = state.deployed(&project.name).await?;
-        let builds = state.builds(&project.name).await?;
         drop(state);
         // The mainline's newest commit, when its discovery failed: what runs stays on `commit`.
         let failed = head.and_then(|head| {
@@ -1237,23 +1277,6 @@ pub async fn status(controller: &Controller) -> Result<Value, String> {
                     "commit": running,
                     "available": (running != Some(&latest.commit)).then_some(&latest.commit),
                     "rollout": format!("{rollout:?}").to_lowercase(),
-                    "source": source,
-                }));
-            }
-            // An app's code is its directory, at the commit whose build is served.
-            let directory = project.path.trim_matches('/');
-            for app in &manifest.apps {
-                let served = plan::served_build(&app.name, &builds);
-                let path = match directory {
-                    "" => app.path(),
-                    directory => format!("{directory}/{}", app.path()),
-                };
-                let source =
-                    served.and_then(|commit| browse::source_url(&project.url, commit, &path, None));
-                resources.push(json!({
-                    "name": app.name,
-                    "kind": "app",
-                    "commit": served,
                     "source": source,
                 }));
             }
@@ -1323,6 +1346,7 @@ fn target(
         weir: config.weir.clone(),
         snapshots: config.snapshots.clone(),
         environments: config.environments.clone().unwrap_or_default(),
+        app_builds: config.app_builds.clone().unwrap_or_default(),
         environment,
         pull_secrets: config.pull_secrets.clone(),
     }

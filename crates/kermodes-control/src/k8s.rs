@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{Event, Node, PersistentVolumeClaim, Pod, Secret};
+use k8s_openapi::api::core::v1::{Event, Node, PersistentVolumeClaim, Pod, Secret, Service};
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::Api;
 use kube::api::{
@@ -34,6 +34,9 @@ pub struct Kube {
     /// weir's StatefulSet, for its rollout.
     statefulsets: Api<StatefulSet>,
     budgets: Api<PodDisruptionBudget>,
+    /// Apps' Services, and their HTTPRoutes (`gateway.networking.k8s.io`).
+    services: Api<Service>,
+    routes: Api<DynamicObject>,
     jobs: Api<Job>,
     pods: Api<Pod>,
     nodes: Api<Node>,
@@ -68,6 +71,15 @@ impl Kube {
             deployments: Api::namespaced(client.clone(), namespace),
             statefulsets: Api::namespaced(client.clone(), namespace),
             budgets: Api::namespaced(client.clone(), namespace),
+            services: Api::namespaced(client.clone(), namespace),
+            routes: Api::namespaced_with(
+                client.clone(),
+                namespace,
+                &ApiResource::from_gvk_with_plural(
+                    &GroupVersionKind::gvk("gateway.networking.k8s.io", "v1", "HTTPRoute"),
+                    "httproutes",
+                ),
+            ),
             jobs: Api::namespaced(client.clone(), namespace),
             pods: Api::namespaced(client.clone(), namespace),
             nodes: Api::all(client.clone()),
@@ -480,32 +492,6 @@ impl Kube {
             .map_err(|e| format!("cannot read {serving}'s log: {e}"))
     }
 
-    /// The last `tail` lines of the log of `app`'s newest build in `project`.
-    pub async fn build_log(&self, project: &str, app: &str, tail: i64) -> Result<String, String> {
-        let selector = format!("kermodes.io/project={project},kermodes.io/app={app}");
-        let mut pods = self
-            .pods
-            .list(&ListParams::default().labels(&selector))
-            .await
-            .map_err(|e| format!("cannot list {app}'s builds: {e}"))?
-            .items;
-        pods.sort_by_key(|p| p.metadata.creation_timestamp.as_ref().map(|t| t.0));
-        let newest = pods
-            .last()
-            .and_then(|p| p.metadata.name.clone())
-            .ok_or_else(|| format!("{app} has no build from the last day"))?;
-        let params = LogParams {
-            container: Some("build".into()),
-            tail_lines: Some(tail),
-            timestamps: true,
-            ..LogParams::default()
-        };
-        self.pods
-            .logs(&newest, &params)
-            .await
-            .map_err(|e| format!("cannot read {newest}'s log: {e}"))
-    }
-
     async fn pods_of(&self, name: &str) -> Result<Vec<Pod>, String> {
         Ok(self
             .pods
@@ -540,6 +526,32 @@ impl Kube {
             )
             .await
             .map_err(|e| format!("cannot apply {name}'s disruption budget: {e}"))?;
+        Ok(())
+    }
+
+    pub async fn apply_service(&self, service: &Service) -> Result<(), String> {
+        let name = service.metadata.name.as_deref().unwrap_or_default();
+        self.services
+            .patch(
+                name,
+                &PatchParams::apply(MANAGER).force(),
+                &Patch::Apply(service),
+            )
+            .await
+            .map_err(|e| format!("cannot apply {name}'s Service: {e}"))?;
+        Ok(())
+    }
+
+    pub async fn apply_route(&self, route: &DynamicObject) -> Result<(), String> {
+        let name = route.metadata.name.as_deref().unwrap_or_default();
+        self.routes
+            .patch(
+                name,
+                &PatchParams::apply(MANAGER).force(),
+                &Patch::Apply(route),
+            )
+            .await
+            .map_err(|e| format!("cannot apply {name}'s HTTPRoute: {e}"))?;
         Ok(())
     }
 
@@ -604,25 +616,20 @@ impl Kube {
         Ok(found)
     }
 
-    /// Deletes a resource's Deployment and its disruption budget.
+    /// Deletes a resource's Deployment, its disruption budget, and an app's Service and
+    /// HTTPRoute. What is not there is gone already, HTTPRoutes included where the cluster has no
+    /// Gateway API.
     pub async fn delete(&self, name: &str) -> Result<(), String> {
         let gone = |result: Result<_, kube::Error>| match result {
             Ok(_) => Ok(()),
             Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
             Err(e) => Err(format!("cannot delete {name}: {e}")),
         };
-        gone(
-            self.deployments
-                .delete(name, &DeleteParams::default())
-                .await
-                .map(|_| ()),
-        )?;
-        gone(
-            self.budgets
-                .delete(name, &DeleteParams::default())
-                .await
-                .map(|_| ()),
-        )
+        let params = DeleteParams::default();
+        gone(self.deployments.delete(name, &params).await.map(|_| ()))?;
+        gone(self.budgets.delete(name, &params).await.map(|_| ()))?;
+        gone(self.services.delete(name, &params).await.map(|_| ()))?;
+        gone(self.routes.delete(name, &params).await.map(|_| ()))
     }
 
     pub async fn rollout(&self, name: &str) -> Result<Rollout, String> {

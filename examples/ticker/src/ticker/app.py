@@ -14,8 +14,23 @@ COLUMNS = {
     "ts": km.timestamp(),
 }
 
-# The quote board and tape, in TypeScript: apps/market.
-market = km.app("market")
+
+# The market app: this function runs in the app's own process, which serves the board it returns
+# and the TypeScript page in apps/market. Its process holds today's md.ticks for the board.
+@km.app(memory="2Gi")
+def market(db):
+    # Whichever starts first creates md.ticks (creating it again changes nothing).
+    db.create_table("md.ticks", COLUMNS)
+    ticks = db.live_table("md.ticks")
+    day = ticks.agg_by(
+        "sym",
+        trades="count(*)",
+        volume="sum(size)",
+        low="min(price)",
+        high="max(price)",
+    )
+    last = ticks.last_by("sym").select("sym", "price")
+    return {"board": last.natural_join(day, on="sym")}
 
 
 # About 100 ticks a second, some 100 MB a day in weir: a demo that runs for weeks until the merge

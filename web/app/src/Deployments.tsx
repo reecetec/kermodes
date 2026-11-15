@@ -98,8 +98,6 @@ function Actions({ row, onDone }: { row: Row | null; onDone: (error: string | nu
   const [busy, setBusy] = useState<string | null>(null);
   const d = row?.source.type === 'deployment' ? row.source.deployment : null;
   const managed = row != null && row.project === SYSTEM;
-  // An app follows its project's commits: each builds, and the newest built is served.
-  const isApp = d?.kind === 'app';
   const stopped = d != null && (d.status === 'Stopped' || d.status === 'Stopping');
   const act = async (action: 'rollout' | 'restart' | 'stop' | 'start') => {
     if (d == null) return;
@@ -108,14 +106,8 @@ function Actions({ row, onDone }: { row: Row | null; onDone: (error: string | nu
     onDone(await post(`${path}/${action}`));
     setBusy(null);
   };
-  const off = d == null || isApp || busy != null;
-  const why = managed
-    ? 'Managed by the Helm release'
-    : d == null
-      ? 'Select a deployment'
-      : isApp
-        ? 'Apps build from each commit of their project'
-        : undefined;
+  const off = d == null || busy != null;
+  const why = managed ? 'Managed by the Helm release' : d == null ? 'Select a deployment' : undefined;
   return (
     <div className="flex items-center gap-1.5" title={why}>
       {d?.available != null && d.update === 'manual' && (

@@ -1,7 +1,9 @@
-//! The gateway (architecture.md §4, §15.2): the web UI's server. This first slice serves one
-//! local session: the built web app, and on `/ws` a WebSocket over which the app lists the
-//! session's tables and opens them in the table viewer (§15.3). Authentication, routing to
-//! worker pods, and Flight come with the cluster gateway (M4).
+//! The gateway (architecture.md §4, §15.2): the web UI's server, and each app's. `serve` runs
+//! the UI's: the built web app at `/`, and on `/ws` a WebSocket over which the app lists the
+//! session's tables and opens them in the table viewer (§15.3). `serve_at` runs an app's own:
+//! its built frontend and the same WebSocket under the app's path (`/apps/<project>/<name>/`),
+//! which is where the cluster routes it. Authentication and Flight come with the cluster gateway
+//! (M4).
 //!
 //! The tables are those published (`Server::publish`) and, given a store (`Stored`), every
 //! stored table: listed from the catalog without reading rows, and opened live only while a
@@ -118,8 +120,8 @@ struct Shared {
     cycles: watch::Sender<u64>,
     /// The built web app (`index.html` and its assets), if any.
     app: Option<PathBuf>,
-    /// Apps a development server runs (`serve_app`): each one's dev server, by project and name.
-    apps: Mutex<BTreeMap<(String, String), String>>,
+    /// Apps `kermodes dev` runs, by project and name: each one's dev server and process.
+    apps: Mutex<BTreeMap<(String, String), AppServers>>,
     /// Requests to the controller and to apps' dev servers.
     client: Client<HttpConnector, Full<Bytes>>,
     /// `kermodes control`, whose API the programs page reads through this server.
@@ -132,6 +134,14 @@ struct Shared {
     /// Numbers each opening of a stored table, so a view's hold on one let go (failed) never
     /// counts against the next.
     generations: AtomicU64,
+}
+
+/// Where `kermodes dev` runs an app: its dev server (Vite, the pages and hot reload) and its own
+/// process (`kermodes run`, its tables on `<path>ws`). Both serve under the app's path.
+#[derive(Clone)]
+struct AppServers {
+    dev: String,
+    process: String,
 }
 
 struct Control {
@@ -194,7 +204,7 @@ impl Shared {
             .expect("kermodes gateway views poisoned by an earlier panic")
     }
 
-    fn apps(&self) -> MutexGuard<'_, BTreeMap<(String, String), String>> {
+    fn apps(&self) -> MutexGuard<'_, BTreeMap<(String, String), AppServers>> {
         self.apps
             .lock()
             .expect("kermodes gateway apps poisoned by an earlier panic")
@@ -229,6 +239,36 @@ impl Shared {
 pub fn serve(
     session: Session,
     addr: SocketAddr,
+    app: Option<PathBuf>,
+    control: Option<String>,
+    stored: Option<Stored>,
+) -> io::Result<Server> {
+    start(session, addr, "/", app, control, stored)
+}
+
+/// Serves an app's own process: its built frontend (`app`) and the session's tables, those it
+/// publishes and those of `stored`, all under `base` (`/apps/<project>/<name>/`, ending in a
+/// slash), where the cluster's route sends the app's requests unchanged.
+pub fn serve_at(
+    session: Session,
+    addr: SocketAddr,
+    base: &str,
+    app: Option<PathBuf>,
+    stored: Option<Stored>,
+) -> io::Result<Server> {
+    if !base.starts_with('/') || !base.ends_with('/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("an app's path starts and ends with /, not {base}"),
+        ));
+    }
+    start(session, addr, base, app, None, stored)
+}
+
+fn start(
+    session: Session,
+    addr: SocketAddr,
+    base: &str,
     app: Option<PathBuf>,
     control: Option<String>,
     stored: Option<Stored>,
@@ -274,25 +314,38 @@ pub fn serve(
         .enable_all()
         .build()?;
     let (shutdown, stopped) = oneshot::channel::<()>();
-    let router = Router::new()
-        .route("/ws", get(upgrade))
-        .route("/api/projects", get(projects))
-        .route("/api/catalog", get(catalog))
-        .route("/api/components", get(components))
-        .route("/api/components/{component}/{action}", get(component_get))
-        .route(
-            "/api/deployments/{project}/{resource}/{action}",
-            get(deployment_get).post(deployment_post),
-        )
-        .route("/api/apps", get(apps_list))
-        .route("/api/artifacts", get(artifacts))
-        .route("/api/artifacts/prune", axum::routing::post(prune_artifacts))
-        .route("/apps/{project}/{name}", get(app_slash))
-        .route("/apps/{project}/{name}/", any(app_proxy))
-        .route("/apps/{project}/{name}/{*path}", any(app_proxy))
-        .route("/", get(index))
-        .route("/{*path}", get(asset))
-        .with_state(shared.clone());
+    let router = if base == "/" {
+        Router::new()
+            .route("/ws", get(upgrade))
+            .route("/api/projects", get(projects))
+            .route("/api/catalog", get(catalog))
+            .route("/api/components", get(components))
+            .route("/api/components/{component}/{action}", get(component_get))
+            .route(
+                "/api/deployments/{project}/{resource}/{action}",
+                get(deployment_get).post(deployment_post),
+            )
+            .route("/api/apps", get(apps_list))
+            .route("/api/artifacts", get(artifacts))
+            .route("/api/artifacts/prune", axum::routing::post(prune_artifacts))
+            .route("/apps/{project}/{name}", get(app_slash))
+            .route("/apps/{project}/{name}/", any(app_proxy))
+            .route("/apps/{project}/{name}/{*path}", any(app_proxy))
+            .route("/", get(index))
+            .route("/{*path}", get(asset))
+    } else {
+        let slashless = base.trim_end_matches('/').to_owned();
+        let page = base.to_owned();
+        Router::new()
+            .route(&format!("{base}ws"), get(upgrade))
+            .route(
+                &slashless,
+                get(move || async move { axum::response::Redirect::permanent(&page) }),
+            )
+            .route(base, get(index))
+            .route(&format!("{base}{{*path}}"), get(asset))
+    }
+    .with_state(shared.clone());
     let maintained = shared.clone();
     let runtime = thread::Builder::new()
         .name("kermodes-gateway".into())
@@ -350,14 +403,18 @@ impl Server {
         self.shared.catalog.send_modify(|v| *v += 1);
     }
 
-    /// Serves the app `name` of `project`, which a development server runs at `upstream`
-    /// (`http://127.0.0.1:5173`), at `/apps/<project>/<name>/`: requests and WebSockets (hot
-    /// reload) pass to it, path and all, so its page reaches this server's `/ws` as its own.
-    pub fn serve_app(&self, project: &str, name: &str, upstream: &str) {
-        let upstream = upstream.trim_end_matches('/').to_owned();
+    /// Serves the app `name` of `project` at `/apps/<project>/<name>/`, as `kermodes dev` runs
+    /// it: its tables' WebSocket (`<path>ws`) passes to its own process at `process`, and every
+    /// other request and WebSocket (pages, hot reload) to its dev server at `dev`
+    /// (`http://127.0.0.1:5173`), path and all, as the cluster's route sends them to its pod.
+    pub fn serve_app(&self, project: &str, name: &str, dev: &str, process: &str) {
+        let servers = AppServers {
+            dev: dev.trim_end_matches('/').to_owned(),
+            process: process.trim_end_matches('/').to_owned(),
+        };
         self.shared
             .apps()
-            .insert((project.to_owned(), name.to_owned()), upstream);
+            .insert((project.to_owned(), name.to_owned()), servers);
     }
 
     /// Stops serving the app `name` of `project`; whether it was served.
@@ -658,6 +715,10 @@ async fn file(shared: &Shared, path: &Path) -> Response {
         Err(_) if path == Path::new("index.html") => {
             (StatusCode::NOT_FOUND, NOT_BUILT).into_response()
         }
+        // A path with no extension is a page of the app's own router: its index answers it.
+        Err(_) if path.extension().is_none() => {
+            Box::pin(file(shared, Path::new("index.html"))).await
+        }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -680,10 +741,10 @@ async fn app_slash(UrlPath((project, name)): UrlPath<(String, String)>) -> Respo
     axum::response::Redirect::permanent(&format!("/apps/{project}/{name}/")).into_response()
 }
 
-/// A request for an app. One a development server runs (`kermodes dev`) passes to its dev
-/// server with its path and query as they came (it serves under `/apps/<project>/<name>/`),
-/// WebSockets too (Vite's hot reload), with the subprotocol asked for. Any other is a built
-/// app's file, which the controller serves.
+/// A request for an app that `kermodes dev` runs: its tables' WebSocket passes to its process,
+/// anything else to its dev server, with its path and query as they came (both serve under
+/// `/apps/<project>/<name>/`), WebSockets with the subprotocol asked for. In the cluster, the
+/// app's own route sends its requests to its pod, so any that reach this server name no app.
 async fn app_proxy(State(shared): State<Arc<Shared>>, request: HttpRequest) -> Response {
     let uri = request.uri();
     let app = uri.path().strip_prefix("/apps/").and_then(|rest| {
@@ -693,12 +754,11 @@ async fn app_proxy(State(shared): State<Arc<Shared>>, request: HttpRequest) -> R
     let Some((project, name)) = app.filter(|(project, name)| plain(project) && plain(name)) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some(upstream) = shared.apps().get(&(project, name)).cloned() else {
-        if request.method() != Method::GET {
-            return StatusCode::METHOD_NOT_ALLOWED.into_response();
-        }
-        return to_control(&shared, Method::GET, uri.path()).await;
+    let tables = uri.path() == format!("/apps/{project}/{name}/ws");
+    let Some(servers) = shared.apps().get(&(project, name)).cloned() else {
+        return (StatusCode::NOT_FOUND, "no such app runs here").into_response();
     };
+    let upstream = if tables { servers.process } else { servers.dev };
     let target = format!(
         "{upstream}{}",
         uri.path_and_query().map_or(uri.path(), |p| p.as_str())

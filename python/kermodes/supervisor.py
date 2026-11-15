@@ -1,9 +1,10 @@
 """Runs a project locally (`kermodes dev --project`), as the cluster does (architecture.md
 §11.2, §16.6): each resource in its own process, restarted when it dies, and rolled on every
 change to the project's Python. A roll starts the new run, waits until it is ready, then stops
-the old one, so a writer hands its source over (§7.4) without a gap. Each app runs its own dev
-server (Vite, with hot reload) behind the UI's server at `/apps/<project>/<name>/`, where it
-has the address it has in the cluster."""
+the old one, so a writer hands its source over (§7.4) without a gap. An app's process serves its
+tables as in the cluster; its pages come from its own dev server (Vite, with hot reload). Both
+are behind the UI's server at `/apps/<project>/<name>/`, the address the app has in the
+cluster."""
 
 import json
 import os
@@ -36,6 +37,8 @@ ENV = os.environ | {"PYTHONDONTWRITEBYTECODE": "1"}
 class Run:
     process: subprocess.Popen
     ready: Path
+    # Where an app's run serves its tables; none for other resources.
+    port: int | None = None
     started: float = field(default_factory=time.monotonic)
 
     def is_ready(self) -> bool:
@@ -54,9 +57,11 @@ class Run:
 
 @dataclass
 class App:
-    """An app's dev server, and the manifests and lockfile it was installed from."""
+    """An app's dev server (its pages), its port, and the manifests and lockfile it was
+    installed from."""
 
     process: subprocess.Popen
+    port: int
     deps: dict[Path, float]
 
     def stop(self) -> None:
@@ -82,7 +87,7 @@ class Supervisor:
         self.runs: dict[str, Run] = {}
         self.specs: dict[str, dict] = {}
         self.apps: dict[str, App] = {}
-        # Each app's directory, as the project declares it (`km.app(name, path=)`).
+        # Each app's frontend directory, as the project declares it (`@km.app(path=)`).
         self.app_dirs: dict[str, Path] = {}
         # Apps whose install failed, with the dependency files it failed on: tried again when
         # they change.
@@ -117,6 +122,7 @@ class Supervisor:
                 # Back off a crashing resource rather than spin on it.
                 self.restarts[name] = time.monotonic() + 2
                 self.runs[name] = self._start(name)
+                self._route(name)
         for name, app in list(self.apps.items()):
             if app.deps != self._deps(name):
                 print(
@@ -148,14 +154,15 @@ class Supervisor:
             if name not in specs:
                 print(f"kermodes dev: {name} removed; stopping it", flush=True)
                 self.runs.pop(name).stop()
-        for name in specs:
-            self._roll(name)
         self.specs = specs
         self.name = manifest["project"]
+        for name in specs:
+            self._roll(name)
         if self.ui is not None:
             self.app_dirs = {
-                app["name"]: self.project / app["path"]
-                for app in manifest.get("apps", [])
+                name: self.project / spec["path"]
+                for name, spec in specs.items()
+                if spec["kind"] == "app"
             }
             apps = set(self.app_dirs)
             for name in set(self.apps) - apps:
@@ -192,9 +199,7 @@ class Supervisor:
             self.failed[name] = deps
             return
         # A free port for Vite; it serves under the address the app has in the cluster.
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            port = probe.getsockname()[1]
+        port = _free_port()
         base = f"/apps/{self.name}/{name}/"
         process = subprocess.Popen(
             [bun, "run", "dev", "--port", str(port), "--strictPort"]
@@ -202,10 +207,23 @@ class Supervisor:
             cwd=self.app_dirs[name],
             start_new_session=True,
         )
-        self.apps[name] = App(process, deps)
-        self.ui.serve_app(self.name, name, f"http://127.0.0.1:{port}")
+        self.apps[name] = App(process, port, deps)
+        self._route(name)
         print(
             f"kermodes dev: app {name} at {self.ui.url.rstrip('/')}{base}", flush=True
+        )
+
+    def _route(self, name: str) -> None:
+        """Points the UI's server at the app's dev server and its current run, once both
+        exist."""
+        app, run = self.apps.get(name), self.runs.get(name)
+        if self.ui is None or app is None or run is None or run.port is None:
+            return
+        self.ui.serve_app(
+            self.name,
+            name,
+            f"http://127.0.0.1:{app.port}",
+            f"http://127.0.0.1:{run.port}",
         )
 
     def _stop_app(self, name: str) -> None:
@@ -257,29 +275,32 @@ class Supervisor:
                 return
             time.sleep(0.05)
         self.runs[name] = new
+        self._route(name)
         if old is not None:
             old.stop()
         print(f"kermodes dev: {name} {'rolled' if old else 'started'}", flush=True)
 
     def _start(self, name: str) -> Run:
         ready = self._dir / f"{name}-{time.monotonic_ns()}.ready"
-        process = subprocess.Popen(
-            [
-                self.python,
-                "-m",
-                "kermodes",
-                "run",
-                name,
-                "--project",
-                str(self.project),
-                "--server",
-                self.server,
-                "--ready-file",
-                str(ready),
-            ],
-            env=ENV,
-        )
-        return Run(process, ready)
+        command = [
+            self.python,
+            "-m",
+            "kermodes",
+            "run",
+            name,
+            "--project",
+            str(self.project),
+            "--server",
+            self.server,
+            "--ready-file",
+            str(ready),
+        ]
+        # An app serves its tables; each run on a port of its own, so a roll's new run starts
+        # beside the old one.
+        port = _free_port() if self.specs[name]["kind"] == "app" else None
+        if port is not None:
+            command += ["--host", "127.0.0.1", "--port", str(port)]
+        return Run(subprocess.Popen(command, env=ENV), ready, port)
 
     def _manifest(self) -> dict | None:
         # Discovery imports the project's code: in its own process, never the dev server's.
@@ -344,3 +365,9 @@ class Supervisor:
                     path = Path(directory, name)
                     files[path] = path.stat().st_mtime
         return files
+
+
+def _free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]

@@ -1,6 +1,7 @@
 """The `kermodes` command."""
 
 import argparse
+import dataclasses
 import itertools
 import json
 import os
@@ -167,9 +168,10 @@ def main(argv: list[str] | None = None) -> None:
     run = commands.add_parser(
         "run",
         help="run one of a project's resources in this process",
-        description="Runs an ingester or deployment from the working tree until it fails or is "
-        "stopped, on a server's tables (--server, $KERMODES_URL, else kermodes dev) or a local "
-        "store (--data-dir).",
+        description="Runs an ingester, deployment, or app from the working tree until it fails "
+        "or is stopped, on a server's tables (--server, $KERMODES_URL, else kermodes dev) or a "
+        "local store (--data-dir). An app serves its frontend (--app-dir, its built files) and "
+        "tables at /apps/<project>/<name>/ on --host and --port.",
     )
     run.add_argument("resource")
     run.add_argument("--project", type=Path, default=Path("."))
@@ -182,6 +184,13 @@ def main(argv: list[str] | None = None) -> None:
         "--ready-file",
         type=Path,
         help="created once the run can take over from one it replaces (readiness probes)",
+    )
+    run.add_argument("--host", default="127.0.0.1", help="where an app listens")
+    run.add_argument("--port", type=int, default=8080, help="where an app listens")
+    run.add_argument(
+        "--app-dir",
+        type=Path,
+        help="an app's built frontend (without one, only its tables are served)",
     )
 
     merge = commands.add_parser(
@@ -234,7 +243,12 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(projects.discover(args.project).manifest(), indent=2))
     elif args.command == "run":
         run_resource(
-            args.project, args.resource, args.server, args.data_dir, args.ready_file
+            args.project,
+            args.resource,
+            args.server,
+            args.data_dir,
+            args.ready_file,
+            projects.Serving("", args.host, args.port, args.app_dir),
         )
     elif args.command == "control":
         run_control(args.config)
@@ -291,14 +305,17 @@ def run_resource(
     server: str | None,
     data_dir: Path | None,
     ready: Path | None,
+    serving: projects.Serving,
 ) -> None:
-    resource = projects.discover(project).resource(name)
+    found = projects.discover(project)
+    resource = found.resource(name)
     # A run started while its store is away (weir restarting) waits for it rather than exiting,
     # so a restart does not become a crash loop; it is not ready until then.
     db = km.local(data_dir) if data_dir else connect_when_up(server, "kermodes run")
     print(f"running {name}; Ctrl-C to stop", flush=True)
+    serving = dataclasses.replace(serving, path=found.app_path(name))
     try:
-        projects.run(resource, db, ready)
+        projects.run(resource, db, ready, serving)
     except KeyboardInterrupt:
         pass
 

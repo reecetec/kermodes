@@ -38,9 +38,14 @@ export {
 
 const ConnectionContext = createContext<Connection | null>(null);
 
-/** The page's own server: `ws(s)://<host>/ws`, as an app served by Kermodes reaches it */
-function sameOrigin(): string {
-  return `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
+/**
+ * The page's own server: an app's at `<its path>ws`, as Kermodes serves every app under
+ * `/apps/<project>/<name>/` (its own process, in the cluster and under `kermodes dev`), at any
+ * page of the app's own router; any other page's at the origin's `/ws`.
+ */
+export function pageServer(location: { protocol: string; host: string; pathname: string }): string {
+  const app = /^\/apps\/[^/]+\/[^/]+\//.exec(location.pathname)?.[0] ?? '/';
+  return `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}${app}ws`;
 }
 
 /**
@@ -57,7 +62,10 @@ export function KermodesProvider({
   connection?: Connection;
   children: ReactNode;
 }) {
-  const connection = useMemo(() => given ?? new KermodesConnection(url ?? sameOrigin()), [given, url]);
+  const connection = useMemo(
+    () => given ?? new KermodesConnection(url ?? pageServer(window.location)),
+    [given, url]
+  );
   // Closed here only if made here
   useEffect(() => (given == null ? () => connection.close() : undefined), [connection, given]);
   return <ConnectionContext.Provider value={connection}>{children}</ConnectionContext.Provider>;

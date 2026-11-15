@@ -14,6 +14,7 @@ use kermodes_weir::{SourceId, TableName};
 
 use crate::k8s::Rollout;
 use crate::manifest::Resource;
+use crate::plan::Build;
 
 /// What Kubernetes shows of one pod of a deployment.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -122,7 +123,8 @@ pub struct Row {
 
 impl Row {
     /// `resource` of `project`, running `commit` while `latest` is its newest deployable commit,
-    /// stopped or not, as Kubernetes shows it (`None`: nothing runs it).
+    /// stopped or not, as Kubernetes shows it (`None`: nothing runs it), and waiting or not for
+    /// its build at `latest` (`plan::awaited_build`): a failed one is its warning.
     pub fn new(
         project: &str,
         resource: &Resource,
@@ -130,12 +132,22 @@ impl Row {
         latest: &str,
         stopped: bool,
         observed: Option<&Observed>,
+        awaited: Option<&Build>,
     ) -> Self {
         let pods = observed.map_or(&[][..], |o| &o.pods);
-        let status = match (stopped, pods.is_empty()) {
-            (true, true) => "Stopped",
-            (true, false) => "Stopping",
-            (false, _) => status(observed.map_or(Rollout::Absent, |o| o.rollout), pods),
+        let status = match (stopped, pods.is_empty(), commit, awaited) {
+            (true, true, ..) => "Stopped",
+            (true, false, ..) => "Stopping",
+            // Nothing has run it yet: its build comes first.
+            (false, _, None, Some(Build::Building)) => "Building",
+            (false, _, None, Some(Build::Failed(_))) => "Build failed",
+            (false, ..) => status(observed.map_or(Rollout::Absent, |o| o.rollout), pods),
+        };
+        let event = match awaited {
+            Some(Build::Failed(why)) => Some((format!("Build failed: {why}"), None)),
+            _ => observed
+                .and_then(|o| o.warning.as_ref())
+                .map(|(text, at)| (text.clone(), Some(*at))),
         };
         // The run serving: a ready pod, else the newest there is.
         let serving = pods.iter().find(|p| p.ready).or_else(|| pods.last());
@@ -154,38 +166,8 @@ impl Row {
             cpu_limit: cores(&resource.cpu).unwrap_or(0.0),
             memory: observed.map_or(0, |o| o.memory),
             memory_limit: bytes(&resource.memory).unwrap_or(0),
-            event: observed.and_then(|o| o.warning.as_ref().map(|(text, _)| text.clone())),
-            event_ns: observed.and_then(|o| o.warning.as_ref().map(|(_, at)| *at)),
-        }
-    }
-
-    /// `app` of `project`: its build status, the commit it serves while `latest` is the
-    /// newest, and why its newest build failed. It has no pods: the UI's server serves it.
-    pub fn app(
-        project: &str,
-        app: &str,
-        status: &str,
-        served: Option<&str>,
-        latest: &str,
-        warning: Option<String>,
-    ) -> Self {
-        Self {
-            project: project.into(),
-            name: app.into(),
-            kind: "app".into(),
-            status: status.into(),
-            update: "auto".into(),
-            commit: served.map(str::to_owned),
-            available: (served != Some(latest)).then(|| latest.to_owned()),
-            node: None,
-            started_ns: None,
-            restarts: 0,
-            cpu: 0.0,
-            cpu_limit: 0.0,
-            memory: 0,
-            memory_limit: 0,
-            event: warning,
-            event_ns: None,
+            event_ns: event.as_ref().and_then(|(_, at)| *at),
+            event: event.map(|(text, _)| text),
         }
     }
 }
@@ -389,6 +371,7 @@ mod tests {
             cpu: "250m".into(),
             memory: "256Mi".into(),
             defined_at: None,
+            path: None,
         };
         let observed = Observed {
             rollout: Rollout::Rolling,
@@ -410,7 +393,15 @@ mod tests {
             memory: 64 << 20,
             warning: Some(("BackOff: restarting".into(), 9)),
         };
-        let row = Row::new("ticker", &resource, Some("a"), "b", false, Some(&observed));
+        let row = Row::new(
+            "ticker",
+            &resource,
+            Some("a"),
+            "b",
+            false,
+            Some(&observed),
+            None,
+        );
         assert_eq!(
             (
                 row.status.as_str(),
@@ -439,14 +430,22 @@ mod tests {
 
         // Nothing runs it, and it is current: no update, no usage.
         // Someone stopped it: stopping while its run shuts down, then stopped.
-        let stopping = Row::new("ticker", &resource, Some("b"), "b", true, Some(&observed));
-        let stopped = Row::new("ticker", &resource, Some("b"), "b", true, None);
+        let stopping = Row::new(
+            "ticker",
+            &resource,
+            Some("b"),
+            "b",
+            true,
+            Some(&observed),
+            None,
+        );
+        let stopped = Row::new("ticker", &resource, Some("b"), "b", true, None, None);
         assert_eq!(
             (stopping.status.as_str(), stopped.status.as_str()),
             ("Stopping", "Stopped")
         );
 
-        let idle = Row::new("ticker", &resource, Some("b"), "b", false, None);
+        let idle = Row::new("ticker", &resource, Some("b"), "b", false, None, None);
         assert_eq!(
             (
                 idle.status.as_str(),
@@ -455,6 +454,54 @@ mod tests {
                 idle.restarts
             ),
             ("Not running", None, 0.0, 0)
+        );
+    }
+
+    #[test]
+    fn an_app_held_by_its_build_says_so() {
+        let market = Resource {
+            name: "market".into(),
+            kind: "app".into(),
+            update: Update::Auto,
+            rollout: Replacement::Rolling,
+            cpu: "500m".into(),
+            memory: "512Mi".into(),
+            defined_at: None,
+            path: Some("apps/market".into()),
+        };
+        let running = Observed {
+            rollout: Rollout::Ready,
+            pods: vec![pod(true, None)],
+            cpu: 0.0,
+            memory: 0,
+            warning: Some(("BackOff: restarting".into(), 9)),
+        };
+        let failed = Build::Failed("bun install: lockfile out of date".into());
+        let row = |commit, observed, awaited| {
+            let row = Row::new("ticker", &market, commit, "b", false, observed, awaited);
+            (row.status, row.event, row.event_ns)
+        };
+        let says = |status: &str, event: Option<&str>, at: Option<i64>| {
+            (status.to_owned(), event.map(str::to_owned), at)
+        };
+        let why = Some("Build failed: bun install: lockfile out of date");
+        // Its previous run keeps serving, its failed build the warning.
+        assert_eq!(
+            row(Some("a"), Some(&running), Some(&failed)),
+            says("Running", why, None)
+        );
+        assert_eq!(
+            row(Some("a"), Some(&running), Some(&Build::Building)),
+            says("Running", Some("BackOff: restarting"), Some(9))
+        );
+        // Nothing ran it yet.
+        assert_eq!(
+            row(None, None, Some(&Build::Building)),
+            says("Building", None, None)
+        );
+        assert_eq!(
+            row(None, None, Some(&failed)),
+            says("Build failed", why, None)
         );
     }
 }

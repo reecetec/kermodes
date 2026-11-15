@@ -901,7 +901,7 @@ strategy/
     kermodes_app.py      resource declarations: tables, ingesters, deployments, jobs, features, models
     ...
   package.json        optional: a Bun workspace of apps/* and shared packages/*, one bun.lock
-  apps/market/        an app's TypeScript (km.app("market")), served at /apps/<project>/market/
+  apps/market/        an app's TypeScript (@km.app() def market), served at /apps/<project>/market/
   tests/              pytest: unit tests on km.local(), replay tests on pinned history
 ```
 
@@ -925,7 +925,7 @@ replay = [{ tables = ["sports.odds", "sports.games"], dates = "2026-10-01..2026-
 ttl = "3d"
 ```
 
-Resources are declared in Python (`km.table`, `km.ingester(...)`, `@km.deployment()`, `km.app`, `@km.job`,
+Resources are declared in Python (`km.table`, `km.ingester(...)`, `@km.deployment()`, `@km.app()`, `@km.job`,
 `@km.feature_view`, `km.model`). Discovery imports `entry` in the project's environment, fresh
 each time, and emits a **manifest**: the resolved specs as JSON (`kermodes manifest`). The
 manifest, not the Python source, is what `plan` and `apply` consume. Discovery refuses what the
@@ -1226,39 +1226,48 @@ namespaces).
   that the UI, the notebook grid, and apps built on Kermodes all draw from.
 - `@kermodes/client`: TypeScript package speaking the delta protocol over WebSocket and decoding Arrow
   IPC with `apache-arrow`, and the protocol's types. Used by the UI, the grid, and apps.
-- Apps built on Kermodes: Python computes and publishes tables; a TypeScript frontend of any
-  components shows them. A project declares each app beside its resources, `km.app("market")`,
-  its code the project's directory `path` (`apps/<name>` by default) with a `package.json` whose
-  `dev` and `build` scripts run Vite; one namespace holds both, as both are rows of the
-  Deployments tab. Kermodes gives Vite the app's address,
-  `/apps/<project>/<name>/`, as its base. `@kermodes/react` gives `KermodesProvider` (one
-  connection, the page's own server by default) and `useTable(name, { sort, filters, offset,
-  limit } | { last })`: the asked rows as plain objects, kept current, with the total, columns,
-  and a status (loading, live, static, reconnecting, failed). Only those rows travel; `last`
-  follows an append table's end by position, so the server holds nothing to sort. An app's
-  tests give `KermodesProvider` a `fakeKermodes({ table: rows })` connection: the rows reach
-  `useTable` through the same Arrow decoding, in the order given, and `set` ticks them. For a
-  table shown as a table, `@kermodes/react/table`'s `<Table name>` is the platform's own viewer
-  (§15.3) on the provider's connection, in the page's theme; with `follow` it starts at the end
-  and stays there as rows arrive, which needs no sort. It is its own entry, so an app that does
-  not show one does not carry the grid. Apps style themselves with `@kermodes/theme`'s Tailwind
-  preset. Every candidate publishes `@kermodes/client`, `grid`, `react`, and `theme` to npm under
-  the `dev` tag and every release under `latest` (§16.1, `web/pack.ts`), and an app pins the
-  version it was built against like any dependency; a project's `.npmrc` names any private
-  registry and the environment variable holding its token. Under `kermodes dev` the
-  UI's server passes `/apps/<project>/<name>/` (WebSockets too, for hot reload) to the app's dev
-  server, lists the apps at `/api/apps`, and links them from its top bar. In the cluster, the
-  controller builds each app at every deployable commit of its project in a Job (`builds.image`,
-  Bun): the commit's code, `bun install --frozen-lockfile` where the lockfile is, and Vite's
-  build under the app's address, uploaded as a tar to a presigned URL in the artifacts store, a
-  bucket of its own whose keys only the controller holds. The build's environment is the
-  `builds.secretName` Secret's: read-only registry tokens, since builds run project code.
-  Postgres records only how each build went. The newest finished build is served, through the
-  UI's server, by the controller, which keeps its files in memory; a failed build leaves the one
-  before it serving. Builds older than the one served are deleted. Each app is a row of the
-  Deployments tab: Building, Running, or Build failed with why, the commit it serves, and its
-  name a link to it; its logs are its newest build's.
-  `examples/ticker/apps/market` is one: a quote board, the newest ticks, and two figures.
+- Apps built on Kermodes: an app is a deployment with a UI. A project declares it as a function,
+  `@km.app()` over `def market(db)`, with a deployment's update policy, rollout, and resources;
+  its frontend is the project's directory `path` (`apps/<name>` by default) with a
+  `package.json` whose `dev` and `build` scripts run Vite. The app runs as its own process: the
+  function computes tables and returns those its frontend shows (`{"board": table}`, or
+  nothing), and the process serves its built frontend, those tables, and the platform's
+  (`kermodes-gateway`'s `serve_at`), all under the app's path, `/apps/<project>/<name>/`, which
+  is also Vite's base. So an app's views cost its own process, not the shared UI, and it has
+  what a deployment has: a row of the Deployments tab with its pods' usage, logs, events,
+  Restart and Stop, and a rollout at each commit. `@kermodes/react` gives `KermodesProvider`
+  (one connection, by default its page's own server: an app's under its path, any other page's
+  at `/ws`) and `useTable(name, { sort, filters, offset, limit } | { last })`: the asked rows as
+  plain objects, kept current, with the total, columns, and a status (loading, live, static,
+  reconnecting, failed). Only those rows travel; `last` follows an append table's end by
+  position, so the server holds nothing to sort. An app's tests give `KermodesProvider` a
+  `fakeKermodes({ table: rows })` connection: the rows reach `useTable` through the same Arrow
+  decoding, in the order given, and `set` ticks them. For a table shown as a table,
+  `@kermodes/react/table`'s `<Table name>` is the platform's own viewer (§15.3) on the
+  provider's connection, in the page's theme; with `follow` it starts at the end and stays there
+  as rows arrive, which needs no sort. It is its own entry, so an app that does not show one
+  does not carry the grid. Apps style themselves with `@kermodes/theme`'s Tailwind preset.
+  Every candidate publishes `@kermodes/client`, `grid`, `react`, and `theme` to npm under the
+  `dev` tag and every release under `latest` (§16.1, `web/pack.ts`), and an app pins the version
+  it was built against like any dependency; a project's `.npmrc` names any private registry and
+  the environment variable holding its token. Under `kermodes dev`, each app's process runs as
+  the project's other resources do, rolled on every change to its Python, and its pages come
+  from its own Vite dev server with hot reload; the UI's server passes the app's path to both
+  (its tables' WebSocket to the process, the rest to Vite), lists the apps at `/api/apps`, and
+  links them from its top bar. In the cluster, the controller builds each app's frontend at
+  every deployable commit of its project in a Job (`builds.image`, Bun): the commit's code, `bun
+  install --frozen-lockfile` where the lockfile is, and Vite's build under the app's path,
+  uploaded as a tar to a presigned URL in the artifacts store, a bucket of its own whose keys
+  only the controller holds. The build's environment is the `builds.secretName` Secret's:
+  read-only registry tokens, since builds run project code. Postgres records only how each
+  build went. An app rolls out to a commit once that commit's build is done; a failed build
+  leaves the run before it, and its row says why. Its pod fetches the build into the container
+  at start, from the controller's `/builds/<project>/<app>/<commit>` (a redirect to the store).
+  Kubernetes routes the app: a Service, and a Gateway API `HTTPRoute` for its path on the
+  Gateway and hostnames of the UI's route (`ui.httpRoute`), using only the API's Core features
+  (a path prefix to a Service, no rewrite), so any conformant implementation serves it. The UI's
+  server is not on an app's path. `examples/ticker` declares one, `market`: a board its function
+  computes from `md.ticks`, the newest ticks, and two figures.
 - Ticking and large tables: the table viewer (§15.3). Lists of things (deployments, the
   catalog) are plain tables with fixed column widths, so values changing or a panel opening
   never moves a column, and details open in a panel docked beside or below the list.

@@ -4,37 +4,19 @@
 
 use serde::Deserialize;
 
+/// Manifests from before apps were resources list them under `apps`, which is ignored: such a
+/// commit runs no app until a newer one declares them as resources.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct Manifest {
     pub project: String,
     pub resources: Vec<Resource>,
-    /// The project's apps (`apps/<name>/`), built per commit and served at
-    /// `/apps/<project>/<name>/`; manifests from before apps have none.
-    #[serde(default)]
-    pub apps: Vec<App>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub struct App {
-    pub name: String,
-    /// Its directory within the project; manifests from before apps were declared have none.
-    #[serde(default)]
-    pub path: Option<String>,
-}
-
-impl App {
-    /// Its directory within the project: as declared, else `apps/<name>`.
-    pub fn path(&self) -> String {
-        self.path
-            .clone()
-            .unwrap_or_else(|| format!("apps/{}", self.name))
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct Resource {
     pub name: String,
-    /// `deployment` or `ingester`, as the run reads it; the controller only reports it.
+    /// `deployment`, `ingester`, or `app`, as the run reads it; the controller reports it and
+    /// gives an app its frontend and its address.
     #[serde(default = "default_kind")]
     pub kind: String,
     pub update: Update,
@@ -48,6 +30,20 @@ pub struct Resource {
     /// Where the project declares it; manifests from before this have none.
     #[serde(default)]
     pub defined_at: Option<DefinedAt>,
+    /// An app's frontend: its directory within the project, built per commit.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+impl Resource {
+    /// The directory of an app's frontend within the project; none for any other kind.
+    pub fn app_path(&self) -> Option<&str> {
+        if self.kind == "app" {
+            self.path.as_deref()
+        } else {
+            None
+        }
+    }
 }
 
 /// A file within the project's directory, and a line in it.
@@ -104,6 +100,10 @@ impl Manifest {
                      (\"500m\"), memory bytes or a quantity (\"512Mi\", \"2Gi\")",
                     resource.name, resource.cpu, resource.memory
                 ));
+            }
+            // Without its directory there is nothing to build, and nothing for it to serve.
+            if resource.kind == "app" && resource.path.is_none() {
+                return Err(format!("the app `{}` names no path", resource.name));
             }
         }
         Ok(manifest)
@@ -180,5 +180,26 @@ mod tests {
                 line: 12,
             }))
         );
+    }
+
+    #[test]
+    fn an_app_is_a_resource_with_a_frontend_and_old_app_lists_are_ignored() {
+        let path =
+            |extra: &str| manifest(extra).map(|m| m.resources[0].app_path().map(str::to_owned));
+        assert_eq!(
+            path(r#", "kind": "app", "function": "ticker.app:market", "path": "apps/market""#),
+            Ok(Some("apps/market".into()))
+        );
+        // Only an app has a frontend, and an app always has one.
+        assert_eq!(
+            path(r#", "kind": "deployment", "path": "apps/market""#),
+            Ok(None)
+        );
+        assert!(path(r#", "kind": "app""#).is_err());
+        // A manifest stored before apps were resources still reads.
+        let old = Manifest::parse(
+            r#"{"project": "p", "resources": [], "apps": [{"name": "market", "path": "apps/m"}]}"#,
+        );
+        assert_eq!(old.map(|m| m.resources.len()), Ok(0));
     }
 }

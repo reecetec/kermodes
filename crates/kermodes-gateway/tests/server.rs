@@ -247,8 +247,85 @@ async fn the_app_is_served_from_its_directory_only() {
     std::fs::remove_dir_all(app).unwrap();
 }
 
-/// An app's dev server (`kermodes dev`) is reached through the gateway at the app's address:
-/// requests with their path and query, and its hot-reload WebSocket with its subprotocol.
+/// An app's own process (`serve_at`) serves its built frontend and its tables under the app's
+/// path, where the cluster's route sends its requests unchanged; nothing outside it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_apps_process_serves_its_page_and_tables_under_its_path() {
+    let app = std::env::temp_dir().join(format!("kermodes-gateway-own-{}", std::process::id()));
+    std::fs::create_dir_all(app.join("assets")).unwrap();
+    std::fs::write(app.join("index.html"), "<!doctype html>market").unwrap();
+    std::fs::write(app.join("assets/app.js"), "export {}").unwrap();
+    let session = Session::new();
+    let schema = Arc::new(Schema::new(vec![Field::new("sym", DataType::Utf8, true)]));
+    let spreads = session.keyed_input_table(&schema, &["sym"]).unwrap();
+    session.step();
+    let base = "/apps/ticker/market/";
+    let server = kermodes_gateway::serve_at(
+        session,
+        "127.0.0.1:0".parse().unwrap(),
+        base,
+        Some(app.clone()),
+        None,
+    )
+    .unwrap();
+    server.publish("spreads", &spreads);
+    let get = |path: &str| {
+        let addr = server.addr();
+        let path = path.to_owned();
+        async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let request = format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            response
+        }
+    };
+    let page = get(base).await;
+    assert!(
+        page.starts_with("HTTP/1.1 200") && page.ends_with("market"),
+        "{page}"
+    );
+    let script = get("/apps/ticker/market/assets/app.js").await;
+    assert!(script.contains("text/javascript"), "{script}");
+    // A page of the app's own router is answered by its index; a missing file is not.
+    assert!(
+        get("/apps/ticker/market/quotes/AAPL")
+            .await
+            .ends_with("market")
+    );
+    assert!(
+        get("/apps/ticker/market/assets/gone.js")
+            .await
+            .starts_with("HTTP/1.1 404")
+    );
+    let bare = get("/apps/ticker/market").await;
+    assert!(
+        bare.starts_with("HTTP/1.1 308") && bare.contains("location: /apps/ticker/market/"),
+        "{bare}"
+    );
+    for outside in [
+        "/",
+        "/ws",
+        "/assets/app.js",
+        "/api/components",
+        "/apps/ticker/other/",
+    ] {
+        assert!(get(outside).await.starts_with("HTTP/1.1 404"), "{outside}");
+    }
+
+    let url = format!("ws://{}{base}ws", server.addr());
+    let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let tables = text(&mut socket).await;
+    assert_eq!(tables["type"], "tables");
+    assert_eq!(tables["tables"][0]["name"], "spreads");
+    std::fs::remove_dir_all(app).unwrap();
+}
+
+/// An app `kermodes dev` runs is reached through the gateway at the app's address: its tables'
+/// WebSocket goes to its own process; pages with their path and query, and the hot-reload
+/// WebSocket with its subprotocol, go to its dev server.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_apps_dev_server_is_reached_through_the_gateway() {
     use axum::extract::ws::{Message as Ws, WebSocketUpgrade};
@@ -271,6 +348,16 @@ async fn an_apps_dev_server_is_reached_through_the_gateway() {
         .route("/apps/ticker/market/hmr", axum::routing::get(hmr))
         .fallback(|uri: axum::http::Uri| async move { format!("dev server: {uri}") });
     tokio::spawn(async move { axum::serve(dev, router).await.unwrap() });
+    // Stands in for the app's own process: answers on its tables' WebSocket.
+    let process = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let process_url = format!("http://{}", process.local_addr().unwrap());
+    let tables = |ws: WebSocketUpgrade| async move {
+        ws.on_upgrade(|mut socket| async move {
+            let _ = socket.send(Ws::text("the app's tables")).await;
+        })
+    };
+    let router = axum::Router::new().route("/apps/ticker/market/ws", axum::routing::get(tables));
+    tokio::spawn(async move { axum::serve(process, router).await.unwrap() });
 
     let server = kermodes_gateway::serve(
         Session::new(),
@@ -300,7 +387,7 @@ async fn an_apps_dev_server_is_reached_through_the_gateway() {
             .starts_with("HTTP/1.1 404")
     );
 
-    server.serve_app("ticker", "market", &dev_url);
+    server.serve_app("ticker", "market", &dev_url, &process_url);
     let listed = get("/api/apps").await;
     assert!(
         listed.ends_with(r#"[{"name":"market","project":"ticker"}]"#),
@@ -341,6 +428,14 @@ async fn an_apps_dev_server_is_reached_through_the_gateway() {
         .unwrap()
         .unwrap();
     assert_eq!(echoed, Message::text("echo update"));
+    let url = format!("ws://{}/apps/ticker/market/ws", server.addr());
+    let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(10), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(first, Message::text("the app's tables"));
 
     assert!(server.stop_app("ticker", "market"));
     assert!(
