@@ -1244,13 +1244,17 @@ namespaces).
   each resource's file and line (`defined_at` in the manifest) and the controller builds the
   link (`/api/projects`). Commits from before `defined_at` link to the project's directory.
 - The platform's own parts lead the table as the project `system`: weir, Postgres, the
-  controller, the web UI, and the lake's history (its size from `/api/catalog`). Their rows sum
+  controller, the web UI, and the lake. Their rows sum
   their pods (a Postgres row shows its primary's disks) and open each pod in the panel. The Helm
   release runs them, so their actions are disabled. The controller reads them
   (`/api/components`) rather than a `sys.*` table, so the page can say weir is down while it is.
   A part's status says, most pressing first, why a pod cannot run (CrashLoopBackOff, an image
-  pull), then whether its Deployment or StatefulSet is rolling out, so an upgrade reads as
-  Rolling out rather than Degraded, then how many of its pods are ready.
+  pull), then whether its Deployment or StatefulSet is rolling out, or its pods run two versions,
+  so an upgrade reads as Rolling out rather than Degraded, then how many of its pods are ready.
+  The lake has no pods: the controller lists one object of its store (at most every 30 s, within
+  2 s) and reads its merge Jobs, so it reads Unreachable, Merge failed, Merge overdue (due an
+  hour with no Job), Merging, or Healthy, with why; its size and newest merged date come from
+  `/api/catalog`.
   Each pod's disks come from the component itself, not the node (no kubelet access): weir's
   volume from its `stats` action; each Postgres instance's databases and WAL from its CNPG
   metrics, its data volume's size from its claim. One that cannot be read in two seconds shows

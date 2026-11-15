@@ -657,16 +657,21 @@ impl Kube {
                 let labels = job.metadata.labels?;
                 let table = labels.get("kermodes.io/table")?.clone();
                 let date = kermodes_weir::Date::parse(labels.get("kermodes.io/date")?).ok()?;
-                let finished = job
+                let conditions = job
                     .status
                     .and_then(|status| status.conditions)
-                    .unwrap_or_default()
-                    .iter()
-                    .any(|c| (c.type_ == "Complete" || c.type_ == "Failed") && c.status == "True");
+                    .unwrap_or_default();
+                let ended = |kind: &str| {
+                    conditions
+                        .iter()
+                        .any(|c| c.type_ == kind && c.status == "True")
+                };
+                let failed = ended("Failed");
                 Some(MergeJob {
                     table,
                     date,
-                    active: !finished,
+                    active: !failed && !ended("Complete"),
+                    failed,
                 })
             })
             .collect())

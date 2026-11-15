@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::record_batch::RecordBatch;
 
@@ -21,6 +21,7 @@ use crate::manifest::{Manifest, Update};
 use crate::plan::{self, Decision, Target};
 use crate::report;
 use crate::state::{Commit, State};
+use crate::system;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -85,6 +86,89 @@ pub struct Controller {
     /// Per project, the mainline head last seen leaving the project's directory as it was, so
     /// it is not fetched again at every poll.
     unchanged: Mutex<HashMap<String, String>>,
+    /// The lake's last probe and when it ran, so a page polling the components reaches the
+    /// store at most every `LAKE_PROBE_EVERY`.
+    lake_probe: Mutex<Option<(Instant, Result<(), String>)>>,
+}
+
+/// How long a probe of the lake's store stands, and how long one may take.
+const LAKE_PROBE_EVERY: Duration = Duration::from_secs(30);
+const LAKE_PROBE_DEADLINE: Duration = Duration::from_secs(2);
+/// How long a merge may be due without a Job before the lake reads Merge overdue.
+const MERGE_OVERDUE_NS: i64 = 3_600_000_000_000;
+
+impl Controller {
+    /// The lake as a component of the platform, when history is configured: its store probed,
+    /// its merges (`system::lake_status`).
+    pub async fn lake(&self) -> Option<system::Component> {
+        let history = self.config.history.as_ref()?;
+        let probe = self.probe_lake(&history.url).await;
+        let jobs = self.kube.merge_jobs().await.unwrap_or_default();
+        // Without weir's dates, nothing can be overdue: weir down shows on its own row.
+        let held = past_dates(self.config.weir.clone())
+            .await
+            .unwrap_or_default();
+        let overdue = plan::merges_due(now_ns() - MERGE_OVERDUE_NS, &held, &jobs);
+        let (status, warning) = system::lake_status(&probe, &jobs, &overdue);
+        Some(system::Component {
+            name: "lake".into(),
+            status,
+            instances: Vec::new(),
+            warning,
+            warning_ns: None,
+        })
+    }
+
+    async fn probe_lake(&self, url: &str) -> Result<(), String> {
+        let mut last = self.lake_probe.lock().await;
+        if let Some((at, result)) = last.as_ref()
+            && at.elapsed() < LAKE_PROBE_EVERY
+        {
+            return result.clone();
+        }
+        let url = url.to_owned();
+        // The lake runs on a runtime of its own, opened and dropped on a blocking thread.
+        let probe = tokio::task::spawn_blocking(move || {
+            kermodes_lake::Lake::open(&url)
+                .and_then(|lake| lake.probe())
+                .map_err(|e| e.to_string())
+        });
+        let result = match tokio::time::timeout(LAKE_PROBE_DEADLINE, probe).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err(format!(
+                "the store did not answer within {} s",
+                LAKE_PROBE_DEADLINE.as_secs()
+            )),
+        };
+        *last = Some((Instant::now(), result.clone()));
+        result
+    }
+}
+
+fn now_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as i64)
+}
+
+/// Each table's past dates weir still holds, over Flight.
+async fn past_dates(weir: String) -> Result<Vec<(String, Vec<kermodes_weir::Date>)>, String> {
+    // The Flight client blocks on a runtime of its own.
+    tokio::task::spawn_blocking(move || {
+        let client = kermodes_flight::Client::connect(&weir).map_err(|e| e.to_string())?;
+        client
+            .tables()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|(name, _)| {
+                let dates = client.past_dates(&name).map_err(|e| e.to_string())?;
+                Ok((name.to_string(), dates))
+            })
+            .collect::<Result<Vec<_>, String>>()
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Runs the controller on a runtime of its own until SIGTERM or SIGINT, blocking the caller.
@@ -106,6 +190,7 @@ pub async fn run(config: Config) -> Result<(), String> {
         kube: Kube::connect(&config.namespace).await?,
         config,
         unchanged: Mutex::new(HashMap::new()),
+        lake_probe: Mutex::new(None),
     });
     let listener = tokio::net::TcpListener::bind(&controller.config.listen)
         .await
@@ -163,26 +248,9 @@ async fn merge_forever(controller: &Controller) {
 }
 
 async fn merge_once(controller: &Controller, history: &plan::History) -> Result<(), String> {
-    let weir = controller.config.weir.clone();
-    // The Flight client blocks on a runtime of its own.
-    let held = tokio::task::spawn_blocking(move || {
-        let client = kermodes_flight::Client::connect(&weir).map_err(|e| e.to_string())?;
-        client
-            .tables()
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .map(|(name, _)| {
-                let dates = client.past_dates(&name).map_err(|e| e.to_string())?;
-                Ok((name.to_string(), dates))
-            })
-            .collect::<Result<Vec<_>, String>>()
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+    let held = past_dates(controller.config.weir.clone()).await?;
     let jobs = controller.kube.merge_jobs().await?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as i64);
+    let now = now_ns();
     for (table, date) in plan::merges_due(now, &held, &jobs) {
         let config = &controller.config;
         let job = plan::merge_job(

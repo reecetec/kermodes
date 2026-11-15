@@ -91,8 +91,8 @@ function tabsOf(row: Row, source: string | null): { name: string; content: React
         { name: 'settings', content: <ComponentSettings c={c} /> },
       ];
     }
-    case 'history':
-      return [{ name: 'summary', content: <HistorySummary row={row} /> }];
+    case 'lake':
+      return [{ name: 'summary', content: <LakeSummary row={row} /> }];
   }
 }
 
@@ -263,9 +263,9 @@ function ComponentSettings({ c }: { c: Component }) {
   );
 }
 
-function HistorySummary({ row }: { row: Row }) {
-  if (row.source.type !== 'history') return null;
-  const tables = row.source.catalog.tables;
+function LakeSummary({ row }: { row: Row }) {
+  if (row.source.type !== 'lake') return null;
+  const tables = row.source.catalog?.tables ?? [];
   const all = totals(tables, utcDate(new Date()));
   const largest = tables
     .map(t => ({ table: t.table, bytes: t.history.reduce((s, d) => s + d.bytes, 0) }))
@@ -274,6 +274,9 @@ function HistorySummary({ row }: { row: Row }) {
     .slice(0, 8);
   return (
     <div className="px-3 py-1">
+      <Field label="Status">{row.status}</Field>
+      {row.warning != null && <Field label="Why">{row.warning}</Field>}
+      <Field label="Merged">{row.revision ?? 'nothing yet'}</Field>
       <Field label="Size">{bytes(all.historyBytes)}</Field>
       <Field label="Rows">{all.historyRows.toLocaleString()}</Field>
       <Field label="Tables">{tables.filter(t => t.history.length > 0).length}</Field>
@@ -285,7 +288,8 @@ function HistorySummary({ row }: { row: Row }) {
         </div>
       ))}
       <p className="py-2 text-xs text-muted-foreground">
-        Merged from weir each night by the controller; the Catalog tab has every date.
+        Each past date is merged from weir into the lake every night; the controller checks the
+        store answers every 30 seconds. The Catalog tab has every date.
       </p>
     </div>
   );

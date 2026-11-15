@@ -6,7 +6,7 @@ import {
   choices,
   componentRow,
   counts,
-  historyRow,
+  lakeRow,
   matches,
   tableRows,
   toneOf,
@@ -98,7 +98,7 @@ describe('tableRows', () => {
     );
     expect(rows.map(r => r.key)).toEqual([
       'system/postgres',
-      'system/history',
+      'system/lake',
       'alpha/a',
       'alpha/z',
       'zeta/b',
@@ -123,9 +123,31 @@ describe('componentRow', () => {
   });
 });
 
-describe('historyRow', () => {
-  it("is what every table's merged dates take", () => {
-    expect(historyRow(catalog).disks).toEqual([{ name: 'lake', used: 75, size: null }]);
+describe('lakeRow', () => {
+  it("is what every table's merged dates take, through the newest, as the controller finds it", () => {
+    const check = {
+      name: 'lake',
+      status: 'Merge failed',
+      instances: [],
+      warning: 'merging md.ticks 2026-11-14 failed; it is tried again tomorrow',
+      warning_ns: null,
+    };
+    const row = lakeRow(catalog, check);
+    expect(row.disks).toEqual([{ name: 'lake', used: 75, size: null }]);
+    expect([row.status, row.warning, toneOf(row.status)]).toEqual([
+      'Merge failed',
+      check.warning,
+      'bad',
+    ]);
+    expect(row.revision).toMatch(/^through \d{4}-\d{2}-\d{2}$/);
+    // Without history configured the controller does not check the lake
+    expect(toneOf(lakeRow(catalog, null).status)).toBe('idle');
+  });
+
+  it('takes the lake out of the components it arrives with', () => {
+    const check = { name: 'lake', status: 'Healthy', instances: [], warning: null, warning_ns: null };
+    const keys = tableRows([], [postgres, check], catalog).map(r => r.key);
+    expect(keys).toEqual(['system/postgres', 'system/lake']);
   });
 });
 
@@ -160,9 +182,9 @@ describe('matches', () => {
   });
 
   it('filters by each field, hides stopped rows, and searches every column', () => {
-    expect(keys({ project: 'system' })).toEqual(['system/postgres', 'system/history']);
+    expect(keys({ project: 'system' })).toEqual(['system/postgres', 'system/lake']);
     expect(keys({ hideStopped: true })).not.toContain('ticker/old');
-    expect(keys({ kind: 'lake' })).toEqual(['system/history']);
+    expect(keys({ kind: 'object store' })).toEqual(['system/lake']);
     expect(keys({ query: 'ticker stopped' })).toEqual(['ticker/old']);
     expect(keys({ node: '2 nodes', project: 'ticker' })).toEqual([]);
   });

@@ -31,8 +31,8 @@ const COLUMNS: { label: string; width: string; numeric?: boolean }[] = [
   { label: 'Kind', width: 'w-[8rem]' },
   { label: 'Rows today', width: 'w-[8rem]', numeric: true },
   { label: 'In weir', width: 'w-[7rem]', numeric: true },
-  { label: 'History rows', width: 'w-[9rem]', numeric: true },
-  { label: 'History size', width: 'w-[7.5rem]', numeric: true },
+  { label: 'Lake rows', width: 'w-[9rem]', numeric: true },
+  { label: 'In lake', width: 'w-[7.5rem]', numeric: true },
   { label: 'Dates', width: 'w-[13rem]' },
   { label: 'Columns', width: 'w-[6rem]', numeric: true },
 ];
@@ -114,8 +114,8 @@ function TableDetail({
                 <th className="py-1 pr-3 font-medium">Date</th>
                 <th className="py-1 pr-3 text-right font-medium">weir rows</th>
                 <th className="py-1 pr-3 text-right font-medium">weir</th>
-                <th className="py-1 pr-3 text-right font-medium">history rows</th>
-                <th className="py-1 text-right font-medium">history</th>
+                <th className="py-1 pr-3 text-right font-medium">lake rows</th>
+                <th className="py-1 text-right font-medium">lake</th>
               </tr>
             </thead>
             <tbody>
@@ -230,7 +230,7 @@ export function CatalogPage({ onOpen }: { onOpen: (table: string) => void }) {
               ? `${plural(tables.length, 'table')} in ${plural(spaces, 'namespace')}`
               : `${shown.length} of ${tables.length} tables`}
             {' · '}
-            {count(all.today)} rows today · history {size(all.historyBytes)}
+            {count(all.today)} rows today · lake {size(all.historyBytes)}
           </span>
           {volume && (
             <span title={`${bytes(volume.free)} free`}>

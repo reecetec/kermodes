@@ -158,6 +158,17 @@ impl Lake {
         Ok(Self { store, runtime })
     }
 
+    /// Whether the store answers: lists its first object, if it has one. A missing bucket, a
+    /// refused credential, or an endpoint that does not answer is an error.
+    pub fn probe(&self) -> Result<(), Error> {
+        self.runtime.block_on(async {
+            match self.store.list(None).next().await {
+                Some(Err(e)) => Err(Error::Io(format!("history store: {e}"))),
+                _ => Ok(()),
+            }
+        })
+    }
+
     /// Writes `dates`, in order, as files under `location` (a table's), each date's rows from
     /// `rows`, which hands them to the function it is given. A date with no rows is in no file.
     /// One file holds the dates until it reaches `target`; it then ends with the row group, so a

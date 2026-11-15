@@ -6,7 +6,9 @@ export type Tone = 'ok' | 'busy' | 'bad' | 'idle';
 
 const TONES: Record<string, Tone> = {
   Running: 'ok',
-  Stored: 'ok',
+  Healthy: 'ok',
+  Merging: 'busy',
+  Unchecked: 'idle',
   'Rolling out': 'busy',
   Starting: 'busy',
   Degraded: 'busy',
@@ -43,7 +45,7 @@ export type Row = {
   source:
     | { type: 'deployment'; deployment: Deployment }
     | { type: 'component'; component: Component }
-    | { type: 'history'; catalog: Catalog };
+    | { type: 'lake'; catalog: Catalog | null; component: Component | null };
 };
 
 const PARTS: Record<string, { name: string; kind: string }> = {
@@ -107,29 +109,34 @@ export function componentRow(c: Component): Row {
   };
 }
 
-/** The lake's history as a row: what every table's merged dates take, with no pods of its own */
-export function historyRow(catalog: Catalog): Row {
-  const used = catalog.tables.reduce(
-    (sum, t) => sum + t.history.reduce((s, d) => s + d.bytes, 0),
-    0
-  );
+/**
+ * The lake as a row, with no pods of its own: how the controller finds it (its store probed,
+ * its merges), what every table's merged dates take, and the newest date merged.
+ */
+export function lakeRow(catalog: Catalog | null, component: Component | null): Row {
+  const tables = catalog?.tables ?? [];
+  const used = tables.reduce((sum, t) => sum + t.history.reduce((s, d) => s + d.bytes, 0), 0);
+  const newest = tables
+    .flatMap(t => t.history.map(d => d.date))
+    .reduce<string | null>((max, date) => (max == null || date > max ? date : max), null);
   return {
-    key: `${SYSTEM}/history`,
-    name: 'history',
+    key: `${SYSTEM}/lake`,
+    name: 'lake',
     project: SYSTEM,
-    kind: 'lake',
-    status: 'Stored',
-    revision: null,
+    kind: 'object store',
+    // Without history configured the controller does not check it
+    status: component?.status ?? 'Unchecked',
+    revision: newest == null ? null : `through ${newest}`,
     cpu: null,
     cpuLimit: null,
     memory: null,
     memoryLimit: null,
-    disks: [{ name: 'lake', used, size: null }],
+    disks: catalog == null ? [] : [{ name: 'lake', used, size: null }],
     restarts: 0,
     started: null,
     node: null,
-    warning: null,
-    source: { type: 'history', catalog },
+    warning: component?.warning ?? null,
+    source: { type: 'lake', catalog, component },
   };
 }
 
@@ -139,9 +146,10 @@ export function tableRows(
   components: readonly Component[] | null,
   catalog: Catalog | null
 ): Row[] {
+  const lake = components?.find(c => c.name === 'lake') ?? null;
   const system = [
-    ...(components ?? []).map(componentRow),
-    ...(catalog == null ? [] : [historyRow(catalog)]),
+    ...(components ?? []).filter(c => c !== lake).map(componentRow),
+    ...(catalog == null && lake == null ? [] : [lakeRow(catalog, lake)]),
   ];
   const others = deployments
     .map(deploymentRow)

@@ -31,12 +31,14 @@ pub struct History {
     pub secret: String,
 }
 
-/// A merge Job that exists: the table and date it merges, and whether it is still running.
+/// A merge Job that exists: the table and date it merges, whether it is still running, and
+/// whether it ended in failure.
 #[derive(Clone, Debug)]
 pub struct MergeJob {
     pub table: String,
     pub date: Date,
     pub active: bool,
+    pub failed: bool,
 }
 
 /// How long after a date's midnight (UTC) its merge waits: a write timestamped just before
@@ -661,6 +663,7 @@ mod tests {
             table: table.into(),
             date: day(date),
             active,
+            failed: false,
         };
         type Case<'a> = (
             &'a str,

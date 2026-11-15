@@ -1518,6 +1518,7 @@ dependencies = [
  "base64 0.22.1",
  "k8s-openapi",
  "kermodes-flight",
+ "kermodes-lake",
  "kermodes-weir",
  "kube",
  "ring",

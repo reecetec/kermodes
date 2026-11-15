@@ -90,10 +90,14 @@ async fn logs(
     }
 }
 
-/// The platform's own components: weir, Postgres, the controller, and the web UI.
+/// The platform's own components: weir, Postgres, the controller, the web UI, and, with history
+/// configured, the lake.
 async fn components(State(controller): State<Arc<Controller>>) -> Response {
     match controller.kube.components(&controller.config.weir).await {
-        Ok(components) => axum::Json(components).into_response(),
+        Ok(mut components) => {
+            components.extend(controller.lake().await);
+            axum::Json(components).into_response()
+        }
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
     }
 }

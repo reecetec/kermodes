@@ -4,7 +4,10 @@
 
 use serde::Serialize;
 
+use kermodes_weir::Date;
+
 use crate::k8s::Rollout;
+use crate::plan::MergeJob;
 
 /// The components' `app.kubernetes.io/component` labels, in the order they are shown.
 pub const COMPONENTS: [&str; 4] = ["weir", "database", "control", "ui"];
@@ -117,9 +120,16 @@ pub fn status(instances: &[Instance], rollout: Option<Rollout>) -> String {
     {
         return reason.into();
     }
+    // Pods of two versions mean old ones are still going, even once the workload says it has
+    // rolled out: until they are gone the component is still changing, not degraded.
+    let mut versions = instances.iter().filter_map(|i| i.version.as_deref());
+    let mixed = versions
+        .next()
+        .is_some_and(|first| versions.any(|v| v != first));
     match rollout {
         Some(Rollout::Failed) => return "Rollout failed".into(),
         Some(Rollout::Rolling) => return "Rolling out".into(),
+        _ if mixed => return "Rolling out".into(),
         _ => {}
     }
     let ready = instances.iter().filter(|i| i.ready).count();
@@ -133,6 +143,41 @@ pub fn status(instances: &[Instance], rollout: Option<Rollout>) -> String {
             .find_map(|i| i.waiting.clone())
             .unwrap_or_else(|| "Starting".into())
     }
+}
+
+/// The lake as the Deployments tab shows it, from what the controller can see of it: whether
+/// its store answered (`probe`), the merge Jobs that exist (a finished one lasts a day), and the
+/// merges that have been due for an hour with no Job (`overdue`). Most pressing first; the
+/// second value says which table and date, or why.
+pub fn lake_status(
+    probe: &Result<(), String>,
+    jobs: &[MergeJob],
+    overdue: &[(String, Date)],
+) -> (String, Option<String>) {
+    if let Err(why) = probe {
+        return ("Unreachable".into(), Some(why.clone()));
+    }
+    if let Some(job) = jobs.iter().find(|j| j.failed) {
+        return (
+            "Merge failed".into(),
+            Some(format!(
+                "merging {} {} failed; it is tried again tomorrow",
+                job.table, job.date
+            )),
+        );
+    }
+    if let Some((table, date)) = overdue.first() {
+        return (
+            "Merge overdue".into(),
+            Some(format!(
+                "{table} {date} has waited over an hour for its merge"
+            )),
+        );
+    }
+    if jobs.iter().any(|j| j.active) {
+        return ("Merging".into(), None);
+    }
+    ("Healthy".into(), None)
 }
 
 /// An image reference's tag (`registry/name:0.4.131` → `0.4.131`), without a digest; `None`
@@ -153,8 +198,55 @@ pub fn recovered(reason: &str, at_ns: i64, ready_since_ns: Option<i64>) -> bool 
 
 #[cfg(test)]
 mod tests {
-    use super::{Disk, Instance, image_tag, postgres_disks, recovered, status, weir_disk};
+    use super::{
+        Disk, Instance, image_tag, lake_status, postgres_disks, recovered, status, weir_disk,
+    };
     use crate::k8s::Rollout;
+    use crate::plan::MergeJob;
+    use kermodes_weir::Date;
+
+    #[test]
+    fn the_lake_says_what_is_wrong_most_pressing_first() {
+        let day = Date::parse("2026-11-14").unwrap();
+        let job = |active: bool, failed: bool| MergeJob {
+            table: "md.ticks".into(),
+            date: day,
+            active,
+            failed,
+        };
+        let overdue = vec![("md.ticks".to_owned(), day)];
+        let down: Result<(), String> = Err("connection refused".into());
+        type Case<'a> = (
+            &'a Result<(), String>,
+            Vec<MergeJob>,
+            &'a [(String, Date)],
+            &'a str,
+        );
+        let cases: Vec<Case> = vec![
+            (&Ok(()), vec![], &[], "Healthy"),
+            (&Ok(()), vec![job(false, false)], &[], "Healthy"),
+            (&Ok(()), vec![job(true, false)], &[], "Merging"),
+            (&Ok(()), vec![job(true, false)], &overdue, "Merge overdue"),
+            (
+                &Ok(()),
+                vec![job(true, false), job(false, true)],
+                &overdue,
+                "Merge failed",
+            ),
+            (&down, vec![job(false, true)], &overdue, "Unreachable"),
+        ];
+        for (probe, jobs, overdue, expected) in cases {
+            assert_eq!(
+                lake_status(probe, &jobs, overdue).0,
+                expected,
+                "{jobs:?} {overdue:?}"
+            );
+        }
+        assert_eq!(
+            lake_status(&down, &[], &[]).1.as_deref(),
+            Some("connection refused")
+        );
+    }
 
     #[test]
     fn a_component_says_what_is_wrong_then_whether_it_is_rolling_out_then_how_ready() {
@@ -166,6 +258,11 @@ mod tests {
         let (up, down) = (instance(true, None), instance(false, None));
         let creating = instance(false, Some("ContainerCreating"));
         let crashing = instance(false, Some("CrashLoopBackOff"));
+        let at = |version: &str, ready: bool| Instance {
+            version: Some(version.into()),
+            ready,
+            ..Instance::default()
+        };
         let cases: Vec<(Vec<Instance>, Option<Rollout>, &str)> = vec![
             (vec![up.clone(), up.clone()], None, "Running"),
             (
@@ -200,6 +297,17 @@ mod tests {
             (vec![down.clone(), crashing], None, "CrashLoopBackOff"),
             (vec![creating], None, "ContainerCreating"),
             (vec![down], None, "Starting"),
+            // The Deployment is done but the old pod has not gone yet
+            (
+                vec![at("0.4.144", true), at("0.4.145", true)],
+                Some(Rollout::Ready),
+                "Rolling out",
+            ),
+            (
+                vec![at("0.4.145", true), at("0.4.145", false)],
+                Some(Rollout::Ready),
+                "Degraded",
+            ),
         ];
         for (instances, rollout, expected) in &cases {
             assert_eq!(

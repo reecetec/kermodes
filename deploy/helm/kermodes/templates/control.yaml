@@ -218,6 +218,20 @@ spec:
                   name: {{ . }}
                   key: secret
             {{- end }}
+            {{- if .Values.history.url }}
+            # The Deployments tab's lake row probes the history store as a merge Job reaches it.
+            - name: AWS_ENDPOINT
+              value: {{ .Values.history.endpoint | quote }}
+            - name: AWS_ALLOW_HTTP
+              value: {{ hasPrefix "http://" .Values.history.endpoint | quote }}
+            - name: AWS_REGION
+              value: us-east-1
+            {{- end }}
+          {{- if and .Values.history.url .Values.history.secretName }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.history.secretName }}
+          {{- end }}
           ports:
             - name: http
               containerPort: 8732
