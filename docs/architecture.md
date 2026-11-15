@@ -1217,9 +1217,11 @@ namespaces).
   rows. A view of an append table reads its window from the store by position and holds
   nothing else (§15.3); a table is opened live only while a view sorts or filters it, or for a
   keyed table, and let go a minute after the last such view closes. The server's memory
-  follows what is being sorted or filtered, not what is stored. A tab
-  not on screen pauses its view: the server sends it nothing until it is shown again, with its
-  sort and filters kept.
+  follows what is being sorted or filtered, not what is stored. Tables open as panels
+  (dockview): dragged into another's tabs, or beside, above, or below it, or dragged in from
+  the sidebar to where they are dropped; the layout is kept per browser. A panel not on screen
+  pauses its view: the server sends it nothing until it is shown again, with its sort and
+  filters kept.
   `kermodes ui` waits for weir to start, then serves throughout: while weir is away (a restart,
   an upgrade) pages keep loading, and a view of a stored table ends with an error the app
   retries, backing off, until weir is back and the table opens afresh. A `kermodes run` started

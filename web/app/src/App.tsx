@@ -1,18 +1,16 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { LoaderCircle, Moon, Search, Sun, Table2, TableProperties, X } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { LoaderCircle, Moon, Search, Sun, Table2 } from 'lucide-react';
 import {
   type ConnectionStatus,
-  type SocketView,
   type TableInfo,
   type KermodesConnection,
 } from '@kermodes/client';
-import { TableViewer, gridThemeOf } from '@kermodes/grid';
+import { gridThemeOf } from '@kermodes/grid';
 import { CatalogPage } from '@/Catalog';
 import { DEPLOYMENTS_VIEW, DeploymentsPage } from '@/Deployments';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import {
   Tooltip,
   TooltipContent,
@@ -21,12 +19,12 @@ import {
 } from '@/components/ui/tooltip';
 import { Logo } from '@/components/Logo';
 import { cn } from '@/lib/utils';
+import { TABLE_MIME, TablesWorkspace, type WorkspaceHandle } from '@/tables/Workspace';
 
 const THEME_KEY = 'kermodes-theme';
 
 type ThemeName = 'dark' | 'light';
 
-type Tab = { key: string; view: SocketView };
 type Page = 'deployments' | 'catalog' | 'tables';
 
 const PAGE_LABEL: Record<Page, string> = {
@@ -238,6 +236,12 @@ function Sidebar({
               <button
                 type="button"
                 onClick={() => onOpen(table.name)}
+                // Dragged onto the workspace, a table opens where it is dropped
+                draggable
+                onDragStart={event => {
+                  event.dataTransfer.setData(TABLE_MIME, table.name);
+                  event.dataTransfer.effectAllowed = 'copy';
+                }}
                 aria-current={activeTable === table.name ? 'true' : undefined}
                 className={cn(
                   'group flex w-full items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left transition-colors hover:bg-accent',
@@ -277,27 +281,11 @@ function Sidebar({
   );
 }
 
-function EmptyState() {
-  return (
-    <div className="flex flex-1 flex-col items-center justify-center gap-3 text-center">
-      <div className="flex size-12 items-center justify-center rounded-xl border bg-card">
-        <TableProperties className="size-6 text-muted-foreground" />
-      </div>
-      <div>
-        <p className="font-medium">No table open</p>
-        <p className="text-sm text-muted-foreground">
-          Pick a published table on the left to view it live.
-        </p>
-      </div>
-    </div>
-  );
-}
-
 export default function App({ connection }: { connection: KermodesConnection }) {
   useConnection(connection);
   const [themeName, toggleTheme] = useThemeName();
-  const [tabs, setTabs] = useState<Tab[]>([]);
-  const [active, setActive] = useState<string | null>(null);
+  const [activeTable, setActiveTable] = useState<string | null>(null);
+  const workspace = useRef<WorkspaceHandle>(null);
   // The canvas draws with the tokens in effect on <html>; recomputed when the theme flips
   const theme = useMemo(() => gridThemeOf(document.documentElement), [themeName]);
   // Deployments is the main tab wherever a controller reports them, until someone picks a tab.
@@ -307,53 +295,7 @@ export default function App({ connection }: { connection: KermodesConnection }) 
   const [picked, setPicked] = useState<Page | null>(null);
   const page: Page = picked ?? (hasDeployments ? 'deployments' : 'tables');
 
-  const openTable = useCallback(
-    (table: string) => {
-      const existing = tabs.find(tab => tab.view.table === table);
-      if (existing != null) {
-        setActive(existing.key);
-        return;
-      }
-      const view = connection.open(table);
-      const key = `${view.id}`;
-      setTabs(current => [...current, { key, view }]);
-      setActive(key);
-    },
-    [connection, tabs]
-  );
-
-  const closeTab = useCallback(
-    (key: string) => {
-      const index = tabs.findIndex(tab => tab.key === key);
-      if (index < 0) {
-        return;
-      }
-      tabs[index].view.close();
-      const remaining = tabs.filter(tab => tab.key !== key);
-      setTabs(remaining);
-      if (active === key) {
-        setActive(remaining[Math.min(index, remaining.length - 1)]?.key ?? null);
-      }
-    },
-    [tabs, active]
-  );
-
-  const activeTable = useMemo(
-    () => tabs.find(tab => tab.key === active)?.view.table ?? null,
-    [tabs, active]
-  );
-
-  // Only the table on screen gets windows: hidden tabs, and every tab while another page is
-  // open, pause their views, keeping their sort and filters.
-  useEffect(() => {
-    for (const tab of tabs) {
-      if (page === 'tables' && tab.key === active) {
-        tab.view.resume();
-      } else {
-        tab.view.pause();
-      }
-    }
-  }, [tabs, active, page]);
+  const openTable = useCallback((table: string) => workspace.current?.open(table), []);
 
   return (
     <TooltipProvider>
@@ -376,7 +318,7 @@ export default function App({ connection }: { connection: KermodesConnection }) 
             }}
           />
         )}
-        {/* Hidden rather than unmounted, so open tables keep their views. */}
+        {/* Hidden rather than unmounted, so open tables keep their views and layout. */}
         <div className={cn('flex min-h-0 flex-1', page !== 'tables' && 'hidden')}>
           <Sidebar
             tables={connection.tables}
@@ -385,49 +327,13 @@ export default function App({ connection }: { connection: KermodesConnection }) 
             onOpen={openTable}
           />
           <main className="flex min-w-0 flex-1 flex-col">
-            {tabs.length === 0 || active == null ? (
-              <EmptyState />
-            ) : (
-              <Tabs
-                value={active}
-                onValueChange={setActive}
-                className="min-h-0 flex-1 gap-0"
-              >
-                <TabsList className="h-11 w-full justify-start gap-1 overflow-x-auto border-b bg-sidebar px-2 pt-2">
-                  {tabs.map(tab => (
-                    <div key={tab.key} className="group relative flex h-full">
-                      <TabsTrigger
-                        value={tab.key}
-                        className="h-full rounded-t-md border border-b-0 border-transparent pr-8 pl-3 font-mono text-[13px] text-muted-foreground hover:text-foreground data-[state=active]:border-border data-[state=active]:bg-background data-[state=active]:text-foreground"
-                      >
-                        <Table2 className="size-3.5" />
-                        {tab.view.table}
-                      </TabsTrigger>
-                      <button
-                        type="button"
-                        aria-label={`Close ${tab.view.table}`}
-                        onClick={() => closeTab(tab.key)}
-                        className="absolute top-1/2 right-1.5 flex size-5 -translate-y-1/2 items-center justify-center rounded text-muted-foreground opacity-60 hover:bg-accent hover:text-foreground hover:opacity-100"
-                      >
-                        <X className="size-3.5" />
-                      </button>
-                    </div>
-                  ))}
-                </TabsList>
-                <div className="relative min-h-0 flex-1">
-                  {tabs.map(tab => (
-                    <TabsContent
-                      key={tab.key}
-                      value={tab.key}
-                      forceMount
-                      className="absolute inset-0 data-[state=inactive]:invisible"
-                    >
-                      <TableViewer channel={tab.view} theme={theme} />
-                    </TabsContent>
-                  ))}
-                </div>
-              </Tabs>
-            )}
+            <TablesWorkspace
+              ref={workspace}
+              connection={connection}
+              gridTheme={theme}
+              isShown={page === 'tables'}
+              onActive={setActiveTable}
+            />
           </main>
         </div>
       </div>
