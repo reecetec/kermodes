@@ -105,6 +105,10 @@ const GRID_CSS = `
 @keyframes kermodes-spin { to { transform: rotate(360deg); } }
 .kermodes-spinner { animation: kermodes-spin 0.8s linear infinite; }
 
+.kermodes-copy-target {
+  position: absolute; z-index: 4; pointer-events: none; box-sizing: border-box;
+  border: 1.5px solid var(--primary); border-radius: 2px; background: var(--selection);
+}
 .kermodes-cell-expand {
   position: absolute; z-index: 5; display: flex; align-items: center; justify-content: center;
   width: 16px; height: 16px; padding: 0; border: 1px solid var(--border); border-radius: 4px;

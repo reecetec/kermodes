@@ -615,20 +615,31 @@ export function TableViewer({
 
   const copyCellHandler = useMemo(() => new CopyCellMouseHandler(copyCell), [copyCell]);
 
-  // The copy cursor follows the modifier key while the pointer stays still over a cell
+  // Whether Cmd/Ctrl is held: the cell under the pointer is then what a click copies
+  const [isCopyKeyDown, setIsCopyKeyDown] = useState(false);
+  // The copy cursor and target follow the modifier key while the pointer stays still. Capture,
+  // since the viewer's own key handler stops propagation (for notebook shortcuts) before a
+  // bubbling window listener would hear the key while the grid has focus.
   useEffect(() => {
     const update = (event: KeyboardEvent): void => {
-      if ((event.key === 'Meta' || event.key === 'Control') && copyCellHandler.isOverCell) {
-        gridRef.current?.setCursor(
-          copyCellHandler.cursorFor(GridUtils.isModifierKeyDown(event))
-        );
+      if (event.key !== 'Meta' && event.key !== 'Control') {
+        return;
+      }
+      const isDown = GridUtils.isModifierKeyDown(event);
+      setIsCopyKeyDown(isDown);
+      if (copyCellHandler.isOverCell) {
+        gridRef.current?.setCursor(copyCellHandler.cursorFor(isDown));
       }
     };
-    window.addEventListener('keydown', update);
-    window.addEventListener('keyup', update);
+    // A key released in another window never reaches this one
+    const reset = (): void => setIsCopyKeyDown(false);
+    window.addEventListener('keydown', update, true);
+    window.addEventListener('keyup', update, true);
+    window.addEventListener('blur', reset);
     return () => {
-      window.removeEventListener('keydown', update);
-      window.removeEventListener('keyup', update);
+      window.removeEventListener('keydown', update, true);
+      window.removeEventListener('keyup', update, true);
+      window.removeEventListener('blur', reset);
     };
   }, [copyCellHandler]);
 
@@ -909,7 +920,18 @@ export function TableViewer({
             onChange={handleFilterChange}
           />
         )}
-        {expand != null && opened == null && (
+        {isCopyKeyDown && expandAt != null && (
+          <div
+            className="kermodes-copy-target"
+            style={{
+              left: expandAt.x,
+              top: expandAt.y,
+              width: expandAt.width,
+              height: expandAt.height,
+            }}
+          />
+        )}
+        {expand != null && opened == null && !isCopyKeyDown && (
           <button
             type="button"
             className="kermodes-cell-expand"

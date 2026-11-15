@@ -869,7 +869,9 @@ export class GridMetricCalculator {
       y += rowHeight;
 
       if (y >= visibleHeight) {
-        return clamp(lastTop + 1, 0, rowCount - 1);
+        // Bounded at 0: with no rows, rowCount - 1 is -1, and a top of -1 drew an empty row -1
+        // above the first and asked the server for rows from -1
+        return clamp(lastTop + 1, 0, Math.max(rowCount - 1, 0));
       }
 
       lastTop -= 1;
