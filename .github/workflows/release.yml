@@ -8,6 +8,11 @@ name: Release
 # - on a tag vX.Y.Z: the tagged commit's candidate, released as it is. Its wheels, npm tarballs,
 #   and chart are relabelled X.Y.Z (ci/relabel.py, which fails if anything but version metadata
 #   would change), its image gains the tags X.Y.Z and latest, and the wheels go to PyPI.
+#
+# A release touches four registries one after another; one that fails part way is finished by
+# running this workflow by hand for its tag (with this file as it is on master). Every step can
+# run again: the image tags and the relabelled chart are the same, and what npm, PyPI, and the
+# GitHub release already have is skipped. A release tag never moves.
 on:
   workflow_run:
     workflows: [CI]
@@ -15,6 +20,11 @@ on:
     branches: [master]
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release tag (vX.Y.Z) to publish again, finishing a release that failed
+        required: true
 
 permissions:
   contents: read
@@ -46,12 +56,12 @@ jobs:
           # Dependencies first; a rerun skips what it already published.
           for name in client grid react theme; do
             if [ -z "$(npm view "@kermodes/$name@$VERSION" version 2>/dev/null)" ]; then
-              npm publish "candidate/npm/kermodes-$name-$VERSION.tgz" --tag dev --access public
+              npm publish "./candidate/npm/kermodes-$name-$VERSION.tgz" --tag dev --access public
             fi
           done
 
   release:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -64,13 +74,26 @@ jobs:
       CHARTS: oci://ghcr.io/${{ github.repository_owner }}/charts
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Which release
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "$TAG is not a release tag vX.Y.Z" >&2
+            exit 1
+          fi
+          SHA=$(git rev-parse "refs/tags/$TAG^{commit}")
+          { echo "TAG=$TAG"; echo "VERSION=${TAG#v}"; echo "SHA=$SHA"; } >> "$GITHUB_ENV"
+
       - name: Find the tagged commit's candidate
         id: candidate
         run: |
-          RUN=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$GITHUB_SHA" \
+          RUN=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$SHA" \
             --event push --status success --limit 1 --json databaseId --jq '.[0].databaseId')
           if [ -z "$RUN" ]; then
-            echo "$GITHUB_REF_NAME is on $GITHUB_SHA, which has no green CI run on master to release" >&2
+            echo "$TAG is on $SHA, which has no green CI run on master to release" >&2
             exit 1
           fi
           # The candidate's own artifacts only: the run holds others (a docker build record).
@@ -81,7 +104,7 @@ jobs:
           echo "version=$(cat candidate/candidate/version)" >> "$GITHUB_OUTPUT"
 
       - name: Relabel the candidate's files
-        run: python3 ci/relabel.py "${GITHUB_REF_NAME#v}" candidate release
+        run: python3 ci/relabel.py "$VERSION" candidate release
 
       - uses: docker/login-action@v4
         with:
@@ -92,7 +115,7 @@ jobs:
       - name: Tag the candidate's image
         run: |
           docker buildx imagetools create \
-            --tag "$IMAGE:${GITHUB_REF_NAME#v}" --tag "$IMAGE:latest" \
+            --tag "$IMAGE:$VERSION" --tag "$IMAGE:latest" \
             "$IMAGE:${{ steps.candidate.outputs.version }}"
 
       - uses: azure/setup-helm@v5
@@ -101,7 +124,7 @@ jobs:
       - name: Push the chart
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
-          helm push "release/kermodes-${GITHUB_REF_NAME#v}.tgz" "$CHARTS"
+          helm push "release/kermodes-$VERSION.tgz" "$CHARTS"
 
       - uses: actions/setup-node@v5
         with:
@@ -109,15 +132,23 @@ jobs:
           registry-url: https://registry.npmjs.org
       - name: Publish the npm packages
         run: |
+          # Dependencies first; a rerun skips what it already published. The ./ keeps npm from
+          # reading release/<file> as a GitHub repository.
           for name in client grid react theme; do
-            npm publish "release/kermodes-$name-${GITHUB_REF_NAME#v}.tgz" --tag latest --access public
+            if [ -z "$(npm view "@kermodes/$name@$VERSION" version 2>/dev/null)" ]; then
+              npm publish "./release/kermodes-$name-$VERSION.tgz" --tag latest --access public
+            fi
           done
 
       - name: Create the GitHub release
         run: |
-          gh release create "$GITHUB_REF_NAME" release/*.whl --repo "$GITHUB_REPOSITORY" --verify-tag \
-            --title "$GITHUB_REF_NAME" \
-            --notes "Candidate ${{ steps.candidate.outputs.version }}, built and checked by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/${{ steps.candidate.outputs.run }}."
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "$TAG's GitHub release exists"
+          else
+            gh release create "$TAG" release/*.whl --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "$TAG" \
+              --notes "Candidate ${{ steps.candidate.outputs.version }}, built and checked by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/${{ steps.candidate.outputs.run }}."
+          fi
 
       - uses: actions/upload-artifact@v7
         with:
@@ -137,3 +168,6 @@ jobs:
           name: pypi
           path: dist
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # A rerun of a release that reached PyPI.
+          skip-existing: true
