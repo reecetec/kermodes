@@ -17,6 +17,18 @@ pub struct Manifest {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct App {
     pub name: String,
+    /// Its directory within the project; manifests from before apps were declared have none.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+impl App {
+    /// Its directory within the project: as declared, else `apps/<name>`.
+    pub fn path(&self) -> String {
+        self.path
+            .clone()
+            .unwrap_or_else(|| format!("apps/{}", self.name))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]

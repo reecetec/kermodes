@@ -725,19 +725,19 @@ pub fn app_status(
     }
 }
 
-/// The Job that builds `app` at the target's commit: the commit's code, `bun install
-/// --frozen-lockfile` where its lockfile is (the project, when it is a workspace of apps and
-/// shared packages, else the app), Vite's build under the app's address, and a tar of the
-/// output uploaded to `upload`, a presigned URL for its one object.
-pub fn build_job(target: &Target, app: &str, builds: &Builds, upload: &str) -> Job {
+/// The Job that builds `app` from its directory `path` at the target's commit: the commit's
+/// code, `bun install --frozen-lockfile` where its lockfile is (the project, when it is a
+/// workspace of apps and shared packages, else the app), Vite's build under the app's address,
+/// and a tar of the output uploaded to `upload`, a presigned URL for its one object.
+pub fn build_job(target: &Target, app: &str, path: &str, builds: &Builds, upload: &str) -> Job {
     // Project code runs here, with no credentials but the build Secret's.
     const SCRIPT: &str = r#"set -eu
 mkdir -p /work/home /work/tmp
 cp -R "$PROJECT_DIR" /work/project
 cd /work/project
-if [ -f package.json ]; then root=.; else root="apps/$APP"; fi
+if [ -f package.json ]; then root=.; else root="$APP_PATH"; fi
 (cd "$root" && bun install --frozen-lockfile)
-cd "apps/$APP"
+cd "$APP_PATH"
 bun run build --base "/apps/$PROJECT/$APP/" --outDir /work/out --emptyOutDir
 tar -C /work/out -cf /work/app.tar .
 bun -e 'const r = await fetch(process.env.UPLOAD, { method: "PUT", body: Bun.file("/work/app.tar") });
@@ -752,6 +752,7 @@ echo "built $APP"
         "env": [
             {"name": "PROJECT", "value": target.project},
             {"name": "APP", "value": app},
+            {"name": "APP_PATH", "value": path},
             {"name": "PROJECT_DIR", "value": project_dir(target)},
             {"name": "UPLOAD", "value": upload},
             {"name": "HOME", "value": "/work/home"},
@@ -1244,6 +1245,7 @@ mod tests {
             .iter()
             .map(|name| App {
                 name: (*name).into(),
+                path: None,
             })
             .collect()
     }
@@ -1314,7 +1316,13 @@ mod tests {
             image: "oven/bun:1".into(),
             secret: None,
         };
-        let job = build_job(&target("4e0ea58b"), "market", &builds, "https://s3/signed");
+        let job = build_job(
+            &target("4e0ea58b"),
+            "market",
+            "web/market",
+            &builds,
+            "https://s3/signed",
+        );
         let pod = job.spec.unwrap().template.spec.unwrap();
         assert_eq!(pod.security_context.unwrap().run_as_non_root, Some(true));
         let build = &pod.containers[0];
@@ -1330,6 +1338,8 @@ mod tests {
             .collect();
         assert_eq!(env["UPLOAD"], "https://s3/signed");
         assert_eq!(env["APP"], "market");
+        // Built from the directory the project declares, wherever it is.
+        assert_eq!(env["APP_PATH"], "web/market");
         // No Secret unless one is configured: the upload URL is its only reach.
         assert!(build.env_from.is_none());
         // The code and a writable work directory; the root filesystem stays read-only.
@@ -1348,6 +1358,7 @@ mod tests {
         let job = build_job(
             &target("4e0ea58b"),
             "market",
+            "web/market",
             &with_secret,
             "https://s3/signed",
         );

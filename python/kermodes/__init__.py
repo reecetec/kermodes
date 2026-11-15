@@ -14,7 +14,7 @@ from kermodes._native import (
     Writer,
     merge,
 )
-from kermodes.project import deployment, ingester, websocket
+from kermodes.project import app, deployment, ingester, websocket
 
 __all__ = [
     "HistoricalTable",
@@ -24,6 +24,7 @@ __all__ = [
     "StoredTable",
     "Table",
     "Writer",
+    "app",
     "boolean",
     "connect",
     "date32",

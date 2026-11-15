@@ -501,9 +501,15 @@ async fn build_once(
             .start_build(&project.name, app, &latest.commit)
             .await?;
         let target = target(controller, project, &latest.commit, None);
+        let path = manifest
+            .apps
+            .iter()
+            .find(|declared| &declared.name == app)
+            .map(|declared| declared.path())
+            .unwrap_or_default();
         controller
             .kube
-            .start(&plan::build_job(&target, app, config, &upload))
+            .start(&plan::build_job(&target, app, &path, config, &upload))
             .await?;
         eprintln!(
             "kermodes control: {}: building {app} at {}",
@@ -1098,8 +1104,8 @@ pub async fn status(controller: &Controller) -> Result<Value, String> {
             for app in &manifest.apps {
                 let served = plan::served_build(&app.name, &builds);
                 let path = match directory {
-                    "" => format!("apps/{}", app.name),
-                    directory => format!("{directory}/apps/{}", app.name),
+                    "" => app.path(),
+                    directory => format!("{directory}/{}", app.path()),
                 };
                 let source =
                     served.and_then(|commit| browse::source_url(&project.url, commit, &path, None));

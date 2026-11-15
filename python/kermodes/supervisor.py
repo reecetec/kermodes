@@ -82,6 +82,8 @@ class Supervisor:
         self.runs: dict[str, Run] = {}
         self.specs: dict[str, dict] = {}
         self.apps: dict[str, App] = {}
+        # Each app's directory, as the project declares it (`km.app(name, path=)`).
+        self.app_dirs: dict[str, Path] = {}
         # Apps whose install failed, with the dependency files it failed on: tried again when
         # they change.
         self.failed: dict[str, dict[Path, float]] = {}
@@ -151,7 +153,11 @@ class Supervisor:
         self.specs = specs
         self.name = manifest["project"]
         if self.ui is not None:
-            apps = {app["name"] for app in manifest.get("apps", [])}
+            self.app_dirs = {
+                app["name"]: self.project / app["path"]
+                for app in manifest.get("apps", [])
+            }
+            apps = set(self.app_dirs)
             for name in set(self.apps) - apps:
                 print(f"kermodes dev: app {name} removed; stopping it", flush=True)
                 self._stop_app(name)
@@ -193,7 +199,7 @@ class Supervisor:
         process = subprocess.Popen(
             [bun, "run", "dev", "--port", str(port), "--strictPort"]
             + ["--host", "127.0.0.1", "--base", base],
-            cwd=self.project / "apps" / name,
+            cwd=self.app_dirs[name],
             start_new_session=True,
         )
         self.apps[name] = App(process, deps)
@@ -219,11 +225,11 @@ class Supervisor:
         return (
             self.project
             if (self.project / "package.json").exists()
-            else self.project / "apps" / name
+            else self.app_dirs[name]
         )
 
     def _deps(self, name: str) -> dict[Path, float]:
-        app = self.project / "apps" / name
+        app = self.app_dirs[name]
         return {
             path: path.stat().st_mtime
             for path in {
@@ -324,13 +330,14 @@ class Supervisor:
         reload themselves, and dependency directories are never walked."""
         watched = ("kermodes.toml", "uv.lock", "pyproject.toml")
         files = {}
+        apps = set(self.app_dirs.values())
         for directory, subdirectories, names in os.walk(self.project):
             subdirectories[:] = [
                 d
                 for d in subdirectories
                 if not d.startswith(".")
                 and d not in ("node_modules", "__pycache__")
-                and not (directory == str(self.project) and d == "apps")
+                and Path(directory, d) not in apps
             ]
             for name in names:
                 if name.endswith(".py") or name in watched:

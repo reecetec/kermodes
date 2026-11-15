@@ -898,7 +898,7 @@ sportsflow/
     kermodes_app.py      resource declarations: tables, ingesters, deployments, jobs, features, models
     ...
   package.json        optional: a Bun workspace of apps/* and shared packages/*, one bun.lock
-  apps/market/        an app: TypeScript, served at /apps/<project>/market/ (§15.2)
+  apps/market/        an app's TypeScript (km.app("market")), served at /apps/<project>/market/
   tests/              pytest: unit tests on km.local(), replay tests on pinned history
 ```
 
@@ -922,7 +922,7 @@ replay = [{ tables = ["sports.odds", "sports.games"], dates = "2026-10-01..2026-
 ttl = "3d"
 ```
 
-Resources are declared in Python (`km.table`, `km.ingester(...)`, `@km.deployment()`, `@km.job`,
+Resources are declared in Python (`km.table`, `km.ingester(...)`, `@km.deployment()`, `km.app`, `@km.job`,
 `@km.feature_view`, `km.model`). Discovery imports `entry` in the project's environment, fresh
 each time, and emits a **manifest**: the resolved specs as JSON (`kermodes manifest`). The
 manifest, not the Python source, is what `plan` and `apply` consume. Discovery refuses what the
@@ -1219,8 +1219,10 @@ namespaces).
 - `@kermodes/client`: TypeScript package speaking the delta protocol over WebSocket and decoding Arrow
   IPC with `apache-arrow`, and the protocol's types. Used by the UI, the grid, and apps.
 - Apps built on Kermodes: Python computes and publishes tables; a TypeScript frontend of any
-  components shows them. An app is a directory of the project, `apps/<name>/` with a
-  `package.json` whose `dev` and `build` scripts run Vite; Kermodes gives Vite the app's address,
+  components shows them. A project declares each app beside its resources, `km.app("market")`,
+  its code the project's directory `path` (`apps/<name>` by default) with a `package.json` whose
+  `dev` and `build` scripts run Vite; one namespace holds both, as both are rows of the
+  Deployments tab. Kermodes gives Vite the app's address,
   `/apps/<project>/<name>/`, as its base. `@kermodes/react` gives `KermodesProvider` (one
   connection, the page's own server by default) and `useTable(name, { sort, filters, offset,
   limit } | { last })`: the asked rows as plain objects, kept current, with the total, columns,

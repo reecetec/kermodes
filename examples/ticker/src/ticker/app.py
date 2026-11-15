@@ -14,6 +14,9 @@ COLUMNS = {
     "ts": km.timestamp(),
 }
 
+# The quote board and tape, in TypeScript: apps/market.
+market = km.app("market")
+
 
 # About 100 ticks a second, some 100 MB a day in weir: a demo that runs for weeks until the merge
 # job moves days to the lake. It uses well under its size (35m CPU and 40Mi at 1,500 a second).

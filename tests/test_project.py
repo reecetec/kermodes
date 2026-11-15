@@ -80,21 +80,52 @@ def test_a_project_declares_ingesters_and_deployments(tmp_path):
     ]
 
 
-def test_a_projects_apps_are_its_app_directories_with_a_package(tmp_path):
-    make_project(tmp_path, "")
-    for name in ("market", "blotter"):
-        (tmp_path / "apps" / name).mkdir(parents=True)
-        (tmp_path / "apps" / name / "package.json").write_text("{}")
-    # Not an app until it has a package.json
-    (tmp_path / "apps" / "notes").mkdir()
+def test_a_project_declares_its_apps_beside_its_resources(tmp_path):
+    make_project(
+        tmp_path,
+        """
+        import kermodes as km
+
+        market = km.app("market")
+        blotter = km.app("blotter", path="web/blotter")
+        """,
+    )
+    for path in ("apps/market", "web/blotter", "apps/notes"):
+        (tmp_path / path).mkdir(parents=True)
+        (tmp_path / path / "package.json").write_text("{}")
+    # apps/notes is not declared, so it is not an app.
     assert project.discover(tmp_path).manifest()["apps"] == [
-        {"name": "blotter", "path": "apps/blotter"},
-        {"name": "market", "path": "apps/market"},
+        {
+            "name": "market",
+            "path": "apps/market",
+            "defined_at": {"file": "src/ticker/app.py", "line": 4},
+        },
+        {
+            "name": "blotter",
+            "path": "web/blotter",
+            "defined_at": {"file": "src/ticker/app.py", "line": 5},
+        },
     ]
 
-    (tmp_path / "apps" / "Bad Name").mkdir()
-    (tmp_path / "apps" / "Bad Name" / "package.json").write_text("{}")
-    with pytest.raises(km.KermodesError, match="app name `Bad Name`"):
+
+@pytest.mark.parametrize(
+    ("app", "error"),
+    [
+        ('km.app("market", path="apps/missing")', "not a directory of ticker"),
+        ('km.app("market", path="../elsewhere")', "not a directory of ticker"),
+        (
+            'km.app("ticks")\n\n@km.deployment()\ndef ticks(db):\n    pass',
+            "declares `ticks` twice",
+        ),
+    ],
+)
+def test_an_app_needs_its_directory_and_a_name_of_its_own(tmp_path, app, error):
+    make_project(tmp_path, f"import kermodes as km\n{app}\n")
+    (tmp_path / "apps" / "ticks").mkdir(parents=True)
+    (tmp_path / "apps" / "ticks" / "package.json").write_text("{}")
+    (tmp_path.parent / "elsewhere").mkdir(exist_ok=True)
+    (tmp_path.parent / "elsewhere" / "package.json").write_text("{}")
+    with pytest.raises(km.KermodesError, match=error):
         project.discover(tmp_path)
 
 

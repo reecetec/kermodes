@@ -19,8 +19,8 @@ Declarations::
         ...
 
 Discovery imports the entry module and returns a `Project`; its manifest is the JSON the platform
-plans and deploys from (`kermodes manifest`). Apps are the directories of `apps/` holding a
-`package.json`, each served at `/apps/<project>/<name>/` (architecture.md §15.2).
+plans and deploys from (`kermodes manifest`). `km.app` declares a TypeScript frontend in a
+directory of the project, served at `/apps/<project>/<name>/` (architecture.md §15.2).
 """
 
 import importlib
@@ -104,8 +104,32 @@ class Deployment:
 
 Resource = Ingester | Deployment
 
-# Resources declared by the module being discovered; `discover` empties it around each import.
-_declared: list[Resource] = []
+
+@dataclass(frozen=True)
+class App:
+    """A TypeScript frontend in the project's directory `path` (one with a package.json whose
+    `dev` and `build` scripts run Vite), built per commit and served at
+    `/apps/<project>/<name>/`."""
+
+    name: str
+    path: str
+    # Where it is declared: the file and line of the `app(...)` call.
+    defined_at: tuple[str, int] | None = None
+
+
+# What the module being discovered declares; `discover` empties it around each import.
+_declared: list[Resource | App] = []
+
+
+def app(name: str, *, path: str | None = None) -> App:
+    """Declares the app `name`, whose code is the project's directory `path` (`apps/<name>` by
+    default). Kermodes builds it at each commit and serves it beside the project's tables."""
+    caller = sys._getframe(1)
+    declared = App(
+        name, path or f"apps/{name}", (caller.f_code.co_filename, caller.f_lineno)
+    )
+    _declared.append(declared)
+    return declared
 
 
 def ingester(
@@ -181,7 +205,7 @@ class Project:
     namespaces: tuple[str, ...]
     mainline: str
     resources: dict[str, Resource] = field(default_factory=dict)
-    apps: tuple[str, ...] = ()
+    apps: dict[str, App] = field(default_factory=dict)
 
     def resource(self, name: str) -> Resource:
         try:
@@ -202,7 +226,7 @@ class Project:
             "resources": [
                 _spec(r, self.entry, self.root) for r in self.resources.values()
             ],
-            "apps": [{"name": app, "path": f"apps/{app}"} for app in self.apps],
+            "apps": [_app_spec(a, self.root) for a in self.apps.values()],
         }
 
 
@@ -246,13 +270,27 @@ def discover(root: str | Path = ".") -> Project:
         sys.path.remove(path)
 
     resources: dict[str, Resource] = {}
+    apps: dict[str, App] = {}
     for resource in declared:
         if not _NAME.fullmatch(resource.name):
             raise KermodesError(
                 f"resource name `{resource.name}` must match {_NAME.pattern}"
             )
-        if resource.name in resources:
+        # One name per row of the Deployments tab, whatever it is.
+        if resource.name in resources or resource.name in apps:
             raise KermodesError(f"{name} declares `{resource.name}` twice")
+        if isinstance(resource, App):
+            directory = (root / resource.path).resolve()
+            if (
+                not directory.is_relative_to(root)
+                or not (directory / "package.json").exists()
+            ):
+                raise KermodesError(
+                    f"app `{resource.name}`'s path {resource.path} is not a directory of "
+                    f"{name} with a package.json"
+                )
+            apps[resource.name] = resource
+            continue
         if isinstance(resource, Ingester):
             namespace = resource.target.partition(".")[0]
             if namespace not in namespaces:
@@ -261,12 +299,6 @@ def discover(root: str | Path = ".") -> Project:
                     f"only namespaces {list(namespaces)} (kermodes.toml)"
                 )
         resources[resource.name] = resource
-    apps = tuple(sorted(p.parent.name for p in (root / "apps").glob("*/package.json")))
-    for app in apps:
-        if not _NAME.fullmatch(app):
-            raise KermodesError(
-                f"app name `{app}` (apps/{app}) must match {_NAME.pattern}"
-            )
     return Project(name, root, entry, namespaces, mainline, resources, apps)
 
 
@@ -340,6 +372,25 @@ def _memory(name: str, memory: int | str) -> str:
     )
 
 
+def _defined_at(declared: Resource | App, root: Path) -> dict | None:
+    """Where `declared` is, relative to the project, so the platform can link to it at any
+    commit (§15.2)."""
+    if declared.defined_at is None:
+        return None
+    file, line = declared.defined_at
+    path = Path(file).resolve()
+    if not path.is_relative_to(root):
+        return None
+    return {"file": path.relative_to(root).as_posix(), "line": line}
+
+
+def _app_spec(app: App, root: Path) -> dict:
+    spec: dict = {"name": app.name, "path": app.path}
+    if (at := _defined_at(app, root)) is not None:
+        spec["defined_at"] = at
+    return spec
+
+
 def _spec(resource: Resource, entry: str, root: Path) -> dict:
     spec: dict = {
         "name": resource.name,
@@ -348,15 +399,8 @@ def _spec(resource: Resource, entry: str, root: Path) -> dict:
         "cpu": resource.cpu,
         "memory": resource.memory,
     }
-    # Relative to the project, so the platform can link to it at any commit (§15.2).
-    if resource.defined_at is not None:
-        file, line = resource.defined_at
-        path = Path(file).resolve()
-        if path.is_relative_to(root):
-            spec["defined_at"] = {
-                "file": path.relative_to(root).as_posix(),
-                "line": line,
-            }
+    if (at := _defined_at(resource, root)) is not None:
+        spec["defined_at"] = at
     if isinstance(resource, Ingester):
         spec |= {
             "kind": "ingester",
