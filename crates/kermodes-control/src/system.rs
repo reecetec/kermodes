@@ -4,6 +4,8 @@
 
 use serde::Serialize;
 
+use crate::k8s::Rollout;
+
 /// The components' `app.kubernetes.io/component` labels, in the order they are shown.
 pub const COMPONENTS: [&str; 4] = ["weir", "database", "control", "ui"];
 
@@ -94,8 +96,32 @@ pub struct Component {
     pub warning_ns: Option<i64>,
 }
 
-/// One word for how a component is doing: every pod ready, some, or none and why.
-pub fn status(instances: &[Instance]) -> String {
+/// Waiting reasons that mean a pod cannot run, not merely that it has not yet.
+const FAILING: [&str; 6] = [
+    "CrashLoopBackOff",
+    "ImagePullBackOff",
+    "ErrImagePull",
+    "InvalidImageName",
+    "CreateContainerConfigError",
+    "CreateContainerError",
+];
+
+/// One word for how a component is doing, most pressing first: a pod that cannot run says why;
+/// then its workload's rollout (`None` for Postgres, which the operator runs pod by pod), so an
+/// upgrade reads as one rather than as a degraded component; then how many pods are ready.
+pub fn status(instances: &[Instance], rollout: Option<Rollout>) -> String {
+    if let Some(reason) = instances
+        .iter()
+        .filter_map(|i| i.waiting.as_deref())
+        .find(|w| FAILING.contains(w))
+    {
+        return reason.into();
+    }
+    match rollout {
+        Some(Rollout::Failed) => return "Rollout failed".into(),
+        Some(Rollout::Rolling) => return "Rolling out".into(),
+        _ => {}
+    }
     let ready = instances.iter().filter(|i| i.ready).count();
     if ready == instances.len() {
         "Running".into()
@@ -128,28 +154,59 @@ pub fn recovered(reason: &str, at_ns: i64, ready_since_ns: Option<i64>) -> bool 
 #[cfg(test)]
 mod tests {
     use super::{Disk, Instance, image_tag, postgres_disks, recovered, status, weir_disk};
+    use crate::k8s::Rollout;
 
     #[test]
-    fn a_component_is_running_degraded_or_says_why_it_is_not() {
+    fn a_component_says_what_is_wrong_then_whether_it_is_rolling_out_then_how_ready() {
         let instance = |ready: bool, waiting: Option<&str>| Instance {
             ready,
             waiting: waiting.map(str::to_owned),
             ..Instance::default()
         };
-        let cases: &[(&[Instance], &str)] = &[
-            (&[instance(true, None), instance(true, None)], "Running"),
-            (&[instance(true, None), instance(false, None)], "Degraded"),
+        let (up, down) = (instance(true, None), instance(false, None));
+        let creating = instance(false, Some("ContainerCreating"));
+        let crashing = instance(false, Some("CrashLoopBackOff"));
+        let cases: Vec<(Vec<Instance>, Option<Rollout>, &str)> = vec![
+            (vec![up.clone(), up.clone()], None, "Running"),
             (
-                &[
-                    instance(false, None),
-                    instance(false, Some("CrashLoopBackOff")),
-                ],
+                vec![up.clone(), up.clone()],
+                Some(Rollout::Ready),
+                "Running",
+            ),
+            (vec![up.clone(), down.clone()], None, "Degraded"),
+            (
+                vec![up.clone(), down.clone()],
+                Some(Rollout::Ready),
+                "Degraded",
+            ),
+            // The old pod serves while the new one starts: an upgrade, not a degraded component
+            (
+                vec![up.clone(), creating.clone()],
+                Some(Rollout::Rolling),
+                "Rolling out",
+            ),
+            (
+                vec![creating.clone()],
+                Some(Rollout::Rolling),
+                "Rolling out",
+            ),
+            (vec![up.clone()], Some(Rollout::Failed), "Rollout failed"),
+            // A pod that cannot run says why, rollout or not
+            (
+                vec![up, crashing.clone()],
+                Some(Rollout::Rolling),
                 "CrashLoopBackOff",
             ),
-            (&[instance(false, None)], "Starting"),
+            (vec![down.clone(), crashing], None, "CrashLoopBackOff"),
+            (vec![creating], None, "ContainerCreating"),
+            (vec![down], None, "Starting"),
         ];
-        for (instances, expected) in cases {
-            assert_eq!(status(instances), *expected);
+        for (instances, rollout, expected) in &cases {
+            assert_eq!(
+                status(instances, *rollout),
+                *expected,
+                "{instances:?} {rollout:?}"
+            );
         }
     }
 

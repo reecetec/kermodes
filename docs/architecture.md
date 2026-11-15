@@ -1246,6 +1246,9 @@ namespaces).
   their pods (a Postgres row shows its primary's disks) and open each pod in the panel. The Helm
   release runs them, so their actions are disabled. The controller reads them
   (`/api/components`) rather than a `sys.*` table, so the page can say weir is down while it is.
+  A part's status says, most pressing first, why a pod cannot run (CrashLoopBackOff, an image
+  pull), then whether its Deployment or StatefulSet is rolling out, so an upgrade reads as
+  Rolling out rather than Degraded, then how many of its pods are ready.
   Each pod's disks come from the component itself, not the node (no kubelet access): weir's
   volume from its `stats` action; each Postgres instance's databases and WAL from its CNPG
   metrics, its data volume's size from its claim. One that cannot be read in two seconds shows

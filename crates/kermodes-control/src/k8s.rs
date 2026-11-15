@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{Event, Node, PersistentVolumeClaim, Pod};
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
@@ -30,6 +30,8 @@ const DISK_DEADLINE: Duration = Duration::from_secs(2);
 #[derive(Clone)]
 pub struct Kube {
     deployments: Api<Deployment>,
+    /// weir's StatefulSet, for its rollout.
+    statefulsets: Api<StatefulSet>,
     budgets: Api<PodDisruptionBudget>,
     jobs: Api<Job>,
     pods: Api<Pod>,
@@ -61,6 +63,7 @@ impl Kube {
             .map_err(|e| format!("cannot reach Kubernetes: {e}"))?;
         Ok(Self {
             deployments: Api::namespaced(client.clone(), namespace),
+            statefulsets: Api::namespaced(client.clone(), namespace),
             budgets: Api::namespaced(client.clone(), namespace),
             jobs: Api::namespaced(client.clone(), namespace),
             pods: Api::namespaced(client.clone(), namespace),
@@ -295,6 +298,29 @@ impl Kube {
                 warnings.insert(component.clone(), (text, at));
             }
         }
+        // Each component's rollout, from its workload: without one (Postgres, or a list that
+        // fails), its status is its pods' readiness alone.
+        let mut rollouts: BTreeMap<String, Rollout> = BTreeMap::new();
+        let component_of = |meta: &kube::api::ObjectMeta| {
+            meta.labels
+                .as_ref()?
+                .get("app.kubernetes.io/component")
+                .cloned()
+        };
+        if let Ok(list) = self.deployments.list(&selector).await {
+            for deployment in &list.items {
+                if let Some(component) = component_of(&deployment.metadata) {
+                    rollouts.insert(component, rollout_of(deployment));
+                }
+            }
+        }
+        if let Ok(list) = self.statefulsets.list(&selector).await {
+            for set in &list.items {
+                if let Some(component) = component_of(&set.metadata) {
+                    rollouts.insert(component, stateful_rollout_of(set));
+                }
+            }
+        }
         Ok(system::COMPONENTS
             .iter()
             .filter_map(|name| {
@@ -302,7 +328,7 @@ impl Kube {
                 let warning = warnings.remove(*name);
                 Some(system::Component {
                     name: (*name).to_owned(),
-                    status: system::status(&instances),
+                    status: system::status(&instances, rollouts.get(*name).copied()),
                     instances,
                     warning_ns: warning.as_ref().map(|(_, at)| *at),
                     warning: warning.map(|(text, _)| text),
@@ -773,6 +799,23 @@ fn rollout_of(deployment: &Deployment) -> Rollout {
     if deadline_passed {
         Rollout::Failed
     } else if observed && updated >= 1 && ready >= 1 && total == updated {
+        Rollout::Ready
+    } else {
+        Rollout::Rolling
+    }
+}
+
+/// Where a StatefulSet's rollout stands: done once every replica runs the newest revision and
+/// the controller has seen the newest spec. A StatefulSet has no progress deadline to fail.
+fn stateful_rollout_of(set: &StatefulSet) -> Rollout {
+    let status = set.status.clone().unwrap_or_default();
+    let generation = set.metadata.generation.unwrap_or(0);
+    let observed = status.observed_generation.unwrap_or(0) >= generation;
+    let replicas = set.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
+    let updated = status.updated_replicas.unwrap_or(0) >= replicas;
+    let current =
+        status.current_revision.is_some() && status.current_revision == status.update_revision;
+    if observed && updated && current {
         Rollout::Ready
     } else {
         Rollout::Rolling

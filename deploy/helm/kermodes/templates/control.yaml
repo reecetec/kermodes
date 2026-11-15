@@ -26,6 +26,10 @@ rules:
   - apiGroups: [apps]
     resources: [deployments]
     verbs: [get, list, watch, create, update, patch, delete]
+  # The Deployments tab: weir's rollout, so an upgrade reads as one.
+  - apiGroups: [apps]
+    resources: [statefulsets]
+    verbs: [list]
   - apiGroups: [batch]
     resources: [jobs]
     verbs: [get, list, create, delete]
