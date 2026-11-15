@@ -561,7 +561,10 @@ class Grid extends PureComponent<GridProps, GridState> {
 
     const updatedState = { ...this.state, ...stateUpdates };
 
-    this.updateMetrics(updatedState);
+    // Without a 2D context nothing is measured or drawn (see `updateCanvas`).
+    if (this.canvasContext != null) {
+      this.updateMetrics(updatedState);
+    }
 
     this.requestUpdateCanvas();
 
@@ -830,6 +833,11 @@ class Grid extends PureComponent<GridProps, GridState> {
    * Updates the canvas, metrics, and render state, then draws the canvas.
    */
   updateCanvas(): void {
+    // No 2D context: a DOM without canvas, as an app's tests render the page in. There is
+    // nothing to draw, and the page around the grid still renders.
+    if (this.canvasContext == null) {
+      return;
+    }
     this.updateCanvasScale();
 
     this.updateMetrics();
