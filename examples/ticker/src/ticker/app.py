@@ -4,6 +4,7 @@ nothing else running: `kermodes dev --project examples/ticker` locally, or synce
 
 import time
 
+import humanize
 import kermodes as km
 
 COLUMNS = {
@@ -19,7 +20,10 @@ COLUMNS = {
 @km.deployment(cpu=0.25, memory="256Mi")
 def ticks(db):
     db.create_table("md.ticks", COLUMNS)
-    feed = km.demo.ticker(rate=100, symbols=100)
+    rate = 100
+    feed = km.demo.ticker(rate=rate, symbols=100)
+    # humanize comes from the project's environment, built from its uv.lock.
+    print(f"md.ticks: about {humanize.intword(rate * 86_400)} ticks a day", flush=True)
     # Waits for the run it replaces to hand over md.ticks (a rolling update).
     ingest = db.ingest_websocket(feed.url, "md.ticks", source="ticks", wait=True)
     # The feed and its connector run as long as this function holds them.
