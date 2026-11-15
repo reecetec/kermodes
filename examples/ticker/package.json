@@ -3,6 +3,7 @@
   "private": true,
   "workspaces": ["apps/*"],
   "scripts": {
-    "typecheck": "bun run --filter '*' typecheck"
+    "typecheck": "bun run --filter '*' typecheck",
+    "test": "bun run --filter '*' test"
   }
 }
