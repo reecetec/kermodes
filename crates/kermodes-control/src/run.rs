@@ -1066,6 +1066,7 @@ pub async fn status(controller: &Controller) -> Result<Value, String> {
         let head = state.latest(&project.name).await?;
         let latest = state.latest_discovered(&project.name).await?;
         let deployed = state.deployed(&project.name).await?;
+        let builds = state.builds(&project.name).await?;
         drop(state);
         // The mainline's newest commit, when its discovery failed: what runs stays on `commit`.
         let failed = head.and_then(|head| {
@@ -1089,6 +1090,23 @@ pub async fn status(controller: &Controller) -> Result<Value, String> {
                     "commit": running,
                     "available": (running != Some(&latest.commit)).then_some(&latest.commit),
                     "rollout": format!("{rollout:?}").to_lowercase(),
+                    "source": source,
+                }));
+            }
+            // An app's code is its directory, at the commit whose build is served.
+            let directory = project.path.trim_matches('/');
+            for app in &manifest.apps {
+                let served = plan::served_build(&app.name, &builds);
+                let path = match directory {
+                    "" => format!("apps/{}", app.name),
+                    directory => format!("{directory}/apps/{}", app.name),
+                };
+                let source =
+                    served.and_then(|commit| browse::source_url(&project.url, commit, &path, None));
+                resources.push(json!({
+                    "name": app.name,
+                    "kind": "app",
+                    "commit": served,
                     "source": source,
                 }));
             }
