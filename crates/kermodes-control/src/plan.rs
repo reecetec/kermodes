@@ -880,7 +880,7 @@ pub fn build_job_name(project: &str, app: &str, commit: &str) -> String {
     )
 }
 
-/// How a commit's checks (its CI) stand, from the git host's combined commit status.
+/// How a commit's checks (its CI) stand, from the git host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Checks {
     Passed,
@@ -889,10 +889,10 @@ pub enum Checks {
     Failed(String),
 }
 
-/// Where the combined status of `commit` is, from the repository's URL: Gitea's and Forgejo's
-/// API on the same host, or GitHub's on its API host.
-pub fn status_url(repository: &str, commit: &str) -> Result<String, String> {
-    let unreadable = || format!("cannot tell where {repository} reports commit statuses");
+/// Where `commit`'s checks are reported, from the repository's URL: GitHub's check runs on its API
+/// host (where Actions reports), or Gitea's and Forgejo's combined status on the same host.
+pub fn checks_url(repository: &str, commit: &str) -> Result<String, String> {
+    let unreadable = || format!("cannot tell where {repository} reports commit checks");
     let (scheme, rest) = repository.split_once("://").ok_or_else(unreadable)?;
     let (host, path) = rest.split_once('/').ok_or_else(unreadable)?;
     let path = path.trim_end_matches('/').trim_end_matches(".git");
@@ -901,19 +901,56 @@ pub fn status_url(repository: &str, commit: &str) -> Result<String, String> {
         return Err(unreadable());
     }
     Ok(if host == "github.com" {
-        format!("https://api.github.com/repos/{owner}/{repo}/commits/{commit}/status")
+        format!(
+            "https://api.github.com/repos/{owner}/{repo}/commits/{commit}/check-runs?per_page=100"
+        )
     } else {
         format!("{scheme}://{host}/api/v1/repos/{owner}/{repo}/commits/{commit}/status")
     })
 }
 
-/// A combined status: its `state`, and each status's `context` and result (`state` on GitHub,
-/// `status` on Gitea and Forgejo) for naming what failed.
-pub fn checks_of(status: &Value) -> Checks {
-    match status["state"].as_str().unwrap_or_default() {
+/// What the host answered at [`checks_url`]: GitHub's check runs (`check_runs`, each with its
+/// `name`, `status`, and once completed its `conclusion`), or a combined status (its `state`, and
+/// each status's `context` and result: `state` on GitHub, `status` on Gitea and Forgejo).
+pub fn checks_of(answer: &Value) -> Checks {
+    let failed = |names: Vec<&str>| {
+        Checks::Failed(if names.is_empty() {
+            "its checks failed".into()
+        } else {
+            format!("its checks failed: {}", names.join(", "))
+        })
+    };
+    if let Some(runs) = answer["check_runs"].as_array() {
+        // None yet: the commit's workflows have not started.
+        if runs.is_empty() || runs.iter().any(|r| r["status"] != "completed") {
+            return Checks::Pending;
+        }
+        let names: Vec<&str> = runs
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r["conclusion"].as_str(),
+                    Some(
+                        "failure"
+                            | "timed_out"
+                            | "cancelled"
+                            | "action_required"
+                            | "startup_failure"
+                    )
+                )
+            })
+            .filter_map(|r| r["name"].as_str())
+            .collect();
+        return if names.is_empty() {
+            Checks::Passed
+        } else {
+            failed(names)
+        };
+    }
+    match answer["state"].as_str().unwrap_or_default() {
         "success" => Checks::Passed,
-        "failure" | "error" => {
-            let failed: Vec<&str> = status["statuses"]
+        "failure" | "error" => failed(
+            answer["statuses"]
                 .as_array()
                 .into_iter()
                 .flatten()
@@ -922,13 +959,8 @@ pub fn checks_of(status: &Value) -> Checks {
                     matches!(result, Some("failure" | "error"))
                 })
                 .filter_map(|s| s["context"].as_str())
-                .collect();
-            Checks::Failed(if failed.is_empty() {
-                "its checks failed".into()
-            } else {
-                format!("its checks failed: {}", failed.join(", "))
-            })
-        }
+                .collect(),
+        ),
         _ => Checks::Pending,
     }
 }
@@ -1421,14 +1453,14 @@ mod tests {
     fn a_commit_waits_for_its_checks_and_fails_with_them() {
         let commit = "4e0ea58b";
         assert_eq!(
-            status_url("https://git.example.com/acme/kermodes.git", commit).unwrap(),
+            checks_url("https://git.example.com/acme/kermodes.git", commit).unwrap(),
             "https://git.example.com/api/v1/repos/acme/kermodes/commits/4e0ea58b/status"
         );
         assert_eq!(
-            status_url("https://github.com/acme/desk", commit).unwrap(),
-            "https://api.github.com/repos/acme/desk/commits/4e0ea58b/status"
+            checks_url("https://github.com/acme/desk", commit).unwrap(),
+            "https://api.github.com/repos/acme/desk/commits/4e0ea58b/check-runs?per_page=100"
         );
-        assert!(status_url("git@host:acme/desk.git", commit).is_err());
+        assert!(checks_url("git@host:acme/desk.git", commit).is_err());
 
         // As Gitea answers: each status's result is its `status`.
         let status = |state: &str| {
@@ -1447,6 +1479,34 @@ mod tests {
         assert_eq!(
             checks_of(&status("failure")),
             Checks::Failed("its checks failed: CI / python (push)".into())
+        );
+
+        // As GitHub answers for Actions: check runs, which its combined status leaves out.
+        let run = |name: &str, status: &str, conclusion: Value| json!({"name": name, "status": status, "conclusion": conclusion});
+        let runs = |runs: Vec<Value>| json!({"total_count": runs.len(), "check_runs": runs});
+        assert_eq!(checks_of(&runs(vec![])), Checks::Pending);
+        assert_eq!(
+            checks_of(&runs(vec![
+                run("rust", "completed", json!("success")),
+                run("python", "in_progress", Value::Null),
+            ])),
+            Checks::Pending
+        );
+        // A job skipped on purpose (one for pushes only, on a pull request) passes.
+        assert_eq!(
+            checks_of(&runs(vec![
+                run("rust", "completed", json!("success")),
+                run("wheels", "completed", json!("skipped")),
+            ])),
+            Checks::Passed
+        );
+        assert_eq!(
+            checks_of(&runs(vec![
+                run("rust", "completed", json!("failure")),
+                run("python", "completed", json!("success")),
+                run("wheels (x86_64)", "completed", json!("cancelled")),
+            ])),
+            Checks::Failed("its checks failed: rust, wheels (x86_64)".into())
         );
     }
 

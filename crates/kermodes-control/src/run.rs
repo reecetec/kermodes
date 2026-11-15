@@ -910,14 +910,14 @@ async fn sync(controller: &Controller, project: &ProjectConfig) -> Result<(), St
     reconcile(controller, project).await
 }
 
-/// How `commit`'s checks stand, from the git host's combined commit status, read with the
-/// project's git credentials.
+/// How `commit`'s checks stand, from the git host (GitHub's check runs, or Gitea's and Forgejo's
+/// combined status), read with the project's git credentials.
 async fn commit_checks(
     controller: &Controller,
     project: &ProjectConfig,
     commit: &str,
 ) -> Result<plan::Checks, String> {
-    let url = plan::status_url(&project.url, commit)?;
+    let url = plan::checks_url(&project.url, commit)?;
     let mut request = controller
         .http
         .get(&url)
@@ -937,9 +937,9 @@ async fn commit_checks(
         .text()
         .await
         .map_err(|e| format!("cannot read {commit}'s checks: {e}"))?;
-    let status: Value =
-        serde_json::from_str(&text).map_err(|e| format!("{url} sent no status: {e}"))?;
-    Ok(plan::checks_of(&status))
+    let answer: Value =
+        serde_json::from_str(&text).map_err(|e| format!("{url} sent no checks: {e}"))?;
+    Ok(plan::checks_of(&answer))
 }
 
 async fn discover(

@@ -974,9 +974,9 @@ Kermodes runs the pipeline itself, in the cluster, because every stage needs the
 environment images, data access, and worker resources. The git host stores code and reviews;
 generic CI (lint, formatting, the project's own tests) runs wherever the repository's CI does. A
 project configured with `checks: true` deploys only commits whose checks passed: a new head waits
-while the git host's combined commit status is pending (read with the project's git
-credentials, from Gitea's and Forgejo's API or GitHub's), and one whose checks failed is recorded
-as not deployable, naming them, as a commit whose discovery failed is.
+while its checks run (read with the project's git credentials: on GitHub the commit's check runs,
+where Actions reports; on Gitea and Forgejo its combined status), and one whose checks failed is
+recorded as not deployable, naming them, as a commit whose discovery failed is.
 
 ```mermaid
 flowchart LR
