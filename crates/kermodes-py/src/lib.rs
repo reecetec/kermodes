@@ -412,15 +412,17 @@ impl Session {
 
     /// Serves this session's published tables to the web UI on `host:port` (port 0 picks a
     /// free one): the app at `server.url`, tables published with `server.publish(name, table)`,
-    /// and the programs of `control`, `kermodes control`'s URL, if given.
+    /// the programs of `control`, `kermodes control`'s URL, if given, and the apps built on
+    /// Kermodes in `apps`, a directory of them, each at `/apps/<name>/`.
     /// Local use: there is no authentication, so it listens on 127.0.0.1 unless told otherwise.
-    #[pyo3(signature = (port=0, host="127.0.0.1", control=None))]
+    #[pyo3(signature = (port=0, host="127.0.0.1", control=None, apps=None))]
     fn serve(
         &self,
         py: Python<'_>,
         port: u16,
         host: &str,
         control: Option<String>,
+        apps: Option<PathBuf>,
     ) -> PyResult<Server> {
         let addr: SocketAddr = format!("{host}:{port}")
             .parse()
@@ -454,7 +456,7 @@ impl Session {
             }
         });
         let server = py
-            .detach(|| kermodes_gateway::serve(session, addr, app, control, stored))
+            .detach(|| kermodes_gateway::serve(session, addr, app, apps, control, stored))
             .map_err(|e| PyValueError::new_err(format!("cannot listen on {addr}: {e}")))?;
         Ok(Server(Mutex::new(server)))
     }

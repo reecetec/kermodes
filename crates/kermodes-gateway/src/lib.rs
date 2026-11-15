@@ -117,6 +117,8 @@ struct Shared {
     cycles: watch::Sender<u64>,
     /// The built web app (`index.html` and its assets), if any.
     app: Option<PathBuf>,
+    /// Apps built on Kermodes, each a directory with an `index.html`, served at `/apps/<name>/`.
+    apps: Option<PathBuf>,
     /// `kermodes control`, whose API the programs page reads through this server.
     control: Option<Control>,
     stored: Option<Stored>,
@@ -214,12 +216,14 @@ impl Shared {
     }
 }
 
-/// Serves `session` on `addr` (port 0 picks a free one), with the web app in `app`, the
-/// programs of `control` (`kermodes control`'s URL), and the tables of `stored`, if there are.
+/// Serves `session` on `addr` (port 0 picks a free one), with the web app in `app`, the apps
+/// built on Kermodes in `apps` (each a directory, at `/apps/<name>/`), the programs of
+/// `control` (`kermodes control`'s URL), and the tables of `stored`, if there are.
 pub fn serve(
     session: Session,
     addr: SocketAddr,
     app: Option<PathBuf>,
+    apps: Option<PathBuf>,
     control: Option<String>,
     stored: Option<Stored>,
 ) -> io::Result<Server> {
@@ -232,6 +236,7 @@ pub fn serve(
         catalog: watch::Sender::new(0),
         cycles: watch::Sender::new(0),
         app,
+        apps,
         control: control.map(|url| Control {
             url: url.trim_end_matches('/').to_owned(),
             client: Client::builder(TokioExecutor::new()).build_http(),
@@ -273,6 +278,10 @@ pub fn serve(
             "/api/deployments/{project}/{resource}/{action}",
             get(deployment_get).post(deployment_post),
         )
+        .route("/api/apps", get(apps_list))
+        .route("/apps/{name}", get(app_slash))
+        .route("/apps/{name}/", get(app_index))
+        .route("/apps/{name}/{*path}", get(app_file))
         .route("/", get(index))
         .route("/{*path}", get(asset))
         .with_state(shared.clone());
@@ -615,6 +624,62 @@ async fn file(shared: &Shared, path: &Path) -> Response {
         }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+/// The apps under `--apps` that are built: directories holding an `index.html`, by name.
+async fn apps_list(State(shared): State<Arc<Shared>>) -> Response {
+    let mut names = Vec::new();
+    if let Some(dir) = &shared.apps
+        && let Ok(mut entries) = tokio::fs::read_dir(dir).await
+    {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let built = tokio::fs::try_exists(entry.path().join("index.html")).await;
+            if let (true, Ok(name)) = (built.unwrap_or(false), entry.file_name().into_string()) {
+                names.push(name);
+            }
+        }
+    }
+    names.sort();
+    axum::Json(names).into_response()
+}
+
+/// An app's page needs the trailing slash, so its relative assets resolve under it.
+async fn app_slash(UrlPath(name): UrlPath<String>) -> Response {
+    if !is_plain(Path::new(&name)) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    axum::response::Redirect::permanent(&format!("/apps/{name}/")).into_response()
+}
+
+async fn app_index(State(shared): State<Arc<Shared>>, UrlPath(name): UrlPath<String>) -> Response {
+    app_served(&shared, &name, "index.html").await
+}
+
+async fn app_file(
+    State(shared): State<Arc<Shared>>,
+    UrlPath((name, path)): UrlPath<(String, String)>,
+) -> Response {
+    app_served(&shared, &name, &path).await
+}
+
+/// A file of the app `name`, read on every request so a rebuild is served at once.
+async fn app_served(shared: &Shared, name: &str, path: &str) -> Response {
+    let (name, path) = (Path::new(name), Path::new(path));
+    let Some(apps) = &shared.apps else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    // One app's directory, and only plain relative paths inside it.
+    if name.components().count() != 1 || !is_plain(name) || !is_plain(path) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match tokio::fs::read(apps.join(name).join(path)).await {
+        Ok(bytes) => ([(header::CONTENT_TYPE, content_type(path))], bytes).into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+fn is_plain(path: &Path) -> bool {
+    path.components().all(|c| matches!(c, Component::Normal(_)))
 }
 
 fn content_type(path: &Path) -> &'static str {

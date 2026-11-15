@@ -50,6 +50,25 @@
         "typescript": "^5.9.0",
       },
     },
+    "examples/market": {
+      "name": "@kermodes/example-market",
+      "version": "0.0.0",
+      "dependencies": {
+        "@kermodes/react": "workspace:*",
+        "@kermodes/theme": "workspace:*",
+        "react": "^19.0.0",
+        "react-dom": "^19.0.0",
+      },
+      "devDependencies": {
+        "@tailwindcss/vite": "^4.3.5",
+        "@types/react": "^19.0.0",
+        "@types/react-dom": "^19.0.0",
+        "@vitejs/plugin-react": "^5.0.0",
+        "tailwindcss": "^4.3.5",
+        "typescript": "^5.9.0",
+        "vite": "^7.0.0",
+      },
+    },
     "grid": {
       "name": "@kermodes/grid",
       "version": "0.0.0",
@@ -64,6 +83,23 @@
         "@types/react-dom": "^19.0.0",
         "react": "^19.0.0",
         "react-dom": "^19.0.0",
+        "typescript": "^5.9.0",
+      },
+      "peerDependencies": {
+        "react": "^19.0.0",
+      },
+    },
+    "react": {
+      "name": "@kermodes/react",
+      "version": "0.0.0",
+      "dependencies": {
+        "@kermodes/client": "workspace:*",
+        "@kermodes/grid": "workspace:*",
+        "apache-arrow": "^21.0.0",
+      },
+      "devDependencies": {
+        "@types/bun": "^1.4.0",
+        "@types/react": "^19.0.0",
         "typescript": "^5.9.0",
       },
       "peerDependencies": {
@@ -204,7 +240,11 @@
 
     "@kermodes/client": ["@kermodes/client@workspace:client"],
 
+    "@kermodes/example-market": ["@kermodes/example-market@workspace:examples/market"],
+
     "@kermodes/grid": ["@kermodes/grid@workspace:grid"],
+
+    "@kermodes/react": ["@kermodes/react@workspace:react"],
 
     "@kermodes/theme": ["@kermodes/theme@workspace:theme"],
 

@@ -24,7 +24,11 @@ class Session:
     @property
     def table_count(self) -> int: ...
     def serve(
-        self, port: int = 0, host: str = "127.0.0.1", control: str | None = None
+        self,
+        port: int = 0,
+        host: str = "127.0.0.1",
+        control: str | None = None,
+        apps: str | PathLike[str] | None = None,
     ) -> Server: ...
     def create_table(
         self,

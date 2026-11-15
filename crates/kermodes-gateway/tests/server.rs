@@ -105,6 +105,7 @@ async fn the_app_lists_opens_filters_and_follows_published_tables() {
         None,
         None,
         None,
+        None,
     )
     .unwrap();
     server.publish("book", &book);
@@ -215,6 +216,7 @@ async fn the_app_is_served_from_its_directory_only() {
         Some(app.clone()),
         None,
         None,
+        None,
     )
     .unwrap();
     let get = |path: &str| {
@@ -247,6 +249,63 @@ async fn the_app_is_served_from_its_directory_only() {
     std::fs::remove_dir_all(app).unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn apps_built_on_kermodes_are_served_under_their_names() {
+    let apps = std::env::temp_dir().join(format!("kermodes-gateway-apps-{}", std::process::id()));
+    std::fs::create_dir_all(apps.join("market/assets")).unwrap();
+    std::fs::write(apps.join("market/index.html"), "<!doctype html>market").unwrap();
+    std::fs::write(apps.join("market/assets/app.js"), "export {}").unwrap();
+    // A directory without a page is not an app yet
+    std::fs::create_dir_all(apps.join("unbuilt")).unwrap();
+    std::fs::write(apps.join("secret.txt"), "not served").unwrap();
+    let server = kermodes_gateway::serve(
+        Session::new(),
+        "127.0.0.1:0".parse().unwrap(),
+        None,
+        Some(apps.clone()),
+        None,
+        None,
+    )
+    .unwrap();
+    let get = |path: &str| {
+        let addr = server.addr();
+        let path = path.to_owned();
+        async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let request = format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            response
+        }
+    };
+    let listed = get("/api/apps").await;
+    assert!(listed.ends_with(r#"["market"]"#), "{listed}");
+    let page = get("/apps/market/").await;
+    assert!(
+        page.starts_with("HTTP/1.1 200") && page.ends_with("market"),
+        "{page}"
+    );
+    let script = get("/apps/market/assets/app.js").await;
+    assert!(script.contains("text/javascript"), "{script}");
+    // Relative assets resolve under the page only with its trailing slash
+    let bare = get("/apps/market").await;
+    assert!(
+        bare.starts_with("HTTP/1.1 308") && bare.contains("location: /apps/market/"),
+        "{bare}"
+    );
+    for outside in [
+        "/apps/market/../secret.txt",
+        "/apps/market/%2e%2e/secret.txt",
+        "/apps/%2e%2e/market/index.html",
+        "/apps/unbuilt/",
+    ] {
+        assert!(get(outside).await.starts_with("HTTP/1.1 404"), "{outside}");
+    }
+    std::fs::remove_dir_all(apps).unwrap();
+}
+
 /// The controller's API is reachable only through the routes the app uses, with names checked
 /// and parameters re-encoded: a component's logs keep `pod` and `tail`, and nothing else.
 #[tokio::test(flavor = "multi_thread")]
@@ -276,6 +335,7 @@ async fn only_the_apps_controller_routes_reach_the_controller() {
     let server = kermodes_gateway::serve(
         Session::new(),
         "127.0.0.1:0".parse().unwrap(),
+        None,
         None,
         Some(url),
         None,
@@ -360,6 +420,7 @@ async fn stored_tables_are_open_only_while_viewed() {
     let server = kermodes_gateway::serve(
         session.clone(),
         "127.0.0.1:0".parse().unwrap(),
+        None,
         None,
         None,
         Some(stored),
@@ -530,6 +591,7 @@ async fn stored_append_tables_are_shown_by_position() {
     let server = kermodes_gateway::serve(
         session.clone(),
         "127.0.0.1:0".parse().unwrap(),
+        None,
         None,
         None,
         Some(stored),

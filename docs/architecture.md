@@ -1202,6 +1202,16 @@ namespaces).
   that the UI, the notebook grid, and apps built on Kermodes all draw from.
 - `@kermodes/client`: TypeScript package speaking the delta protocol over WebSocket and decoding Arrow
   IPC with `apache-arrow`. Used by the UI and any other TypeScript consumer.
+- Apps built on Kermodes: Python computes and publishes tables; a TypeScript frontend of any
+  components shows them. `@kermodes/react` (`web/react`) gives `KermodesProvider` (one
+  connection, the page's own server by default) and `useTable(name, { sort, filters, offset,
+  limit } | { last })`: the asked rows as plain objects, kept current, with the total, columns,
+  and a status (loading, live, static, reconnecting, failed). Only those rows travel; `last`
+  follows an append table's end by position, so the server holds nothing to sort. Apps style
+  themselves with `@kermodes/theme`'s Tailwind preset. `kermodes ui --apps DIR` (and `kermodes
+  dev --apps`) serves each built app in `DIR` at `/apps/<name>/` behind the same server, lists
+  them at `/api/apps`, and the UI links them from its top bar. `web/examples/market` is one: a
+  quote board, the newest ticks, and two figures from three live tables.
 - Ticking and large tables: the table viewer (§15.3). Lists of things (deployments, the
   catalog) are plain tables with fixed column widths, so values changing or a panel opening
   never moves a column, and details open in a panel docked beside or below the list.

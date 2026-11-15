@@ -8,7 +8,7 @@ import {
 import { gridThemeOf } from '@kermodes/grid';
 import { CatalogPage } from '@/Catalog';
 import { DEPLOYMENTS_VIEW, DeploymentsPage } from '@/Deployments';
-import { Button } from '@/components/ui/button';
+import { Button, buttonVariants } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import {
@@ -122,6 +122,22 @@ function useHasCatalog(): boolean {
   return has;
 }
 
+/** The apps built on Kermodes this server serves at `/apps/<name>/` (`--apps`) */
+function useApps(): string[] {
+  const [apps, setApps] = useState<string[]>([]);
+  useEffect(() => {
+    let live = true;
+    fetch('/api/apps')
+      .then(response => (response.ok ? (response.json() as Promise<string[]>) : []))
+      .then(names => live && setApps(names))
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, []);
+  return apps;
+}
+
 function TopBar({
   connection,
   themeName,
@@ -140,6 +156,7 @@ function TopBar({
   /** Whether the brand opens Deployments, the home page wherever a controller runs */
   home: boolean;
 }) {
+  const apps = useApps();
   return (
     <header className="flex h-12 shrink-0 items-center gap-3 border-b bg-sidebar px-4">
       {home ? (
@@ -172,6 +189,12 @@ function TopBar({
           >
             {PAGE_LABEL[name]}
           </Button>
+        ))}
+        {apps.length > 0 && <span className="mx-1 h-4 w-px bg-border" aria-hidden />}
+        {apps.map(name => (
+          <a key={name} href={`/apps/${name}/`} className={buttonVariants({ variant: 'ghost', size: 'sm' })}>
+            {name}
+          </a>
         ))}
       </nav>
       <div className="ml-auto flex items-center gap-2">
