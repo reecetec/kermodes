@@ -6,11 +6,16 @@
   "type": "module",
   "main": "src/index.tsx",
   "types": "src/index.tsx",
+  "exports": {
+    ".": "./src/index.tsx",
+    "./table": "./src/table.tsx"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@kermodes/client": "workspace:*",
+    "@kermodes/grid": "workspace:*",
     "apache-arrow": "^21.0.0"
   },
   "peerDependencies": {

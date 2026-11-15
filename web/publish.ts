@@ -36,8 +36,16 @@ const pinned = (deps: Record<string, string> | undefined) =>
         ])
       );
 
-/** A TypeScript package: bundled to dist/index.js and declared in dist/index.d.ts */
-async function build(dir: string, entry: string, declarations: Record<string, string[]>) {
+/**
+ * A TypeScript package: each of `entries` (export path to source) bundled to dist/<name>.js,
+ * sharing what they have in common through chunks (one React context, not one per entry), and
+ * declared in dist/<name>.d.ts.
+ */
+async function build(
+  dir: string,
+  entries: Record<string, string>,
+  declarations: Record<string, string[]>
+) {
   const manifest = await read(dir);
   const out = path.join(staging, dir);
   const external = [
@@ -45,9 +53,10 @@ async function build(dir: string, entry: string, declarations: Record<string, st
     ...Object.keys(manifest.peerDependencies ?? {}),
   ];
   const built = await Bun.build({
-    entrypoints: [path.join(web, dir, entry)],
+    entrypoints: Object.values(entries).map(entry => path.join(web, dir, entry)),
     outdir: path.join(out, 'dist'),
-    naming: 'index.js',
+    naming: { entry: '[name].[ext]', chunk: 'chunk-[hash].[ext]' },
+    splitting: true,
     target: 'browser',
     format: 'esm',
     // React's production JSX runtime, not the development one
@@ -79,6 +88,13 @@ async function build(dir: string, entry: string, declarations: Record<string, st
   );
   await $`bunx tsc -p ${tsconfig}`.cwd(web);
   await rm(tsconfig);
+  // Each entry's file, by the export path it is published under
+  const exports = Object.fromEntries(
+    Object.entries(entries).map(([exported, entry]) => {
+      const name = path.basename(entry).replace(/\.tsx?$/, '');
+      return [exported, { types: `./dist/${name}.d.ts`, import: `./dist/${name}.js` }];
+    })
+  );
   await Bun.write(
     path.join(out, 'package.json'),
     JSON.stringify(
@@ -89,7 +105,7 @@ async function build(dir: string, entry: string, declarations: Record<string, st
         type: 'module',
         main: './dist/index.js',
         types: './dist/index.d.ts',
-        exports: { '.': { types: './dist/index.d.ts', import: './dist/index.js' } },
+        exports,
         files: ['dist'],
         dependencies: pinned(manifest.dependencies),
         peerDependencies: manifest.peerDependencies,
@@ -127,14 +143,19 @@ async function copy(dir: string, files: string[]) {
   return out;
 }
 
-const client = await build('client', 'src/index.ts', {});
-const react = await build('react', 'src/index.tsx', {
-  '@kermodes/client': [path.join(client, 'dist/index.d.ts')],
-});
+const client = await build('client', { '.': 'src/index.ts' }, {});
+const clientTypes = { '@kermodes/client': [path.join(client, 'dist/index.d.ts')] };
+// The platform's own table viewer, which @kermodes/react's <Table> draws with
+const grid = await build('grid', { '.': 'src/index.ts' }, clientTypes);
+const react = await build(
+  'react',
+  { '.': 'src/index.tsx', './table': 'src/table.tsx' },
+  { ...clientTypes, '@kermodes/grid': [path.join(grid, 'dist/index.d.ts')] }
+);
 const theme = await copy('theme', ['tokens.css', 'tailwind.css']);
 
 const host = registry.replace(/^https?:/, '');
-for (const out of [client, react, theme]) {
+for (const out of [client, grid, react, theme]) {
   await Bun.write(
     path.join(out, '.npmrc'),
     `@kermodes:registry=${registry}\n${host}:_authToken=\${NPM_TOKEN}\n`

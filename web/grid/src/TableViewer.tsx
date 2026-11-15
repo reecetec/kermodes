@@ -343,6 +343,9 @@ export type TableViewerProps = {
   theme: GridTheme;
   // When set, the grid is as tall as its rows, up to this height; otherwise it fills its parent
   maxGridHeight?: number;
+  // Starts at the table's end and stays there as rows arrive, until scrolled up (and again
+  // once scrolled back down): an append table's newest rows, by position, with no sort
+  follow?: boolean;
 };
 
 /**
@@ -354,6 +357,7 @@ export function TableViewer({
   channel,
   theme,
   maxGridHeight,
+  follow = false,
 }: TableViewerProps): React.ReactElement {
   const [state, setState] = useState<ViewerState>(() => channel.state());
   const model = useMemo(() => {
@@ -905,6 +909,8 @@ export function TableViewer({
           renderer={renderer}
           mouseHandlers={mouseHandlers}
           onViewChanged={handleViewChanged}
+          isStickyBottom={follow}
+          isStuckToBottom={follow}
         />
         {isFilterBarShown && (
           <FilterBar

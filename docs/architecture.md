@@ -1229,9 +1229,13 @@ namespaces).
   and a status (loading, live, static, reconnecting, failed). Only those rows travel; `last`
   follows an append table's end by position, so the server holds nothing to sort. An app's
   tests give `KermodesProvider` a `fakeKermodes({ table: rows })` connection: the rows reach
-  `useTable` through the same Arrow decoding, in the order given, and `set` ticks them. Apps style
-  themselves with `@kermodes/theme`'s Tailwind preset. Each release publishes
-  `@kermodes/client`, `react`, and `theme` at its version to the npm registry (`web/publish.ts`),
+  `useTable` through the same Arrow decoding, in the order given, and `set` ticks them. For a
+  table shown as a table, `@kermodes/react/table`'s `<Table name>` is the platform's own viewer
+  (§15.3) on the provider's connection, in the page's theme; with `follow` it starts at the end
+  and stays there as rows arrive, which needs no sort. It is its own entry, so an app that does
+  not show one does not carry the grid. Apps style themselves with `@kermodes/theme`'s Tailwind
+  preset. Each release publishes `@kermodes/client`, `grid`, `react`, and `theme` at its
+  version to the npm registry (`web/publish.ts`),
   and an app pins the version it was built against like any dependency; a project's `.npmrc`
   names the registry and the environment variable holding its token. Under `kermodes dev` the
   UI's server passes `/apps/<project>/<name>/` (WebSockets too, for hot reload) to the app's dev

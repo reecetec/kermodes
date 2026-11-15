@@ -74,6 +74,7 @@
       "version": "0.0.0",
       "dependencies": {
         "@kermodes/client": "workspace:*",
+        "@kermodes/grid": "workspace:*",
         "apache-arrow": "^21.0.0",
       },
       "devDependencies": {
@@ -83,6 +84,7 @@
       },
       "peerDependencies": {
         "react": "^19.0.0",
+        "react-dom": "^19.0.0",
       },
     },
     "theme": {
