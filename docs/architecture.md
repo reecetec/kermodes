@@ -1087,9 +1087,14 @@ them with the fixed artifact on the replay clock, committing each date atomicall
 
 ### 11.7 Repositories and credentials
 
-- A `Repository` registers a git remote on any host, fetched over SSH or HTTPS, with its
-  credentials (secret reference) and a webhook secret. Credentials stay in the control plane;
-  worker pods never hold them.
+- A project names its repository by URL, on any host, fetched over HTTPS. Credentials are
+  Secrets in the controller's namespace, as Argo CD's: labelled `kermodes.io/secret-type:
+  repository` for the repository at exactly its `url`, or `repo-creds` for every repository whose
+  URL starts with its `url` (`https://github.com/acme`), each with `username` and `password` (a
+  token). A repository takes its own Secret, else the longest prefix that covers it; a public one
+  needs none. The controller reads them at every sync, so a new or rotated Secret applies at
+  once, and uses them for git and for the host's checks API. Credentials stay in the control
+  plane; worker pods never hold them.
 - Host adapters are optional: the GitHub, GitLab, and Gitea adapters post commit statuses and plan
   comments. Without one, results are in the UI.
 - Code snapshots reach workers through an init container with a short-lived token and are mounted

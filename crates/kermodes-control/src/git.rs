@@ -14,6 +14,52 @@ pub struct Credentials {
     pub password: String,
 }
 
+/// The label a Secret carries to hold git credentials, as Argo CD's `secret-type`: `repository`
+/// for one repository, `repo-creds` for every repository under a URL prefix.
+pub const SECRET_TYPE: &str = "kermodes.io/secret-type";
+
+/// Which repositories a credentials Secret covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// The repository at exactly its `url` (`repository`).
+    Repository,
+    /// Every repository whose URL starts with its `url` (`repo-creds`).
+    Prefix,
+}
+
+/// One labelled Secret's credentials, for the repositories its scope and `url` cover.
+#[derive(Clone)]
+pub struct RepositorySecret {
+    pub scope: Scope,
+    pub url: String,
+    pub credentials: Credentials,
+}
+
+/// The credentials for the repository at `url`, as Argo CD picks them: its own `repository`
+/// Secret's, else the longest matching `repo-creds` prefix's; none for a public repository.
+/// URLs compare without case, a trailing `/`, or `.git`.
+pub fn credentials_for<'a>(url: &str, secrets: &'a [RepositorySecret]) -> Option<&'a Credentials> {
+    let normal = |url: &str| {
+        url.trim_end_matches('/')
+            .trim_end_matches(".git")
+            .to_ascii_lowercase()
+    };
+    let url = normal(url);
+    let exact = secrets
+        .iter()
+        .find(|s| s.scope == Scope::Repository && normal(&s.url) == url);
+    exact
+        .or_else(|| {
+            secrets
+                .iter()
+                .filter(|s| {
+                    s.scope == Scope::Prefix && url.starts_with(&s.url.to_ascii_lowercase())
+                })
+                .max_by_key(|s| s.url.len())
+        })
+        .map(|s| &s.credentials)
+}
+
 /// A project's mainline: where to find it, and which directory is the project.
 #[derive(Clone, Debug)]
 pub struct Repository {
@@ -136,7 +182,45 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    use super::{Repository, head, snapshot};
+    use super::{
+        Credentials, Repository, RepositorySecret, Scope, credentials_for, head, snapshot,
+    };
+
+    #[test]
+    fn a_repository_takes_its_own_credentials_else_its_longest_prefix() {
+        let secret = |scope, url: &str, username: &str| RepositorySecret {
+            scope,
+            url: url.into(),
+            credentials: Credentials {
+                username: username.into(),
+                password: "token".into(),
+            },
+        };
+        let secrets = [
+            secret(Scope::Prefix, "https://github.com/", "github"),
+            secret(Scope::Prefix, "https://github.com/acme", "acme"),
+            secret(
+                Scope::Repository,
+                "https://github.com/acme/desk.git",
+                "desk",
+            ),
+            secret(
+                Scope::Repository,
+                "https://git.example.com/acme/data",
+                "data",
+            ),
+        ];
+        let user = |url| credentials_for(url, &secrets).map(|c| c.username.as_str());
+        // Its own Secret, whatever the URL's case, trailing slash, or .git.
+        assert_eq!(user("https://GitHub.com/acme/desk/"), Some("desk"));
+        assert_eq!(user("https://git.example.com/acme/data.git"), Some("data"));
+        // Otherwise the longest prefix that covers it.
+        assert_eq!(user("https://github.com/acme/models.git"), Some("acme"));
+        assert_eq!(user("https://github.com/other/repo"), Some("github"));
+        // A repository Secret covers only its repository; nothing covers a public host.
+        assert_eq!(user("https://git.example.com/acme/data-two"), None);
+        assert_eq!(user("https://gitlab.com/acme/desk"), None);
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("kermodes-git-{}-{name}", std::process::id()));

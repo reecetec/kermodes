@@ -132,8 +132,8 @@ def main(argv: list[str] | None = None) -> None:
         description="Syncs each configured project's mainline from git, discovers what each "
         "commit declares, and runs every resource as a Kubernetes Deployment rolled out by its "
         "update policy (architecture.md §11.3-11.4, §16.2). Secrets come from the environment: "
-        "KERMODES_CATALOG (its Postgres), KERMODES_GIT_USERNAME and KERMODES_GIT_PASSWORD, "
-        "KERMODES_WEBHOOK_SECRET; POD_NAMESPACE is where it runs.",
+        "KERMODES_CATALOG (its Postgres) and KERMODES_WEBHOOK_SECRET; git credentials from "
+        "labelled Secrets in its namespace (§11.7); POD_NAMESPACE is where it runs.",
     )
     control.add_argument(
         "--config", type=Path, required=True, help="JSON: projects, image, weir, ..."
@@ -263,8 +263,6 @@ def run_control(config_path: Path) -> None:
     config = json.loads(config_path.read_text())
     for key, variable in [
         ("database", "KERMODES_CATALOG"),
-        ("git_username", "KERMODES_GIT_USERNAME"),
-        ("git_password", "KERMODES_GIT_PASSWORD"),
         ("webhook_secret", "KERMODES_WEBHOOK_SECRET"),
         ("namespace", "POD_NAMESPACE"),
     ]:

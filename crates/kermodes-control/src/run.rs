@@ -48,10 +48,8 @@ pub struct Config {
     pub webhook_secret: Option<String>,
     #[serde(default = "poll_seconds")]
     pub poll_seconds: u64,
-    #[serde(default)]
-    pub git_username: Option<String>,
-    #[serde(default)]
-    pub git_password: Option<String>,
+    /// The projects to sync. Their git credentials are not configuration but labelled Secrets in
+    /// the namespace (§11.7, `Kube::repository_secrets`).
     pub projects: Vec<ProjectConfig>,
     /// Where history goes; without it, nothing is merged.
     #[serde(default)]
@@ -82,13 +80,6 @@ pub struct ProjectConfig {
 impl Config {
     pub fn parse(json: &str) -> Result<Self, String> {
         serde_json::from_str(json).map_err(|e| format!("an unreadable controller config: {e}"))
-    }
-
-    fn credentials(&self) -> Option<Credentials> {
-        Some(Credentials {
-            username: self.git_username.clone()?,
-            password: self.git_password.clone()?,
-        })
     }
 }
 
@@ -791,7 +782,7 @@ async fn sync(controller: &Controller, project: &ProjectConfig) -> Result<(), St
         branch: project.branch.clone(),
         path: project.path.clone(),
     };
-    let credentials = controller.config.credentials();
+    let credentials = project_credentials(controller, project).await?;
     let head = {
         let (repo, credentials) = (repo.clone(), credentials.clone());
         tokio::task::spawn_blocking(move || git::head(&repo, credentials.as_ref()))
@@ -810,7 +801,7 @@ async fn sync(controller: &Controller, project: &ProjectConfig) -> Result<(), St
     let pending = match known {
         None => {
             let checks = if project.checks {
-                commit_checks(controller, project, &head).await?
+                commit_checks(controller, project, credentials.as_ref(), &head).await?
             } else {
                 plan::Checks::Passed
             };
@@ -910,11 +901,22 @@ async fn sync(controller: &Controller, project: &ProjectConfig) -> Result<(), St
     reconcile(controller, project).await
 }
 
+/// The credentials for a project's repository, from the namespace's labelled Secrets as they are
+/// now; none for a public repository.
+async fn project_credentials(
+    controller: &Controller,
+    project: &ProjectConfig,
+) -> Result<Option<Credentials>, String> {
+    let secrets = controller.kube.repository_secrets().await?;
+    Ok(git::credentials_for(&project.url, &secrets).cloned())
+}
+
 /// How `commit`'s checks stand, from the git host (GitHub's check runs, or Gitea's and Forgejo's
 /// combined status), read with the project's git credentials.
 async fn commit_checks(
     controller: &Controller,
     project: &ProjectConfig,
+    credentials: Option<&Credentials>,
     commit: &str,
 ) -> Result<plan::Checks, String> {
     let url = plan::checks_url(&project.url, commit)?;
@@ -923,8 +925,8 @@ async fn commit_checks(
         .get(&url)
         .header("accept", "application/json")
         .header("user-agent", "kermodes-control");
-    if let Some(credentials) = controller.config.credentials() {
-        request = request.basic_auth(credentials.username, Some(credentials.password));
+    if let Some(credentials) = credentials {
+        request = request.basic_auth(&credentials.username, Some(&credentials.password));
     }
     let response = request
         .send()

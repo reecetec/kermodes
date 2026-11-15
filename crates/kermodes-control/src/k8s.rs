@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{Event, Node, PersistentVolumeClaim, Pod};
+use k8s_openapi::api::core::v1::{Event, Node, PersistentVolumeClaim, Pod, Secret};
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::Api;
 use kube::api::{
@@ -15,6 +15,7 @@ use kube::api::{
     PatchParams, PostParams,
 };
 
+use crate::git::{Credentials, RepositorySecret, SECRET_TYPE, Scope};
 use crate::plan::{MergeJob, Placement};
 use crate::report::{self, Observed};
 use crate::system;
@@ -41,6 +42,8 @@ pub struct Kube {
     claims: Api<PersistentVolumeClaim>,
     /// metrics-server's pod usage (`metrics.k8s.io`).
     metrics: Api<DynamicObject>,
+    /// Git credentials, in Secrets labelled as Argo CD's (§11.7).
+    secrets: Api<Secret>,
 }
 
 /// Where a resource's rollout stands, as Kubernetes reports it.
@@ -70,6 +73,7 @@ impl Kube {
             nodes: Api::all(client.clone()),
             events: Api::namespaced(client.clone(), namespace),
             claims: Api::namespaced(client.clone(), namespace),
+            secrets: Api::namespaced(client.clone(), namespace),
             metrics: Api::namespaced_with(
                 client,
                 namespace,
@@ -552,6 +556,52 @@ impl Kube {
             .into_iter()
             .filter_map(|d| d.metadata.name)
             .collect())
+    }
+
+    /// The git credentials in the namespace's labelled Secrets, read at every sync so a new or
+    /// rotated one applies at once. One without a `url`, `username`, or `password` is left out
+    /// and logged.
+    pub async fn repository_secrets(&self) -> Result<Vec<RepositorySecret>, String> {
+        let selector = format!("{SECRET_TYPE} in (repository,repo-creds)");
+        let secrets = self
+            .secrets
+            .list(&ListParams::default().labels(&selector))
+            .await
+            .map_err(|e| format!("cannot list git credentials: {e}"))?;
+        let mut found = Vec::new();
+        for secret in secrets.items {
+            let name = secret.metadata.name.clone().unwrap_or_default();
+            let scope = match secret
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(SECRET_TYPE))
+            {
+                Some(t) if t == "repository" => Scope::Repository,
+                _ => Scope::Prefix,
+            };
+            let data = secret.data.unwrap_or_default();
+            let value = |key: &str| {
+                data.get(key)
+                    .and_then(|v| String::from_utf8(v.0.clone()).ok())
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| format!("Secret {name} has no `{key}`"))
+            };
+            match (value("url"), value("username"), value("password")) {
+                (Ok(url), Ok(username), Ok(password)) => found.push(RepositorySecret {
+                    scope,
+                    url,
+                    credentials: Credentials { username, password },
+                }),
+                (url, username, password) => {
+                    let missing = [url.err(), username.err(), password.err()];
+                    for why in missing.into_iter().flatten() {
+                        eprintln!("kermodes control: git credentials skipped: {why}");
+                    }
+                }
+            }
+        }
+        Ok(found)
     }
 
     /// Deletes a resource's Deployment and its disruption budget.

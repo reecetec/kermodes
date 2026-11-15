@@ -18,11 +18,11 @@ control:
   replicas: 2
   pollSeconds: 30
   # Each: name (its kermodes.toml's), url (any git host, HTTPS), branch (its mainline), and path
-  # (its directory in the repository; empty for the root).
+  # (its directory in the repository; empty for the root). A private repository's credentials
+  # are a Secret in this namespace, as Argo CD's: labelled kermodes.io/secret-type: repository
+  # (for the repository at its `url`) or repo-creds (for every repository under its `url`), with
+  # `url`, `username`, and `password` (a token). A public repository needs none.
   projects: []
-  # A Secret with `username` and `password` (a token) for the projects' repositories.
-  git:
-    secretName: ""
   # A Secret with `secret`, which signs pushes to POST /hooks/sync (X-Hub-Signature-256, as
   # GitHub, Gitea, and Forgejo send it); without one, the webhook is off.
   webhook:

@@ -53,6 +53,11 @@ rules:
   - apiGroups: [""]
     resources: [persistentvolumeclaims]
     verbs: [list]
+  # Git credentials: Secrets labelled kermodes.io/secret-type (architecture.md §11.7). RBAC
+  # cannot select by label, so this reads every Secret in the namespace, as Argo CD's does.
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [list]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -208,18 +213,6 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.catalog.secretName }}
                   key: {{ .Values.catalog.secretKey }}
-            {{- with .Values.control.git.secretName }}
-            - name: KERMODES_GIT_USERNAME
-              valueFrom:
-                secretKeyRef:
-                  name: {{ . }}
-                  key: username
-            - name: KERMODES_GIT_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ . }}
-                  key: password
-            {{- end }}
             {{- with .Values.control.webhook.secretName }}
             - name: KERMODES_WEBHOOK_SECRET
               valueFrom:
