@@ -141,6 +141,10 @@ jobs:
           # Compiled objects in the Actions cache, so a push rebuilds only what changed.
           sccache: "true"
           args: --release --locked --out dist
+      # The app is gitignored, so only pyproject.toml's include puts it in the wheel; without it
+      # `kermodes ui` answers 404 at /.
+      - name: Check the wheel carries the web app
+        run: unzip -l dist/*.whl | grep -q 'kermodes/static/app/index.html'
       - uses: actions/upload-artifact@v5
         with:
           name: wheels-${{ matrix.target }}

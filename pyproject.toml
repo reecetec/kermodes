@@ -32,6 +32,9 @@ manifest-path = "crates/kermodes-py/Cargo.toml"
 module-name = "kermodes._native"
 python-source = "python"
 editable-profile = "dev-py"
+# The web app and notebook widget, built from web/ before the wheel (`bun run build`). They are
+# gitignored, and maturin leaves out what git ignores, so the wheel names them.
+include = [{ path = "python/kermodes/static/**/*", format = "wheel" }]
 
 [tool.uv]
 # uv rebuilds the extension only when one of these changes.
