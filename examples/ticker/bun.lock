@@ -9,8 +9,8 @@
       "name": "market",
       "version": "0.0.0",
       "dependencies": {
-        "@kermodes/react": "0.5.0",
-        "@kermodes/theme": "0.5.0",
+        "@kermodes/react": "0.5.1-dev.5.g952f27b",
+        "@kermodes/theme": "0.5.1-dev.5.g952f27b",
         "react": "^19.0.0",
         "react-dom": "^19.0.0",
       },
@@ -133,13 +133,13 @@
 
     "@jridgewell/trace-mapping": ["@jridgewell/trace-mapping@0.3.31", "", { "dependencies": { "@jridgewell/resolve-uri": "^3.1.0", "@jridgewell/sourcemap-codec": "^1.4.14" } }, "sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw=="],
 
-    "@kermodes/client": ["@kermodes/client@0.5.0", "", {}, "sha512-GajyVUw0F4UxhQ3kX5/RwC5fh1SG4s51Rc2d3A6qNkBHzEXt6aPV7Bklrk+hC27Y85RJSIvjvvmP9JHfCK0/mg=="],
+    "@kermodes/client": ["@kermodes/client@0.5.1-dev.5.g952f27b", "", {}, "sha512-h5jYxe+8vAq8WMFqtLpZIL9LDYwwxYk7o7FveAHm3lSjThfkgpaW1+0doVgCopZBHSUD8ldHl6Nk9uzVP+gd7w=="],
 
-    "@kermodes/grid": ["@kermodes/grid@0.5.0", "", { "dependencies": { "@kermodes/client": "0.5.0", "apache-arrow": "^21.0.0", "classnames": "^2.5.1", "memoize-one": "^6.0.0" }, "peerDependencies": { "react": "^19.0.0" } }, "sha512-iG8NhU2k2KYumBdcXH4qWlYhN7t89hU1RJvr50G4DcaaKEEONnYl7MRQeAdRQFt3zF4C/Fd6L1d6EPGJGgathg=="],
+    "@kermodes/grid": ["@kermodes/grid@0.5.1-dev.5.g952f27b", "", { "dependencies": { "@kermodes/client": "0.5.1-dev.5.g952f27b", "apache-arrow": "^21.0.0", "classnames": "^2.5.1", "memoize-one": "^6.0.0" }, "peerDependencies": { "react": "^19.0.0" } }, "sha512-zkmnj9LZmpASIjIZEpj9N0Yod7H0gxr4OZ1EGy3Bkvc7/sLa3n667B5tDRLez4kUwZBD/cEpWjGFct7JrTJwyQ=="],
 
-    "@kermodes/react": ["@kermodes/react@0.5.0", "", { "dependencies": { "@kermodes/client": "0.5.0", "@kermodes/grid": "0.5.0", "apache-arrow": "^21.0.0" }, "peerDependencies": { "react": "^19.0.0" } }, "sha512-PCa8cRqRpXDYqhGD+eVCNONS3ip/w7G56/HaKgE9HMAYWjzjb/vEtiwQ+1bcnc7yPpHV9WgPYsU+UXUYcbL7jA=="],
+    "@kermodes/react": ["@kermodes/react@0.5.1-dev.5.g952f27b", "", { "dependencies": { "@kermodes/client": "0.5.1-dev.5.g952f27b", "@kermodes/grid": "0.5.1-dev.5.g952f27b", "apache-arrow": "^21.0.0" }, "peerDependencies": { "react": "^19.0.0" } }, "sha512-ehIvxIwL/85YMnDM5xG3IwXGiU3CvH3LEyB7M1MVTkEmBy9490KSYkA30B/8Pr7tLLUg2q/SAE5HSwrfy1Lysg=="],
 
-    "@kermodes/theme": ["@kermodes/theme@0.5.0", "", {}, "sha512-RCakOutoeAzLuWIYdcmMVxw+ujkh8iy957G5ZBuJ3GSBY7wTMLqJW5Xa/i1A+fTNgdlkDev0TypO+VlJxxAEdg=="],
+    "@kermodes/theme": ["@kermodes/theme@0.5.1-dev.5.g952f27b", "", {}, "sha512-crNVOTIA8RVAy3xRlhNv1IsdqKEmY8kFoh0I8sbX29XoY7jdM84cqZFjoQviE8Vw9q5/gJHV1JPf5scS5os6CA=="],
 
     "@rolldown/pluginutils": ["@rolldown/pluginutils@1.0.0-rc.3", "", {}, "sha512-eybk3TjzzzV97Dlj5c+XrBFW57eTNhzod66y9HrBlzJ6NsCrWCp/2kaPS3K9wJmurBC0Tdw4yPjXKZqlznim3Q=="],
 
