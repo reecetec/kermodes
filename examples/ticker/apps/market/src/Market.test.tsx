@@ -15,7 +15,7 @@ it("shows each symbol's quote and day, and counts the ticks as they arrive", asy
   const kermodes = fakeKermodes({
     board: [
       { sym: 'AAPL', price: 189.5, trades: 1, volume: 100, low: 189.5, high: 189.5 },
-      { sym: 'MSFT', price: 410.25, trades: 1, volume: 1250, low: 401, high: 412.75 },
+      { sym: 'MSFT', price: 410.25, trades: 1, volume: 41_041_590, low: 401, high: 412.75 },
     ],
     'md.ticks': ticks,
   });
@@ -28,7 +28,7 @@ it("shows each symbol's quote and day, and counts the ticks as they arrive", asy
   // Each quote's card: its last price, and its day's range and volume.
   expect(await screen.findByText('410.25')).toBeDefined();
   expect(screen.getByText('189.50')).toBeDefined();
-  expect(screen.getByText('401.00–412.75 · 1,250')).toBeDefined();
+  expect(screen.getByText('401.00–412.75 · 41M')).toBeDefined();
   const figure = (label: string) => screen.getByText(label).nextElementSibling?.textContent;
   expect(figure('Ticks today')).toBe('2');
   expect(figure('Symbols quoted')).toBe('2');

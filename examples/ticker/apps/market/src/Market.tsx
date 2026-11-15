@@ -7,6 +7,8 @@ type Quote = { sym: string; price: number; trades: number; volume: number; low: 
 
 const price = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const count = new Intl.NumberFormat('en-US');
+// A day's volume runs to tens of millions: compact, so a card's line does not wrap.
+const volume = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 });
 
 /**
  * A market board: the app's own `board` (each symbol's last price and day) as cards in ordinary
@@ -86,7 +88,7 @@ function QuoteCard({ quote }: { quote: Quote }) {
       <div className="font-mono text-xs text-muted-foreground">{quote.sym}</div>
       <div className="mt-0.5 text-lg font-medium tabular-nums">{price.format(quote.price)}</div>
       <div className="mt-0.5 text-[11px] text-muted-foreground tabular-nums">
-        {price.format(quote.low)}–{price.format(quote.high)} · {count.format(quote.volume)}
+        {price.format(quote.low)}–{price.format(quote.high)} · {volume.format(quote.volume)}
       </div>
     </div>
   );
