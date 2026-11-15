@@ -907,20 +907,22 @@ pub fn awaited_build(
     }
 }
 
-/// The Job that builds `app` from its directory `path` at the target's commit: the commit's
-/// code, `bun install --frozen-lockfile` where its lockfile is (the project, when it is a
-/// workspace of apps and shared packages, else the app), Vite's build under the app's address,
-/// and a tar of the output uploaded to `upload`, a presigned URL for its one object.
+/// The Job that builds `app`'s page from its directory `path` at the target's commit: the
+/// platform's kit for it (written by the platform image, as `kermodes dev` writes it), the
+/// commit's code, `bun install --frozen-lockfile` in the project, Vite's build under the app's
+/// address, and a tar of the output uploaded to `upload`, a presigned URL for its one object.
 pub fn build_job(target: &Target, app: &str, path: &str, builds: &Builds, upload: &str) -> Job {
     // Project code runs here, with no credentials but the build Secret's.
     const SCRIPT: &str = r#"set -eu
 mkdir -p /work/home /work/tmp
 cp -R "$PROJECT_DIR" /work/project
 cd /work/project
-if [ -f package.json ]; then root=.; else root="$APP_PATH"; fi
-(cd "$root" && bun install --frozen-lockfile)
-cd "$APP_PATH"
-bun run build --base "/apps/$PROJECT/$APP/" --outDir /work/out --emptyOutDir
+bun install --frozen-lockfile
+mkdir -p ".kermodes/apps/$APP"
+cp -R /work/kit/. ".kermodes/apps/$APP/"
+KERMODES_APP_DIR="/work/project/$APP_PATH" KERMODES_PROJECT=/work/project \
+  bun x --bun vite build --config ".kermodes/apps/$APP/vite.config.ts" \
+  --base "/apps/$PROJECT/$APP/" --outDir /work/out --emptyOutDir
 tar -C /work/out -cf /work/app.tar .
 bun -e 'const r = await fetch(process.env.UPLOAD, { method: "PUT", body: Bun.file("/work/app.tar") });
 if (!r.ok) { console.error(`upload refused: ${r.status} ${await r.text()}`); process.exit(1); }'
@@ -955,7 +957,24 @@ echo "built $APP"
     if let Some(secret) = &builds.secret {
         build["envFrom"] = json!([{"secretRef": {"name": secret}}]);
     }
-    let mut spec = pod(target, vec![snapshot(target)], vec![build], "Never");
+    // The kit comes from the platform image, so the build image needs nothing of Kermodes'.
+    let kit = json!({
+        "name": "kit",
+        "image": target.image,
+        "args": [
+            "app-kit",
+            "/work/kit",
+            "--app",
+            format!("/work/project/{path}"),
+            "--name",
+            app,
+            "--source",
+            "/work/project/node_modules/@kermodes",
+        ],
+        "volumeMounts": [{"name": "work", "mountPath": "/work"}],
+        "securityContext": container_security(),
+    });
+    let mut spec = pod(target, vec![snapshot(target), kit], vec![build], "Never");
     spec["volumes"]
         .as_array_mut()
         .expect("a pod's volumes are a list")
@@ -1663,6 +1682,17 @@ mod tests {
             .map(|m| m.mount_path.as_str())
             .collect();
         assert_eq!(mounts, ["/code", "/work"]);
+        // The platform image writes the kit, after the snapshot and before the build, for the
+        // app's directory in the copy the build makes.
+        let inits = pod.init_containers.clone().unwrap();
+        let names: Vec<&str> = inits.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["snapshot", "kit"]);
+        assert_eq!(inits[1].image.as_deref(), Some("registry/kermodes:0.3.0"));
+        let args = inits[1].args.clone().unwrap();
+        assert_eq!(
+            args[..4],
+            ["app-kit", "/work/kit", "--app", "/work/project/web/market"]
+        );
 
         let with_secret = Builds {
             secret: Some("kermodes-build".into()),

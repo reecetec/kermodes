@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from kermodes import environment
+from kermodes import appkit, environment
 from kermodes._native import KermodesError, Server
 
 READY_TIMEOUT = 60.0
@@ -124,7 +124,7 @@ class Supervisor:
                 self.runs[name] = self._start(name)
                 self._route(name)
         for name, app in list(self.apps.items()):
-            if app.deps != self._deps(name):
+            if app.deps != self._deps():
                 print(
                     f"kermodes dev: app {name}'s dependencies changed; reinstalling",
                     flush=True,
@@ -138,7 +138,7 @@ class Supervisor:
                 self.restarts[f"app {name}"] = time.monotonic() + 2
                 self._restart_app(name)
         for name, deps in list(self.failed.items()):
-            if deps != self._deps(name):
+            if deps != self._deps():
                 del self.failed[name]
                 self._start_app(name)
 
@@ -179,16 +179,17 @@ class Supervisor:
             self._stop_app(name)
 
     def _start_app(self, name: str) -> None:
-        """Installs the app's dependencies and starts its dev server behind the UI's server."""
+        """Installs the project's JavaScript dependencies and starts the app's dev server,
+        Vite with the platform's kit, behind the UI's server."""
         assert self.ui is not None
         bun = shutil.which("bun")
         if bun is None:
             print(f"kermodes dev: app {name} needs Bun (https://bun.sh)", flush=True)
             return
-        deps = self._deps(name)
+        deps = self._deps()
         installed = subprocess.run(
             [bun, "install"],
-            cwd=self._js_root(name),
+            cwd=self.project,
             capture_output=True,
             text=True,
             check=False,
@@ -198,13 +199,37 @@ class Supervisor:
             print(f"kermodes dev: app {name}: bun install failed: {last}", flush=True)
             self.failed[name] = deps
             return
+        kit = self.project / ".kermodes" / "apps" / name
+        web = appkit.checkout_web()
+        # From a Kermodes checkout, the packages' sources: an edit to them reloads the app.
+        sources = (
+            [web / "react" / "src", web / "grid" / "src"]
+            if web is not None
+            else [self.project / "node_modules" / "@kermodes"]
+        )
+        appkit.write(kit, self.app_dirs[name], name, sources)
+        env = os.environ | {
+            "KERMODES_APP_DIR": str(self.app_dirs[name]),
+            "KERMODES_PROJECT": str(self.project),
+        }
+        if web is not None:
+            env["KERMODES_WEB"] = str(web)
         # A free port for Vite; it serves under the address the app has in the cluster.
         port = _free_port()
         base = f"/apps/{self.name}/{name}/"
         process = subprocess.Popen(
-            [bun, "run", "dev", "--port", str(port), "--strictPort"]
-            + ["--host", "127.0.0.1", "--base", base],
-            cwd=self.app_dirs[name],
+            [bun, "x", "--bun", "vite", "--config", str(kit / "vite.config.ts")]
+            + [
+                "--port",
+                str(port),
+                "--strictPort",
+                "--host",
+                "127.0.0.1",
+                "--base",
+                base,
+            ],
+            cwd=self.project,
+            env=env,
             start_new_session=True,
         )
         self.apps[name] = App(process, port, deps)
@@ -237,24 +262,11 @@ class Supervisor:
         self._stop_app(name)
         self._start_app(name)
 
-    def _js_root(self, name: str) -> Path:
-        """Where the app's dependencies install: the project, when it is a workspace of its
-        apps and shared packages, else the app's own directory."""
-        return (
-            self.project
-            if (self.project / "package.json").exists()
-            else self.app_dirs[name]
-        )
-
-    def _deps(self, name: str) -> dict[Path, float]:
-        app = self.app_dirs[name]
+    def _deps(self) -> dict[Path, float]:
+        """The project's JavaScript manifest and lockfile, which every app installs from."""
         return {
             path: path.stat().st_mtime
-            for path in {
-                self._js_root(name) / "package.json",
-                self._js_root(name) / "bun.lock",
-                app / "package.json",
-            }
+            for path in (self.project / "package.json", self.project / "bun.lock")
             if path.exists()
         }
 

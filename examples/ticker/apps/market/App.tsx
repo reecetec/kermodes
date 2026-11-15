@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react';
 import { useTable, type TableStatus } from '@kermodes/react';
 import { Table } from '@kermodes/react/table';
 
-/** A row of `board`, which the app's own Python computes (src/ticker/app.py) */
+/** A row of `board`, which the app's own Python computes (app.py, beside this) */
 type Quote = { sym: string; price: number; trades: number; volume: number; low: number; high: number };
 
 const price = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -15,7 +15,7 @@ const volume = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFrac
  * markup from `useTable`, which keeps their rows current, and the tape as the platform's own
  * table viewer, following md.ticks' end. Both come from the app's own server.
  */
-export function Market() {
+export default function App() {
   const board = useTable<Quote>('board', { sort: ['sym'], limit: 24 });
   // Only its size: the last row is the least there is to ask for.
   const ticks = useTable('md.ticks', { last: 1 });

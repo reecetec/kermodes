@@ -55,10 +55,12 @@ def test_an_app_serves_its_frontend_and_tables_under_its_path(tmp_path):
     project = tmp_path / "ticker"
     (project / "src" / "ticker").mkdir(parents=True)
     (project / "kermodes.toml").write_text(
-        '[project]\nname = "ticker"\nentry = "ticker.app"\nnamespaces = ["md"]\n'
+        '[project]\nname = "ticker"\nentry = "ticker.resources"\nnamespaces = ["md"]\n'
     )
     (project / "src" / "ticker" / "__init__.py").write_text("")
-    (project / "src" / "ticker" / "app.py").write_text(
+    (project / "src" / "ticker" / "resources.py").write_text("")
+    (project / "apps" / "market").mkdir(parents=True)
+    (project / "apps" / "market" / "app.py").write_text(
         textwrap.dedent("""
             import kermodes as km
 
@@ -68,8 +70,7 @@ def test_an_app_serves_its_frontend_and_tables_under_its_path(tmp_path):
                 return {"spreads": ticks.where("price > 0")}
         """)
     )
-    (project / "apps" / "market").mkdir(parents=True)
-    (project / "apps" / "market" / "package.json").write_text("{}")
+    (project / "apps" / "market" / "App.tsx").write_text("export default () => null;\n")
     built = tmp_path / "built"
     built.mkdir()
     (built / "index.html").write_text("<!doctype html>market")

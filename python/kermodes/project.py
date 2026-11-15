@@ -18,17 +18,20 @@ Declarations::
         writer = db.writer("md.quotes", source="poller", wait=True)
         ...
 
-    @km.app()  # its frontend in apps/market/
+    # apps/market/app.py, beside the app's page apps/market/App.tsx
+    @km.app()
     def market(db):
         return {"last": db.live_table("md.ticks").last_by("sym")}
 
-Discovery imports the entry module and returns a `Project`; its manifest is the JSON the platform
-plans and deploys from (`kermodes manifest`). An app is a deployment with a frontend: its process
-runs its function and serves the frontend and the tables it returns at
-`/apps/<project>/<name>/` (architecture.md §15.2).
+Discovery imports the entry module and each `apps/<name>/app.py` and returns a `Project`; its
+manifest is the JSON the platform plans and deploys from (`kermodes manifest`). An app is a
+deployment with a page: its process runs its function and serves the page and the tables it
+returns at `/apps/<project>/<name>/` (architecture.md §15.2).
 """
 
+import dataclasses
 import importlib
+import importlib.util
 import re
 import sys
 import time
@@ -133,34 +136,32 @@ _declared: list[Resource] = []
 
 
 def app(
-    name: str | None = None,
     *,
-    path: str | None = None,
     update: Update = "auto",
     rollout: Rollout = "rolling",
     cpu: float | str = DEFAULT_CPU,
     memory: int | str = DEFAULT_MEMORY,
 ) -> Callable[[Callable[[Session], object]], Callable[[Session], object]]:
-    """Declares the decorated `function(db)` as an app, named after it unless `name`, whose
-    frontend is the project's directory `path` (`apps/<name>` by default). Its process serves
-    the frontend and the tables the function returns (`{"name": table}`, or nothing), beside
+    """Declares the decorated `function(db)` as the app of the directory it is in: in
+    `apps/<name>/app.py`, the app `<name>`, whose page is `apps/<name>/App.tsx`. Its process
+    serves the page and the tables the function returns (`{"name": table}`, or nothing), beside
     the platform's; `cpu` and `memory` as for a deployment."""
 
     def declare(function: Callable[[Session], object]) -> Callable[[Session], object]:
         function_name = getattr(function, "__name__", None)
         if function_name is None:
             raise KermodesError("@km.app() decorates a function")
-        resource_name = name or function_name.replace("_", "-")
         code = getattr(function, "__code__", None)
+        # Named and placed by discovery, from the directory of the app.py declaring it.
         resource = App(
-            resource_name,
+            function_name,
             function,
             function_name,
-            path or f"apps/{resource_name}",
+            "",
             update,
             rollout,
-            _cpu(resource_name, cpu),
-            _memory(resource_name, memory),
+            _cpu(function_name, cpu),
+            _memory(function_name, memory),
             None if code is None else (code.co_filename, code.co_firstlineno),
         )
         _check_policy(resource)
@@ -272,7 +273,7 @@ class Project:
 
 def discover(root: str | Path = ".") -> Project:
     """Loads the project in `root`: its `kermodes.toml`, then the resources its entry module
-    declares."""
+    declares and the app each `apps/<name>/app.py` declares."""
     root = Path(root).resolve()
     config_path = root / "kermodes.toml"
     if not config_path.exists():
@@ -291,7 +292,7 @@ def discover(root: str | Path = ".") -> Project:
     namespaces = tuple(config.get("namespaces", ()))
     mainline = config.get("mainline", "main")
 
-    # Code lives in src/ when the project has one (architecture.md §11.1).
+    # Code lives in src/ when the project has one (architecture.md §11.1); apps import from it.
     path = str(root / "src") if (root / "src").is_dir() else str(root)
     sys.path.insert(0, path)
     _declared.clear()
@@ -305,6 +306,13 @@ def discover(root: str | Path = ".") -> Project:
             del sys.modules[module]
         importlib.import_module(entry)
         declared = list(_declared)
+        if stray := [d.name for d in declared if isinstance(d, App)]:
+            raise KermodesError(
+                f"{entry} declares the app {stray[0]}: an app is declared in "
+                "apps/<name>/app.py, beside its page"
+            )
+        for app_file in sorted((root / "apps").glob("*/app.py")):
+            declared.append(_app_of(app_file, root))
     finally:
         _declared.clear()
         sys.path.remove(path)
@@ -318,16 +326,6 @@ def discover(root: str | Path = ".") -> Project:
         # One name per row of the Deployments tab, whatever it is.
         if resource.name in resources:
             raise KermodesError(f"{name} declares `{resource.name}` twice")
-        if isinstance(resource, App):
-            directory = (root / resource.path).resolve()
-            if (
-                not directory.is_relative_to(root)
-                or not (directory / "package.json").exists()
-            ):
-                raise KermodesError(
-                    f"app `{resource.name}`'s path {resource.path} is not a directory of "
-                    f"{name} with a package.json"
-                )
         if isinstance(resource, Ingester):
             namespace = resource.target.partition(".")[0]
             if namespace not in namespaces:
@@ -337,6 +335,27 @@ def discover(root: str | Path = ".") -> Project:
                 )
         resources[resource.name] = resource
     return Project(name, root, entry, namespaces, mainline, resources)
+
+
+def _app_of(app_file: Path, root: Path) -> App:
+    """The app `apps/<name>/app.py` declares: its one `@km.app()`, named after its directory,
+    whose page `App.tsx` is beside it."""
+    directory = app_file.parent
+    where = directory.relative_to(root).as_posix()
+    start = len(_declared)
+    spec = importlib.util.spec_from_file_location(
+        f"kermodes_app_{directory.name}", app_file
+    )
+    assert spec is not None and spec.loader is not None
+    spec.loader.exec_module(importlib.util.module_from_spec(spec))
+    found = _declared[start:]
+    if len(found) != 1 or not isinstance(found[0], App):
+        raise KermodesError(
+            f"{where}/app.py declares one @km.app() function and nothing else"
+        )
+    if not (directory / "App.tsx").exists():
+        raise KermodesError(f"app `{directory.name}` has no page: {where}/App.tsx")
+    return dataclasses.replace(found[0], name=directory.name, path=where)
 
 
 @dataclass(frozen=True)
@@ -487,7 +506,7 @@ def _spec(resource: Resource, entry: str, root: Path) -> dict:
     elif isinstance(resource, App):
         spec |= {
             "kind": "app",
-            "function": f"{entry}:{resource.function_name}",
+            "function": f"{resource.path}/app.py:{resource.function_name}",
             "path": resource.path,
         }
     else:

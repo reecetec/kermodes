@@ -897,18 +897,20 @@ strategy/
   kermodes.toml          project name, owned namespaces, mainline, test config
   pyproject.toml      Python dependencies (kermodes + project deps)
   uv.lock             → environment (§10.6)
-  src/strategy/
-    kermodes_app.py      resource declarations: tables, ingesters, deployments, jobs, features, models
+  package.json        the JavaScript the project's apps use, one bun.lock (only with apps)
+  src/strategy/       the project's package: shared code, imported by resources and apps
+    resources.py      resource declarations: tables, ingesters, deployments, jobs, features, models
     ...
-  package.json        optional: a Bun workspace of apps/* and shared packages/*, one bun.lock
-  apps/market/        an app's TypeScript (@km.app() def market), served at /apps/<project>/market/
+  apps/market/        an app (§15.2), served at /apps/<project>/market/
+    app.py            @km.app() def market(db): its Python, which returns the tables its page shows
+    App.tsx           its page: the default export, any React and TypeScript
   tests/              pytest: unit tests on km.local(), replay tests on pinned history
 ```
 
 ```toml
 [project]
 name = "strategy"
-entry = "strategy.kermodes_app"       # module whose decorators declare resources
+entry = "strategy.resources"          # module whose decorators declare resources
 namespaces = ["strat"]               # namespaces this project owns
 mainline = "main"                    # merged commits deploy to prod (§11.3)
 
@@ -1226,14 +1228,19 @@ namespaces).
   that the UI, the notebook grid, and apps built on Kermodes all draw from.
 - `@kermodes/client`: TypeScript package speaking the delta protocol over WebSocket and decoding Arrow
   IPC with `apache-arrow`, and the protocol's types. Used by the UI, the grid, and apps.
-- Apps built on Kermodes: an app is a deployment with a UI. A project declares it as a function,
-  `@km.app()` over `def market(db)`, with a deployment's update policy, rollout, and resources;
-  its frontend is the project's directory `path` (`apps/<name>` by default) with a
-  `package.json` whose `dev` and `build` scripts run Vite. The app runs as its own process: the
-  function computes tables and returns those its frontend shows (`{"board": table}`, or
-  nothing), and the process serves its built frontend, those tables, and the platform's
-  (`kermodes-gateway`'s `serve_at`), all under the app's path, `/apps/<project>/<name>/`, which
-  is also Vite's base. So an app's views cost its own process, not the shared UI, and it has
+- Apps built on Kermodes: an app is a deployment with a UI, and a directory of the project:
+  `apps/<name>/app.py` declares it, one `@km.app()` function with a deployment's update
+  policy, rollout, and resources, and `apps/<name>/App.tsx` is its page. Discovery imports each
+  `app.py` beside the entry module, with the project's package importable, so an app's Python
+  shares the project's code. The platform owns everything else a page needs: the HTML, the
+  entry that mounts `App.tsx` in Kermodes' provider and theme, and Vite's config, a kit in the
+  `kermodes` package that `kermodes dev` and the build Job write into the project's
+  `.kermodes/apps/<name>/` (`kermodes app-kit`) and run Vite with, from the project, whose
+  `package.json` holds the JavaScript every app uses. The app runs as its own process: the
+  function computes tables and returns those its page shows (`{"board": table}`, or nothing),
+  and the process serves its built page, those tables, and the platform's (`kermodes-gateway`'s
+  `serve_at`), all under the app's path, `/apps/<project>/<name>/`, which is also Vite's base.
+  So an app's views cost its own process, not the shared UI, and it has
   what a deployment has: a row of the Deployments tab with its pods' usage, logs, events,
   Restart and Stop, and a rollout at each commit. `@kermodes/react` gives `KermodesProvider`
   (one connection, by default its page's own server: an app's under its path, any other page's
@@ -1251,12 +1258,14 @@ namespaces).
   `dev` tag and every release under `latest` (§16.1, `web/pack.ts`), and an app pins the version
   it was built against like any dependency; a project's `.npmrc` names any private registry and
   the environment variable holding its token. Under `kermodes dev`, each app's process runs as
-  the project's other resources do, rolled on every change to its Python, and its pages come
-  from its own Vite dev server with hot reload; the UI's server passes the app's path to both
-  (its tables' WebSocket to the process, the rest to Vite), lists the apps at `/api/apps`, and
-  links them from its top bar. In the cluster, the controller builds each app's frontend at
-  every deployable commit of its project in a Job (`builds.image`, Bun): the commit's code, `bun
-  install --frozen-lockfile` where the lockfile is, and Vite's build under the app's path,
+  the project's other resources do, rolled on every change to its Python, and its page comes
+  from Vite with hot reload; run from a Kermodes checkout, the kit serves `@kermodes/*` from
+  the checkout's `web/` sources, so a change to the theme, the table, or the layout reloads the
+  app at once. The UI's server passes the app's path to both (its tables' WebSocket to the
+  process, the rest to Vite), lists the apps at `/api/apps`, and links them from its top bar.
+  In the cluster, the controller builds each app's page at every deployable commit of its
+  project in a Job (`builds.image`, Bun): the platform image writes the kit, then the commit's
+  code, `bun install --frozen-lockfile` in the project, and Vite's build under the app's path,
   uploaded as a tar to a presigned URL in the artifacts store, a bucket of its own whose keys
   only the controller holds. The build's environment is the `builds.secretName` Secret's:
   read-only registry tokens, since builds run project code. Postgres records only how each

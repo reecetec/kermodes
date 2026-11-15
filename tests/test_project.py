@@ -80,74 +80,100 @@ def test_a_project_declares_ingesters_and_deployments(tmp_path):
     ]
 
 
-def test_a_project_declares_apps_as_resources_with_a_frontend(tmp_path):
+def make_app(root, name: str, code: str, page: bool = True) -> None:
+    """`apps/<name>/` with its app.py and, unless told otherwise, its page."""
+    directory = root / "apps" / name
+    directory.mkdir(parents=True)
+    (directory / "app.py").write_text(textwrap.dedent(code))
+    if page:
+        (directory / "App.tsx").write_text("export default () => null;\n")
+
+
+def test_each_app_is_a_directory_with_its_python_beside_its_page(tmp_path):
     make_project(
         tmp_path,
         """
         import kermodes as km
 
-        @km.app()
-        def market(db):
-            return {}
+        @km.deployment()
+        def ticks(db):
+            pass
+        """,
+    )
+    (tmp_path / "src" / "ticker" / "shared.py").write_text("SYMBOL = 'sym'\n")
+    make_app(
+        tmp_path,
+        "market",
+        """
+        import kermodes as km
+        from ticker.shared import SYMBOL  # an app's Python uses the project's package
 
-        @km.app(path="web/blotter", memory="1Gi")
+        @km.app()
+        def board(db):
+            return {}
+        """,
+    )
+    make_app(
+        tmp_path,
+        "blotter",
+        """
+        import kermodes as km
+
+        @km.app(memory="1Gi")
         def blotter(db):
             pass
         """,
     )
-    for path in ("apps/market", "web/blotter", "apps/notes"):
-        (tmp_path / path).mkdir(parents=True)
-        (tmp_path / path / "package.json").write_text("{}")
-    # apps/notes is not declared, so it is not an app.
-    assert project.discover(tmp_path).manifest()["resources"] == [
-        {
-            "name": "market",
-            "update": "auto",
-            "rollout": "rolling",
-            "cpu": "500m",
-            "memory": "512Mi",
-            "defined_at": {"file": "src/ticker/app.py", "line": 4},
-            "kind": "app",
-            "function": "ticker.app:market",
-            "path": "apps/market",
-        },
-        {
-            "name": "blotter",
-            "update": "auto",
-            "rollout": "rolling",
-            "cpu": "500m",
-            "memory": "1Gi",
-            "defined_at": {"file": "src/ticker/app.py", "line": 8},
-            "kind": "app",
-            "function": "ticker.app:blotter",
-            "path": "web/blotter",
-        },
-    ]
+    # A directory with no app.py is not an app.
+    (tmp_path / "apps" / "shared").mkdir()
+    resources = project.discover(tmp_path).manifest()["resources"]
+    assert [r["name"] for r in resources] == ["ticks", "blotter", "market"]
+    assert resources[2] == {
+        "name": "market",
+        "update": "auto",
+        "rollout": "rolling",
+        "cpu": "500m",
+        "memory": "512Mi",
+        "defined_at": {"file": "apps/market/app.py", "line": 5},
+        "kind": "app",
+        "function": "apps/market/app.py:board",
+        "path": "apps/market",
+    }
+    assert resources[1]["memory"] == "1Gi"
 
 
 @pytest.mark.parametrize(
-    ("app", "error"),
+    ("entry", "apps", "error"),
     [
         (
-            '@km.app(path="apps/missing")\ndef market(db): pass',
-            "not a directory of ticker",
+            "@km.app()\ndef market(db): pass",
+            {},
+            "an app is declared in apps/<name>/app.py",
+        ),
+        ("", {"market": ("@km.app()\ndef market(db): pass", False)}, "has no page"),
+        (
+            "",
+            {
+                "market": (
+                    "@km.app()\ndef a(db): pass\n@km.app()\ndef b(db): pass",
+                    True,
+                )
+            },
+            "declares one @km.app",
         ),
         (
-            '@km.app(path="../elsewhere")\ndef market(db): pass',
-            "not a directory of ticker",
-        ),
-        (
-            "@km.app()\ndef ticks(db): pass\n\n@km.deployment(name='ticks')\ndef other(db): pass",
+            "@km.deployment()\ndef ticks(db): pass",
+            {"ticks": ("@km.app()\ndef ticks(db): pass", True)},
             "declares `ticks` twice",
         ),
     ],
 )
-def test_an_app_needs_its_directory_and_a_name_of_its_own(tmp_path, app, error):
-    make_project(tmp_path, f"import kermodes as km\n{app}\n")
-    (tmp_path / "apps" / "ticks").mkdir(parents=True)
-    (tmp_path / "apps" / "ticks" / "package.json").write_text("{}")
-    (tmp_path.parent / "elsewhere").mkdir(exist_ok=True)
-    (tmp_path.parent / "elsewhere" / "package.json").write_text("{}")
+def test_an_app_has_its_directory_its_page_and_a_name_of_its_own(
+    tmp_path, entry, apps, error
+):
+    make_project(tmp_path, f"import kermodes as km\n{entry}\n")
+    for name, (code, page) in apps.items():
+        make_app(tmp_path, name, f"import kermodes as km\n{code}\n", page)
     with pytest.raises(km.KermodesError, match=error):
         project.discover(tmp_path)
 

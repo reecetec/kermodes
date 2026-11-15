@@ -11,5 +11,5 @@
     "skipLibCheck": true,
     "types": ["vite/client", "bun"]
   },
-  "include": ["src", "vite.config.ts", "happy-dom.ts"]
+  "include": ["apps", "happy-dom.ts"]
 }

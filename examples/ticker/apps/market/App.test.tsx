@@ -1,7 +1,7 @@
 import { afterEach, expect, it } from 'bun:test';
 import { act, cleanup, render, screen } from '@testing-library/react';
 import { KermodesProvider, fakeKermodes } from '@kermodes/react';
-import { Market } from './Market';
+import App from './App';
 
 afterEach(cleanup);
 
@@ -21,7 +21,7 @@ it("shows each symbol's quote and day, and counts the ticks as they arrive", asy
   });
   render(
     <KermodesProvider connection={kermodes}>
-      <Market />
+      <App />
     </KermodesProvider>
   );
 

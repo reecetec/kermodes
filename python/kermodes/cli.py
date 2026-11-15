@@ -12,7 +12,7 @@ import urllib.request
 from pathlib import Path
 
 import kermodes as km
-from kermodes import _native, environment
+from kermodes import _native, appkit, environment
 from kermodes import project as projects
 from kermodes.supervisor import Supervisor
 
@@ -147,6 +147,23 @@ def main(argv: list[str] | None = None) -> None:
     fetch.add_argument("url")
     fetch.add_argument("dest", type=Path)
 
+    kit = commands.add_parser(
+        "app-kit",
+        help="write the platform's setup of an app's page into DEST (app build Jobs)",
+        description="Writes the Vite config, HTML, and entry that build the app in --app (its "
+        "App.tsx) into DEST, for Vite to run from the project (architecture.md §15.2).",
+    )
+    kit.add_argument("dest", type=Path)
+    kit.add_argument("--app", type=Path, required=True, help="the app's directory")
+    kit.add_argument("--name", required=True, help="the app's name")
+    kit.add_argument(
+        "--source",
+        type=Path,
+        action="append",
+        default=[],
+        help="where else Tailwind finds the page's classes (the packages it builds on)",
+    )
+
     build_env = commands.add_parser(
         "build-env",
         help="build a project's environment from its uv.lock (environment build Jobs)",
@@ -254,6 +271,8 @@ def main(argv: list[str] | None = None) -> None:
         run_control(args.config)
     elif args.command == "fetch-snapshot":
         fetch_snapshot(args.url, args.dest)
+    elif args.command == "app-kit":
+        appkit.write(args.dest, args.app, args.name, args.source)
     elif args.command == "build-env":
         environment.build(args.project, args.into)
         if args.upload:
