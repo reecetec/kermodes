@@ -34,7 +34,7 @@ A table is a schema, a row set, column sources, and attributes:
 |---|---|---|
 | `static` | Never changes | Run once, materialize, keep no state |
 | `add_only` | Only `added` deltas | Skip removal state (group row sets, min/max multisets) |
-| `append_only` | `add_only`, and each new row is keyed by its position (so new keys exceed all existing ones) | Keep rows as arriving chunks; windows look only backward |
+| `append_only` | `add_only`, and each new row is keyed by its position (so new keys exceed all existing ones) | Keep rows in immutable chunks, small arrivals combined (§2.4); windows look only backward |
 | `blink` | Rows visible for one cycle only | Aggregate without retaining rows |
 
 Operators derive their output's attributes from their inputs' (e.g. `where` over `add_only` is
@@ -61,7 +61,16 @@ error saying which.
 ### 2.4 Storage
 
 Append-only tables keep the batches they receive as immutable Arrow chunks, keyed by position,
-and hand them out without copying.
+and hand them out without copying. Batches under 4,096 rows are the exception: they collect in a
+run at the end of the table, and the run is concatenated into one chunk once it holds 65,536
+rows, or when a larger batch arrives behind it. Arrow costs about 1 KB per batch, so an ingester
+flushing every 100 ms (about ten rows a batch) would otherwise leave a table holding three times
+its data, with every lookup walking every chunk; from 4,096 rows the cost is under 1% and a copy
+would only raise the peak. Each row is copied at most once, so the open run, at most one chunk's
+worth of rows, is all that stays small. Storage takes each cycle's delta and hands it
+back as slices of its chunks, so a received batch is freed once combined, even during a load that
+arrives as one cycle. Deltas are dropped when their cycle ends: a quiet table would otherwise keep
+its last one, a second copy of everything it loaded.
 
 Every other table (keyed inputs, `where` over them, `last_by` and `agg_by` outputs) gives each
 live row a slot in mutable columns, with a hash map from key to slot:
@@ -76,9 +85,8 @@ superseded bytes outweigh the live ones (and exceed 1 MiB). Deltas carry previou
 copies taken before a cycle is applied, so overwriting loses nothing.
 
 Every operator materializes its output this way, including `where` (Arrow `filter`), `last_by`
-(the group's last row is copied), and `agg_by`. Redirected views over a parent's rows and
-coalescing small append-only chunks are later optimizations, taken when measurements call for
-them.
+(the group's last row is copied), and `agg_by`. Redirected views over a parent's rows are a
+later optimization, taken when measurements call for it.
 
 Reading rows out produces Arrow `RecordBatch`es: the chunks themselves for append-only tables
 (`interleave` for selected rows), and a gather from the slot columns for everything else.

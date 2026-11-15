@@ -76,6 +76,42 @@ fn tables_built_later_start_from_current_rows() {
 }
 
 #[test]
+fn tiny_appends_are_held_in_large_batches() {
+    let session = Session::new();
+    let input = session.input_table(&schema()).unwrap();
+    let descending = input.sort(&["size desc"]).unwrap();
+    let numbered = |from: i64, n: i64| {
+        let sizes: Vec<i64> = (from..from + n).collect();
+        rows(&vec!["s"; n as usize], &sizes)
+    };
+
+    // 200,000 rows in small batches, one a cycle, as an ingester flushing often gives them: held
+    // as a few large batches plus the latest small ones.
+    for from in (0..200_000).step_by(100) {
+        input.append(&[numbered(from, 100)]).unwrap();
+        session.step();
+    }
+    assert!(input.snapshot().unwrap().len() < 200);
+
+    // A large batch arriving while small ones wait leaves no run of them behind.
+    input.append(&[numbered(200_000, 70_000)]).unwrap();
+    session.step();
+    assert!(input.snapshot().unwrap().len() < 10);
+
+    let all: Vec<i64> = (0..270_000).collect();
+    assert_eq!(sizes(&input), all);
+    assert_eq!(
+        sizes(&descending),
+        all.iter().rev().copied().collect::<Vec<_>>()
+    );
+    let later = input.update(&["size = size * 2"]).unwrap();
+    assert_eq!(
+        sizes(&later),
+        all.iter().map(|size| size * 2).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn static_tables_compute_immediately_and_never_tick() {
     let session = Session::new();
     let data = rows(&["a", "b", "c"], &[1, 2, 3]);

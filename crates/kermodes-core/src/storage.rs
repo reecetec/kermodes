@@ -7,7 +7,7 @@
 
 use ahash::RandomState;
 use arrow::array::{Array, ArrayRef, new_null_array};
-use arrow::compute::{interleave, interleave_record_batch};
+use arrow::compute::{concat_batches, interleave, interleave_record_batch};
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
@@ -18,12 +18,22 @@ use crate::slots::Slots;
 /// A row's identity within one table. Keys are never reused.
 pub(crate) type RowKey = u64;
 
+/// Appended batches under `SMALL_ROWS` are combined into chunks of at least `CHUNK_ROWS`. Arrow
+/// costs about 1 KB per batch: a table fed tiny batches (an ingester flushing every 100 ms gives
+/// ~10 rows each) would otherwise hold about 3x its data, and every lookup would walk hundreds of
+/// thousands of chunks. From 4,096 rows that cost is under 1%, and a copy would only raise the
+/// peak, so larger batches are kept as given. Each row is copied at most once.
+const SMALL_ROWS: usize = 4_096;
+const CHUNK_ROWS: usize = 1 << 16;
+
 enum Index {
     /// Keys `0..len`, in chunk order: append-only tables.
     Dense {
         chunks: Vec<RecordBatch>,
         starts: Vec<RowKey>,
         len: RowKey,
+        /// The chunks from here on are small batches waiting to be combined.
+        small_from: usize,
     },
     /// Any keys, each in a slot. A hash map from key to slot: lookups are the hot path; key order
     /// is needed only for snapshots, which sort.
@@ -88,6 +98,22 @@ fn dense_location(
     Ok((chunk, (key - starts[chunk]) as usize))
 }
 
+/// Combines the dense chunks from `from` on into one.
+fn combine(
+    chunks: &mut Vec<RecordBatch>,
+    starts: &mut Vec<RowKey>,
+    from: usize,
+) -> Result<(), ArrowError> {
+    if chunks.len() - from < 2 {
+        return Ok(());
+    }
+    let combined = concat_batches(&chunks[from].schema(), &chunks[from..])?;
+    chunks.truncate(from);
+    chunks.push(combined);
+    starts.truncate(from + 1);
+    Ok(())
+}
+
 impl Storage {
     /// For tables that only ever append, keyed by position.
     pub fn dense(schema: SchemaRef) -> Self {
@@ -97,6 +123,7 @@ impl Storage {
                 chunks: Vec::new(),
                 starts: Vec::new(),
                 len: 0,
+                small_from: 0,
             },
         }
     }
@@ -141,6 +168,7 @@ impl Storage {
                 chunks,
                 starts,
                 len,
+                ..
             } => {
                 let indices = keys
                     .iter()
@@ -179,6 +207,7 @@ impl Storage {
                 chunks,
                 starts,
                 len,
+                ..
             } => {
                 // Missing keys point at a one-row NULL array placed after the chunks.
                 let indices = keys
@@ -330,12 +359,16 @@ impl Storage {
         })
     }
 
-    pub fn apply(&mut self, delta: &Delta) -> Result<(), ArrowError> {
+    /// Applies a cycle's changes and returns them as stored. An append-only table hands its
+    /// added rows back as slices of its chunks: the batches it was given are freed as they are
+    /// combined, rather than kept alive by the delta beside their copies.
+    pub fn apply(&mut self, delta: Delta) -> Result<Delta, ArrowError> {
         match &mut self.index {
             Index::Dense {
                 chunks,
                 starts,
                 len,
+                small_from,
             } => {
                 if delta.removed.iter().any(|r| !r.keys.is_empty())
                     || delta.modified.iter().any(|m| !m.keys.is_empty())
@@ -344,16 +377,33 @@ impl Storage {
                         "an append-only table received removes or modifies".into(),
                     ));
                 }
-                for rows in delta.added.iter().filter(|r| !r.keys.is_empty()) {
+                let first = *len;
+                for rows in delta.added.into_iter().filter(|r| !r.keys.is_empty()) {
                     if rows.keys.first() != Some(len) {
                         return Err(ArrowError::InvalidArgumentError(
                             "an append-only table received out-of-order keys".into(),
                         ));
                     }
+                    let count = rows.keys.len();
+                    let small = count < SMALL_ROWS;
+                    if !small {
+                        // A run left short would otherwise stay small between large chunks.
+                        combine(chunks, starts, *small_from)?;
+                    }
                     starts.push(*len);
-                    *len += rows.keys.len() as RowKey;
-                    chunks.push(rows.batch.clone());
+                    *len += count as RowKey;
+                    chunks.push(rows.batch);
+                    if !small {
+                        *small_from = chunks.len();
+                    } else if (*len - starts[*small_from]) as usize >= CHUNK_ROWS {
+                        combine(chunks, starts, *small_from)?;
+                        *small_from = chunks.len();
+                    }
                 }
+                Ok(Delta {
+                    added: stored_rows(chunks, starts, first),
+                    ..Delta::default()
+                })
             }
             Index::Sparse {
                 slot_of,
@@ -401,10 +451,30 @@ impl Storage {
                     columns.write(&rows.batch, &slots);
                 }
                 columns.compact();
+                Ok(delta)
             }
         }
-        Ok(())
     }
+}
+
+/// A dense table's rows from key `from` on, as slices of its chunks.
+fn stored_rows(chunks: &[RecordBatch], starts: &[RowKey], from: RowKey) -> Vec<Rows> {
+    let first = starts
+        .partition_point(|start| *start <= from)
+        .saturating_sub(1);
+    chunks
+        .iter()
+        .zip(starts)
+        .skip(first)
+        .filter_map(|(chunk, start)| {
+            let skip = from.saturating_sub(*start);
+            let count = chunk.num_rows() as RowKey - skip.min(chunk.num_rows() as RowKey);
+            (count > 0).then(|| Rows {
+                keys: (*start + skip..*start + skip + count).collect(),
+                batch: chunk.slice(skip as usize, count as usize),
+            })
+        })
+        .collect()
 }
 
 /// Either end of a table's key order.

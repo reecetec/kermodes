@@ -931,7 +931,6 @@ impl Session {
         for (index, writes) in writes.into_iter().enumerate() {
             let (before, rest) = graph.tables.split_at_mut(index);
             let table = &mut rest[0];
-            table.delta = None;
             if table.failure.is_some() {
                 continue;
             }
@@ -1011,6 +1010,12 @@ impl Session {
             if table.delta.is_some() || table.failure.is_some() {
                 table.changed = cycle;
             }
+        }
+        // Deltas are read only within their cycle. Dropped now, not at the table's next cycle:
+        // a table that goes quiet would otherwise hold its last changes for good, a second copy of
+        // everything it loaded once storage has combined or slotted those rows.
+        for table in &mut graph.tables {
+            table.delta = None;
         }
         graph.cycle = cycle;
         drop(graph);
@@ -1190,7 +1195,7 @@ impl TableState {
                 }
             })
             .collect();
-        state.storage.as_mut().expect(STORED).apply(&Delta {
+        state.storage.as_mut().expect(STORED).apply(Delta {
             added,
             ..Delta::default()
         })?;
@@ -1284,10 +1289,10 @@ impl TableState {
     fn commit(&mut self, result: Result<Delta, ArrowError>) {
         let applied = result.and_then(|delta| {
             if !delta.is_empty() {
-                if let Some(storage) = &mut self.storage {
-                    storage.apply(&delta)?;
-                }
-                self.delta = Some(delta);
+                self.delta = Some(match &mut self.storage {
+                    Some(storage) => storage.apply(delta)?,
+                    None => delta,
+                });
             }
             Ok(())
         });
