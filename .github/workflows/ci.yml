@@ -181,6 +181,9 @@ jobs:
       - uses: docker/setup-buildx-action@v4
       - name: Build and push the image
         uses: docker/build-push-action@v7
+        env:
+          # The build record is an artifact of its own, which nothing reads.
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
         with:
           context: .
           platforms: linux/amd64

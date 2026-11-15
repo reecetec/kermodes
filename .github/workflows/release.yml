@@ -73,7 +73,10 @@ jobs:
             echo "$GITHUB_REF_NAME is on $GITHUB_SHA, which has no green CI run on master to release" >&2
             exit 1
           fi
-          gh run download "$RUN" --repo "$GITHUB_REPOSITORY" --dir candidate
+          # The candidate's own artifacts only: the run holds others (a docker build record).
+          gh run download "$RUN" --repo "$GITHUB_REPOSITORY" --name candidate --dir candidate/candidate
+          gh run download "$RUN" --repo "$GITHUB_REPOSITORY" --pattern 'wheels-*' --dir candidate
+          ls -R candidate
           echo "run=$RUN" >> "$GITHUB_OUTPUT"
           echo "version=$(cat candidate/candidate/version)" >> "$GITHUB_OUTPUT"
 
