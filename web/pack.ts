@@ -161,7 +161,7 @@ const react = await build(
   { '.': 'src/index.tsx', './table': 'src/table.tsx' },
   { ...clientTypes, '@kermodes/grid': [path.join(grid, 'dist/index.d.ts')] }
 );
-const theme = await copy('theme', ['tokens.css', 'tailwind.css']);
+const theme = await copy('theme', ['tokens.css', 'layout.css', 'tailwind.css']);
 
 for (const out of [client, grid, react, theme]) {
   await $`bun pm pack --destination ${staging} --quiet`.cwd(out);

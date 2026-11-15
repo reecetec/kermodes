@@ -359,18 +359,16 @@ class Supervisor:
         return True
 
     def _files(self) -> dict[Path, float]:
-        """The project's Python, its kermodes.toml, and what its environment is built from. Apps
-        reload themselves, and dependency directories are never walked."""
+        """The project's Python (its apps' app.py included), its kermodes.toml, and what its
+        environment is built from. Pages reload themselves (Vite), and dependency directories
+        are never walked."""
         watched = ("kermodes.toml", "uv.lock", "pyproject.toml")
         files = {}
-        apps = set(self.app_dirs.values())
         for directory, subdirectories, names in os.walk(self.project):
             subdirectories[:] = [
                 d
                 for d in subdirectories
-                if not d.startswith(".")
-                and d not in ("node_modules", "__pycache__")
-                and Path(directory, d) not in apps
+                if not d.startswith(".") and d not in ("node_modules", "__pycache__")
             ]
             for name in names:
                 if name.endswith(".py") or name in watched:

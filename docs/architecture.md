@@ -1253,7 +1253,9 @@ namespaces).
   `@kermodes/react/table`'s `<Table name>` is the platform's own viewer (§15.3) on the
   provider's connection, in the page's theme; with `follow` it starts at the end and stays there
   as rows arrive, which needs no sort. It is its own entry, so an app that does not show one
-  does not carry the grid. Apps style themselves with `@kermodes/theme`'s Tailwind preset.
+  does not carry the grid. A dashboard lays out with `Dashboard`, `Panel`, `Split` (resizable,
+  its sizes kept per browser), and `Stats`, so a page of panels looks like the platform's by
+  default (docs/theme.md, Layout); apps style the rest with `@kermodes/theme`'s Tailwind preset.
   Every candidate publishes `@kermodes/client`, `grid`, `react`, and `theme` to npm under the
   `dev` tag and every release under `latest` (§16.1, `web/pack.ts`), and an app pins the version
   it was built against like any dependency; a project's `.npmrc` names any private registry and

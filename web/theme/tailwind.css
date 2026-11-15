@@ -1,8 +1,10 @@
 /*
- * The tokens as Tailwind v4 theme values, with shadcn/ui's names. An app imports this after
- * Tailwind: `@import 'tailwindcss'; @import '@kermodes/theme/tailwind.css';`
+ * The tokens as Tailwind v4 theme values, with shadcn/ui's names, and the layout's styles. An app
+ * imports this after Tailwind: `@import 'tailwindcss'; @import '@kermodes/theme/tailwind.css';`
+ * A page without Tailwind imports tokens.css and layout.css alone.
  */
 @import './tokens.css';
+@import './layout.css';
 
 /* Dark unless a light theme is set above */
 @custom-variant dark (&:not(:where([data-theme='light'], [data-theme='light'] *)));

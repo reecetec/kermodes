@@ -16,7 +16,8 @@
   "dependencies": {
     "@kermodes/client": "workspace:*",
     "@kermodes/grid": "workspace:*",
-    "apache-arrow": "^21.0.0"
+    "apache-arrow": "^21.0.0",
+    "react-resizable-panels": "^4.24.0"
   },
   "peerDependencies": {
     "react": "^19.0.0"

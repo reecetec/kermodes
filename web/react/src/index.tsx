@@ -27,6 +27,7 @@ import {
 
 export type { Connection } from './connection';
 export { fakeKermodes, type FakeKermodes } from './fake';
+export { Dashboard, Panel, Split, Stat, Stats, Status } from './layout';
 export {
   rowRange,
   sortKeys,
