@@ -228,6 +228,60 @@ impl Client {
         Ok(())
     }
 
+    /// How many rows `name` holds today, and its rows `[start, start + count)` in commit order,
+    /// with `columns` only (every column when `None`), as `Store::rows_at` gives them.
+    pub fn rows_at(
+        &self,
+        name: &TableName,
+        start: u64,
+        count: u64,
+        columns: Option<&[String]>,
+    ) -> Result<(u64, Vec<RecordBatch>), Error> {
+        let mut flight = self.flight.clone();
+        let mut ticket = json!({"table": name.to_string(), "rows": [start, count]});
+        if let Some(columns) = columns {
+            ticket["columns"] = json!(columns);
+        }
+        let ticket = Ticket {
+            ticket: ticket.to_string().into(),
+        };
+        self.runtime.block_on(async move {
+            let data = flight
+                .do_get(ticket)
+                .await
+                .map_err(|s| error_from_status(&s))?
+                .into_inner()
+                .map_err(FlightError::from);
+            let mut decoded = FlightDataDecoder::new(data);
+            let (mut total, mut rows) = (None, Vec::new());
+            while let Some(message) = decoded.next().await {
+                let message = match message {
+                    Ok(message) => message,
+                    Err(FlightError::Tonic(status)) => return Err(error_from_status(&status)),
+                    Err(e) => return Err(Error::Io(format!("reading {name}'s rows: {e}"))),
+                };
+                match message.payload {
+                    DecodedPayload::Schema(_) => {
+                        let bytes: [u8; 8] = message
+                            .inner
+                            .app_metadata
+                            .as_ref()
+                            .try_into()
+                            .map_err(|_| {
+                                Error::Io(format!("{name}'s rows came without the day's row count"))
+                            })?;
+                        total = Some(u64::from_le_bytes(bytes));
+                    }
+                    DecodedPayload::RecordBatch(batch) => rows.push(batch),
+                    DecodedPayload::None => {}
+                }
+            }
+            let total =
+                total.ok_or_else(|| Error::Io(format!("{name}'s rows came without a schema")))?;
+            Ok((total, rows))
+        })
+    }
+
     /// The past dates weir still holds rows of for `name`.
     pub fn past_dates(&self, name: &TableName) -> Result<Vec<Date>, Error> {
         let dates = self.action("past_dates", json!({"table": name.to_string()}))?;

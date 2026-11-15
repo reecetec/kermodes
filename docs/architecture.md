@@ -435,6 +435,12 @@ catalog as live tables.
   queue bounded in bytes: while it catches up, the replay waits for the reader past 16 MiB, so a
   day of any size costs about that much of weir's memory per reader; a reader 128 MiB behind live
   writes is dropped (its stream ends, and it subscribes again) rather than held in memory.
+- Reads by position, for viewers that show a table without holding it (§15.3): rows
+  `[start, start + n)` of a table's day in commit order, the columns asked for only, and the
+  day's row count as batches commit. Positions come from the index alone: the day's batches
+  merged by ingest time (one clock per table, so ingest order is commit order) with their
+  running row counts, a binary search to a batch, and that batch read from its segment. A
+  subscription can ask for some columns only, so a viewer sorting one column moves that column.
 - Later: sealed segments over `DoGet` with the engine caching them locally, the tail over
   `DoExchange` resumed by row position (§17).
 - Co-located workers may memory-map sealed segments directly; this is an optimization only.
@@ -1206,8 +1212,10 @@ namespaces).
   protocol is in `kermodes-gateway`'s module doc. `kermodes dev` and `kermodes ui` start the same
   server.
   A session with a store also lists every stored table, from the catalog without reading its
-  rows, and opens one live only while a view shows it, letting it go a minute after the last
-  view closes. The server's memory follows what is being looked at, not what is stored. A tab
+  rows. A view of an append table reads its window from the store by position and holds
+  nothing else (§15.3); a table is opened live only while a view sorts or filters it, or for a
+  keyed table, and let go a minute after the last such view closes. The server's memory
+  follows what is being sorted or filtered, not what is stored. A tab
   not on screen pauses its view: the server sends it nothing until it is shown again, with its
   sort and filters kept.
   `kermodes ui` waits for weir to start, then serves throughout: while weir is away (a restart,
@@ -1267,10 +1275,19 @@ notebooks and the web UI, in the spirit of Deephaven's. It is our own component,
 its virtualised metrics, canvas renderer, and mouse and keyboard handling are the hard,
 proven parts.
 
-- Data stays in the engine. The grid subscribes to a viewport (row range + columns) and
+- Data stays where it is. The grid subscribes to a viewport (row range + columns) and
   receives those rows as Arrow IPC; after each cycle that changes them, the changed rows. The
   grid draws only visible cells on a canvas, so a billion-row ticking table costs what a
   hundred-row one does, and the payload per update is the visible cells.
+- The web UI's server is a viewer, not where tables are computed: it keeps no copy of a stored
+  append table. A plain view reads the window and a margin from weir by position (§7.2) and
+  ticks as weir's row count passes into it, so its memory is the window's whatever the table's
+  size. A sort or quick filter subscribes to the columns it uses only, with each row's
+  position; the engine sorts or filters those, and the visible rows are read by position.
+  Past a memory budget (512 MiB) the grid says the table is too large to sort or filter there,
+  rather than risk the server. Keyed tables (each key's latest row, which a position does not
+  name) and published tables (which live in the session) are viewed as before. Whole tables are
+  for programs and notebooks: `km.connect().live_table()` and `db.table()` give every row.
 - Transport: in notebooks, the widget's comm (a small JSON header plus Arrow IPC buffers); in
   the web UI, the same frames over WebSocket, later Barrage-style deltas over Flight (§9.6).
   What answers the grid (windows, quick filters, sorting, fetches) is the engine's

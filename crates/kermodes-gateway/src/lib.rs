@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use arrow::datatypes::SchemaRef;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -40,10 +41,15 @@ use http_body_util::Full;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
-use kermodes_core::viewer::{Frame, Request, SortKey, Viewer};
+use kermodes_core::viewer::{FETCH_LIMIT, Frame, Request, SortKey, Viewer};
 use kermodes_core::{Session, Table, type_name};
 use serde_json::{Value, json};
 use tokio::sync::{oneshot, watch};
+
+mod window;
+
+pub use window::ReadRows;
+use window::Window;
 
 /// How long the cycle watcher waits before checking whether the server is stopping.
 const CYCLE_WAIT: Duration = Duration::from_millis(500);
@@ -55,6 +61,8 @@ const KEEPALIVE: Duration = Duration::from_secs(30);
 /// How often the server refreshes the stored tables it lists and lets go of tables no view
 /// shows.
 const MAINTAIN_EVERY: Duration = Duration::from_secs(2);
+/// How often views shown by position ask the store whether their table has grown.
+const POLL_EVERY: Duration = Duration::from_millis(250);
 
 /// A stored table as the app lists it: its name, and its columns' names and type names.
 pub type Listed = (String, Vec<(String, String)>);
@@ -65,15 +73,23 @@ pub type ListTables = Box<dyn Fn() -> Result<Vec<Listed>, String> + Send + Sync>
 /// Opens the stored table `name` live, fed by the store.
 pub type OpenTable = Box<dyn Fn(&str) -> Result<Table, String> + Send + Sync>;
 
+/// Whether the stored table `name` is shown by position: an append table's schema, or `None`
+/// for a keyed table, whose rows are its keys' latest values (opened live instead).
+pub type Positional = Box<dyn Fn(&str) -> Result<Option<SchemaRef>, String> + Send + Sync>;
+
 /// What each stored table takes in the store and in history, and the store's volume, as JSON
 /// (`kermodes_weir::Store::stats_json`).
 pub type ReadStats = Box<dyn Fn() -> Result<Value, String> + Send + Sync>;
 
-/// The stored tables a server can open, given by whoever holds the store connection: listed
-/// for the app without reading their rows, and opened live only while a view shows one.
+/// The stored tables a server can show, given by whoever holds the store connection: listed
+/// for the app without reading their rows. An append table's view reads its window by position
+/// and holds nothing else; a keyed table, or an append table being sorted or filtered, is opened
+/// live only while a view needs it.
 pub struct Stored {
     pub list: ListTables,
     pub open: OpenTable,
+    pub positional: Positional,
+    pub rows: ReadRows,
     pub stats: ReadStats,
     /// How long a table no view shows stays open, so a view opened again soon finds it at once.
     pub idle: Duration,
@@ -618,31 +634,158 @@ async fn upgrade(ws: WebSocketUpgrade, State(shared): State<Arc<Shared>>) -> Res
     ws.on_upgrade(move |socket| connection(socket, shared))
 }
 
-/// An open view: its viewer, the cycle of the window last sent, whether the app has paused it,
-/// and its hold on the stored table it shows, if it shows one.
+/// An open view. A stored append table is shown by position (`window`) unless it is sorted or
+/// filtered; the engine's `viewer` shows everything else: published tables, keyed stored
+/// tables, and an append table while it is sorted or filtered, held live by `lease` meanwhile.
 struct Open {
-    viewer: Arc<Mutex<Viewer>>,
+    viewer: Option<Arc<Mutex<Viewer>>>,
+    window: Option<Window>,
+    /// What the window last sent reflects: the engine view's cycle, or a window's row count.
     sent: Option<u64>,
     paused: bool,
     lease: Option<Lease>,
+    /// The highest sort or filter number applied while shown by position.
+    applied: u64,
+}
+
+/// A view's reply: its frame, `None` once its table is gone, or why it failed.
+type Reply = Result<Option<Frame>, String>;
+
+impl Open {
+    fn read(shared: &Shared) -> &ReadRows {
+        &shared
+            .stored
+            .as_ref()
+            .expect("a window shows a stored table")
+            .rows
+    }
+
+    /// The window as the view shows it now.
+    async fn rows(&self, shared: &Arc<Shared>) -> Reply {
+        match (&self.viewer, &self.window) {
+            (Some(viewer), _) => {
+                let viewer = viewer.clone();
+                blocking(move || lock(&viewer).rows())
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            (None, Some(window)) => {
+                let (window, shared) = (window.clone(), shared.clone());
+                blocking(move || window.rows(Open::read(&shared)).map(Some)).await
+            }
+            (None, None) => unreachable!("a view shows a viewer or a window"),
+        }
+    }
+
+    /// What says the window may have changed: an engine view's last changing cycle, or a
+    /// window's row count; `None` once the table is gone or cannot be read.
+    async fn changed(&self, shared: &Arc<Shared>) -> Option<u64> {
+        match (&self.viewer, &self.window) {
+            (Some(viewer), _) => {
+                let viewer = viewer.clone();
+                blocking(move || lock(&viewer).changed()).await
+            }
+            (None, Some(window)) => {
+                let (name, shared) = (window.name.clone(), shared.clone());
+                blocking(move || {
+                    Open::read(&shared)(&name, 0, 0)
+                        .ok()
+                        .map(|(total, _)| total)
+                })
+                .await
+            }
+            (None, None) => None,
+        }
+    }
+
+    /// Answers a viewer message. A sort or filter of a window opens its table live, as only
+    /// the engine sorts and filters; once neither applies, the view goes back to its window and
+    /// lets the table go.
+    async fn receive(&mut self, shared: &Arc<Shared>, request: Request) -> Reply {
+        if let (Request::Viewport { top, bottom }, Some(window)) = (&request, &mut self.window) {
+            window.set_viewport(*top, *bottom);
+        }
+        if let Some(viewer) = self.viewer.clone() {
+            let (reply, plain, applied) = blocking(move || {
+                let mut viewer = lock(&viewer);
+                let reply = viewer.receive(request);
+                let plain = viewer.sort().is_empty() && viewer.filters().is_empty();
+                (reply, plain, viewer.applied())
+            })
+            .await;
+            if plain && self.window.is_some() && reply.is_ok() {
+                (self.viewer, self.lease, self.applied) = (None, None, applied);
+                return self.rows(shared).await;
+            }
+            return reply.map_err(|e| e.to_string());
+        }
+        let window = self
+            .window
+            .clone()
+            .expect("a view shows a viewer or a window");
+        match request {
+            Request::Viewport { .. } => self.rows(shared).await,
+            Request::Fetch { id, start, count } => {
+                let shared = shared.clone();
+                let count = count.min(FETCH_LIMIT) as u64;
+                blocking(move || {
+                    window
+                        .fetch(Open::read(&shared), id, start as u64, count)
+                        .map(Some)
+                })
+                .await
+            }
+            Request::Sort { by, number } if by.is_empty() => {
+                self.applied = self.applied.max(number);
+                self.rows(shared).await
+            }
+            Request::Filter { filters, number }
+                if filters.values().all(|text| text.trim().is_empty()) =>
+            {
+                self.applied = self.applied.max(number);
+                self.rows(shared).await
+            }
+            request => {
+                let (table, lease) = match lease(shared, &window.name).await {
+                    Ok(held) => held,
+                    Err(Refused::Missing) => return Ok(None),
+                    Err(Refused::Unavailable(why)) => return Err(why),
+                };
+                let viewer = Arc::new(Mutex::new(blocking(move || Viewer::new(&table)).await));
+                let (held, viewport) = (viewer.clone(), window.viewport);
+                let reply = blocking(move || {
+                    let mut viewer = lock(&held);
+                    if let Some((top, bottom)) = viewport {
+                        viewer.receive(Request::Viewport { top, bottom })?;
+                    }
+                    viewer.receive(request)
+                })
+                .await;
+                (self.viewer, self.lease) = (Some(viewer), Some(lease));
+                reply.map_err(|e| e.to_string())
+            }
+        }
+    }
 }
 
 /// The messages for a view's reply, and whether the view goes on: one showing a stored table
 /// that failed (or was let go) ends with an error the app retries, and lets the table go so a
 /// retry subscribes afresh.
-fn deliver(
-    shared: &Shared,
-    id: u64,
-    open: &mut Open,
-    reply: Result<Option<Frame>, kermodes_core::Error>,
-) -> (Vec<Message>, bool) {
-    if let Some(lease) = &open.lease
+fn deliver(shared: &Shared, id: u64, open: &mut Open, reply: Reply) -> (Vec<Message>, bool) {
+    let stored = open
+        .lease
+        .as_ref()
+        .map(|lease| lease.name.clone())
+        .or_else(|| open.window.as_ref().map(|window| window.name.clone()));
+    if let Some(name) = stored
         && !matches!(reply, Ok(Some(_)))
     {
-        shared.evict(&lease.name, lease.generation);
+        if let Some(lease) = &open.lease {
+            shared.evict(&lease.name, lease.generation);
+        }
         let why = match reply {
-            Err(e) => e.to_string(),
-            _ => format!("{} is gone", lease.name),
+            Err(e) => e,
+            _ => format!("{name} is gone"),
         };
         return (vec![retry(id, &why)], false);
     }
@@ -651,7 +794,39 @@ fn deliver(
     {
         open.sent = Some(frame.cycle);
     }
-    (answer(id, &open.viewer, reply), true)
+    (answer(id, open, reply), true)
+}
+
+/// Sends each view whose window may have changed its window again: engine views after a cycle
+/// (`engine`), views shown by position when their table has grown.
+async fn refresh(
+    shared: &Arc<Shared>,
+    views: &mut HashMap<u64, Open>,
+    outgoing: &mut Vec<Message>,
+    engine: bool,
+) {
+    let mut ended = Vec::new();
+    for (id, open) in views.iter_mut() {
+        if open.paused || open.viewer.is_some() != engine {
+            continue;
+        }
+        let changed = open.changed(shared).await;
+        // Unchanged, or a published table let go (which keeps today's quiet).
+        if changed == open.sent
+            || (changed.is_none() && open.lease.is_none() && open.window.is_none())
+        {
+            continue;
+        }
+        let reply = open.rows(shared).await;
+        let (messages, goes_on) = deliver(shared, *id, open, reply);
+        outgoing.extend(messages);
+        if !goes_on {
+            ended.push(*id);
+        }
+    }
+    for id in ended {
+        views.remove(&id);
+    }
 }
 
 async fn connection(mut socket: WebSocket, shared: Arc<Shared>) {
@@ -661,6 +836,7 @@ async fn connection(mut socket: WebSocket, shared: Arc<Shared>) {
     let mut outgoing = vec![tables(&shared)];
     let mut keepalive =
         tokio::time::interval_at(tokio::time::Instant::now() + KEEPALIVE, KEEPALIVE);
+    let mut poll = tokio::time::interval(POLL_EVERY);
     loop {
         for message in outgoing.drain(..) {
             if socket.send(message).await.is_err() {
@@ -677,28 +853,10 @@ async fn connection(mut socket: WebSocket, shared: Arc<Shared>) {
             },
             Ok(()) = cycles.changed() => {
                 cycles.borrow_and_update();
-                let mut ended = Vec::new();
-                for (id, open) in &mut views {
-                    if open.paused {
-                        continue;
-                    }
-                    let viewer = open.viewer.clone();
-                    let changed = blocking(move || lock(&viewer).changed()).await;
-                    // Unchanged, or a published table let go (which keeps today's quiet).
-                    if changed == open.sent || (changed.is_none() && open.lease.is_none()) {
-                        continue;
-                    }
-                    let viewer = open.viewer.clone();
-                    let reply = blocking(move || lock(&viewer).rows()).await;
-                    let (messages, goes_on) = deliver(&shared, *id, open, reply);
-                    outgoing.extend(messages);
-                    if !goes_on {
-                        ended.push(*id);
-                    }
-                }
-                for id in ended {
-                    views.remove(&id);
-                }
+                refresh(&shared, &mut views, &mut outgoing, true).await;
+            },
+            _ = poll.tick() => {
+                refresh(&shared, &mut views, &mut outgoing, false).await;
             },
             Ok(()) = catalog.changed() => {
                 catalog.borrow_and_update();
@@ -725,27 +883,45 @@ async fn handle(shared: &Arc<Shared>, views: &mut HashMap<u64, Open>, text: &str
             let name = message["table"].as_str().unwrap_or_default().to_owned();
             let published = shared.tables().get(&name).cloned();
             let published = published.or_else(|| shared.views().get(&name).cloned());
-            let (table, lease) = match published {
-                Some(table) => (table, None),
-                None => match lease(shared, &name).await {
-                    Ok((table, lease)) => (table, Some(lease)),
-                    Err(Refused::Missing) => {
-                        return vec![error(Some(id), &format!("no table `{name}`"))];
-                    }
-                    Err(Refused::Unavailable(why)) => return vec![retry(id, &why)],
-                },
-            };
-            let viewer = Arc::new(Mutex::new(blocking(move || Viewer::new(&table)).await));
-            let rows = {
-                let viewer = viewer.clone();
-                blocking(move || lock(&viewer).rows()).await
-            };
             let mut open = Open {
-                viewer,
+                viewer: None,
+                window: None,
                 sent: None,
                 paused: false,
-                lease,
+                lease: None,
+                applied: 0,
             };
+            if let Some(table) = published {
+                open.viewer = Some(Arc::new(Mutex::new(
+                    blocking(move || Viewer::new(&table)).await,
+                )));
+            } else {
+                if shared.stored.is_none() || !shared.listed().iter().any(|(n, _)| *n == name) {
+                    return vec![error(Some(id), &format!("no table `{name}`"))];
+                }
+                let (asker, wanted) = (shared.clone(), name.clone());
+                let positional = blocking(move || {
+                    (asker.stored.as_ref().expect("checked above").positional)(&wanted)
+                })
+                .await;
+                match positional {
+                    Ok(Some(schema)) => open.window = Some(Window::new(name, schema)),
+                    Ok(None) => match lease(shared, &name).await {
+                        Ok((table, lease)) => {
+                            open.viewer = Some(Arc::new(Mutex::new(
+                                blocking(move || Viewer::new(&table)).await,
+                            )));
+                            open.lease = Some(lease);
+                        }
+                        Err(Refused::Missing) => {
+                            return vec![error(Some(id), &format!("no table `{name}`"))];
+                        }
+                        Err(Refused::Unavailable(why)) => return vec![retry(id, &why)],
+                    },
+                    Err(why) => return vec![retry(id, &why)],
+                }
+            }
+            let rows = open.rows(shared).await;
             let (messages, goes_on) = deliver(shared, id, &mut open, rows);
             if goes_on {
                 views.insert(id, open);
@@ -767,8 +943,7 @@ async fn handle(shared: &Arc<Shared>, views: &mut HashMap<u64, Open>, text: &str
                 return vec![error(Some(id), "no such view")];
             };
             open.paused = false;
-            let viewer = open.viewer.clone();
-            let reply = blocking(move || lock(&viewer).rows()).await;
+            let reply = open.rows(shared).await;
             let (messages, goes_on) = deliver(shared, id, open, reply);
             if !goes_on {
                 views.remove(&id);
@@ -784,8 +959,7 @@ async fn handle(shared: &Arc<Shared>, views: &mut HashMap<u64, Open>, text: &str
                 Ok(None) => return vec![error(Some(id), &format!("unknown message `{kind}`"))],
                 Err(e) => return vec![error(Some(id), &e)],
             };
-            let viewer = open.viewer.clone();
-            let reply = blocking(move || lock(&viewer).receive(request)).await;
+            let reply = open.receive(shared, request).await;
             let (messages, goes_on) = deliver(shared, id, open, reply);
             if !goes_on {
                 views.remove(&id);
@@ -849,45 +1023,53 @@ fn request(kind: &str, message: &Value) -> Result<Option<Request>, String> {
 }
 
 /// A view's frame as messages: its state (for windows), then the binary frame; or the error.
-fn answer(
-    id: u64,
-    viewer: &Mutex<Viewer>,
-    reply: Result<Option<Frame>, kermodes_core::Error>,
-) -> Vec<Message> {
+fn answer(id: u64, open: &Open, reply: Reply) -> Vec<Message> {
     match reply {
         Ok(Some(frame)) => {
             let mut messages = Vec::with_capacity(2);
             if frame.fetched.is_none() {
-                messages.push(state(id, &lock(viewer), &frame));
+                messages.push(state(id, open, &frame));
             }
             messages.push(binary(id, frame));
             messages
         }
         Ok(None) => vec![error(Some(id), "the table is gone")],
-        Err(e) => vec![error(Some(id), &e.to_string())],
+        Err(e) => vec![error(Some(id), &e)],
     }
 }
 
-fn state(id: u64, viewer: &Viewer, frame: &Frame) -> Message {
-    let sort: Vec<Value> = viewer
-        .sort()
-        .iter()
-        .map(|k| json!({"column": k.column, "descending": k.descending}))
-        .collect();
-    Message::Text(
-        json!({
+fn state(id: u64, open: &Open, frame: &Frame) -> Message {
+    let state = match &open.viewer {
+        Some(viewer) => {
+            let viewer = lock(viewer);
+            let sort: Vec<Value> = viewer
+                .sort()
+                .iter()
+                .map(|k| json!({"column": k.column, "descending": k.descending}))
+                .collect();
+            json!({
+                "type": "state",
+                "view": id,
+                "row_count": frame.total,
+                "status": viewer.status(frame.cycle),
+                "sort": sort,
+                "filters": viewer.filters(),
+                "filter_errors": viewer.filter_errors(),
+                "applied": viewer.applied(),
+            })
+        }
+        None => json!({
             "type": "state",
             "view": id,
             "row_count": frame.total,
-            "status": viewer.status(frame.cycle),
-            "sort": sort,
-            "filters": viewer.filters(),
-            "filter_errors": viewer.filter_errors(),
-            "applied": viewer.applied(),
-        })
-        .to_string()
-        .into(),
-    )
+            "status": "ticking",
+            "sort": [],
+            "filters": {},
+            "filter_errors": {},
+            "applied": open.applied,
+        }),
+    };
+    Message::Text(state.to_string().into())
 }
 
 fn binary(id: u64, frame: Frame) -> Message {

@@ -10,11 +10,12 @@
 //! is a resend and is dropped.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, Take, Write};
+use std::io::{Read, Seek, SeekFrom, Take, Write};
 use std::path::{Path, PathBuf};
 
+use arrow::buffer::Buffer;
 use arrow::datatypes::SchemaRef;
-use arrow::ipc::reader::StreamReader;
+use arrow::ipc::reader::{StreamDecoder, StreamReader};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 
@@ -261,6 +262,88 @@ impl Partition {
             .map(|entry| entry.ingest_ns)
     }
 
+    /// Each committed batch's rows and ingest time, in order.
+    pub(crate) fn batch_rows(&self) -> impl Iterator<Item = (u64, i64)> + '_ {
+        self.segments()
+            .flat_map(|segment| segment.entries.iter().map(|e| (e.rows, e.ingest_ns)))
+    }
+
+    /// The committed batches `first..first + count` (counting from 0), read directly: a batch's
+    /// bytes run from the end of the one before it, or of its segment's schema, to its own end.
+    /// A committed batch never changes, so this reads while writers go on appending.
+    pub(crate) fn read_batches(
+        &self,
+        first: usize,
+        count: usize,
+    ) -> Result<Vec<RecordBatch>, Error> {
+        let header = schema_header(&self.schema)?;
+        let mut batches = Vec::with_capacity(count);
+        let mut skip = first;
+        for segment in self.segments() {
+            if batches.len() == count {
+                break;
+            }
+            let held = segment.entries.len();
+            if skip >= held {
+                skip -= held;
+                continue;
+            }
+            let take = (count - batches.len()).min(held - skip);
+            let path = data_path(&self.dir, segment.number);
+            let mut file = File::open(&path).map_err(|e| Error::io(&path, e))?;
+            let begin = match skip {
+                0 => header.len() as u64,
+                _ => segment.entries[skip - 1].end,
+            };
+            let end = segment.entries[skip + take - 1].end;
+            let mut bytes = vec![0; (end - begin) as usize];
+            if skip == 0 {
+                // The first batch starts where the schema the writer put first ends.
+                let mut written = vec![0; header.len()];
+                file.read_exact(&mut written)
+                    .map_err(|e| Error::io(&path, e))?;
+                if written != header {
+                    return Err(Error::Corrupt(format!(
+                        "{}: the stream does not start with its table's schema",
+                        path.display()
+                    )));
+                }
+            }
+            file.seek(SeekFrom::Start(begin))
+                .and_then(|_| file.read_exact(&mut bytes))
+                .map_err(|e| Error::io(&path, e))?;
+            let arrow =
+                |e: arrow::error::ArrowError| Error::Arrow(format!("{}: {e}", path.display()));
+            let mut decoder = StreamDecoder::new();
+            decoder
+                .decode(&mut Buffer::from(header.clone()))
+                .map_err(arrow)?;
+            let mut body = Buffer::from(bytes);
+            for entry in &segment.entries[skip..skip + take] {
+                let batch = decoder.decode(&mut body).map_err(arrow)?;
+                match batch {
+                    Some(batch) if batch.num_rows() as u64 == entry.rows => batches.push(batch),
+                    _ => {
+                        return Err(Error::Corrupt(format!(
+                            "{}: the stream does not hold the batches its index commits",
+                            path.display()
+                        )));
+                    }
+                }
+            }
+            skip = 0;
+        }
+        if batches.len() < count {
+            return Err(Error::NotFound(format!(
+                "batches {first}..{} of {}: {} are committed",
+                first + count,
+                self.dir.display(),
+                self.committed()
+            )));
+        }
+        Ok(batches)
+    }
+
     fn segments(&self) -> impl Iterator<Item = &Segment> {
         self.closed
             .iter()
@@ -457,6 +540,14 @@ fn data_path(dir: &Path, number: u32) -> PathBuf {
 
 fn index_path(dir: &Path, number: u32) -> PathBuf {
     dir.join(format!("seg-{number:06}.idx"))
+}
+
+/// The schema message a segment's stream starts with, as its writer wrote it: the same schema
+/// encodes to the same bytes.
+fn schema_header(schema: &SchemaRef) -> Result<Vec<u8>, Error> {
+    let writer = StreamWriter::try_new(Vec::new(), schema)
+        .map_err(|e| Error::Arrow(format!("cannot encode a schema: {e}")))?;
+    Ok(writer.get_ref().clone())
 }
 
 /// A segment's committed batches: its index records up to the first that fails its check. A

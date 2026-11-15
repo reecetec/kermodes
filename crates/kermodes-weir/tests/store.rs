@@ -493,3 +493,108 @@ fn full_segments_roll_over() {
     let store = Store::open(&dir.0).unwrap();
     assert_eq!(count(&store), 10 * rows as u64);
 }
+
+/// Every `n` of `rows`, in order.
+fn ns(rows: &[RecordBatch]) -> Vec<i64> {
+    rows.iter()
+        .flat_map(|b| b.column(0).as_primitive::<Int64Type>().values().to_vec())
+        .collect()
+}
+
+/// A viewer's read by position is a slice of what a subscriber receives, in the same order:
+/// over batches of uneven sizes (an empty one too) from two sources, at every edge, after more
+/// commits than when positions were first asked for, and in a store reopened since; it says
+/// how many rows there are, sends only the columns asked for, and refuses keyed tables.
+#[test]
+fn reads_by_position_are_slices_of_the_replay() {
+    let dir = TempDir::new();
+    let mut next = 0;
+    let mut write = |writer: &kermodes_weir::Writer, rows: i64| {
+        writer.write(&batch(next..next + rows), None).unwrap();
+        next += rows;
+    };
+    {
+        let store = Store::open(&dir.0).unwrap();
+        store.create_table(&ticks(), &schema()).unwrap();
+        let (a, b) = (
+            store.writer(&ticks(), &source("a"), false).unwrap(),
+            store.writer(&ticks(), &source("b"), false).unwrap(),
+        );
+        for (writer, rows) in [(&a, 3), (&b, 1), (&a, 0), (&b, 5), (&b, 2), (&a, 4)] {
+            write(writer, rows);
+        }
+        let check = |store: &Store| {
+            let replay = values(store);
+            let total = replay.len() as u64;
+            for start in 0..=total + 1 {
+                for count in [0, 1, 2, 4, 7, total] {
+                    let (seen, rows) = store.rows_at(&ticks(), start, count, None).unwrap();
+                    assert_eq!(seen, total);
+                    let from = (start as usize).min(replay.len());
+                    let to = (start + count).min(total) as usize;
+                    let expected = &replay[from..to.max(from)];
+                    assert_eq!(ns(&rows), expected, "rows {start}..+{count}");
+                }
+            }
+        };
+        check(&store);
+        // Positions now built: later commits extend them.
+        write(&a, 2);
+        write(&b, 6);
+        check(&store);
+        let (_, rows) = store
+            .rows_at(&ticks(), 2, 5, Some(&["sym".to_owned()]))
+            .unwrap();
+        let names: Vec<_> = rows[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(names, ["sym"]);
+        let syms: Vec<String> = rows
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_string::<i32>()
+                    .iter()
+                    .map(|s| s.unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let replay = values(&store);
+        assert_eq!(
+            syms,
+            replay[2..7]
+                .iter()
+                .map(|v| format!("s{v}"))
+                .collect::<Vec<_>>()
+        );
+        let none = store.rows_at(&ticks(), 0, 3, Some(&[])).unwrap();
+        assert_eq!(
+            none.1.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            3,
+            "rows, no columns"
+        );
+        assert!(matches!(
+            store.rows_at(&ticks(), 0, 1, Some(&["nope".to_owned()])),
+            Err(Error::Schema(_))
+        ));
+    }
+    let store = Store::open(&dir.0).unwrap();
+    let replay = values(&store);
+    let (total, rows) = store.rows_at(&ticks(), 10, 9, None).unwrap();
+    assert_eq!(
+        (total, ns(&rows)),
+        (replay.len() as u64, replay[10..19].to_vec())
+    );
+
+    let keyed = TableName::parse("md.quotes").unwrap();
+    store
+        .create_keyed_table(&keyed, &schema(), &["sym".to_owned()])
+        .unwrap();
+    assert!(matches!(
+        store.rows_at(&keyed, 0, 1, None),
+        Err(Error::Schema(_))
+    ));
+}

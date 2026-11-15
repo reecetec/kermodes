@@ -228,6 +228,62 @@ fn tagged(
         .boxed()
 }
 
+impl Service {
+    /// Rows `[start, start + count)` of a table's day by position (`Store::rows_at`): the schema
+    /// of the columns asked for, its `app_metadata` the day's row count (u64, little-endian),
+    /// then the rows.
+    async fn rows_at(
+        &self,
+        name: TableName,
+        schema: arrow::datatypes::SchemaRef,
+        ticket: &Value,
+    ) -> Result<Response<Stream<FlightData>>, Status> {
+        let range = |at: usize| {
+            ticket["rows"][at]
+                .as_u64()
+                .ok_or_else(|| Status::invalid_argument("`rows` is [start, count]"))
+        };
+        let (start, count) = (range(0)?, range(1)?);
+        let columns = match &ticket["columns"] {
+            Value::Null => None,
+            columns => Some(names_from_json(columns).map_err(status)?),
+        };
+        let schema = match &columns {
+            None => schema,
+            Some(columns) => {
+                let indices = columns
+                    .iter()
+                    .map(|c| schema.index_of(c))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| Status::invalid_argument(e.to_string()))?;
+                Arc::new(
+                    schema
+                        .project(&indices)
+                        .map_err(|e| Status::internal(e.to_string()))?,
+                )
+            }
+        };
+        let store = self.store.clone();
+        let (total, rows) =
+            blocking(move || store.rows_at(&name, start, count, columns.as_deref())).await?;
+        let messages = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(stream::iter(rows.into_iter().map(Ok)))
+            .enumerate()
+            .map(move |(at, message)| {
+                message.map(|mut message| {
+                    if at == 0 {
+                        message.app_metadata = total.to_le_bytes().to_vec().into();
+                    }
+                    message
+                })
+            })
+            .map_err(|e| Status::internal(e.to_string()))
+            .boxed();
+        Ok(Response::new(messages))
+    }
+}
+
 #[tonic::async_trait]
 impl FlightService for Service {
     type HandshakeStream = Stream<HandshakeResponse>;
@@ -332,6 +388,9 @@ impl FlightService for Service {
         };
         // Asked for since the marker; a reader before it would not know one.
         let marks = ticket["caught_up"].as_bool() == Some(true);
+        if !ticket["rows"].is_null() {
+            return self.rows_at(name, schema, &ticket).await;
+        }
         if !ticket["date"].is_null() {
             let date = date(&ticket, "date")?;
             // A past date's batches, then the end. The queue holds a few batches, so the read

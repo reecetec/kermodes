@@ -91,6 +91,8 @@ struct TableLog {
     /// checkpoint's size (unknown, so 0, after a restart).
     since_checkpoint: usize,
     checkpoint_bytes: usize,
+    /// An append table's day in commit order, once a read by position has asked for it.
+    positions: Option<Positions>,
 }
 
 impl TableLog {
@@ -98,6 +100,59 @@ impl TableLog {
     fn tick(&mut self) -> i64 {
         self.clock = now_ns().max(self.clock + 1);
         self.clock
+    }
+}
+
+/// An append table's day in commit order, for reads by position (§7.2): each batch's partition,
+/// its index there, and the rows before it. Built from the index on first use; each commit
+/// extends it, as ingest times rise across the table's partitions.
+struct Positions {
+    day: String,
+    streams: Vec<Stream>,
+    /// (stream, batch within its partition, rows before it)
+    batches: Vec<(u32, u32, u64)>,
+    rows: u64,
+}
+
+impl Positions {
+    fn build(log: &TableLog, day: &str) -> Self {
+        let mut streams = Vec::new();
+        let mut batches = Vec::new();
+        for ((date, stream), partition) in &log.partitions {
+            if date != day {
+                continue;
+            }
+            let at = streams.len() as u32;
+            streams.push(stream.clone());
+            for (index, (rows, ingest_ns)) in partition.batch_rows().enumerate() {
+                batches.push((ingest_ns, at, index as u32, rows));
+            }
+        }
+        // Ties (from before the table's clock) go to the earlier partition, as a replay's do.
+        batches.sort_unstable_by_key(|&(ingest_ns, at, index, _)| (ingest_ns, at, index));
+        let mut positions = Self {
+            day: day.to_owned(),
+            streams,
+            batches: Vec::with_capacity(batches.len()),
+            rows: 0,
+        };
+        for (_, at, index, rows) in batches {
+            positions.batches.push((at, index, positions.rows));
+            positions.rows += rows;
+        }
+        positions
+    }
+
+    fn push(&mut self, stream: &Stream, index: usize, rows: u64) {
+        let at = match self.streams.iter().position(|known| known == stream) {
+            Some(at) => at,
+            None => {
+                self.streams.push(stream.clone());
+                self.streams.len() - 1
+            }
+        };
+        self.batches.push((at as u32, index as u32, self.rows));
+        self.rows += rows;
     }
 }
 
@@ -342,12 +397,7 @@ impl Store {
         name: &TableName,
         mut subscriber: Subscriber,
     ) -> Result<SchemaRef, Error> {
-        let today = Date::of_ns(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos() as i64),
-        )
-        .to_string();
+        let today = today();
         let log = self.log(name)?;
         // Where the replay starts in each partition: a keyed table's latest checkpoint and the
         // changes after it; every batch of an append table's.
@@ -397,6 +447,91 @@ impl Store {
             }
             delivered.extend(caught_up);
         }
+    }
+
+    /// How many rows `name` holds today (UTC), and its rows `[start, start + count)` of them in
+    /// commit order, as a replay delivers them, with `columns` only (every column when `None`).
+    /// For viewers that show a table without holding it (§7.2). An append table's only: a keyed
+    /// table's rows are its keys' latest values, which positions do not name.
+    pub fn rows_at(
+        &self,
+        name: &TableName,
+        start: u64,
+        count: u64,
+        columns: Option<&[String]>,
+    ) -> Result<(u64, Vec<RecordBatch>), Error> {
+        let today = today();
+        let log = self.log(name)?;
+        let mut guard = lock(&log.state);
+        let state = &mut *guard;
+        if !state.entry.key.is_empty() {
+            return Err(Error::Schema(format!(
+                "{name} is keyed: its rows are its keys' latest values, read by key, not position"
+            )));
+        }
+        let projection =
+            columns
+                .map(|columns| {
+                    columns
+                        .iter()
+                        .map(|column| {
+                            state.entry.schema.index_of(column).map_err(|_| {
+                                Error::Schema(format!("{name} has no column `{column}`"))
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()?;
+        if state.positions.as_ref().is_none_or(|p| p.day != today) {
+            let built = Positions::build(state, &today);
+            state.positions = Some(built);
+        }
+        let positions = state.positions.as_ref().expect("built above");
+        let total = positions.rows;
+        let end = start.saturating_add(count).min(total);
+        let mut rows = Vec::new();
+        if start >= end {
+            return Ok((total, rows));
+        }
+        // The last batch starting at or before `start`, then each one up to `end`, read as runs
+        // of consecutive batches of one partition.
+        let mut at = positions
+            .batches
+            .partition_point(|&(_, _, before)| before <= start)
+            - 1;
+        let mut runs: Vec<(u32, u32, u32, u64)> = Vec::new();
+        while at < positions.batches.len() && positions.batches[at].2 < end {
+            let (stream, index, before) = positions.batches[at];
+            match runs.last_mut() {
+                Some(run) if run.0 == stream && run.1 + run.2 == index => run.2 += 1,
+                _ => runs.push((stream, index, 1, before)),
+            }
+            at += 1;
+        }
+        for (stream, first, count, mut before) in runs {
+            let key = (today.clone(), positions.streams[stream as usize].clone());
+            let partition = state
+                .partitions
+                .get(&key)
+                .expect("a position's partition is held");
+            for batch in partition.read_batches(first as usize, count as usize)? {
+                let len = batch.num_rows() as u64;
+                let from = start.max(before) - before;
+                let to = end.min(before + len).saturating_sub(before);
+                before += len;
+                if from >= to {
+                    continue;
+                }
+                let batch = batch.slice(from as usize, (to - from) as usize);
+                rows.push(match &projection {
+                    Some(columns) => batch
+                        .project(columns)
+                        .map_err(|e| Error::Arrow(e.to_string()))?,
+                    None => batch,
+                });
+            }
+        }
+        Ok((total, rows))
     }
 
     /// The past dates weir still holds rows of for `name`: not yet merged, or merged and not yet
@@ -521,6 +656,7 @@ impl Store {
                 clock,
                 since_checkpoint: 0,
                 checkpoint_bytes: 0,
+                positions: None,
             }),
             released: Condvar::new(),
         });
@@ -633,6 +769,10 @@ impl Writer {
         let partition = log.partitions.get_mut(&key).expect("inserted above");
         if !partition.append(batch, seq, ingest_ns, self.epoch, change)? {
             return Ok(false);
+        }
+        let committed = partition.committed();
+        if let Some(positions) = log.positions.as_mut().filter(|p| p.day == key.0) {
+            positions.push(&key.1, committed - 1, batch.num_rows() as u64);
         }
         let stamp = Stamp { change, ingest_ns };
         log.subscribers
@@ -914,6 +1054,11 @@ fn now_ns() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as i64)
+}
+
+/// Today's UTC date, the day live readers are given.
+fn today() -> String {
+    Date::of_ns(now_ns()).to_string()
 }
 
 /// Today's date is still being written: only a past one is read whole, merged, or dropped.

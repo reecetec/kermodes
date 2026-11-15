@@ -373,3 +373,58 @@ fn keyed_changes_cross_the_wire_with_their_kind() {
         Err(Error::Schema(_))
     ));
 }
+
+/// A viewer reads rows by position over the wire as the store gives them: the day's count with
+/// any window, only the columns asked for, a count alone, and a keyed table's refusal.
+#[test]
+fn rows_by_position_cross_the_wire() {
+    let dir = TempDir::new();
+    let store = Arc::new(Store::open(&dir.0).unwrap());
+    let server = serve(store.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+    let client = Client::connect(&format!("grpc://{}", server.addr())).unwrap();
+    client.create_table(&ticks(), &schema()).unwrap();
+    let writer = client
+        .writer(&ticks(), &SourceId::parse("feed").unwrap(), false)
+        .unwrap();
+    for (from, to) in [(0, 3), (3, 4), (4, 9)] {
+        writer.write(&batch(from..to), None).unwrap();
+    }
+    let ns = |rows: &[RecordBatch]| -> Vec<i64> {
+        rows.iter()
+            .flat_map(|b| b.column(0).as_primitive::<Int64Type>().values().to_vec())
+            .collect()
+    };
+    let (total, rows) = client.rows_at(&ticks(), 2, 4, None).unwrap();
+    assert_eq!((total, ns(&rows)), (9, vec![2, 3, 4, 5]));
+    let (_, local) = store.rows_at(&ticks(), 2, 4, None).unwrap();
+    assert_eq!(rows, local, "as the store gives them");
+
+    let only = ["sym".to_owned()];
+    let (_, rows) = client.rows_at(&ticks(), 7, 10, Some(&only)).unwrap();
+    let syms: Vec<_> = rows
+        .iter()
+        .flat_map(|b| {
+            let syms = b.column(0).as_string::<i32>();
+            (0..syms.len())
+                .map(|i| syms.value(i).to_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        (rows[0].num_columns(), syms),
+        (1, vec!["s7".to_owned(), "s8".to_owned()])
+    );
+    assert_eq!(
+        client.rows_at(&ticks(), 0, 0, None).unwrap(),
+        (9, Vec::new())
+    );
+
+    let keyed = TableName::parse("md.quotes").unwrap();
+    client
+        .create_keyed_table(&keyed, &schema(), &["sym".to_owned()])
+        .unwrap();
+    assert!(matches!(
+        client.rows_at(&keyed, 0, 1, None),
+        Err(Error::Schema(_))
+    ));
+}

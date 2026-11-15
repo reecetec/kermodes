@@ -350,6 +350,9 @@ async fn stored_tables_are_open_only_while_viewed() {
                 opened.lock().unwrap().push(feed);
                 Ok(table)
             }),
+            // As a keyed table: opened live, which this test is about.
+            positional: Box::new(|_| Ok(None)),
+            rows: Box::new(|_, _, _| Err("keyed tables are not read by position".to_owned())),
             stats: Box::new(|| Ok(json!({"tables": [{"table": "md.ticks", "weir": []}]}))),
             idle: Duration::ZERO,
         }
@@ -449,4 +452,161 @@ async fn stored_tables_are_open_only_while_viewed() {
         "{catalog}"
     );
     assert_eq!(openings(), 4 - 1, "listing the catalog opened nothing");
+}
+
+/// A stored append table is shown by position: its window comes from the store and nothing is
+/// opened; the view follows the table as it grows and reads wherever the grid scrolls, keyed
+/// by the rows' positions. A sort opens the table live; clearing it goes back to the window and
+/// lets the table go.
+#[tokio::test(flavor = "multi_thread")]
+async fn stored_append_tables_are_shown_by_position() {
+    let session = Session::new();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("sym", DataType::Utf8, true),
+        Field::new("price", DataType::Float64, true),
+    ]));
+    // The store's day, by position: r0 at 0.0, r1 at 1.0, ...
+    let day = Arc::new(std::sync::Mutex::new(250_usize));
+    let rows = {
+        let schema = schema.clone();
+        move |from: usize, to: usize| {
+            let syms: Vec<String> = (from..to).map(|i| format!("r{i}")).collect();
+            let prices: Vec<f64> = (from..to).map(|i| i as f64).collect();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(syms)) as ArrayRef,
+                    Arc::new(Float64Array::from(prices)),
+                ],
+            )
+            .unwrap()
+        }
+    };
+    let live = Arc::new(std::sync::Mutex::new(Vec::<kermodes_core::WeakTable>::new()));
+    let stored = {
+        let (session, live, day, rows, schema) = (
+            session.clone(),
+            live.clone(),
+            day.clone(),
+            rows.clone(),
+            schema.clone(),
+        );
+        let read = (day.clone(), rows.clone());
+        kermodes_gateway::Stored {
+            list: Box::new(|| {
+                let columns = vec![
+                    ("sym".to_owned(), "utf8".to_owned()),
+                    ("price".to_owned(), "float64".to_owned()),
+                ];
+                Ok(vec![("md.ticks".to_owned(), columns)])
+            }),
+            open: Box::new(move |name| {
+                let (table, feed) = session
+                    .fed_table(&schema, &format!("live {name}"))
+                    .map_err(|e| e.to_string())?;
+                feed.append(&[rows(0, *day.lock().unwrap())]).unwrap();
+                feed.ready();
+                live.lock().unwrap().push(table.downgrade());
+                std::mem::forget(feed);
+                Ok(table)
+            }),
+            positional: {
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new("sym", DataType::Utf8, true),
+                    Field::new("price", DataType::Float64, true),
+                ]));
+                Box::new(move |_| Ok(Some(schema.clone())))
+            },
+            rows: Box::new(move |_, start, count| {
+                let total = *read.0.lock().unwrap();
+                let from = (start as usize).min(total);
+                let to = (start + count).min(total as u64) as usize;
+                Ok((total as u64, vec![(read.1)(from, to)]))
+            }),
+            stats: Box::new(|| Ok(json!({"tables": []}))),
+            idle: Duration::ZERO,
+        }
+    };
+    let server = kermodes_gateway::serve(
+        session.clone(),
+        "127.0.0.1:0".parse().unwrap(),
+        None,
+        None,
+        Some(stored),
+    )
+    .unwrap();
+    let url = format!("ws://{}/ws", server.addr());
+    let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    while text(&mut socket).await["tables"][0]["name"] != "md.ticks" {}
+    let openings = || live.lock().unwrap().len();
+
+    send(
+        &mut socket,
+        json!({"type": "open", "view": 1, "table": "md.ticks"}),
+    )
+    .await;
+    let (state, header, rows, keys) = window(&mut socket).await;
+    assert_eq!(
+        (header["start"].clone(), state["row_count"].clone()),
+        (json!(0), json!(250))
+    );
+    assert_eq!((syms(&rows)[0], keys[0], keys.len()), ("r0", 0, 200));
+    assert_eq!(openings(), 0, "shown by position, nothing opened");
+
+    // The table grows: the window follows within a poll.
+    *day.lock().unwrap() = 260;
+    let (state, ..) = window(&mut socket).await;
+    assert_eq!(state["row_count"], 260);
+
+    // Deep in the table: the rows there, keyed by their positions.
+    send(
+        &mut socket,
+        json!({"type": "viewport", "view": 1, "top": 150, "bottom": 159}),
+    )
+    .await;
+    let (_, header, rows, keys) = window(&mut socket).await;
+    assert_eq!(header["start"], 50);
+    assert_eq!((syms(&rows)[0], keys[0], keys.len()), ("r50", 50, 210));
+
+    // Sorting opens the table live; the sorted rows show where the grid is.
+    send(
+        &mut socket,
+        json!({"type": "sort", "view": 1, "request": 1,
+               "by": [{"column": "price", "descending": true}]}),
+    )
+    .await;
+    let (state, ..) = window(&mut socket).await;
+    assert_eq!(
+        (state["sort"][0]["column"].clone(), state["applied"].clone()),
+        (json!("price"), json!(1))
+    );
+    assert_eq!(openings(), 1);
+    // The live table loads in a cycle, as the store's feed gives it.
+    session.step();
+    let (_, header, rows, _) = window(&mut socket).await;
+    assert_eq!(
+        (header["start"].clone(), syms(&rows)[0]),
+        (json!(50), "r209")
+    );
+    assert_eq!(openings(), 1);
+
+    // Unsorted again: the window by position, and the live table let go.
+    send(
+        &mut socket,
+        json!({"type": "sort", "view": 1, "request": 2, "by": []}),
+    )
+    .await;
+    let (state, header, rows, _) = window(&mut socket).await;
+    assert_eq!(
+        (state["sort"].clone(), state["applied"].clone()),
+        (json!([]), json!(2))
+    );
+    assert_eq!(
+        (header["start"].clone(), syms(&rows)[0]),
+        (json!(50), "r50")
+    );
+    assert!(
+        live.lock().unwrap()[0].upgrade().is_none(),
+        "the live table is let go"
+    );
 }

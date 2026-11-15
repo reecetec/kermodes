@@ -153,6 +153,19 @@ impl Tables {
         }
     }
 
+    /// How many rows `name` holds today, and its rows `[start, start + count)` by position.
+    fn rows_at(
+        &self,
+        name: &kermodes_weir::TableName,
+        start: u64,
+        count: u64,
+    ) -> Result<(u64, Vec<RecordBatch>), kermodes_weir::Error> {
+        match self {
+            Tables::Local(store) => store.rows_at(name, start, count, None),
+            Tables::Remote(client) => client.rows_at(name, start, count, None),
+        }
+    }
+
     /// Every stored table with its columns' names and type names, as the web UI lists them.
     fn listing(&self) -> Result<Vec<kermodes_gateway::Listed>, kermodes_weir::Error> {
         let columns = |schema: &Schema| {
@@ -416,13 +429,25 @@ impl Session {
         let package: PathBuf = py.import("kermodes")?.getattr("__file__")?.extract()?;
         let app = package.parent().map(|dir| dir.join("static").join("app"));
         let session = self.engine.clone();
-        // The store's tables, each opened live while the app views it.
+        // The store's tables: append tables shown by position, keyed ones opened live while
+        // the app views them.
         let stored = self.tables.clone().map(|tables| {
             let (lister, reader, engine) = (tables.clone(), tables.clone(), self.engine.clone());
+            let (asker, rows) = (tables.clone(), tables.clone());
+            let parse =
+                |name: &str| kermodes_weir::TableName::parse(name).map_err(|e| e.to_string());
             kermodes_gateway::Stored {
                 list: Box::new(move || lister.listing().map_err(|e| e.to_string())),
                 open: Box::new(move |name| {
                     open_live(&engine, &tables, name).map_err(|e| e.to_string())
+                }),
+                positional: Box::new(move |name| {
+                    let entry = asker.entry(&parse(name)?).map_err(|e| e.to_string())?;
+                    Ok(entry.key.is_empty().then_some(entry.schema))
+                }),
+                rows: Box::new(move |name, start, count| {
+                    rows.rows_at(&parse(name)?, start, count)
+                        .map_err(|e| e.to_string())
                 }),
                 stats: Box::new(move || reader.stats().map_err(|e| e.to_string())),
                 idle: VIEWED_IDLE,
