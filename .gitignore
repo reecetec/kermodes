@@ -1,6 +1,6 @@
 /target/
 /.venv/
-/.kermodes/
+.kermodes/
 __pycache__/
 *.so
 *.pyd

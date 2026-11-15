@@ -61,6 +61,15 @@ impl Artifacts {
             .map_err(|e| format!("cannot sign an upload of {object}: {e}"))
     }
 
+    /// A URL that downloads `object` with a GET, valid for `ttl`.
+    pub async fn download_url(&self, object: &str, ttl: Duration) -> Result<String, String> {
+        self.s3
+            .signed_url(Method::GET, &Path::from(object), ttl)
+            .await
+            .map(|url| url.to_string())
+            .map_err(|e| format!("cannot sign a download of {object}: {e}"))
+    }
+
     /// Whether `object` was uploaded.
     pub async fn exists(&self, object: &str) -> Result<bool, String> {
         match self.s3.head(&Path::from(object)).await {

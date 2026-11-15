@@ -11,7 +11,7 @@ import urllib.request
 from pathlib import Path
 
 import kermodes as km
-from kermodes import _native
+from kermodes import _native, environment
 from kermodes import project as projects
 from kermodes.supervisor import Supervisor
 
@@ -146,6 +146,16 @@ def main(argv: list[str] | None = None) -> None:
     fetch.add_argument("url")
     fetch.add_argument("dest", type=Path)
 
+    build_env = commands.add_parser(
+        "build-env",
+        help="build a project's environment from its uv.lock (environment build Jobs)",
+        description="Installs the project's locked dependencies into a new venv over this "
+        "Python and its Kermodes, and with --upload PUTs a tar of it there.",
+    )
+    build_env.add_argument("--project", type=Path, default=Path("."))
+    build_env.add_argument("--into", type=Path, required=True)
+    build_env.add_argument("--upload", help="a presigned URL for the environment's tar")
+
     manifest = commands.add_parser(
         "manifest",
         help="print a project's resources as JSON",
@@ -230,6 +240,11 @@ def main(argv: list[str] | None = None) -> None:
         run_control(args.config)
     elif args.command == "fetch-snapshot":
         fetch_snapshot(args.url, args.dest)
+    elif args.command == "build-env":
+        environment.build(args.project, args.into)
+        if args.upload:
+            environment.upload(args.into, args.upload)
+        print(f"built {args.into}", flush=True)
     elif args.command == "merge":
         session = (
             km.local(args.data_dir)

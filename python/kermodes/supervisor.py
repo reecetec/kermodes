@@ -17,7 +17,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from kermodes._native import Server
+from kermodes import environment
+from kermodes._native import KermodesError, Server
 
 READY_TIMEOUT = 60.0
 """How long a new run may take to become ready before its roll fails and the old run stays."""
@@ -76,6 +77,8 @@ class Supervisor:
         self.project = project.resolve()
         self.server = server
         self.ui = ui
+        # The interpreter discovery and runs use: the project's environment's, once built.
+        self.python = sys.executable
         self.runs: dict[str, Run] = {}
         self.specs: dict[str, dict] = {}
         self.apps: dict[str, App] = {}
@@ -133,6 +136,8 @@ class Supervisor:
 
     def sync(self) -> None:
         """Discovers the project and rolls its resources onto the working tree."""
+        if not self._environment():
+            return
         manifest = self._manifest()
         if manifest is None:
             return
@@ -254,7 +259,7 @@ class Supervisor:
         ready = self._dir / f"{name}-{time.monotonic_ns()}.ready"
         process = subprocess.Popen(
             [
-                sys.executable,
+                self.python,
                 "-m",
                 "kermodes",
                 "run",
@@ -274,7 +279,7 @@ class Supervisor:
         # Discovery imports the project's code: in its own process, never the dev server's.
         result = subprocess.run(
             [
-                sys.executable,
+                self.python,
                 "-m",
                 "kermodes",
                 "manifest",
@@ -292,9 +297,32 @@ class Supervisor:
             return None
         return json.loads(result.stdout)
 
+    def _environment(self) -> bool:
+        """Builds the project's environment from its uv.lock, as the cluster does, unless it is
+        built; discovery and runs then use its Python. Whether there is one to run on."""
+        lock = environment.lock_of(self.project)
+        if lock is None:
+            self.python = sys.executable
+            return True
+        built = self.project / ".kermodes" / "environments" / lock[:16]
+        if not built.exists():
+            print("kermodes dev: building the environment from uv.lock", flush=True)
+            # Built aside and moved into place, so a failed build never looks built.
+            scratch = built.with_name(f"{built.name}.building")
+            shutil.rmtree(scratch, ignore_errors=True)
+            try:
+                environment.build(self.project, scratch)
+            except KermodesError as e:
+                print(f"kermodes dev: the environment did not build: {e}", flush=True)
+                return False
+            scratch.rename(built)
+        self.python = str(built / "bin" / "python")
+        return True
+
     def _files(self) -> dict[Path, float]:
-        """The project's Python and its kermodes.toml. Apps reload themselves, and dependency
-        directories are never walked."""
+        """The project's Python, its kermodes.toml, and what its environment is built from. Apps
+        reload themselves, and dependency directories are never walked."""
+        watched = ("kermodes.toml", "uv.lock", "pyproject.toml")
         files = {}
         for directory, subdirectories, names in os.walk(self.project):
             subdirectories[:] = [
@@ -305,7 +333,7 @@ class Supervisor:
                 and not (directory == str(self.project) and d == "apps")
             ]
             for name in names:
-                if name.endswith(".py") or name == "kermodes.toml":
+                if name.endswith(".py") or name in watched:
                     path = Path(directory, name)
                     files[path] = path.stat().st_mtime
         return files

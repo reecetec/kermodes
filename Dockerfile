@@ -36,6 +36,8 @@ LABEL org.opencontainers.image.created="${IMAGE_CREATED}" \
       org.opencontainers.image.title="Kermodes" \
       org.opencontainers.image.version="${IMAGE_VERSION}"
 COPY --from=wheel /dist/ /tmp/dist/
+# uv, as CI's: environment builds read projects' uv.lock and install with it (§10.6).
+COPY --from=wheel /usr/local/bin/uv /usr/local/bin/uv
 # git: `kermodes control` syncs projects with it.
 RUN apt-get update && \
     apt-get install --yes --no-install-recommends git && \

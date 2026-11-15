@@ -851,23 +851,31 @@ s = km.connect().session(env="sportsflow@main", worker_class="medium", memory="8
 
 ### 10.6 Environments
 
-An environment is an immutable, prebuilt Python environment. Nothing is installed when a worker
-starts.
+An environment is an immutable, prebuilt Python environment: a project's locked dependencies in a
+venv over the platform's own Python and Kermodes. Nothing is installed when a pod starts.
 
-- Source: the project's `pyproject.toml` + `uv.lock` at the commit. Notebook sessions may instead
-  use an inline dependency list, which the control plane resolves with uv into a lock stored with
-  the `Environment` version.
-- Identity: hash of `uv.lock`, `pyproject.toml`, Python version, Kermodes version, and platform.
-  Code changes that don't touch the lock reuse the existing environment.
-- Build, in the pipeline's build stage and only on a cache miss: an unprivileged Kubernetes Job
-  starts from the `kermodes:<version>` image, runs `uv sync --frozen --no-dev --no-install-project`
-  into `/opt/kermodes/env`, and pushes that directory as one OCI layer on top of the base (no Docker
-  daemon, no privileged builder) to the platform's OCI registry as `kermodes-env:<hash>`.
-- Workers reference the image by digest. The kubelet's image cache makes later starts on a node
-  instant; an optional pre-pull DaemonSet warms environments marked hot.
-- Sessions may `%pip install` into a session-only overlay for exploration. The session is then marked
-  dirty; the dependency has to land in the project's lock to be deployed.
-- Unreferenced environment images are garbage-collected, keeping the last N per project.
+- Source: the project's `pyproject.toml` + `uv.lock` at the commit; a project without a lockfile
+  runs on the platform's Python alone. Kermodes is the platform's: a lock that pins it is not
+  installed over it.
+- Identity: a hash of `uv.lock` and `pyproject.toml` (the commit's *lock*), and of that with the
+  platform image (the environment's *key*), so a new Python or Kermodes builds its own. Code
+  changes that don't touch the lock reuse the existing environment.
+- Build, once per key: an unprivileged Job on the `kermodes:<version>` image (which carries uv)
+  runs `kermodes build-env`: `uv export --frozen` of the lock, `python -m venv --copies /env`,
+  `uv pip install` into it, and a `.pth` naming the platform's site-packages, so Kermodes resolves
+  under the project's packages; the build fails if Kermodes no longer imports over them. A tar
+  of `/env` goes to a presigned URL in the artifacts store; the build's environment is the
+  `builds.secretName` Secret's (private index tokens).
+- A commit with a lock is discovered once its environment is built (discovery imports the code);
+  one whose environment fails to build is not deployable, saying why. Nothing rolls onto a commit
+  before its environment under the running platform is built; after an upgrade, the old pods run
+  until it is.
+- Pods: an init container fetches `/environments/<key>` from the controller, which answers with a
+  redirect to a URL signed then, so a pod restarting days later gets one that works and the bytes
+  never pass through the controller; the run is `/env/bin/python -m kermodes run`.
+- `kermodes dev` builds the same from the working tree, under the project's `.kermodes/`, and runs
+  discovery and resources on it; a changed lock rebuilds and rolls.
+- Environments no project's five newest commits use under the running platform are deleted.
 
 ## 11. Projects and delivery
 

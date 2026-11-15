@@ -35,6 +35,10 @@ pub struct Config {
     pub weir: String,
     /// This controller's snapshot endpoint, as pods reach it.
     pub snapshots: String,
+    /// This controller's environment endpoint, as pods reach it; without it (and the artifacts
+    /// store), a project with a lockfile cannot deploy.
+    #[serde(default)]
+    pub environments: Option<String>,
     /// Where the controller's HTTP API listens.
     pub listen: String,
     #[serde(default)]
@@ -296,6 +300,9 @@ async fn build_forever(controller: &Controller) {
         return std::future::pending().await;
     };
     loop {
+        if let Err(e) = environments_once(controller, artifacts).await {
+            eprintln!("kermodes control: building environments: {e}");
+        }
         for project in &controller.config.projects {
             if let Err(e) = build_once(controller, artifacts, builds, project).await {
                 eprintln!("kermodes control: {}: building apps: {e}", project.name);
@@ -303,6 +310,137 @@ async fn build_forever(controller: &Controller) {
         }
         tokio::time::sleep(BUILD_EVERY).await;
     }
+}
+
+/// How many of a project's newest commits keep their environments.
+const ENVIRONMENTS_KEPT: i64 = 5;
+
+/// Settles ended environment builds (built only if the environment is there), asking for a
+/// sync when one built so discovery goes on at once, and deletes environments no project's
+/// newest commits run on under this platform.
+async fn environments_once(controller: &Controller, artifacts: &Artifacts) -> Result<(), String> {
+    let environments = controller.state.lock().await.environments().await?;
+    let mut built_any = false;
+    for (key, state) in &environments {
+        if *state != Build::Building {
+            continue;
+        }
+        let job = plan::environment_job_name(key);
+        let Some(outcome) = controller.kube.job_outcome(&job, "build").await? else {
+            continue;
+        };
+        let result = match outcome {
+            Ok(_) if artifacts.exists(&plan::environment_object(key)).await? => Ok(()),
+            Ok(_) => Err("the build ended without uploading the environment".into()),
+            Err(why) => Err(why),
+        };
+        match &result {
+            Ok(()) => eprintln!("kermodes control: built environment {key}"),
+            Err(e) => eprintln!("kermodes control: environment {key} failed: {e}"),
+        }
+        built_any |= result.is_ok();
+        let mut state = controller.state.lock().await;
+        state.finish_environment(key, &result).await?;
+    }
+    if built_any {
+        controller.state.lock().await.request_sync().await?;
+    }
+    let mut wanted = BTreeSet::new();
+    for project in &controller.config.projects {
+        let locks = controller
+            .state
+            .lock()
+            .await
+            .recent_locks(&project.name, ENVIRONMENTS_KEPT)
+            .await?;
+        for lock in locks {
+            wanted.insert(plan::environment_key(&lock, &controller.config.image));
+        }
+    }
+    for (key, state) in environments {
+        if state != Build::Building && !wanted.contains(&key) {
+            artifacts.delete(&plan::environment_object(&key)).await?;
+            controller
+                .state
+                .lock()
+                .await
+                .remove_environment(&key)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// What a commit's resources run on, under this platform.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Environment {
+    /// The project has no lockfile: the platform's Python alone.
+    Platform,
+    Ready(String),
+    /// Building: discovery and rollouts wait for it.
+    Waiting,
+    Failed(String),
+}
+
+impl Environment {
+    fn key(&self) -> Option<String> {
+        match self {
+            Environment::Ready(key) => Some(key.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// The environment for `lock` under this platform, its build started from `commit` if there is
+/// none yet.
+async fn environment(
+    controller: &Controller,
+    project: &ProjectConfig,
+    commit: &str,
+    lock: Option<&str>,
+) -> Result<Environment, String> {
+    let Some(lock) = lock else {
+        return Ok(Environment::Platform);
+    };
+    let (Some(artifacts), Some(builds), Some(_)) = (
+        &controller.artifacts,
+        &controller.config.builds,
+        &controller.config.environments,
+    ) else {
+        return Ok(Environment::Failed(
+            "this platform builds no environments: it has no artifacts store or builder".into(),
+        ));
+    };
+    let key = plan::environment_key(lock, &controller.config.image);
+    let known = controller.state.lock().await.environment(&key).await?;
+    Ok(match known {
+        Some(Build::Built) => Environment::Ready(key),
+        Some(Build::Failed(why)) => Environment::Failed(why),
+        Some(Build::Building) => Environment::Waiting,
+        None => {
+            let ttl = Duration::from_secs(plan::BUILD_DEADLINE_SECONDS + 300);
+            let upload = artifacts
+                .upload_url(&plan::environment_object(&key), ttl)
+                .await?;
+            // Recorded first: a Job that never starts then reads as gone, and the build as failed.
+            controller
+                .state
+                .lock()
+                .await
+                .start_environment(&key)
+                .await?;
+            let target = target(controller, project, commit, None);
+            controller
+                .kube
+                .start(&plan::environment_job(&target, &key, builds, &upload))
+                .await?;
+            eprintln!(
+                "kermodes control: {}: building environment {key} from {commit}",
+                project.name
+            );
+            Environment::Waiting
+        }
+    })
 }
 
 async fn build_once(
@@ -362,7 +500,7 @@ async fn build_once(
             .await
             .start_build(&project.name, app, &latest.commit)
             .await?;
-        let target = target(controller, project, &latest.commit);
+        let target = target(controller, project, &latest.commit, None);
         controller
             .kube
             .start(&plan::build_job(&target, app, config, &upload))
@@ -551,6 +689,7 @@ async fn sync(controller: &Controller, project: &ProjectConfig) -> Result<(), St
             })
             .await
             .map_err(|e| e.to_string())??;
+            let lock = plan::lock_of(&snapshot.tar, &project.path)?;
             let mut state = controller.state.lock().await;
             // A commit elsewhere in the repository is not a new version of the project: what
             // runs keeps running, with nothing to discover or roll out.
@@ -569,6 +708,7 @@ async fn sync(controller: &Controller, project: &ProjectConfig) -> Result<(), St
                     &project.name,
                     &snapshot.commit,
                     &snapshot.tree,
+                    lock.as_deref(),
                     &snapshot.tar,
                 )
                 .await?;
@@ -596,14 +736,19 @@ async fn sync(controller: &Controller, project: &ProjectConfig) -> Result<(), St
                     .await?;
                 return reconcile(controller, project).await;
             }
-            Some(snapshot.commit)
+            Some((snapshot.commit, lock))
         }
         // Discovery was interrupted (the controller restarted): run it again.
-        Some(c) if c.manifest.is_none() && c.error.is_none() => Some(c.commit),
+        Some(c) if c.manifest.is_none() && c.error.is_none() => Some((c.commit, c.lock)),
         Some(_) => None,
     };
-    if let Some(commit) = pending {
-        let result = discover(controller, project, &commit).await;
+    if let Some((commit, lock)) = pending {
+        let result = match environment(controller, project, &commit, lock.as_deref()).await? {
+            // Discovered once its environment is built: the code imports what it locked.
+            Environment::Waiting => return reconcile(controller, project).await,
+            Environment::Failed(why) => Err(format!("its environment did not build: {why}")),
+            ready => discover(controller, project, &commit, ready.key()).await,
+        };
         if let Err(e) = &result {
             eprintln!(
                 "kermodes control: {}: {commit} not deployable: {e}",
@@ -656,10 +801,12 @@ async fn discover(
     controller: &Controller,
     project: &ProjectConfig,
     commit: &str,
+    environment: Option<String>,
 ) -> Result<String, String> {
+    let target = target(controller, project, commit, environment);
     let output = controller
         .kube
-        .discover(&plan::discovery_job(&target(controller, project, commit)))
+        .discover(&plan::discovery_job(&target))
         .await?;
     let manifest = Manifest::parse(&output)?;
     if manifest.project != project.name {
@@ -688,7 +835,12 @@ async fn rediscover_if_stale(
     let stale = |c: &Commit| c.discovered_by.as_deref() != Some(image.as_str());
     let head = controller.state.lock().await.latest(&project.name).await?;
     if let Some(head) = head.filter(|c| c.error.is_some() && stale(c)) {
-        let result = discover(controller, project, &head.commit).await;
+        let lock = head.lock.as_deref();
+        let result = match environment(controller, project, &head.commit, lock).await? {
+            Environment::Waiting => return Ok(()),
+            Environment::Failed(why) => Err(format!("its environment did not build: {why}")),
+            ready => discover(controller, project, &head.commit, ready.key()).await,
+        };
         match &result {
             Ok(_) => eprintln!(
                 "kermodes control: {}: {} reads under {image}",
@@ -715,7 +867,12 @@ async fn rediscover_if_stale(
     let Some(latest) = latest.filter(stale) else {
         return Ok(());
     };
-    let result = discover(controller, project, &latest.commit).await;
+    let lock = latest.lock.as_deref();
+    let result = match environment(controller, project, &latest.commit, lock).await? {
+        Environment::Waiting => return Ok(()),
+        Environment::Failed(why) => Err(format!("its environment did not build: {why}")),
+        ready => discover(controller, project, &latest.commit, ready.key()).await,
+    };
     match &result {
         Ok(_) => eprintln!(
             "kermodes control: {}: {} read again by {image}",
@@ -737,13 +894,48 @@ async fn rediscover_if_stale(
 /// Brings a project's Deployments to its newest deployable commit, resource by resource.
 async fn reconcile(controller: &Controller, project: &ProjectConfig) -> Result<(), String> {
     rediscover_if_stale(controller, project).await?;
-    let mut state = controller.state.lock().await;
-    let Some(latest) = state.latest_discovered(&project.name).await? else {
+    let (latest, deployed) = {
+        let mut state = controller.state.lock().await;
+        (
+            state.latest_discovered(&project.name).await?,
+            state.deployed(&project.name).await?,
+        )
+    };
+    let Some(latest) = latest else {
         return Ok(());
     };
+    // What each commit that runs, or is about to, runs on under this platform: nothing rolls
+    // onto a commit before its environment is built, and a new platform builds its own.
+    let mut environments = HashMap::new();
+    let commits: BTreeSet<&str> = deployed
+        .values()
+        .map(String::as_str)
+        .chain([latest.commit.as_str()])
+        .collect();
+    for commit in commits {
+        let lock = if commit == latest.commit {
+            latest.lock.clone()
+        } else {
+            let known = controller
+                .state
+                .lock()
+                .await
+                .commit(&project.name, commit)
+                .await?;
+            known.and_then(|c| c.lock)
+        };
+        let ready = environment(controller, project, commit, lock.as_deref()).await?;
+        environments.insert(commit.to_owned(), ready);
+    }
+    // The environment a commit runs on: `None` until it can.
+    let runs_on = |commit: &str| match environments.get(commit) {
+        Some(Environment::Platform) => Some(None),
+        Some(Environment::Ready(key)) => Some(Some(key.clone())),
+        _ => None,
+    };
+    let mut state = controller.state.lock().await;
     let manifest = Manifest::parse(latest.manifest.as_deref().unwrap_or_default())?;
     let names = plan::object_names(&project.name, &manifest.resources)?;
-    let deployed = state.deployed(&project.name).await?;
     let stopped = state.stopped(&project.name).await?;
     for resource in &manifest.resources {
         let name = &names[&resource.name];
@@ -751,7 +943,10 @@ async fn reconcile(controller: &Controller, project: &ProjectConfig) -> Result<(
         let is_stopped = stopped.contains(&resource.name);
         match plan::decide(resource.update, running, &latest.commit) {
             Decision::Apply => {
-                let target = target(controller, project, &latest.commit);
+                let Some(environment) = runs_on(&latest.commit) else {
+                    continue;
+                };
+                let target = target(controller, project, &latest.commit, environment);
                 controller
                     .kube
                     .apply(&plan::deployment(&target, resource, name, is_stopped))
@@ -775,7 +970,10 @@ async fn reconcile(controller: &Controller, project: &ProjectConfig) -> Result<(
                     && (resource.update == Update::Auto
                         || controller.kube.replicas(name).await? != Some(desired))
                 {
-                    let target = target(controller, project, commit);
+                    let Some(environment) = runs_on(commit) else {
+                        continue;
+                    };
+                    let target = target(controller, project, commit, environment);
                     controller
                         .kube
                         .apply(&plan::deployment(&target, resource, name, is_stopped))
@@ -820,8 +1018,10 @@ pub async fn roll_out(
         .iter()
         .find(|p| p.name == project)
         .ok_or_else(|| format!("no project {project}"))?;
-    let mut state = controller.state.lock().await;
-    let latest = state
+    let latest = controller
+        .state
+        .lock()
+        .await
         .latest_discovered(project)
         .await?
         .ok_or_else(|| format!("{project} has no deployable commit"))?;
@@ -832,11 +1032,21 @@ pub async fn roll_out(
         .find(|r| r.name == resource)
         .ok_or_else(|| format!("{project} declares no resource {resource}"))?;
     let name = plan::object_name(project, resource)?;
+    let lock = latest.lock.as_deref();
+    let environment = match environment(controller, config, &latest.commit, lock).await? {
+        Environment::Platform => None,
+        Environment::Ready(key) => Some(key),
+        Environment::Waiting => {
+            return Err(format!("{}'s environment is still building", latest.commit));
+        }
+        Environment::Failed(why) => return Err(format!("its environment did not build: {why}")),
+    };
+    let mut state = controller.state.lock().await;
     let is_stopped = state.stopped(project).await?.contains(resource);
     controller
         .kube
         .apply(&plan::deployment(
-            &target(controller, config, &latest.commit),
+            &target(controller, config, &latest.commit, environment),
             declared,
             &name,
             is_stopped,
@@ -933,7 +1143,12 @@ async fn source(
     })
 }
 
-fn target(controller: &Controller, project: &ProjectConfig, commit: &str) -> Target {
+fn target(
+    controller: &Controller,
+    project: &ProjectConfig,
+    commit: &str,
+    environment: Option<String>,
+) -> Target {
     let config = &controller.config;
     Target {
         project: project.name.clone(),
@@ -942,6 +1157,8 @@ fn target(controller: &Controller, project: &ProjectConfig, commit: &str) -> Tar
         image: config.image.clone(),
         weir: config.weir.clone(),
         snapshots: config.snapshots.clone(),
+        environments: config.environments.clone().unwrap_or_default(),
+        environment,
         pull_secrets: config.pull_secrets.clone(),
     }
 }

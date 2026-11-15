@@ -40,9 +40,41 @@ pub async fn serve(controller: Arc<Controller>, listener: tokio::net::TcpListene
         .route("/api/deployments/{project}/{resource}/start", post(start))
         .route("/apps/{project}/{app}/", get(app_page))
         .route("/apps/{project}/{app}/{*path}", get(app_path))
+        .route("/environments/{key}", get(environment))
         .with_state(controller);
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("kermodes control: the HTTP server stopped: {e}");
+    }
+}
+
+/// Sends a pod's init container to the built environment `key` in the artifacts store, by a
+/// URL signed now: a pod restarting days later gets a fresh one, and the environment's bytes
+/// never pass through the controller.
+async fn environment(
+    State(controller): State<Arc<Controller>>,
+    Path(key): Path<String>,
+) -> Response {
+    let Some(store) = &controller.artifacts else {
+        return (
+            StatusCode::NOT_FOUND,
+            "this platform builds no environments",
+        )
+            .into_response();
+    };
+    match controller.state.lock().await.environment(&key).await {
+        Ok(Some(plan::Build::Built)) => {}
+        Ok(_) => {
+            return (StatusCode::NOT_FOUND, format!("no built environment {key}")).into_response();
+        }
+        Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+    }
+    let ttl = std::time::Duration::from_secs(900);
+    match store
+        .download_url(&plan::environment_object(&key), ttl)
+        .await
+    {
+        Ok(url) => axum::response::Redirect::temporary(&url).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
     }
 }
 

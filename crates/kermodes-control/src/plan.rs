@@ -163,12 +163,17 @@ pub struct Target {
     /// The project's directory within its repository; empty for the root.
     pub path: String,
     pub commit: String,
-    /// The image runs use: the platform's, until environment images exist (§10.6).
+    /// The image runs use: the platform's.
     pub image: String,
     /// weir's Flight URL, where runs keep their tables.
     pub weir: String,
     /// The controller's snapshot endpoint: `{snapshots}/{project}/{commit}` is the code as a tar.
     pub snapshots: String,
+    /// The controller's environment endpoint: `{environments}/{key}` sends to the environment.
+    pub environments: String,
+    /// The environment the commit runs on (`environment_key`), built from its lockfile; none
+    /// runs it on the platform's Python alone.
+    pub environment: Option<String>,
     pub pull_secrets: Vec<String>,
 }
 
@@ -251,7 +256,7 @@ pub fn deployment(target: &Target, resource: &Resource, name: &str, stopped: boo
         }),
         Rollout::Recreate => json!({"type": "Recreate"}),
     };
-    let run = json!({
+    let mut run = json!({
         "name": "run",
         "image": target.image,
         "args": [
@@ -279,6 +284,8 @@ pub fn deployment(target: &Target, resource: &Resource, name: &str, stopped: boo
         ],
         "securityContext": container_security(),
     });
+    let mut init = vec![snapshot(target)];
+    on_environment(target, &mut init, &mut run);
     let object = json!({
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -296,7 +303,7 @@ pub fn deployment(target: &Target, resource: &Resource, name: &str, stopped: boo
             "progressDeadlineSeconds": 600,
             "template": {
                 "metadata": {"labels": pod_labels},
-                "spec": pod(target, vec![snapshot(target)], vec![run], "Always"),
+                "spec": pod(target, init, vec![run], "Always"),
             },
         },
     });
@@ -354,7 +361,7 @@ pub fn to_move<'a>(placements: &'a [Placement], cordoned: &BTreeSet<String>) -> 
 /// read back from the Job's log.
 pub fn discovery_job(target: &Target) -> Job {
     let name = discovery_job_name(&target.project, &target.commit, &target.image);
-    let discover = json!({
+    let mut discover = json!({
         "name": "discover",
         "image": target.image,
         "args": ["manifest", "--project", project_dir(target)],
@@ -362,6 +369,9 @@ pub fn discovery_job(target: &Target) -> Job {
         "volumeMounts": [{"name": "code", "mountPath": "/code", "readOnly": true}],
         "securityContext": container_security(),
     });
+    // Discovery imports the project's code, and with it what the code imports.
+    let mut init = vec![snapshot(target)];
+    on_environment(target, &mut init, &mut discover);
     let object = json!({
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -379,7 +389,7 @@ pub fn discovery_job(target: &Target) -> Job {
             "activeDeadlineSeconds": 300,
             "template": {
                 "metadata": {"labels": {"kermodes.io/project": target.project}},
-                "spec": pod(target, vec![snapshot(target)], vec![discover], "Never"),
+                "spec": pod(target, init, vec![discover], "Never"),
             },
         },
     });
@@ -422,6 +432,13 @@ fn snapshot(target: &Target) -> Value {
 }
 
 fn pod(target: &Target, init: Vec<Value>, containers: Vec<Value>, restart: &str) -> Value {
+    let mut volumes = vec![
+        json!({"name": "code", "emptyDir": {}}),
+        json!({"name": "run", "emptyDir": {"medium": "Memory"}}),
+    ];
+    if target.environment.is_some() {
+        volumes.push(json!({"name": "env", "emptyDir": {}}));
+    }
     json!({
         "restartPolicy": restart,
         "imagePullSecrets": target
@@ -432,11 +449,155 @@ fn pod(target: &Target, init: Vec<Value>, containers: Vec<Value>, restart: &str)
         "securityContext": pod_security(),
         "initContainers": init,
         "containers": containers,
-        "volumes": [
-            {"name": "code", "emptyDir": {}},
-            {"name": "run", "emptyDir": {"medium": "Memory"}},
-        ],
+        "volumes": volumes,
     })
+}
+
+/// Runs `container` on the target's environment, if it has one: an init container fetches it
+/// into `/env` (the controller sends it to the artifacts store), and the container runs the
+/// environment's Python, which sees the platform's Kermodes under the project's packages.
+fn on_environment(target: &Target, init: &mut Vec<Value>, container: &mut Value) {
+    let Some(key) = &target.environment else {
+        return;
+    };
+    init.push(json!({
+        "name": "environment",
+        "image": target.image,
+        "args": ["fetch-snapshot", format!("{}/{key}", target.environments), "/env"],
+        "volumeMounts": [{"name": "env", "mountPath": "/env"}],
+        "securityContext": container_security(),
+    }));
+    container["command"] = json!(["/env/bin/python", "-m", "kermodes"]);
+    container["volumeMounts"]
+        .as_array_mut()
+        .expect("a container's mounts are a list")
+        .push(json!({"name": "env", "mountPath": "/env", "readOnly": true}));
+}
+
+/// A hash of what a project's environment is built from, its `uv.lock` and `pyproject.toml` in
+/// the snapshot `tar` (paths from the repository's root, the project at `path`): the same as
+/// `kermodes.environment.lock_of` gives. None for a project without a lockfile.
+pub fn lock_of(tar: &[u8], path: &str) -> Result<Option<String>, String> {
+    use std::io::Read;
+    let unreadable = |e: std::io::Error| format!("an unreadable snapshot: {e}");
+    let dir = path.trim_matches('/');
+    let at = |name: &str| {
+        if dir.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{dir}/{name}")
+        }
+    };
+    let (lock_path, project_path) = (at("uv.lock"), at("pyproject.toml"));
+    let (mut lock, mut project) = (None, Vec::new());
+    let mut archive = tar::Archive::new(tar);
+    for entry in archive.entries().map_err(unreadable)? {
+        let mut entry = entry.map_err(unreadable)?;
+        let name = entry
+            .path()
+            .map_err(unreadable)?
+            .to_string_lossy()
+            .into_owned();
+        if name == lock_path {
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).map_err(unreadable)?;
+            lock = Some(bytes);
+        } else if name == project_path {
+            entry.read_to_end(&mut project).map_err(unreadable)?;
+        }
+    }
+    Ok(lock.map(|lock| {
+        let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+        for part in [&lock[..], &project[..]] {
+            digest.update(part);
+            digest.update(b"\0");
+        }
+        hex(digest.finish().as_ref())
+    }))
+}
+
+/// The environment a lock runs on under the platform `image`: a new platform (its Python, its
+/// Kermodes) builds its own.
+pub fn environment_key(lock: &str, image: &str) -> String {
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    digest.update(lock.as_bytes());
+    digest.update(b"\0");
+    digest.update(image.as_bytes());
+    hex(&digest.finish().as_ref()[..16])
+}
+
+/// Where the environment `key` is kept in the artifacts store: a tar of the venv.
+pub fn environment_object(key: &str) -> String {
+    format!("environments/{key}.tar")
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The Job that builds the environment `key` from the target's commit: `kermodes build-env`,
+/// which installs the commit's locked dependencies into `/env` over the platform's Python and
+/// uploads a tar of it to `upload`, a presigned URL for its one object.
+pub fn environment_job(target: &Target, key: &str, builds: &Builds, upload: &str) -> Job {
+    let mut build = json!({
+        "name": "build",
+        "image": target.image,
+        "args": ["build-env", "--project", project_dir(target), "--into", "/env", "--upload", upload],
+        // The root filesystem is read-only: uv's cache and the tar go to the work volume.
+        "env": [
+            {"name": "HOME", "value": "/work"},
+            {"name": "TMPDIR", "value": "/work"},
+            {"name": "UV_CACHE_DIR", "value": "/work/uv"},
+            {"name": "PYTHONDONTWRITEBYTECODE", "value": "1"},
+        ],
+        "resources": {
+            "requests": {"cpu": "1", "memory": "2Gi"},
+            "limits": {"cpu": "2", "memory": "2Gi"},
+        },
+        "volumeMounts": [
+            {"name": "code", "mountPath": "/code", "readOnly": true},
+            {"name": "env", "mountPath": "/env"},
+            {"name": "work", "mountPath": "/work"},
+        ],
+        "securityContext": container_security(),
+    });
+    // Registry tokens a project's uv index needs, as for app builds.
+    if let Some(secret) = &builds.secret {
+        build["envFrom"] = json!([{"secretRef": {"name": secret}}]);
+    }
+    let mut spec = pod(target, vec![snapshot(target)], vec![build], "Never");
+    let volumes = spec["volumes"]
+        .as_array_mut()
+        .expect("a pod's volumes are a list");
+    volumes.push(json!({"name": "env", "emptyDir": {}}));
+    volumes.push(json!({"name": "work", "emptyDir": {}}));
+    let object = json!({
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": environment_job_name(key),
+            "labels": {
+                "app.kubernetes.io/component": "environment",
+                "app.kubernetes.io/managed-by": "kermodes-control",
+                "kermodes.io/environment": key,
+            },
+        },
+        "spec": {
+            "backoffLimit": 0,
+            "ttlSecondsAfterFinished": 86_400,
+            "activeDeadlineSeconds": BUILD_DEADLINE_SECONDS,
+            "template": {
+                "metadata": {"labels": {"app.kubernetes.io/component": "environment"}},
+                "spec": spec,
+            },
+        },
+    });
+    serde_json::from_value(object).expect("a Job built from known fields")
+}
+
+/// One Job per environment: its key names it.
+pub fn environment_job_name(key: &str) -> String {
+    format!("environment-{key}")
 }
 
 fn container_security() -> Value {
@@ -748,6 +909,8 @@ mod tests {
             image: "registry/kermodes:0.3.0".into(),
             weir: "grpc://kermodes-weir:8731".into(),
             snapshots: "http://kermodes-control:8732/snapshots".into(),
+            environments: "http://kermodes-control:8732/environments".into(),
+            environment: None,
             pull_secrets: vec!["pull".into()],
         }
     }
@@ -1227,5 +1390,147 @@ mod tests {
             checks_of(&status("failure")),
             Checks::Failed("its checks failed: CI / python (push)".into())
         );
+    }
+
+    /// A snapshot as git archives one: paths from the repository's root.
+    fn snapshot_of(files: &[(&str, &str)]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, text) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(text.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, text.as_bytes())
+                .unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn an_environment_is_one_per_lock_and_platform() {
+        let (lock, project) = ("version = 1\n", "[project]\nname = \"p\"\n");
+        let tar = snapshot_of(&[
+            ("examples/ticker/uv.lock", lock),
+            ("examples/ticker/pyproject.toml", project),
+            ("examples/ticker/src/ticker/app.py", "import humanize\n"),
+        ]);
+        // kermodes.environment.lock_of gives the same for the same files (kermodes dev's).
+        let hashed = lock_of(&tar, "examples/ticker").unwrap().unwrap();
+        assert_eq!(
+            hashed,
+            "198f1cbe438276820a59355a0ac6eeb09ee128e2308ba3b52500df3433091104"
+        );
+        // Code changes keep the lock; the lockfile or the project's dependencies change it.
+        let code = snapshot_of(&[
+            ("examples/ticker/uv.lock", lock),
+            ("examples/ticker/pyproject.toml", project),
+            (
+                "examples/ticker/src/ticker/app.py",
+                "import humanize, math\n",
+            ),
+        ]);
+        assert_eq!(
+            lock_of(&code, "examples/ticker").unwrap(),
+            Some(hashed.clone())
+        );
+        let deps = snapshot_of(&[
+            ("examples/ticker/uv.lock", "version = 2\n"),
+            ("examples/ticker/pyproject.toml", project),
+        ]);
+        assert_ne!(
+            lock_of(&deps, "examples/ticker").unwrap(),
+            Some(hashed.clone())
+        );
+        // No lockfile, no environment; a project at the repository's root reads its own.
+        assert_eq!(
+            lock_of(
+                &snapshot_of(&[("examples/ticker/app.py", "")]),
+                "examples/ticker"
+            ),
+            Ok(None)
+        );
+        let root = snapshot_of(&[("uv.lock", lock), ("pyproject.toml", project)]);
+        assert_eq!(lock_of(&root, "").unwrap(), Some(hashed.clone()));
+        // A new platform builds its own.
+        assert_ne!(
+            environment_key(&hashed, "registry/kermodes:0.4.1"),
+            environment_key(&hashed, "registry/kermodes:0.4.2")
+        );
+    }
+
+    #[test]
+    fn runs_and_discovery_fetch_their_environment_and_run_its_python() {
+        let ticks = resource("ticks", Update::Auto, Rollout::Rolling);
+        let on = Target {
+            environment: Some("e1".into()),
+            ..target("a")
+        };
+        let deployment = deployment(&on, &ticks, "ticker-ticks", false);
+        let pod = deployment.spec.unwrap().template.spec.unwrap();
+        let init = pod.init_containers.unwrap();
+        assert_eq!(init.len(), 2);
+        assert_eq!(
+            init[1].args.clone().unwrap(),
+            [
+                "fetch-snapshot",
+                "http://kermodes-control:8732/environments/e1",
+                "/env"
+            ]
+        );
+        let run = &pod.containers[0];
+        assert_eq!(
+            run.command.clone().unwrap(),
+            ["/env/bin/python", "-m", "kermodes"]
+        );
+        let env = run
+            .volume_mounts
+            .iter()
+            .flatten()
+            .find(|m| m.mount_path == "/env")
+            .unwrap();
+        assert_eq!(env.read_only, Some(true));
+        let discovery = discovery_job(&on).spec.unwrap().template.spec.unwrap();
+        assert_eq!(
+            discovery.containers[0].command.clone().unwrap(),
+            ["/env/bin/python", "-m", "kermodes"]
+        );
+        // Without a lockfile, the platform's Python as before.
+        let plain = deployment_pod(&target("a"), &ticks);
+        assert!(plain.containers[0].command.is_none());
+        assert_eq!(plain.init_containers.unwrap().len(), 1);
+
+        let builds = Builds {
+            image: "oven/bun:1".into(),
+            secret: Some("kermodes-build".into()),
+        };
+        let job = environment_job(&target("a"), "e1", &builds, "https://s3/signed");
+        assert_eq!(job.metadata.name.as_deref(), Some("environment-e1"));
+        let build = &job.spec.unwrap().template.spec.unwrap().containers[0];
+        // The platform's image, so the environment is built over its Python and Kermodes.
+        assert_eq!(build.image.as_deref(), Some("registry/kermodes:0.3.0"));
+        assert_eq!(
+            build.args.clone().unwrap(),
+            [
+                "build-env",
+                "--project",
+                "/code/examples/ticker",
+                "--into",
+                "/env",
+                "--upload",
+                "https://s3/signed"
+            ]
+        );
+        let security = build.security_context.clone().unwrap();
+        assert_eq!(security.read_only_root_filesystem, Some(true));
+    }
+
+    fn deployment_pod(target: &Target, resource: &Resource) -> k8s_openapi::api::core::v1::PodSpec {
+        deployment(target, resource, "ticker-ticks", false)
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
     }
 }

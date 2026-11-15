@@ -28,9 +28,12 @@ pub struct Commit {
     /// The platform image whose `kermodes manifest` read it; unknown for commits read before
     /// this was recorded.
     pub discovered_by: Option<String>,
+    /// The hash of the project's `uv.lock` and `pyproject.toml` (`plan::lock_of`), which its
+    /// environment is built from; none for a project without a lockfile.
+    pub lock: Option<String>,
 }
 
-const COMMIT_COLUMNS: &str = "commit, tree, manifest, error, discovered_by";
+const COMMIT_COLUMNS: &str = "commit, tree, manifest, error, discovered_by, lock";
 
 fn commit_row(row: tokio_postgres::Row) -> Commit {
     Commit {
@@ -39,6 +42,7 @@ fn commit_row(row: tokio_postgres::Row) -> Commit {
         manifest: row.get(2),
         error: row.get(3),
         discovered_by: row.get(4),
+        lock: row.get(5),
     }
 }
 
@@ -61,6 +65,13 @@ impl State {
              );
              ALTER TABLE kermodes_control_commits ADD COLUMN IF NOT EXISTS tree TEXT;
              ALTER TABLE kermodes_control_commits ADD COLUMN IF NOT EXISTS discovered_by TEXT;
+             ALTER TABLE kermodes_control_commits ADD COLUMN IF NOT EXISTS lock TEXT;
+             CREATE TABLE IF NOT EXISTS kermodes_control_environments (
+                 key TEXT PRIMARY KEY,
+                 started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                 built BOOLEAN NOT NULL DEFAULT false,
+                 error TEXT
+             );
              CREATE TABLE IF NOT EXISTS kermodes_control_deployed (
                  project TEXT NOT NULL,
                  resource TEXT NOT NULL,
@@ -89,24 +100,120 @@ impl State {
         })
     }
 
-    /// Records a synced commit's snapshot, before its discovery; does nothing if it is known.
+    /// Records a synced commit's snapshot and lock, before its discovery; does nothing if it is
+    /// known.
     pub async fn add_commit(
         &mut self,
         project: &str,
         commit: &str,
         tree: &str,
+        lock: Option<&str>,
         snapshot: &[u8],
     ) -> Result<(), String> {
         self.client()
             .await?
             .execute(
-                "INSERT INTO kermodes_control_commits (project, commit, tree, snapshot)
-                 VALUES ($1, $2, $3, $4) ON CONFLICT (project, commit) DO NOTHING",
-                &[&project, &commit, &tree, &snapshot],
+                "INSERT INTO kermodes_control_commits (project, commit, tree, lock, snapshot)
+                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (project, commit) DO NOTHING",
+                &[&project, &commit, &tree, &lock, &snapshot],
             )
             .await
             .map_err(sql)?;
         Ok(())
+    }
+
+    /// How the environment `key` stands, if it was ever built (`plan::environment_key`). The
+    /// environment itself is in the artifacts store; this records only how its build went.
+    pub async fn environment(&mut self, key: &str) -> Result<Option<plan::Build>, String> {
+        Ok(self
+            .client()
+            .await?
+            .query_opt(
+                "SELECT built, error FROM kermodes_control_environments WHERE key = $1",
+                &[&key],
+            )
+            .await
+            .map_err(sql)?
+            .map(|row| build_state(row.get(0), row.get(1))))
+    }
+
+    /// Every environment ever started, and how each stands.
+    pub async fn environments(&mut self) -> Result<Vec<(String, plan::Build)>, String> {
+        Ok(self
+            .client()
+            .await?
+            .query(
+                "SELECT key, built, error FROM kermodes_control_environments",
+                &[],
+            )
+            .await
+            .map_err(sql)?
+            .iter()
+            .map(|row| (row.get(0), build_state(row.get(1), row.get(2))))
+            .collect())
+    }
+
+    pub async fn start_environment(&mut self, key: &str) -> Result<(), String> {
+        self.client()
+            .await?
+            .execute(
+                "INSERT INTO kermodes_control_environments (key) VALUES ($1)
+                 ON CONFLICT DO NOTHING",
+                &[&key],
+            )
+            .await
+            .map_err(sql)?;
+        Ok(())
+    }
+
+    pub async fn finish_environment(
+        &mut self,
+        key: &str,
+        result: &Result<(), String>,
+    ) -> Result<(), String> {
+        let (built, error) = match result {
+            Ok(()) => (true, None),
+            Err(e) => (false, Some(e.as_str())),
+        };
+        self.client()
+            .await?
+            .execute(
+                "UPDATE kermodes_control_environments SET built = $2, error = $3 WHERE key = $1",
+                &[&key, &built, &error],
+            )
+            .await
+            .map_err(sql)?;
+        Ok(())
+    }
+
+    pub async fn remove_environment(&mut self, key: &str) -> Result<(), String> {
+        self.client()
+            .await?
+            .execute(
+                "DELETE FROM kermodes_control_environments WHERE key = $1",
+                &[&key],
+            )
+            .await
+            .map_err(sql)?;
+        Ok(())
+    }
+
+    /// The locks of a project's newest `count` commits: the environments worth keeping.
+    pub async fn recent_locks(&mut self, project: &str, count: i64) -> Result<Vec<String>, String> {
+        Ok(self
+            .client()
+            .await?
+            .query(
+                "SELECT lock FROM kermodes_control_commits
+                 WHERE project = $1 AND lock IS NOT NULL
+                 ORDER BY synced_at DESC LIMIT $2",
+                &[&project, &count],
+            )
+            .await
+            .map_err(sql)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect())
     }
 
     /// Records what discovery under `image` found for a commit: its manifest, or why there is
@@ -333,11 +440,7 @@ impl State {
             .map(|row| plan::BuildRecord {
                 app: row.get(0),
                 commit: row.get(1),
-                state: match (row.get::<_, bool>(2), row.get::<_, Option<String>>(3)) {
-                    (true, _) => plan::Build::Built,
-                    (false, Some(error)) => plan::Build::Failed(error),
-                    (false, None) => plan::Build::Building,
-                },
+                state: build_state(row.get(2), row.get(3)),
             })
             .collect())
     }
@@ -439,6 +542,15 @@ fn sql(error: tokio_postgres::Error) -> String {
     }
 }
 
+/// How a build stands, from its row's `built` and `error`.
+fn build_state(built: bool, error: Option<String>) -> plan::Build {
+    match (built, error) {
+        (true, _) => plan::Build::Built,
+        (false, Some(error)) => plan::Build::Failed(error),
+        (false, None) => plan::Build::Building,
+    }
+}
+
 /// A fresh schema of the test Postgres for the test `name`, or `None` without one (CI always has
 /// one).
 #[cfg(test)]
@@ -476,7 +588,7 @@ mod tests {
         };
         let mut state = State::open(&url).await.unwrap();
         state
-            .add_commit("ticker", "a", "tree a", b"tar a")
+            .add_commit("ticker", "a", "tree a", None, b"tar a")
             .await
             .unwrap();
         // Known but not yet discovered: not deployable.
@@ -487,7 +599,7 @@ mod tests {
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         state
-            .add_commit("ticker", "b", "tree b", b"tar b")
+            .add_commit("ticker", "b", "tree b", Some("lock b"), b"tar b")
             .await
             .unwrap();
         state

@@ -112,6 +112,7 @@ data:
         "image" (include "kermodes.image" .)
         "weir" (include "kermodes.weirUrl" .)
         "snapshots" (printf "http://%s:8732/snapshots" $name)
+        "environments" (printf "http://%s:8732/environments" $name)
         "listen" "0.0.0.0:8732"
         "pull_secrets" $pullSecrets
         "poll_seconds" .Values.control.pollSeconds
