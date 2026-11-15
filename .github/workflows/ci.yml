@@ -145,7 +145,7 @@ jobs:
       # `kermodes ui` answers 404 at /.
       - name: Check the wheel carries the web app
         run: unzip -l dist/*.whl | grep -q 'kermodes/static/app/index.html'
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.target }}
           path: dist/*.whl
@@ -168,19 +168,19 @@ jobs:
           fetch-depth: 0
       - id: version
         run: ci/version >> "$GITHUB_OUTPUT"
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           name: wheels-x86_64
           path: dist
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - name: Build and push the image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64
@@ -192,7 +192,7 @@ jobs:
             IMAGE_SOURCE=${{ github.server_url }}/${{ github.repository }}
             IMAGE_VERSION=${{ steps.version.outputs.semver }}
 
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
         with:
           version: v4.3.0
       - name: Push the chart
@@ -214,7 +214,7 @@ jobs:
           mkdir -p ../candidate/npm && mv .publish/*.tgz ../candidate/npm/
 
       - run: echo "${{ steps.version.outputs.semver }}" > candidate/version
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: candidate
           path: candidate/
