@@ -29,83 +29,93 @@ impl StoredTable {
     /// or missed. A keyed table is its latest state, ticking.
     #[pyo3(name = "where")]
     fn where_(&self, py: Python<'_>, predicate: &str) -> PyResult<Table> {
-        let name = &self.entry.name;
-        if !self.entry.key.is_empty() {
-            return py
-                .detach(|| {
-                    self.live(name, Fed::State, &self.entry.schema)?
-                        .filter(predicate)
-                        .map_err(engine_error)
-                })
-                .map(Table);
-        }
-        let (first, last) = kermodes_lake::date_bounds(predicate);
-        let Some(first) = first else {
-            return Err(PyValueError::new_err(format!(
-                "{name}'s rows span its whole history: say which dates, as in \
-                 where(\"Date >= '2026-11-01' && ...\")"
-            )));
-        };
-        let today = Date::of_ns(now_ns());
-        py.detach(|| {
-            let mut parts = Vec::new();
-            if first < today {
-                let yesterday = Date::from_days(today.days() - 1);
-                let before = last.map_or(yesterday, |last| last.min(yesterday));
-                parts.push(
-                    self.history(first, before, predicate)?
-                        .filter(predicate)
-                        .map_err(engine_error)?,
-                );
-            }
-            if last.is_none_or(|last| last >= today) {
-                let schema = kermodes_lake::with_date_column(&self.entry.schema);
-                parts.push(
-                    self.live(name, Fed::Dated(schema.clone()), &schema)?
-                        .filter(predicate)
-                        .map_err(engine_error)?,
-                );
-            }
-            match parts.as_slice() {
-                [only] => Ok(only.clone()),
-                parts => kermodes_core::Table::merge(&parts.iter().collect::<Vec<_>>())
-                    .map_err(engine_error),
-            }
-        })
-        .map(Table)
+        py.detach(|| self.rows(Some(predicate))).map(Table)
     }
 
     /// What `where(predicate)` would read of history (files, row groups, and bytes, from the
     /// catalog and the files' footers alone), and whether today follows from weir.
     fn explain(&self, py: Python<'_>, predicate: &str) -> PyResult<String> {
-        let (first, last) = kermodes_lake::date_bounds(predicate);
-        let today = Date::of_ns(now_ns());
-        let name = &self.entry.name;
-        let mut lines = Vec::new();
-        if let Some(first) = first.filter(|&first| first < today) {
-            let yesterday = Date::from_days(today.days() - 1);
-            let before = last.map_or(yesterday, |last| last.min(yesterday));
-            let explain = py.detach(|| {
-                kermodes_lake::explain_history(
-                    self.tables.weir(),
-                    self.lake()?.as_ref(),
-                    name,
-                    Some(first),
-                    Some(before),
-                    &kermodes_lake::column_bounds(predicate),
-                )
-                .map_err(store_error)
-            })?;
-            lines.push(format!("{name} {first} to {before}: {explain}"));
-        }
-        if last.is_none_or(|last| last >= today) {
-            lines.push(format!("{name} {today} on: ticking from weir"));
-        }
-        Ok(lines.join("\n"))
+        py.detach(|| self.describe(Some(predicate)))
+            .map(|(described, _)| described)
     }
 }
 
 impl StoredTable {
+    /// The rows `where(predicate)` gives; with no predicate, a keyed table's latest state (an
+    /// append table's rows need dates).
+    pub(crate) fn rows(&self, predicate: Option<&str>) -> PyResult<kermodes_core::Table> {
+        let name = &self.entry.name;
+        if !self.entry.key.is_empty() {
+            let state = self.live(name, Fed::State, &self.entry.schema)?;
+            return match predicate {
+                Some(predicate) => state.filter(predicate).map_err(engine_error),
+                None => Ok(state),
+            };
+        }
+        let (first, last) = predicate.map_or((None, None), kermodes_lake::date_bounds);
+        let (Some(first), Some(predicate)) = (first, predicate) else {
+            return Err(PyValueError::new_err(format!(
+                "{name}'s rows span its whole history: say which dates, as in \
+                 Date >= '2026-11-01'"
+            )));
+        };
+        let today = Date::of_ns(now_ns());
+        let mut parts = Vec::new();
+        if first < today {
+            let yesterday = Date::from_days(today.days() - 1);
+            let before = last.map_or(yesterday, |last| last.min(yesterday));
+            parts.push(
+                self.history(first, before, predicate)?
+                    .filter(predicate)
+                    .map_err(engine_error)?,
+            );
+        }
+        if last.is_none_or(|last| last >= today) {
+            let schema = kermodes_lake::with_date_column(&self.entry.schema);
+            parts.push(
+                self.live(name, Fed::Dated(schema.clone()), &schema)?
+                    .filter(predicate)
+                    .map_err(engine_error)?,
+            );
+        }
+        match parts.as_slice() {
+            [only] => Ok(only.clone()),
+            parts => {
+                kermodes_core::Table::merge(&parts.iter().collect::<Vec<_>>()).map_err(engine_error)
+            }
+        }
+    }
+
+    /// What `rows(predicate)` would read, and whether it ticks.
+    pub(crate) fn describe(&self, predicate: Option<&str>) -> PyResult<(String, bool)> {
+        let name = &self.entry.name;
+        if !self.entry.key.is_empty() {
+            return Ok((format!("{name}'s latest state, ticking from weir"), true));
+        }
+        let (first, last) = predicate.map_or((None, None), kermodes_lake::date_bounds);
+        let today = Date::of_ns(now_ns());
+        let mut lines = Vec::new();
+        if let Some(first) = first.filter(|&first| first < today) {
+            let yesterday = Date::from_days(today.days() - 1);
+            let before = last.map_or(yesterday, |last| last.min(yesterday));
+            let explain = kermodes_lake::explain_history(
+                self.tables.weir(),
+                self.lake()?.as_ref(),
+                name,
+                Some(first),
+                Some(before),
+                &predicate.map_or_else(Vec::new, kermodes_lake::column_bounds),
+            )
+            .map_err(store_error)?;
+            lines.push(format!("{name} {first} to {before}: {explain}"));
+        }
+        let ticks = last.is_none_or(|last| last >= today);
+        if ticks {
+            lines.push(format!("{name} {today} on: ticking from weir"));
+        }
+        Ok((lines.join("\n"), ticks))
+    }
+
     fn lake(&self) -> PyResult<Arc<kermodes_lake::Lake>> {
         self.lake.clone().map_err(KermodesError::new_err)
     }

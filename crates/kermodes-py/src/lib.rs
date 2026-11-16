@@ -2,6 +2,7 @@
 
 mod publish;
 mod replay;
+mod sql;
 mod stored;
 
 use std::net::SocketAddr;
@@ -518,29 +519,39 @@ impl Session {
     /// The stored table `name` across its history and today, a `StoredTable`: nothing is read
     /// until `where` says which dates.
     fn table(&self, py: Python<'_>, name: &str) -> PyResult<stored::StoredTable> {
-        let tables = self.stored()?.clone();
-        let name = kermodes_weir::TableName::parse(name).map_err(store_error)?;
-        let entry = py.detach(|| tables.entry(&name)).map_err(store_error)?;
-        Ok(stored::StoredTable {
-            engine: self.engine.clone(),
-            tables,
-            lake: self.lake().map_err(|e| e.to_string()),
-            entry,
-        })
+        py.detach(|| self.stored_table(name))
     }
 
     /// The stored table `name`'s history (architecture.md §8), a `HistoricalTable`: nothing is
     /// read until it is used, so `where` can read only the dates it asks for.
     fn historical_table(&self, py: Python<'_>, name: &str) -> PyResult<HistoricalTable> {
-        let tables = self.stored()?.clone();
-        let name = kermodes_weir::TableName::parse(name).map_err(store_error)?;
-        py.detach(|| tables.entry(&name)).map_err(store_error)?;
-        Ok(HistoricalTable {
-            engine: self.engine.clone(),
-            tables,
-            lake: self.lake()?,
-            name,
-        })
+        py.detach(|| self.historical(name))
+    }
+
+    /// The result of the SQL `query` (architecture.md §9.8), a `Table` that ticks when a table
+    /// it reads ticks. Its tables are stored tables by name (`ns.table` across history and
+    /// today, its `WHERE` saying which dates; `live.ns.table`; `hist.ns.table`), and tables
+    /// passed by keyword, under that name: `db.sql("SELECT ... FROM board", board=board)`.
+    #[pyo3(signature = (query, **tables))]
+    fn sql(
+        &self,
+        py: Python<'_>,
+        query: &str,
+        tables: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Table> {
+        sql::query(self, py, query, tables).map(Table)
+    }
+
+    /// How `sql(query)` would run, without reading anything: the engine's operators, each
+    /// static or ticking, and what each stored table read would read of history.
+    #[pyo3(signature = (query, **tables))]
+    fn explain(
+        &self,
+        py: Python<'_>,
+        query: &str,
+        tables: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<String> {
+        sql::explain(self, py, query, tables)
     }
 
     /// A replay of the stored tables' past dates `first` to `last` (`YYYY-MM-DD`, before
@@ -589,13 +600,7 @@ impl Session {
     /// The stored table `name`, ticking: every row written so far, then each batch as it is
     /// written. Its rows come only from its writers. A keyed table holds each key's latest row.
     fn live_table(&self, py: Python<'_>, name: &str) -> PyResult<Table> {
-        let tables = self.stored()?;
-        let table = py.detach(|| open_live(&self.engine, tables, name));
-        match table {
-            Ok(table) => Ok(Table(table)),
-            Err(OpenError::Store(e)) => Err(store_error(e)),
-            Err(OpenError::Engine(e)) => Err(engine_error(e)),
-        }
+        py.detach(|| self.live(name)).map(Table)
     }
 
     /// The stored keyed table `name`'s changes as they happen, ticking: its state as of its
@@ -724,6 +729,38 @@ impl Session {
 }
 
 impl Session {
+    fn stored_table(&self, name: &str) -> PyResult<stored::StoredTable> {
+        let tables = self.stored()?.clone();
+        let name = kermodes_weir::TableName::parse(name).map_err(store_error)?;
+        let entry = tables.entry(&name).map_err(store_error)?;
+        Ok(stored::StoredTable {
+            engine: self.engine.clone(),
+            tables,
+            lake: self.lake().map_err(|e| e.to_string()),
+            entry,
+        })
+    }
+
+    fn historical(&self, name: &str) -> PyResult<HistoricalTable> {
+        let tables = self.stored()?.clone();
+        let name = kermodes_weir::TableName::parse(name).map_err(store_error)?;
+        tables.entry(&name).map_err(store_error)?;
+        Ok(HistoricalTable {
+            engine: self.engine.clone(),
+            tables,
+            lake: self.lake()?,
+            name,
+        })
+    }
+
+    fn live(&self, name: &str) -> PyResult<kermodes_core::Table> {
+        match open_live(&self.engine, self.stored()?, name) {
+            Ok(table) => Ok(table),
+            Err(OpenError::Store(e)) => Err(store_error(e)),
+            Err(OpenError::Engine(e)) => Err(engine_error(e)),
+        }
+    }
+
     fn stored(&self) -> PyResult<&Tables> {
         self.tables.as_ref().ok_or_else(|| {
             KermodesError::new_err(
@@ -771,39 +808,49 @@ impl HistoricalTable {
     /// (`sym = 'AAPL'`) skip the row groups and pages whose statistics rule them out.
     #[pyo3(name = "where")]
     fn where_(&self, py: Python<'_>, predicate: &str) -> PyResult<Table> {
-        let (first, last) = kermodes_lake::date_bounds(predicate);
-        let bounds = kermodes_lake::column_bounds(predicate);
-        py.detach(|| {
-            self.read(first, last, &bounds)?
-                .filter(predicate)
-                .map_err(engine_error)
-        })
-        .map(Table)
+        py.detach(|| self.rows(Some(predicate))).map(Table)
     }
 
     /// All of it.
     fn table(&self, py: Python<'_>) -> PyResult<Table> {
-        py.detach(|| self.read(None, None, &[])).map(Table)
+        py.detach(|| self.rows(None)).map(Table)
     }
 
     /// What `where(predicate)`, or `table()` without one, would read: files, row groups, rows,
     /// and bytes, from the catalog and the files' footers and page indexes alone.
     #[pyo3(signature = (predicate=None))]
     fn explain(&self, py: Python<'_>, predicate: Option<&str>) -> PyResult<String> {
+        py.detach(|| self.describe(predicate))
+    }
+}
+
+impl HistoricalTable {
+    /// The rows for which `predicate` is true, all of them without one: only the dates, files,
+    /// row groups, and pages its bounds allow are read.
+    fn rows(&self, predicate: Option<&str>) -> PyResult<kermodes_core::Table> {
+        let Some(predicate) = predicate else {
+            return self.read(None, None, &[]);
+        };
+        let (first, last) = kermodes_lake::date_bounds(predicate);
+        let bounds = kermodes_lake::column_bounds(predicate);
+        self.read(first, last, &bounds)?
+            .filter(predicate)
+            .map_err(engine_error)
+    }
+
+    /// What `rows(predicate)` would read.
+    fn describe(&self, predicate: Option<&str>) -> PyResult<String> {
         let (first, last) = predicate.map_or((None, None), kermodes_lake::date_bounds);
         let bounds = predicate.map_or_else(Vec::new, kermodes_lake::column_bounds);
-        let explain = py
-            .detach(|| {
-                kermodes_lake::explain_history(
-                    self.tables.weir(),
-                    &self.lake,
-                    &self.name,
-                    first,
-                    last,
-                    &bounds,
-                )
-            })
-            .map_err(store_error)?;
+        let explain = kermodes_lake::explain_history(
+            self.tables.weir(),
+            &self.lake,
+            &self.name,
+            first,
+            last,
+            &bounds,
+        )
+        .map_err(store_error)?;
         let bound =
             |date: Option<kermodes_weir::Date>| date.map_or("…".into(), |d| d.to_string());
         Ok(format!(
@@ -813,9 +860,7 @@ impl HistoricalTable {
             bound(last)
         ))
     }
-}
 
-impl HistoricalTable {
     fn read(
         &self,
         first: Option<kermodes_weir::Date>,

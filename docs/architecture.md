@@ -135,7 +135,8 @@ Infrastructure crates are allowed where writing our own would add risk without v
 
 `sqlparser` is the one parsing dependency: it turns SQL text into an AST and does nothing else (its
 only runtime dependency is `log`). Writing and maintaining a SQL grammar ourselves would cost more
-than it saves.
+than it saves. Its `visitor` feature (a derive macro from the same project) lets the SQL binder
+rewrite expressions, dropping table qualifiers, without matching every expression variant.
 
 `ahash` (already compiled in through arrow-array) hashes group keys; using it directly adds no
 crate to the build.
@@ -726,29 +727,33 @@ data, history, or both.
 ```python
 edges = db.sql("""
     SELECT o.game_id, o.book, o.price, f.pts_avg
-    FROM sports.odds o
-    ASOF JOIN sports.form f
+    FROM live.sports.odds o
+    ASOF JOIN live.sports.form f
       MATCH_CONDITION (o.ts >= f.ts)
       ON o.player_id = f.player_id
-    WHERE o.Date = today()
 """)  # reads today's live data: ticking
 
 monthly = db.sql("""
     SELECT book, avg(price) AS avg_price, count(*) AS n
     FROM sports.odds
-    WHERE Date BETWEEN '2026-10-01' AND '2026-10-31'
+    WHERE Date >= '2026-10-01' AND Date <= '2026-10-31'
     GROUP BY book
 """)  # merged dates only: static
+
+print(db.explain("SELECT ..."))  # the plan, without reading anything
 ```
 
 Table resolution
 
-- `ns.table` resolves to `db.table` (history ∪ live). The binder prunes `Date` against the
-  catalog: if no unmerged date survives the filter, the plan reads only Parquet and is static; if
-  only today's date survives, it reads only weir.
+- `ns.table` resolves to `db.table` (history ∪ live). An append table's `WHERE` must say which
+  dates; they are pruned against the catalog: if no unmerged date survives, the plan reads only
+  Parquet and is static; if only today's date survives, it reads only weir. A keyed table is its
+  latest state.
 - `live.ns.table` and `hist.ns.table` pin one side explicitly.
 - `FOR SYSTEM_TIME AS OF '<timestamp>'` reads history at a catalog snapshot (§8.2).
-- In sessions, Python variables holding tables are visible to SQL by name, as in Deephaven.
+- Tables in Python are passed by keyword and read under that name:
+  `db.sql("SELECT ... FROM board", board=board)`. Keywords, not the caller's variables, so a query
+  reads only what it is given.
 
 Supported subset, mapped to operators
 
@@ -756,21 +761,36 @@ Supported subset, mapped to operators
 |---|---|
 | `WHERE` | `where` |
 | `SELECT` expressions, aliases | `select` / `update` |
-| `GROUP BY` with aggregates | `agg_by` |
-| `INNER JOIN` / `LEFT JOIN` on equality keys | hash join / `natural_join` |
-| `ASOF JOIN ... MATCH_CONDITION (...) ON ...` | `as_of_join` |
-| `SELECT DISTINCT ON (key) ... ORDER BY ts DESC` | `last_by` |
+| `GROUP BY` with aggregates, `HAVING` | `agg_by`, then `update` and `where` |
+| `LEFT JOIN` on equality keys | `natural_join` |
+| `ASOF JOIN ... MATCH_CONDITION (left.ts >= right.ts) ON ...` | `as_of_join` |
 | Window functions over `ROWS` / `RANGE` frames | `rolling` |
 | `ORDER BY`, `LIMIT` | `sort`, `head` |
 | `UNION ALL` | `merge` |
 | CTEs (`WITH`), subqueries in `FROM` | inlined into the plan |
 
-- Anything else (full outer joins, non-equi joins, correlated subqueries, recursive CTEs) is
-  rejected at bind time with an error naming the construct and the closest supported form.
+- `WHERE` conditions on the first table read alone go with its read, so a stored table reads only
+  the dates, files, and row groups they allow; the rest filter the joined rows.
+- A join adds only the right table's columns the query reads: `r.price` is a column of its own,
+  so it never collides with the left's `price`, and an unqualified name comes from the right only
+  when the left lacks it. `SELECT *` adds every right column, and a name both sides have is an
+  error naming it.
+- Aggregates are `count`, `sum`, `avg`, `min`, `max`, `first`, `last`, `stddev`, over a column or
+  an expression; expressions over aggregates (`sum(px * qty) / sum(qty)`) are computed after
+  grouping. An aggregate without `AS` is named after its function, as in Postgres.
+- `INNER JOIN` is refused: matching many rows to many needs a join operator the engine does not
+  have; `LEFT JOIN` covers a right side with one row per key. `DISTINCT ON (key) ... ORDER BY ts`
+  is refused too: `last_by` keeps each key's last row written, which is its latest by `ts` only
+  when rows arrive in time order.
+- Anything else (full outer joins, non-equi joins, `OFFSET`, correlated subqueries, recursive
+  CTEs) is rejected at bind time with an error naming the construct and the closest supported
+  form.
 - `ORDER BY` / `LIMIT` on ticking inputs are maintained incrementally, as in Deephaven; on static
-  inputs they run once.
-- `EXPLAIN` prints the Kermodes plan with pruning decisions (dates, files, row groups) and whether
-  each subtree runs on the static or incremental path.
+  inputs they run once. `LIMIT` after a ticking `ORDER BY` is refused, as `head` after a ticking
+  `sort` is.
+- `db.explain(query)` prints the Kermodes plan with pruning decisions (dates, files, row groups)
+  and whether each operator runs on the static or incremental path; `db.sql` refuses `EXPLAIN`
+  and points to it.
 - SQL works everywhere a plan does: sessions (`db.sql`), deployments (a deployment may be one SQL
   file in the project), feature views, the web console, and ranger.
 

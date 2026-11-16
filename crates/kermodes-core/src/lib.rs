@@ -16,6 +16,7 @@ pub mod series;
 mod session;
 mod slots;
 mod sort;
+pub mod sql;
 mod storage;
 mod types;
 pub mod viewer;

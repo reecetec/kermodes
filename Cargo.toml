@@ -13,7 +13,9 @@ arrow = { version = "60.1", default-features = false }
 mimalloc = { version = "0.1.52", default-features = false }
 pyo3 = { version = "0.30.1", features = ["abi3-py312"] }
 pyo3-arrow = "0.21"
-sqlparser = { version = "0.64", default-features = false, features = ["std"] }
+# visitor: the SQL binder rewrites expressions (dropping table qualifiers) before handing them to
+# the expression parser.
+sqlparser = { version = "0.64", default-features = false, features = ["std", "visitor"] }
 kermodes-core = { path = "crates/kermodes-core" }
 kermodes-control = { path = "crates/kermodes-control" }
 kermodes-flight = { path = "crates/kermodes-flight" }
