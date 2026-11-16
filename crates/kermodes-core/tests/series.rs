@@ -111,8 +111,24 @@ fn points(series: &Series) -> RecordBatch {
     batch
 }
 
-/// What the series promises for `table`'s rows of `x` and `ys`, recomputed plainly.
-fn expected(table: &Table, x: &str, ys: &[&str], points: usize) -> Vec<Vec<Option<f64>>> {
+/// The least power of two whose multiples from zero cut `low..=high` into at most `buckets`
+/// buckets, found by trying each in turn.
+fn width_for(low: f64, high: f64, buckets: usize) -> f64 {
+    (-80..200)
+        .map(|power| 2f64.powi(power))
+        .find(|width| (high / width).floor() - (low / width).floor() + 1.0 <= buckets as f64)
+        .unwrap()
+}
+
+/// What the series promises for `table`'s rows of `x` and `ys` within `range`, recomputed
+/// plainly.
+fn expected(
+    table: &Table,
+    x: &str,
+    ys: &[&str],
+    points: usize,
+    range: Option<(f64, f64)>,
+) -> Vec<Vec<Option<f64>>> {
     let all = concat_batches(table.schema(), &table.snapshot().unwrap()).unwrap();
     let mut names = vec![x];
     names.extend(ys);
@@ -122,24 +138,23 @@ fn expected(table: &Table, x: &str, ys: &[&str], points: usize) -> Vec<Vec<Optio
         .collect();
     let value = |c: usize, row: usize| columns[c][row].filter(|v| !v.is_nan());
     let with_x: Vec<usize> = (0..all.num_rows())
-        .filter(|r| value(0, *r).is_some())
+        .filter(|r| {
+            value(0, *r).is_some_and(|x| range.is_none_or(|(from, to)| from <= x && x <= to))
+        })
         .collect();
     let mut picked: Vec<usize> = if with_x.len() <= points {
         with_x.clone()
     } else {
-        let buckets = (points / (2 + 2 * ys.len())).max(1);
         let xs = with_x.iter().map(|r| value(0, *r).unwrap());
         let low = xs.clone().fold(f64::INFINITY, f64::min);
         let high = xs.fold(f64::NEG_INFINITY, f64::max);
-        let scale = if high > low {
-            buckets as f64 / (high - low)
-        } else {
-            0.0
-        };
-        let bucket =
-            |row: usize| (((value(0, row).unwrap() - low) * scale) as usize).min(buckets - 1);
+        let width = width_for(low, high, (points / (2 + 2 * ys.len())).max(1));
+        let bucket = |row: usize| (value(0, row).unwrap() / width).floor() as i64;
+        let mut buckets: Vec<i64> = with_x.iter().map(|r| bucket(*r)).collect();
+        buckets.sort_unstable();
+        buckets.dedup();
         let mut picked = Vec::new();
-        for b in 0..buckets {
+        for b in buckets {
             let members: Vec<usize> = with_x.iter().copied().filter(|r| bucket(*r) == b).collect();
             for c in 0..names.len() {
                 let valued: Vec<(usize, f64)> = members
@@ -183,6 +198,9 @@ fn expected(table: &Table, x: &str, ys: &[&str], points: usize) -> Vec<Vec<Optio
         .collect()
 }
 
+/// A chart under test: its series, the table it should match, its ys, budget, and range.
+type Charted<'a> = (Series, &'a Table, Vec<&'a str>, usize, Option<(f64, f64)>);
+
 #[test]
 fn series_over_upserts_and_deletes_match_their_recomputation() {
     let ys = ["a".to_owned(), "b".to_owned()];
@@ -191,29 +209,36 @@ fn series_over_upserts_and_deletes_match_their_recomputation() {
         let session = Session::new();
         let input = session.keyed_input_table(&keyed_schema(), &["id"]).unwrap();
         let filtered = input.filter("flag").unwrap();
-        // Budgets below, around, and above the row count, by one column and by two
-        let charts: Vec<(Series, &Table, Vec<&str>, usize)> = [16, 40, 120, 400]
+        // Budgets below, around, and above the row count, by one column and by two, over every
+        // x and over a range of it
+        let charts: Vec<Charted> = [16, 40, 120, 400]
             .into_iter()
             .flat_map(|points| {
+                let mut ranged = Series::new(&input, "x", &ys, None, points).unwrap();
+                ranged.set_range(Some((5.0, 20.25))).unwrap();
                 [
                     (
                         Series::new(&input, "x", &ys, None, points).unwrap(),
                         &input,
                         vec!["a", "b"],
                         points,
+                        None,
                     ),
                     (
                         Series::new(&input, "x", &ys[..1], None, points).unwrap(),
                         &input,
                         vec!["a"],
                         points,
+                        None,
                     ),
                     (
                         Series::new(&input, "x", &ys[1..], Some("flag"), points).unwrap(),
                         &filtered,
                         vec!["b"],
                         points,
+                        None,
                     ),
+                    (ranged, &input, vec!["a", "b"], points, Some((5.0, 20.25))),
                 ]
             })
             .collect();
@@ -228,7 +253,7 @@ fn series_over_upserts_and_deletes_match_their_recomputation() {
                 }
             }
             session.step();
-            for (series, table, ys, budget) in &charts {
+            for (series, table, ys, budget, range) in &charts {
                 let got = points(series);
                 assert!(
                     got.num_rows() <= *budget,
@@ -236,8 +261,8 @@ fn series_over_upserts_and_deletes_match_their_recomputation() {
                 );
                 assert_eq!(
                     rows_of(&got),
-                    expected(table, "x", ys, *budget),
-                    "seed {seed} cycle {cycle}: {ys:?} in {budget} points"
+                    expected(table, "x", ys, *budget, *range),
+                    "seed {seed} cycle {cycle}: {ys:?} in {budget} points, range {range:?}"
                 );
                 assert_eq!(
                     series.frame().unwrap().unwrap().total,
@@ -280,11 +305,11 @@ fn a_ticking_time_series_downsamples_to_its_budget_as_it_grows() {
         session.step();
         assert_eq!(
             rows_of(&points(&all)),
-            expected(&input, "ts", &["price"], 1000)
+            expected(&input, "ts", &["price"], 1000, None)
         );
         assert_eq!(
             rows_of(&points(&one)),
-            expected(&msft, "ts", &["price"], 1000)
+            expected(&msft, "ts", &["price"], 1000, None)
         );
     }
     // Values are the table's own: the timestamps go out as timestamps
@@ -292,6 +317,105 @@ fn a_ticking_time_series_downsamples_to_its_budget_as_it_grows() {
         points(&all).schema().field(0).data_type(),
         schema.field(0).data_type()
     );
+}
+
+/// Points as (x, y) for comparing frames: a timestamp's nanoseconds as a float, as bucketed.
+fn xy(batch: &RecordBatch) -> Vec<(f64, f64)> {
+    rows_of(batch)
+        .into_iter()
+        .map(|row| (row[0].unwrap(), row[1].unwrap()))
+        .collect()
+}
+
+#[test]
+fn a_growing_series_keeps_the_points_it_has_drawn() {
+    // A walk over time: each frame, every point before the last bucket is as the frame before
+    // drew it, while the width holds; when the range outgrows it, the points there are a subset
+    // of those drawn, never new ones. Only so does a ticking line stay still behind its end.
+    let session = Session::new();
+    let schema = ticks(0).schema();
+    let input = session.input_table(&schema).unwrap();
+    let series = Series::new(&input, "ts", &["price".to_owned()], None, 200).unwrap();
+    let (mut before, mut drawn) = (None::<(f64, f64)>, Vec::new());
+    let mut doublings = 0;
+    for (cycle, rows) in [150, 37, 211, 5, 900, 64, 1300, 3, 2500, 410]
+        .into_iter()
+        .enumerate()
+    {
+        let start = 1_767_225_600_000_000_000_i64 + input.num_rows().unwrap() as i64 * 1_000_000;
+        let batch = ticks(rows);
+        let ts: Vec<i64> = (0..rows as i64).map(|i| start + i * 1_000_000).collect();
+        let batch = RecordBatch::try_new(
+            batch.schema(),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(ts).with_timezone("UTC")),
+                batch.column(1).clone(),
+                batch.column(2).clone(),
+            ],
+        )
+        .unwrap();
+        input.append(&[batch]).unwrap();
+        session.step();
+        let now = xy(&points(&series));
+        let (low, high) = (now[0].0, now[now.len() - 1].0);
+        let width = width_for(low, high, 200 / 4);
+        if let Some((width_before, last_before)) = before {
+            let kept = |points: &[(f64, f64)]| -> Vec<(f64, f64)> {
+                points
+                    .iter()
+                    .copied()
+                    .filter(|p| p.0 < last_before)
+                    .collect()
+            };
+            let (was, is) = (kept(&drawn), kept(&now));
+            if width == width_before {
+                assert_eq!(
+                    is, was,
+                    "cycle {cycle}: points before the last bucket moved"
+                );
+            } else {
+                doublings += 1;
+                assert!(width > width_before, "cycle {cycle}: the width shrank");
+                assert!(
+                    is.iter().all(|p| was.contains(p)),
+                    "cycle {cycle}: a merge drew a point not drawn before"
+                );
+            }
+        }
+        // Where the last bucket started: points from there on may change with the next rows
+        before = Some((width, (high / width).floor() * width));
+        drawn = now;
+    }
+    assert!(
+        doublings > 0,
+        "the walk outgrew no width: it tests nothing of merges"
+    );
+}
+
+#[test]
+fn a_zoomed_series_charts_only_its_range_in_full_detail() {
+    let session = Session::new();
+    let input = session.input_table(&ticks(0).schema()).unwrap();
+    input.append(&[ticks(5000)]).unwrap();
+    session.step();
+    let mut series = Series::new(&input, "ts", &["price".to_owned()], None, 1000).unwrap();
+    let start = 1_767_225_600_000_000_000_f64;
+    // 300 ticks of the 5000, a millisecond apart: they fit, so every one is sent
+    let range = (start + 1_000.0 * 1e6, start + 1_299.0 * 1e6);
+    series.set_range(Some(range)).unwrap();
+    let got = xy(&points(&series));
+    assert_eq!(got.len(), 300);
+    assert_eq!((got[0].0, got[299].0), range);
+    assert_eq!(
+        rows_of(&points(&series)),
+        expected(&input, "ts", &["price"], 1000, Some(range))
+    );
+    // Back to all of it: downsampled again
+    series.set_range(None).unwrap();
+    assert!(points(&series).num_rows() <= 1000);
+    // A range is two finite numbers, the lower first
+    assert!(series.set_range(Some((2.0, 1.0))).is_err());
+    assert!(series.set_range(Some((f64::NAN, 1.0))).is_err());
 }
 
 #[test]

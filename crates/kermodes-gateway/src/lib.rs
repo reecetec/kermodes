@@ -12,7 +12,9 @@
 //! Messages from the app are JSON text: `{"type": "tables"}`, `{"type": "open", "view": id,
 //! "table": name}`, `{"type": "series", "view": id, "table": name, "x": column, "y": [columns],
 //! "where": expression, "points": n}` (a chart's points, `kermodes_core::series`; `where` and
-//! `points` optional), `{"type": "close", "view": id}`, `{"type": "pause" | "resume", "view":
+//! `points` optional), `{"type": "range", "view": id, "x_range": [low, high] | null}` (a zoomed
+//! chart's x range, in x's own units, answered at once), `{"type": "close", "view": id}`,
+//! `{"type": "pause" | "resume", "view":
 //! id}` (a paused view gets no windows until resumed, keeping its sort and filters), and the
 //! viewer's own messages (`viewport`, `sort`, `filter`, `fetch`, as in `kermodes_core::viewer`)
 //! with a `"view"` field. The server answers with JSON text (`tables`, which lists the tables
@@ -1309,6 +1311,40 @@ async fn handle(shared: &Arc<Shared>, views: &mut HashMap<u64, Open>, text: &str
                 return vec![error(Some(id), "no such view")];
             };
             open.paused = false;
+            let reply = open.rows(shared).await;
+            let (messages, goes_on) = deliver(shared, id, open, reply);
+            if !goes_on {
+                views.remove(&id);
+            }
+            messages
+        }
+        ("range", Some(id)) => {
+            let Some(open) = views.get_mut(&id) else {
+                return vec![error(Some(id), "no such view")];
+            };
+            let Some(series) = open.series.clone() else {
+                return vec![error(Some(id), "only a chart's view takes a range")];
+            };
+            let range = match &message["x_range"] {
+                Value::Null => None,
+                Value::Array(ends) => match (
+                    ends.first().and_then(Value::as_f64),
+                    ends.get(1).and_then(Value::as_f64),
+                ) {
+                    (Some(low), Some(high)) if ends.len() == 2 => Some((low, high)),
+                    _ => return vec![error(Some(id), "`x_range` is two numbers, or null")],
+                },
+                _ => {
+                    return vec![error(
+                        Some(id),
+                        "`range` needs `x_range`: two numbers, or null",
+                    )];
+                }
+            };
+            if let Err(e) = lock(&series).set_range(range) {
+                return vec![error(Some(id), &e.to_string())];
+            }
+            // Answered now, not at the next cycle: a person zoomed and is waiting
             let reply = open.rows(shared).await;
             let (messages, goes_on) = deliver(shared, id, open, reply);
             if !goes_on {

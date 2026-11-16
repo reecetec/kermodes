@@ -227,6 +227,12 @@ export type SeriesOptions = {
   where?: string;
   /** The most points to send; 2000 by default, about what a chart's width draws */
   points?: number;
+  /**
+   * Only x within this range, both ends included, in x's own units (a time's unit since the
+   * epoch, a date's days): a zoomed chart's, downsampled to its budget afresh for full detail.
+   * Changing it keeps the view open, so the points shown stay until the new ones arrive.
+   */
+  range?: readonly [number, number] | null;
 };
 
 export type SeriesState = {
@@ -246,7 +252,10 @@ export type SeriesState = {
  *
  *     const { points } = useSeries('md.ticks', { x: 'ts', y: 'price', where: "sym = 'AAPL'" });
  */
-export function useSeries(table: string, { x, y, where, points }: SeriesOptions): SeriesState {
+export function useSeries(
+  table: string,
+  { x, y, where, points, range = null }: SeriesOptions
+): SeriesState {
   const connection = useKermodes();
   const [state, setState] = useState<SeriesState>({
     points: null,
@@ -254,11 +263,16 @@ export function useSeries(table: string, { x, y, where, points }: SeriesOptions)
     status: 'loading',
     error: null,
   });
+  const view = useRef<(ViewerChannel & { close(): void }) | null>(null);
+  // The range the open view was last sent: a new view starts with none
+  const sentRange = useRef('null');
   // The request's contents are what count, not a new array each render
   const ys = typeof y === 'string' ? [y] : y;
   const request = JSON.stringify({ x, y: ys, where, points });
   useEffect(() => {
     const opened = connection.series(table, JSON.parse(request) as SeriesOptions & { y: string[] });
+    view.current = opened;
+    sentRange.current = 'null';
     let latest: { points: Table; total: number } | null = null;
     const publish = () => {
       const current = opened.state();
@@ -280,7 +294,16 @@ export function useSeries(table: string, { x, y, where, points }: SeriesOptions)
       stopPoints();
       stopState();
       opened.close();
+      view.current = null;
     };
   }, [connection, table, request]);
+
+  const rangeKey = JSON.stringify(range);
+  useEffect(() => {
+    if (view.current != null && rangeKey !== sentRange.current) {
+      view.current.send({ type: 'range', x_range: JSON.parse(rangeKey) as [number, number] | null });
+      sentRange.current = rangeKey;
+    }
+  }, [table, request, rangeKey]);
   return state;
 }

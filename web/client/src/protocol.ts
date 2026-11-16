@@ -41,7 +41,10 @@ export type ViewerRequest =
   // Every column's filter text; empty text for no filter on that column
   | { type: 'filter'; filters: Record<string, string>; request?: number }
   // Rows start..start+count, eg. for copying beyond the window; answered by "fetched"
-  | { type: 'fetch'; id: number; start: number; count: number };
+  | { type: 'fetch'; id: number; start: number; count: number }
+  // A chart's x range, both ends included, in x's own units (a time's unit since the epoch, a
+  // date's days); null for all of x. Only a series takes one.
+  | { type: 'range'; x_range: readonly [number, number] | null };
 
 /**
  * Messages from the engine side. Each carries two buffers: an Arrow IPC stream of the rows

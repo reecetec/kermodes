@@ -269,6 +269,28 @@ async fn a_chart_follows_its_table_through_a_series() {
     assert_eq!(column(&rows, 0), [2.0, 3.0]);
     assert_eq!(column(&rows, 1), [25.0, 30.0]);
 
+    // Zoomed to a range: answered at once with the rows in it, and back out with null
+    send(
+        &mut socket,
+        json!({"type": "range", "view": 1, "x_range": [2.5, 3.0]}),
+    )
+    .await;
+    let (_, _, rows, _) = window(&mut socket).await;
+    assert_eq!(column(&rows, 0), [3.0]);
+    send(
+        &mut socket,
+        json!({"type": "range", "view": 1, "x_range": null}),
+    )
+    .await;
+    let (_, _, rows, _) = window(&mut socket).await;
+    assert_eq!(column(&rows, 0), [2.0, 3.0]);
+    send(
+        &mut socket,
+        json!({"type": "range", "view": 1, "x_range": [3.0, 2.0]}),
+    )
+    .await;
+    assert_eq!(text(&mut socket).await["type"], "error");
+
     // A chart is not scrolled or sorted; and it names what it cannot draw.
     send(
         &mut socket,

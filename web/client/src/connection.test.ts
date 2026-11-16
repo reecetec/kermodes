@@ -257,11 +257,13 @@ describe('KermodesConnection', () => {
       frame({ view: series.id, type: 'series', start: 0, total: 5, cycle: 3 }, Uint8Array.of(1), [])
     );
     expect(received).toEqual([{ view: series.id, type: 'series', start: 0, total: 5, cycle: 3 } as ViewerReply]);
+    // Zoomed: the range goes with it when it opens again
+    series.send({ type: 'range', x_range: [10, 20] });
 
     sockets[0].drop();
     jest.advanceTimersByTime(1);
     sockets[1].open();
-    expect(sockets[1].sent).toEqual([asked]);
+    expect(sockets[1].sent).toEqual([asked, { type: 'range', x_range: [10, 20], view: series.id }]);
   });
 
   it('stays closed when closed on purpose', () => {

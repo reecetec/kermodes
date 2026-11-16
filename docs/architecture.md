@@ -1424,10 +1424,16 @@ Plotly's finance bundle in the page's tokens.
 
 - The points are the engine's (`kermodes_core::series`): each `y` against `x`, of the rows a
   `where` keeps, in x order, every value the table's own. While the rows fit the chart's budget
-  (2000 points by default) every row is sent. Past it, x's range is split into equal buckets and
-  each keeps its rows of lowest and highest x and of each y's lowest and highest value: the
-  line's shape, spikes included, in at most the budget. A text x (a bar per category) is sent
-  whole, up to 100,000 rows.
+  (2000 points by default) every row is sent. Past it, x is cut into buckets and each keeps its
+  rows of lowest and highest x and of each y's lowest and highest value: the line's shape,
+  spikes included, in at most the budget. A bucket's width is the least power of two in x's
+  units that fits the budget, and buckets are aligned to its multiples from zero, so a ticking
+  line stays still behind its end: a new row changes only the last bucket's points, and when the
+  range outgrows the width it doubles, merging neighbours into a subset of the points already
+  drawn. A text x (a bar per category) is sent whole, up to 100,000 rows.
+- Zooming in asks for the visible x range (`range`, answered at once on the open view, kept
+  across a reconnect), and only rows in it are charted, so detail appears as the budget covers
+  less; a double-click asks for all of x again. The points shown stay until the new ones arrive.
 - A series reads its table's current rows each time it is sent (a snapshot, which views an
   append table's chunks without copying), so it follows appends, upserts, and deletes alike. It
   is sent again after a cycle that changes its rows, at most twice a second: a day of ticks

@@ -1,14 +1,19 @@
-//! A chart's server side (architecture.md §15.3): the points of one or more `y` columns against
+//! A chart's server side (architecture.md §15.4): the points of one or more `y` columns against
 //! an `x` column of any table, sent whole while they fit the chart's budget and downsampled when
 //! they do not, so a chart of millions of rows sends what its pixels can show.
 //!
-//! Downsampling splits x's range into equal buckets and keeps, in each, the rows with its lowest
-//! and highest x and each y's lowest and highest value: the line's shape, its spikes included,
-//! from at most `points` rows. Points are always in x order, and every value sent is the table's
-//! own (rows are picked, never averaged). A text x (a bar per category) is sent whole.
+//! Downsampling cuts x into buckets and keeps, in each, the rows with its lowest and highest x
+//! and each y's lowest and highest value: the line's shape, its spikes included, from at most
+//! `points` rows. A bucket's width is a power of two in x's own units (nanoseconds for a time),
+//! the least that fits the budget, and buckets are aligned to its multiples from zero: as rows
+//! arrive, only the last bucket's points change, and when the range outgrows the width it
+//! doubles, merging neighbours, whose points are then a subset of those already drawn. A chart
+//! that is zoomed asks for its x range (`set_range`), and only rows within it are charted.
 //!
-//! Each frame reads the table's current rows (a snapshot, which views an append table's chunks
-//! without copying), so a series follows any table: appended, upserted, or deleted from.
+//! Points are always in x order, and every value sent is the table's own (rows are picked, never
+//! averaged). A text x (a bar per category) is sent whole, and is not ranged. Each frame reads
+//! the table's current rows (a snapshot, which views an append table's chunks without copying),
+//! so a series follows any table: appended, upserted, or deleted from.
 
 use arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
 use arrow::buffer::NullBuffer;
@@ -35,6 +40,8 @@ pub struct Series {
     columns: Vec<usize>,
     text: bool,
     points: usize,
+    /// The x range charted, both ends included, in x's own units; `None` for all of it.
+    range: Option<(f64, f64)>,
     refreshing: bool,
 }
 
@@ -101,8 +108,23 @@ impl Series {
             columns,
             text,
             points: points.clamp(MIN_POINTS, MAX_POINTS),
+            range: None,
             refreshing: table.is_refreshing(),
         })
+    }
+
+    /// Charts only rows whose x is within `range`, both ends included, in x's own units (days
+    /// for a date, the column's unit since the epoch for a time); `None` for every row.
+    pub fn set_range(&mut self, range: Option<(f64, f64)>) -> Result<(), Error> {
+        if let Some((low, high)) = range
+            && !(low.is_finite() && high.is_finite() && low <= high)
+        {
+            return Err(Error::Unsupported(format!(
+                "a chart's x range is two finite numbers, the lower first: not {low} to {high}"
+            )));
+        }
+        self.range = range;
+        Ok(())
     }
 
     /// The points as they are now: x then each y, as an Arrow IPC stream, with the number of
@@ -135,7 +157,7 @@ impl Series {
             }
             picked
         } else {
-            pick(&batches, self.points)
+            pick(&batches, self.points, self.range)
         };
         let schema = shown
             .schema()
@@ -297,15 +319,36 @@ fn higher(slot: &mut Option<Point>, value: f64, at: (usize, usize)) {
     }
 }
 
+/// The bucket width for x from `low` to `high` in at most `buckets` buckets: the least power of
+/// two whose multiples from zero cut that span into no more. Powers of two halve and double
+/// exactly, so a wider width's buckets are pairs of a narrower one's, and its multiples divide
+/// any x exactly as a float.
+fn bucket_width(low: f64, high: f64, buckets: usize) -> f64 {
+    let count = |width: f64| (high / width).floor() - (low / width).floor() + 1.0;
+    let mut width = if high > low {
+        ((high - low) / buckets as f64).log2().ceil().exp2()
+    } else {
+        1.0
+    };
+    while count(width) > buckets as f64 {
+        width *= 2.0;
+    }
+    width
+}
+
 /// The rows to send of `batches` (x first, then the ys), as (batch, row) in x order: every row
-/// with an x if they fit `points`, else each bucket's extremes (see the module's docs).
-fn pick(batches: &[RecordBatch], points: usize) -> Vec<(usize, usize)> {
+/// with an x in `range` if they fit `points`, else each bucket's extremes (see the module's
+/// docs).
+fn pick(batches: &[RecordBatch], points: usize, range: Option<(f64, f64)>) -> Vec<(usize, usize)> {
+    let inside = |x: f64| range.is_none_or(|(from, to)| from <= x && x <= to);
     let (mut count, mut low, mut high) = (0, f64::INFINITY, f64::NEG_INFINITY);
     for batch in batches {
         each_x(batch, |_, x| {
-            count += 1;
-            low = low.min(x);
-            high = high.max(x);
+            if inside(x) {
+                count += 1;
+                low = low.min(x);
+                high = high.max(x);
+            }
         });
     }
     // Points compare by x, then by place: ties keep the table's order.
@@ -313,7 +356,11 @@ fn pick(batches: &[RecordBatch], points: usize) -> Vec<(usize, usize)> {
     let mut picked: Vec<Point> = Vec::with_capacity(count.min(points));
     if count <= points {
         for (b, batch) in batches.iter().enumerate() {
-            each_x(batch, |row, x| picked.push((x, (b, row))));
+            each_x(batch, |row, x| {
+                if inside(x) {
+                    picked.push((x, (b, row)));
+                }
+            });
         }
         // An x-ordered table (a time series) is sent as it is.
         if !picked.is_sorted_by(|a, b| a.0 <= b.0) {
@@ -323,32 +370,33 @@ fn pick(batches: &[RecordBatch], points: usize) -> Vec<(usize, usize)> {
     }
     let ys = batches.first().map_or(0, |b| b.num_columns() - 1);
     // Each bucket sends at most its lowest and highest x and each y's lowest and highest.
-    let buckets = (points / (2 + 2 * ys)).max(1);
-    let scale = if high > low {
-        buckets as f64 / (high - low)
-    } else {
-        0.0
-    };
-    let bucket = |x: f64| (((x - low) * scale) as usize).min(buckets - 1);
+    let width = bucket_width(low, high, (points / (2 + 2 * ys)).max(1));
+    let first = (low / width).floor();
+    let buckets = ((high / width).floor() - first) as usize + 1;
+    let bucket = |x: f64| ((x / width).floor() - first) as usize;
     let mut x_ends = vec![(None, None); buckets];
     for (b, batch) in batches.iter().enumerate() {
         each_x(batch, |row, x| {
-            let (first, last) = &mut x_ends[bucket(x)];
-            lower(first, x, (b, row));
-            higher(last, x, (b, row));
+            if inside(x) {
+                let (least, most) = &mut x_ends[bucket(x)];
+                lower(least, x, (b, row));
+                higher(most, x, (b, row));
+            }
         });
     }
-    for (first, last) in &x_ends {
-        picked.extend(first.iter().chain(last));
+    for (least, most) in &x_ends {
+        picked.extend(least.iter().chain(most));
     }
     let mut y_ends = vec![(None, None); buckets];
     for y in 1..=ys {
         y_ends.fill((None, None));
         for (b, batch) in batches.iter().enumerate() {
             each_xy(batch, y, |row, x, value| {
-                let (least, most) = &mut y_ends[bucket(x)];
-                lower(least, value, (b, row));
-                higher(most, value, (b, row));
+                if inside(x) {
+                    let (least, most) = &mut y_ends[bucket(x)];
+                    lower(least, value, (b, row));
+                    higher(most, value, (b, row));
+                }
             });
         }
         // Kept by their y; sent in order of their x

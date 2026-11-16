@@ -1,9 +1,9 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from 'react';
 import Plotly from 'plotly.js-finance-dist';
-import { DataType, type Table, type Vector } from 'apache-arrow';
+import { DataType, type Table, type Timestamp, type Vector } from 'apache-arrow';
 import { useSeries, type SeriesOptions } from './index';
 
-export type ChartProps = SeriesOptions & {
+export type ChartProps = Omit<SeriesOptions, 'range'> & {
   /** The table charted: any the server lists, stored or computed */
   table: string;
   /** How each y is drawn: `line` (by default), `area`, `bar`, or `scatter` */
@@ -57,6 +57,29 @@ function values(vector: Vector): (number | string | null)[] {
     }
     return typeof value === 'bigint' ? Number(value) : (value as number | string);
   });
+}
+
+// Milliseconds to a timestamp's unit (Arrow's TimeUnit: second, milli, micro, nano)
+const PER_MILLISECOND = [1e-3, 1, 1e3, 1e6];
+
+/**
+ * A value of Plotly's x axis in x's own units, as the server ranges by: a time's unit since the
+ * epoch, a date's days, a number as is. Plotly gives a date axis's ends as UTC strings as drawn
+ * ("2026-11-16 00:10:00.1234", or a date alone).
+ */
+function toUnits(value: string | number, x: Vector): number {
+  if (!isTime(x)) {
+    return Number(value);
+  }
+  let ms = Number(value);
+  if (typeof value === 'string') {
+    const iso = value.trim().replace(' ', 'T').replace(/(\.\d{3})\d+/, '$1');
+    ms = Date.parse(iso.includes('T') ? `${iso}Z` : `${iso}T00:00Z`);
+  }
+  if (DataType.isDate(x.type)) {
+    return ms / 86_400_000;
+  }
+  return ms * PER_MILLISECOND[(x.type as Timestamp).unit];
 }
 
 function axisType(vector: Vector): 'date' | 'category' | 'linear' {
@@ -119,14 +142,16 @@ function layout(points: Table, look: Look): Partial<Plotly.Layout> {
 /**
  * A live chart of any Kermodes table (docs/theme.md, Charts): each `y` against `x`, of the rows
  * `where` keeps, drawn in the page's tokens and redrawn as the table changes. The server sends at
- * most `points` (useSeries), so a chart of a day of ticks costs what its pixels do. It fills its
- * parent, which needs a height.
+ * most `points` (useSeries), so a chart of a day of ticks costs what its pixels do; zooming in
+ * asks for that range alone, in full detail, and a double-click goes back to all of it. It
+ * fills its parent, which needs a height.
  *
  *     <Chart table="md.ticks" x="ts" y="price" where="sym = 'AAPL'" />
  *     <Chart table="board" x="sym" y="change_pct" type="bar" />
  */
 export function Chart({ table, x, y, where, points: budget, type = 'line', className, style }: ChartProps) {
-  const series = useSeries(table, { x, y, where, points: budget });
+  const [range, setRange] = useState<[number, number] | null>(null);
+  const series = useSeries(table, { x, y, where, points: budget, range });
   const host = useRef<HTMLDivElement>(null);
   const [look, setLook] = useState<Look | null>(null);
   useLayoutEffect(() => {
@@ -136,22 +161,48 @@ export function Chart({ table, x, y, where, points: budget, type = 'line', class
   }, []);
 
   const { points } = series;
-  // Nothing to draw: before the first points, or a table with no rows (said in place below)
-  const drawable = points != null && points.numRows > 0;
+  // The x the axis is read against when zoomed: the points' own column
+  const xColumn = useRef<Vector | null>(null);
+  xColumn.current = (points?.getChildAt(0) as Vector | null) ?? null;
+  const listening = useRef(false);
+  // Nothing to draw: before the first points, or a table with no rows (said in place below). A
+  // zoom onto no rows still draws its axes, so it can be zoomed out of.
+  const drawable = points != null && (points.numRows > 0 || range != null);
   useEffect(() => {
-    if (host.current == null || look == null) {
+    const element = host.current;
+    if (element == null || look == null) {
       return;
     }
-    if (points == null || points.numRows === 0) {
-      Plotly.purge(host.current);
+    if (points == null || !drawable) {
+      Plotly.purge(element);
+      listening.current = false;
       return;
     }
-    void Plotly.react(host.current, traces(points, type, look.colors), layout(points, look), {
+    void Plotly.react(element, traces(points, type, look.colors), layout(points, look), {
       displaylogo: false,
       displayModeBar: 'hover',
       responsive: false,
+    }).then(plot => {
+      if (listening.current) {
+        return;
+      }
+      listening.current = true;
+      plot.on('plotly_relayout', event => {
+        const column = xColumn.current;
+        if (column == null || axisType(column) === 'category') {
+          return;
+        }
+        if (event['xaxis.autorange'] === true) {
+          setRange(null);
+          return;
+        }
+        const [low, high] = [event['xaxis.range[0]'], event['xaxis.range[1]']];
+        if (low != null && high != null) {
+          setRange([toUnits(low, column), toUnits(high, column)]);
+        }
+      });
     });
-  }, [points, type, look]);
+  }, [points, drawable, type, look]);
 
   // Plotly sizes itself once; a panel resized or docked elsewhere tells it again.
   useEffect(() => {

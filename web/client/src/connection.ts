@@ -153,7 +153,7 @@ export class SocketView implements ViewerChannel {
       series == null
         ? { type: 'open', view: this.id, table: this.table }
         : { type: 'series', view: this.id, table: this.table, ...series },
-      ...['filter', 'sort', 'viewport']
+      ...['filter', 'sort', 'viewport', 'range']
         .map(kind => replay.get(kind))
         .filter(message => message != null)
         .map(message => ({ ...message, view: this.id })),
