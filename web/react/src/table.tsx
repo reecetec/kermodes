@@ -7,20 +7,23 @@ type View = ReturnType<Connection['open']>;
 /**
  * A Kermodes table as the platform's own viewer shows it: live, the cells that change flashing,
  * any number of rows scrolled by the server, with sort, quick filters, and copy, in the page's
- * theme (@kermodes/theme's tokens). It fills its parent, which needs a height. With `follow`, it
- * starts at the table's end and stays there as rows arrive: an append table's newest rows, read
- * by position, with no sort for the server to hold.
+ * theme (@kermodes/theme's tokens). It fills its parent, which needs a height. An append table's
+ * newest rows cost the server no sort, as they are read by position: with `reverse` they come
+ * first, on top (a tape); with `follow` the table starts at its end and stays there as rows
+ * arrive (a log).
  *
- *     <div className="h-96"><Table name="md.ticks" follow /></div>
+ *     <div className="h-96"><Table name="md.ticks" reverse /></div>
  */
 export function Table({
   name,
   follow = false,
+  reverse = false,
   className,
   style,
 }: {
   name: string;
   follow?: boolean;
+  reverse?: boolean;
   className?: string;
   style?: CSSProperties;
 }) {
@@ -44,7 +47,9 @@ export function Table({
   }, []);
   return (
     <div ref={host} className={className} style={{ position: 'relative', height: '100%', ...style }}>
-      {view != null && theme != null && <TableViewer channel={view} theme={theme} follow={follow} />}
+      {view != null && theme != null && (
+        <TableViewer channel={view} theme={theme} follow={follow} reverse={reverse} />
+      )}
     </div>
   );
 }

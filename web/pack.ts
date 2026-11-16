@@ -158,7 +158,7 @@ const clientTypes = { '@kermodes/client': [path.join(client, 'dist/index.d.ts')]
 const grid = await build('grid', { '.': 'src/index.ts' }, clientTypes);
 const react = await build(
   'react',
-  { '.': 'src/index.tsx', './table': 'src/table.tsx' },
+  { '.': 'src/index.tsx', './table': 'src/table.tsx', './chart': 'src/chart.tsx' },
   { ...clientTypes, '@kermodes/grid': [path.join(grid, 'dist/index.d.ts')] }
 );
 const theme = await copy('theme', ['tokens.css', 'fonts.css', 'fonts', 'layout.css', 'tailwind.css']);

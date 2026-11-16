@@ -23,7 +23,8 @@ const fromSource: Alias[] =
   web == null
     ? []
     : [
-        { find: /^@kermodes\/react\/table$/, replacement: `${web}/react/src/table.tsx` },
+        // Each entry (`@kermodes/react/table`, `/chart`) is its source file of that name.
+        { find: /^@kermodes\/react\/(\w+)$/, replacement: `${web}/react/src/$1.tsx` },
         { find: /^@kermodes\/react$/, replacement: `${web}/react/src/index.tsx` },
         { find: /^@kermodes\/client$/, replacement: `${web}/client/src/index.ts` },
         { find: /^@kermodes\/grid$/, replacement: `${web}/grid/src/index.ts` },

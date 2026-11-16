@@ -126,6 +126,16 @@ page whose panels change starts from the page again. Figures go in a `Stats` str
 in the mono, coloured only by sign. The layout's styles are plain CSS, so a page that does not use
 Tailwind looks the same.
 
+## Charts
+
+A chart (`@kermodes/react/chart`) fills its panel on the panel's own background: hairline grid
+lines in `--border`, axis figures small and in the mono, series in `--chart-1` to `--chart-6` in
+order (distinct at a glance; none reads as a sign, which belongs to `--positive` and
+`--negative`), lines 1.5px. One series has no legend; several have one across the top. Hovering
+shows every series' value at that x in one label on `--popover`. Times are UTC, as in the grid.
+Before the first points it says "Loading", for a table with no rows "No rows", and when it
+cannot be drawn, why, in place of the plot.
+
 ## Checks
 
 - `web/theme/tokens.test.ts`: every colour token is defined in both themes, as hex.

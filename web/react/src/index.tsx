@@ -217,3 +217,70 @@ export function useTable<Row extends TableRow = TableRow>(
 
   return state;
 }
+
+export type SeriesOptions = {
+  /** The column across: a number, date, or time; text for a bar per category */
+  x: string;
+  /** The column or columns up: numbers */
+  y: string | readonly string[];
+  /** Which rows, as an engine expression: `"sym = 'AAPL'"` */
+  where?: string;
+  /** The most points to send; 2000 by default, about what a chart's width draws */
+  points?: number;
+};
+
+export type SeriesState = {
+  /** x then each y, in x order; null until the first points arrive */
+  points: Table | null;
+  /** The rows the points stand for: more than the points when the server downsampled */
+  total: number;
+  status: TableStatus;
+  error: string | null;
+};
+
+/**
+ * A chart's points of a Kermodes table, live: any table, every row while they fit `points`,
+ * else downsampled by the server to the shape a chart of that many points shows (each stretch's
+ * first, last, lowest, and highest), sent again as the table changes. Draw them with any
+ * charting library, or `@kermodes/react/chart`'s `<Chart>`.
+ *
+ *     const { points } = useSeries('md.ticks', { x: 'ts', y: 'price', where: "sym = 'AAPL'" });
+ */
+export function useSeries(table: string, { x, y, where, points }: SeriesOptions): SeriesState {
+  const connection = useKermodes();
+  const [state, setState] = useState<SeriesState>({
+    points: null,
+    total: 0,
+    status: 'loading',
+    error: null,
+  });
+  // The request's contents are what count, not a new array each render
+  const ys = typeof y === 'string' ? [y] : y;
+  const request = JSON.stringify({ x, y: ys, where, points });
+  useEffect(() => {
+    const opened = connection.series(table, JSON.parse(request) as SeriesOptions & { y: string[] });
+    let latest: { points: Table; total: number } | null = null;
+    const publish = () => {
+      const current = opened.state();
+      setState({
+        points: latest?.points ?? null,
+        total: latest?.total ?? 0,
+        status: tableStatus(current, latest != null),
+        error: current.error ?? null,
+      });
+    };
+    const stopPoints = opened.onMessage((header, buffers) => {
+      if (header.type === 'series') {
+        latest = { points: tableFromIPC(toBytes(buffers[0])), total: header.total };
+        publish();
+      }
+    });
+    const stopState = opened.onState(publish);
+    return () => {
+      stopPoints();
+      stopState();
+      opened.close();
+    };
+  }, [connection, table, request]);
+  return state;
+}

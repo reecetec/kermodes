@@ -204,6 +204,104 @@ async fn the_app_lists_opens_filters_and_follows_published_tables() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_chart_follows_its_table_through_a_series() {
+    let session = Session::new();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("t", DataType::Float64, true),
+        Field::new("v", DataType::Float64, true),
+    ]));
+    let line = session.keyed_input_table(&schema, &["t"]).unwrap();
+    let batch = |ts: Vec<f64>, vs: Vec<f64>| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Float64Array::from(ts)) as ArrayRef,
+                Arc::new(Float64Array::from(vs)),
+            ],
+        )
+        .unwrap()
+    };
+    // Written out of x order: the points come back in it.
+    line.upsert(&[batch(vec![3.0, 1.0, 2.0], vec![30.0, 10.0, 20.0])])
+        .unwrap();
+    session.step();
+    let mut server = kermodes_gateway::serve(
+        session.clone(),
+        "127.0.0.1:0".parse().unwrap(),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    server.publish("line", &line);
+    let url = format!("ws://{}/ws", server.addr());
+    let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    text(&mut socket).await;
+
+    let column = |rows: &RecordBatch, at: usize| -> Vec<f64> {
+        rows.column(at)
+            .as_primitive::<arrow::datatypes::Float64Type>()
+            .values()
+            .to_vec()
+    };
+    send(
+        &mut socket,
+        json!({"type": "series", "view": 1, "table": "line", "x": "t", "y": ["v"]}),
+    )
+    .await;
+    let (state, header, rows, keys) = window(&mut socket).await;
+    assert_eq!(state["row_count"], 3);
+    assert_eq!(header["type"], "series");
+    assert_eq!(column(&rows, 0), [1.0, 2.0, 3.0]);
+    assert_eq!(column(&rows, 1), [10.0, 20.0, 30.0]);
+    assert!(keys.is_empty());
+
+    // A change to the table pushes the points again, unasked.
+    line.upsert(&[batch(vec![2.0], vec![25.0])]).unwrap();
+    line.delete(&[RecordBatch::try_from_iter([(
+        "t",
+        Arc::new(Float64Array::from(vec![1.0])) as ArrayRef,
+    )])
+    .unwrap()])
+        .unwrap();
+    session.step();
+    let (_, _, rows, _) = window(&mut socket).await;
+    assert_eq!(column(&rows, 0), [2.0, 3.0]);
+    assert_eq!(column(&rows, 1), [25.0, 30.0]);
+
+    // A chart is not scrolled or sorted; and it names what it cannot draw.
+    send(
+        &mut socket,
+        json!({"type": "viewport", "view": 1, "top": 0, "bottom": 10}),
+    )
+    .await;
+    assert_eq!(text(&mut socket).await["type"], "error");
+    for (view, asked) in [
+        (
+            2,
+            json!({"type": "series", "view": 2, "table": "line", "x": "t", "y": "nope"}),
+        ),
+        (
+            3,
+            json!({"type": "series", "view": 3, "table": "line", "x": "t"}),
+        ),
+        (
+            4,
+            json!({"type": "series", "view": 4, "table": "gone", "x": "t", "y": "v"}),
+        ),
+    ] {
+        send(&mut socket, asked).await;
+        let refused = text(&mut socket).await;
+        assert_eq!(
+            (refused["type"].clone(), refused["view"].clone()),
+            (json!("error"), json!(view)),
+            "{refused}"
+        );
+    }
+    server.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_app_is_served_from_its_directory_only() {
     let app = std::env::temp_dir().join(format!("kermodes-gateway-app-{}", std::process::id()));
     std::fs::create_dir_all(app.join("assets")).unwrap();

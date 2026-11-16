@@ -8,7 +8,8 @@
   "types": "src/index.tsx",
   "exports": {
     ".": "./src/index.tsx",
-    "./table": "./src/table.tsx"
+    "./table": "./src/table.tsx",
+    "./chart": "./src/chart.tsx"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
@@ -17,7 +18,8 @@
     "@kermodes/client": "workspace:*",
     "@kermodes/grid": "workspace:*",
     "apache-arrow": "^21.0.0",
-    "dockview-react": "^8.9.0"
+    "dockview-react": "^8.9.0",
+    "plotly.js-finance-dist": "^4.3.0"
   },
   "peerDependencies": {
     "react": "^19.0.0",
@@ -25,6 +27,7 @@
   },
   "devDependencies": {
     "@types/bun": "^1.4.0",
+    "@types/plotly.js": "^3.0.15",
     "@types/react": "^19.0.0",
     "typescript": "^5.9.0"
   }

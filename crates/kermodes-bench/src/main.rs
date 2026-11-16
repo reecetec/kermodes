@@ -1,6 +1,6 @@
 //! Cycle latency and throughput for the engine's core paths.
 //!
-//! `cargo run --release -p kermodes-bench -- [ticks|book] [flags]`
+//! `cargo run --release -p kermodes-bench -- [ticks|book|series] [flags]`
 //!
 //! `ticks` (default; `--rows 100000 --cycles 100 --symbols 10000`): each cycle appends one batch of
 //! a random-walk ticker, then times `step()`: a ticking `where` → `update` → `last_by(sym)` and an
@@ -13,6 +13,10 @@
 //! order's price and size, 10% delete one, 10% insert a new one) and times `step()` through an
 //! `agg_by(sym)` with count, sum, mean, and std.
 //!
+//! `series` (`--rows 100000 --cycles 85 --symbols 100`: a day of the example's ticks): appends
+//! `--cycles` batches, then times a chart's frame of price against time at 2000 points, over
+//! every tick and over one symbol's (a ticking `where`), 20 times each.
+//!
 //! Batch generation is never timed.
 
 use std::sync::Arc;
@@ -22,6 +26,7 @@ use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray, TimestampNan
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use kermodes_core::Session;
+use kermodes_core::series::Series;
 
 struct Args {
     workload: String,
@@ -45,8 +50,8 @@ impl Args {
         let mut words = std::env::args().skip(1).peekable();
         if let Some(name) = words.next_if(|w| !w.starts_with("--")) {
             assert!(
-                name == "ticks" || name == "book",
-                "unknown workload {name}; expected ticks or book"
+                ["ticks", "book", "series"].contains(&name.as_str()),
+                "unknown workload {name}; expected ticks, book, or series"
             );
             args.workload = name;
         }
@@ -162,13 +167,13 @@ fn main() {
     let args = Args::parse();
     match args.workload.as_str() {
         "book" => book(&args),
+        "series" => series(&args),
         _ => ticks(&args),
     }
 }
 
-fn ticks(args: &Args) {
-    let symbols = args.symbols.unwrap_or(10_000);
-    let schema = Arc::new(Schema::new(vec![
+fn ticks_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
         Field::new("sym", DataType::Utf8, true),
         Field::new("price", DataType::Float64, true),
         Field::new("size", DataType::Int64, true),
@@ -177,7 +182,48 @@ fn ticks(args: &Args) {
             DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
             true,
         ),
-    ]));
+    ]))
+}
+
+fn series(args: &Args) {
+    let symbols = args.symbols.unwrap_or(100);
+    let cycles = if args.cycles == 100 { 85 } else { args.cycles };
+    let schema = ticks_schema();
+    let session = Session::new();
+    let ticks = session.input_table(&schema).expect("valid schema");
+    let ys = ["price".to_owned()];
+    let all = Series::new(&ticks, "ts", &ys, None, 2000).expect("valid series");
+    let one = Series::new(&ticks, "ts", &ys, Some("sym = 'S00000'"), 2000).expect("valid series");
+    let mut walk = RandomWalk::new(symbols);
+    for _ in 0..cycles {
+        ticks
+            .append(&[walk.batch(&schema, args.rows)])
+            .expect("batch matches the table");
+        session.step();
+    }
+    for (name, series) in [("every tick", &all), ("one symbol", &one)] {
+        let mut times = Vec::with_capacity(20);
+        let mut frame = None;
+        for _ in 0..20 {
+            let start = Instant::now();
+            frame = series.frame().expect("not failed");
+            times.push(start.elapsed());
+        }
+        let frame = frame.expect("table held");
+        times.sort();
+        println!(
+            "series of {name}: {} rows to {} bytes; frame p50 {:.1} ms, max {:.1} ms",
+            frame.total,
+            frame.rows.len(),
+            millis(times[times.len() / 2]),
+            millis(times[times.len() - 1])
+        );
+    }
+}
+
+fn ticks(args: &Args) {
+    let symbols = args.symbols.unwrap_or(10_000);
+    let schema = ticks_schema();
     let aggregations = [
         ("n", "count(*)"),
         ("avg", "mean(price)"),

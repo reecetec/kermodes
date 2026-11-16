@@ -10,17 +10,20 @@
 //! view shows it, so the server holds what is being looked at rather than everything.
 //!
 //! Messages from the app are JSON text: `{"type": "tables"}`, `{"type": "open", "view": id,
-//! "table": name}`, `{"type": "close", "view": id}`, `{"type": "pause" | "resume", "view":
+//! "table": name}`, `{"type": "series", "view": id, "table": name, "x": column, "y": [columns],
+//! "where": expression, "points": n}` (a chart's points, `kermodes_core::series`; `where` and
+//! `points` optional), `{"type": "close", "view": id}`, `{"type": "pause" | "resume", "view":
 //! id}` (a paused view gets no windows until resumed, keeping its sort and filters), and the
 //! viewer's own messages (`viewport`, `sort`, `filter`, `fetch`, as in `kermodes_core::viewer`)
 //! with a `"view"` field. The server answers with JSON text (`tables`, which lists the tables
 //! and names the views published for pages of their own; `state` for a view before each of its
 //! windows; `error`, with `"retry": true` when the view has ended because its stored table could
 //! not be read, as while the store restarts, and opening it again later may work) and binary
-//! frames: a little-endian u32 header length, the header (JSON: `view`, `type` "rows" or
-//! "fetched", `id` for fetches, `start`, `total`, `cycle`), a u32 rows length, the rows (Arrow
-//! IPC stream), then the rows' keys (little-endian u64 each). After every engine cycle, each
-//! open view whose table changed gets its window again.
+//! frames: a little-endian u32 header length, the header (JSON: `view`, `type` "rows",
+//! "fetched", or "series", `id` for fetches, `start`, `total`, `cycle`), a u32 rows length, the
+//! rows (Arrow IPC stream), then the rows' keys (little-endian u64 each; none for a series).
+//! After every engine cycle, each open view whose table changed gets its window again; a
+//! series at most every `SERIES_EVERY`, since each recomputes from all its table's rows.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -44,6 +47,7 @@ use http_body_util::{BodyExt, Full};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
+use kermodes_core::series::Series;
 use kermodes_core::viewer::{FETCH_LIMIT, Frame, Request, SortKey, Viewer};
 use kermodes_core::{Session, Table, type_name};
 use serde_json::{Value, json};
@@ -61,6 +65,9 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often each connection is pinged: proxies end connections idle for minutes (the cluster's
 /// Envoy after five), and a hidden tab's paused views or a table that does not tick send nothing.
 const KEEPALIVE: Duration = Duration::from_secs(30);
+/// The least time between a series' frames: a chart redrawn twice a second looks live, and a
+/// series of millions of rows costs tens of milliseconds a frame.
+const SERIES_EVERY: Duration = Duration::from_millis(500);
 /// How often the server refreshes the stored tables it lists and lets go of tables no view
 /// shows.
 const MAINTAIN_EVERY: Duration = Duration::from_secs(2);
@@ -914,12 +921,16 @@ async fn upgrade(ws: WebSocketUpgrade, State(shared): State<Arc<Shared>>) -> Res
 
 /// An open view. A stored append table is shown by position (`window`) unless it is sorted or
 /// filtered; the engine's `viewer` shows everything else: published tables, keyed stored
-/// tables, and an append table while it is sorted or filtered, held live by `lease` meanwhile.
+/// tables, and an append table while it is sorted or filtered, held live by `lease` meanwhile. A
+/// chart's view is a `series` instead, of a published table or a stored one held by `lease`.
 struct Open {
     viewer: Option<Arc<Mutex<Viewer>>>,
     window: Option<Window>,
+    series: Option<Arc<Mutex<Series>>>,
     /// What the window last sent reflects: the engine view's cycle, or a window's row count.
     sent: Option<u64>,
+    /// When a series last sent its points.
+    sent_at: Option<Instant>,
     paused: bool,
     lease: Option<Lease>,
     /// The highest sort or filter number applied while shown by position.
@@ -930,6 +941,19 @@ struct Open {
 type Reply = Result<Option<Frame>, String>;
 
 impl Open {
+    fn new() -> Self {
+        Self {
+            viewer: None,
+            window: None,
+            series: None,
+            sent: None,
+            sent_at: None,
+            paused: false,
+            lease: None,
+            applied: 0,
+        }
+    }
+
     fn read(shared: &Shared) -> &ReadRows {
         &shared
             .stored
@@ -938,8 +962,19 @@ impl Open {
             .rows
     }
 
+    /// Whether the engine says when this view changes (after each cycle), rather than a poll.
+    fn engine(&self) -> bool {
+        self.viewer.is_some() || self.series.is_some()
+    }
+
     /// The window as the view shows it now.
     async fn rows(&self, shared: &Arc<Shared>) -> Reply {
+        if let Some(series) = &self.series {
+            let series = series.clone();
+            return blocking(move || lock(&series).frame())
+                .await
+                .map_err(|e| e.to_string());
+        }
         match (&self.viewer, &self.window) {
             (Some(viewer), _) => {
                 let viewer = viewer.clone();
@@ -958,6 +993,10 @@ impl Open {
     /// What says the window may have changed: an engine view's last changing cycle, or a
     /// window's row count; `None` once the table is gone or cannot be read.
     async fn changed(&self, shared: &Arc<Shared>) -> Option<u64> {
+        if let Some(series) = &self.series {
+            let series = series.clone();
+            return blocking(move || lock(&series).changed()).await;
+        }
         match (&self.viewer, &self.window) {
             (Some(viewer), _) => {
                 let viewer = viewer.clone();
@@ -980,6 +1019,9 @@ impl Open {
     /// the engine sorts and filters; once neither applies, the view goes back to its window and
     /// lets the table go.
     async fn receive(&mut self, shared: &Arc<Shared>, request: Request) -> Reply {
+        if self.series.is_some() {
+            return Err("a chart's view is not sorted, filtered, or scrolled".to_owned());
+        }
         if let (Request::Viewport { top, bottom }, Some(window)) = (&request, &mut self.window) {
             window.set_viewport(*top, *bottom);
         }
@@ -1071,6 +1113,7 @@ fn deliver(shared: &Shared, id: u64, open: &mut Open, reply: Reply) -> (Vec<Mess
         && frame.fetched.is_none()
     {
         open.sent = Some(frame.cycle);
+        open.sent_at = Some(Instant::now());
     }
     (answer(id, open, reply), true)
 }
@@ -1085,7 +1128,11 @@ async fn refresh(
 ) {
     let mut ended = Vec::new();
     for (id, open) in views.iter_mut() {
-        if open.paused || open.viewer.is_some() != engine {
+        // A series is checked on the poll too: one held back by `SERIES_EVERY` goes out then.
+        if open.paused || (open.series.is_none() && open.engine() != engine) {
+            continue;
+        }
+        if open.series.is_some() && open.sent_at.is_some_and(|at| at.elapsed() < SERIES_EVERY) {
             continue;
         }
         let changed = open.changed(shared).await;
@@ -1166,14 +1213,7 @@ async fn handle(shared: &Arc<Shared>, views: &mut HashMap<u64, Open>, text: &str
             let name = message["table"].as_str().unwrap_or_default().to_owned();
             let published = shared.tables().get(&name).cloned();
             let published = published.or_else(|| shared.views().get(&name).cloned());
-            let mut open = Open {
-                viewer: None,
-                window: None,
-                sent: None,
-                paused: false,
-                lease: None,
-                applied: 0,
-            };
+            let mut open = Open::new();
             if let Some(table) = published {
                 open.viewer = Some(Arc::new(Mutex::new(
                     blocking(move || Viewer::new(&table)).await,
@@ -1206,6 +1246,49 @@ async fn handle(shared: &Arc<Shared>, views: &mut HashMap<u64, Open>, text: &str
             }
             let rows = open.rows(shared).await;
             let (messages, goes_on) = deliver(shared, id, &mut open, rows);
+            if goes_on {
+                views.insert(id, open);
+            }
+            messages
+        }
+        ("series", Some(id)) => {
+            let name = message["table"].as_str().unwrap_or_default().to_owned();
+            let chart = match Chart::parse(&message) {
+                Ok(chart) => chart,
+                Err(e) => return vec![error(Some(id), &e)],
+            };
+            let mut open = Open::new();
+            let published = shared.tables().get(&name).cloned();
+            let table = match published.or_else(|| shared.views().get(&name).cloned()) {
+                Some(table) => table,
+                None => match lease(shared, &name).await {
+                    Ok((table, lease)) => {
+                        open.lease = Some(lease);
+                        table
+                    }
+                    Err(Refused::Missing) => {
+                        return vec![error(Some(id), &format!("no table `{name}`"))];
+                    }
+                    Err(Refused::Unavailable(why)) => return vec![retry(id, &why)],
+                },
+            };
+            let built = blocking(move || {
+                Series::new(
+                    &table,
+                    &chart.x,
+                    &chart.y,
+                    chart.filter.as_deref(),
+                    chart.points,
+                )
+            })
+            .await;
+            match built {
+                Ok(series) => open.series = Some(Arc::new(Mutex::new(series))),
+                // A column it cannot draw or a `where` that does not compile: no retry helps.
+                Err(e) => return vec![error(Some(id), &e.to_string())],
+            }
+            let reply = open.rows(shared).await;
+            let (messages, goes_on) = deliver(shared, id, &mut open, reply);
             if goes_on {
                 views.insert(id, open);
             }
@@ -1250,6 +1333,40 @@ async fn handle(shared: &Arc<Shared>, views: &mut HashMap<u64, Open>, text: &str
             messages
         }
         _ => vec![error(None, &format!("unknown message `{kind}`"))],
+    }
+}
+
+/// What a `series` message asks to chart.
+struct Chart {
+    x: String,
+    y: Vec<String>,
+    filter: Option<String>,
+    points: usize,
+}
+
+impl Chart {
+    /// Points when a chart does not say: about what a chart a few hundred pixels wide draws.
+    const POINTS: usize = 2000;
+
+    fn parse(message: &Value) -> Result<Self, String> {
+        let x = message["x"].as_str().ok_or("`series` needs a column `x`")?;
+        let y = match &message["y"] {
+            Value::String(column) => vec![column.clone()],
+            Value::Array(columns) => columns
+                .iter()
+                .map(|c| c.as_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()
+                .ok_or("`series` takes `y` as column names")?,
+            _ => return Err("`series` needs a column or columns `y`".to_owned()),
+        };
+        Ok(Self {
+            x: x.to_owned(),
+            y,
+            filter: message["where"].as_str().map(str::to_owned),
+            points: message["points"]
+                .as_u64()
+                .map_or(Self::POINTS, |n| n as usize),
+        })
     }
 }
 
@@ -1313,7 +1430,12 @@ fn answer(id: u64, open: &Open, reply: Reply) -> Vec<Message> {
             if frame.fetched.is_none() {
                 messages.push(state(id, open, &frame));
             }
-            messages.push(binary(id, frame));
+            let kind = match (&frame.fetched, &open.series) {
+                (Some(_), _) => "fetched",
+                (None, Some(_)) => "series",
+                (None, None) => "rows",
+            };
+            messages.push(binary(id, kind, frame));
             messages
         }
         Ok(None) => vec![error(Some(id), "the table is gone")],
@@ -1322,8 +1444,21 @@ fn answer(id: u64, open: &Open, reply: Reply) -> Vec<Message> {
 }
 
 fn state(id: u64, open: &Open, frame: &Frame) -> Message {
-    let state = match &open.viewer {
-        Some(viewer) => {
+    let status = |status: String| {
+        json!({
+            "type": "state",
+            "view": id,
+            "row_count": frame.total,
+            "status": status,
+            "sort": [],
+            "filters": {},
+            "filter_errors": {},
+            "applied": open.applied,
+        })
+    };
+    let state = match (&open.series, &open.viewer) {
+        (Some(series), _) => status(lock(series).status(frame.cycle)),
+        (None, Some(viewer)) => {
             let viewer = lock(viewer);
             let sort: Vec<Value> = viewer
                 .sort()
@@ -1341,24 +1476,15 @@ fn state(id: u64, open: &Open, frame: &Frame) -> Message {
                 "applied": viewer.applied(),
             })
         }
-        None => json!({
-            "type": "state",
-            "view": id,
-            "row_count": frame.total,
-            "status": "ticking",
-            "sort": [],
-            "filters": {},
-            "filter_errors": {},
-            "applied": open.applied,
-        }),
+        (None, None) => status("ticking".to_owned()),
     };
     Message::Text(state.to_string().into())
 }
 
-fn binary(id: u64, frame: Frame) -> Message {
+fn binary(id: u64, kind: &str, frame: Frame) -> Message {
     let mut head = json!({
         "view": id,
-        "type": if frame.fetched.is_some() { "fetched" } else { "rows" },
+        "type": kind,
         "start": frame.start,
         "total": frame.total,
         "cycle": frame.cycle,
@@ -1431,10 +1557,10 @@ fn error(view: Option<u64>, message: &str) -> Message {
     )
 }
 
-fn lock(viewer: &Mutex<Viewer>) -> MutexGuard<'_, Viewer> {
-    viewer
-        .lock()
-        .expect("kermodes viewer poisoned by an earlier panic")
+/// A view's engine side: a viewer or a series.
+fn lock<T>(view: &Mutex<T>) -> MutexGuard<'_, T> {
+    view.lock()
+        .expect("kermodes view poisoned by an earlier panic")
 }
 
 /// Runs engine work (which takes the session's locks) off the async workers.

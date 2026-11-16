@@ -160,6 +160,27 @@ describe('ViewportGridModel', () => {
     expect(model.isRowLoaded(0)).toBe(false);
     expect(model.textForCell(0, 0)).toBe('');
   });
+
+  it('shows the last rows first when reversed, unless sorted', () => {
+    const sym = COLUMNS.findIndex(column => column.name === 'sym');
+    // The table's last two positions, 998 (AAPL) and 999 (a null sym)
+    const model = new ViewportGridModel(COLUMNS, 1_000);
+    model.setReversed(true);
+    model.setWindow(998, twoRows(), KEYS);
+    expect([model.valueAt(sym, 0), model.textForCell(sym, 1)]).toEqual([null, 'AAPL']);
+    // The rows on screen are asked for as the positions behind them
+    expect(model.positionsOf(0, 1)).toEqual({ top: 998, bottom: 999 });
+    expect(model.positionsOf(0, 1_500)).toEqual({ top: 0, bottom: 999 });
+
+    // A new row goes on top: the ones shown move down a row until the window catches up
+    model.setRowCount(1_001);
+    expect([model.isRowLoaded(0), model.textForCell(sym, 2)]).toEqual([false, 'AAPL']);
+
+    // A sort shows its own order
+    model.setRowCount(1_000);
+    model.setSort([{ column: 'px', descending: false }]);
+    expect([model.textForCell(sym, 998), model.positionsOf(0, 1)]).toEqual(['AAPL', { top: 0, bottom: 1 }]);
+  });
 });
 
 /** A window of rows by key, each row an array of column values */

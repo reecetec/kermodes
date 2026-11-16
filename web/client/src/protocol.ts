@@ -44,12 +44,26 @@ export type ViewerRequest =
   | { type: 'fetch'; id: number; start: number; count: number };
 
 /**
- * Messages from the engine side. Both carry two buffers: an Arrow IPC stream of
- * the rows (all columns, in `columns` order) and their keys as little-endian uint64.
+ * Messages from the engine side. Each carries two buffers: an Arrow IPC stream of the rows
+ * (all columns, in `columns` order; a series' x then its ys) and their keys as little-endian
+ * uint64 (none for a series).
  */
 export type ViewerReply =
   | { type: 'rows'; start: number; total: number; cycle: number }
-  | { type: 'fetched'; id: number; start: number; total: number };
+  | { type: 'fetched'; id: number; start: number; total: number }
+  // A chart's points: `total` is the rows they stand for
+  | { type: 'series'; start: number; total: number; cycle: number };
+
+/**
+ * A chart's points of a table: each `y` against `x`, of the rows `where` keeps (an engine
+ * expression), sent whole while they fit `points` and downsampled to it when they do not.
+ */
+export type SeriesRequest = {
+  x: string;
+  y: readonly string[];
+  where?: string;
+  points?: number;
+};
 
 export type ViewerBuffer = ArrayBuffer | ArrayBufferView;
 

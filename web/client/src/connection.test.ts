@@ -243,6 +243,27 @@ describe('KermodesConnection', () => {
     ]);
   });
 
+  it("opens a chart's series, and opens it again as asked after a reconnect", () => {
+    const { connection, sockets } = connect();
+    sockets[0].open();
+    sockets[0].receive(JSON.stringify(TABLES));
+    const request = { x: 'ts', y: ['px'], where: "sym = 'AAPL'", points: 800 };
+    const series = connection.series('trades', request);
+    const asked = { type: 'series', view: series.id, table: 'trades', ...request };
+    expect(sockets[0].sent).toEqual([asked]);
+    const received: ViewerReply[] = [];
+    series.onMessage(header => received.push(header));
+    sockets[0].receive(
+      frame({ view: series.id, type: 'series', start: 0, total: 5, cycle: 3 }, Uint8Array.of(1), [])
+    );
+    expect(received).toEqual([{ view: series.id, type: 'series', start: 0, total: 5, cycle: 3 } as ViewerReply]);
+
+    sockets[0].drop();
+    jest.advanceTimersByTime(1);
+    sockets[1].open();
+    expect(sockets[1].sent).toEqual([asked]);
+  });
+
   it('stays closed when closed on purpose', () => {
     const { connection, sockets } = connect();
     sockets[0].open();

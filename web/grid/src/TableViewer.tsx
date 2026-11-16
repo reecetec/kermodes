@@ -211,7 +211,7 @@ function useViewportSender(channel: ViewerChannel) {
     };
 
     return {
-      onViewChanged({ top, bottom }: GridMetrics): void {
+      onViewChanged({ top, bottom }: { top: number; bottom: number }): void {
         pending = { top, bottom };
         if (frame == null) {
           frame = requestAnimationFrame(flush);
@@ -346,6 +346,9 @@ export type TableViewerProps = {
   // Starts at the table's end and stays there as rows arrive, until scrolled up (and again
   // once scrolled back down): an append table's newest rows, by position, with no sort
   follow?: boolean;
+  // The table's last rows first: an append table's newest on top, read by position, with no
+  // sort for the server to hold; a sort from the header shows its own order instead
+  reverse?: boolean;
 };
 
 /**
@@ -358,6 +361,7 @@ export function TableViewer({
   theme,
   maxGridHeight,
   follow = false,
+  reverse = false,
 }: TableViewerProps): React.ReactElement {
   const [state, setState] = useState<ViewerState>(() => channel.state());
   const model = useMemo(() => {
@@ -366,6 +370,7 @@ export function TableViewer({
     viewModel.setSort(initial.sort);
     return viewModel;
   }, [channel]);
+  useEffect(() => model.setReversed(reverse), [model, reverse]);
   const gridRef = useRef<Grid>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [rowCount, setRowCount] = useState(model.rowCount);
@@ -475,7 +480,8 @@ export function TableViewer({
   const scrolledTo = useRef('');
   const handleViewChanged = useCallback(
     (metrics: GridMetrics) => {
-      viewport.onViewChanged(metrics);
+      // The server reads by position: the rows on screen, reversed or not, are positions
+      viewport.onViewChanged(model.positionsOf(metrics.top, metrics.bottom));
       const scroll = `${metrics.top}:${metrics.topOffset}:${metrics.left}:${metrics.leftOffset}`;
       if (scroll !== scrolledTo.current) {
         scrolledTo.current = scroll;
@@ -568,9 +574,11 @@ export function TableViewer({
           plan.isCapped = true;
         }
         const count = plan.rows[plan.rows.length - 1] - first + 1;
-        const table = await fetcher.fetch(first, count);
+        // The selected rows' positions: the same span, from its lowest
+        const { top } = model.positionsOf(first, plan.rows[plan.rows.length - 1]);
+        const table = await fetcher.fetch(top, count);
         const vectors = model.columns.map((_, i) => table.getChildAt(i));
-        valueAt = (column, row) => vectors[column]?.get(row - first) ?? null;
+        valueAt = (column, row) => vectors[column]?.get(model.positionOf(row) - top) ?? null;
       }
       const text = copyText(
         plan,

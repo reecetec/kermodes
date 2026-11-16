@@ -1251,12 +1251,14 @@ namespaces).
   `fakeKermodes({ table: rows })` connection: the rows reach `useTable` through the same Arrow
   decoding, in the order given, and `set` ticks them. For a table shown as a table,
   `@kermodes/react/table`'s `<Table name>` is the platform's own viewer (§15.3) on the
-  provider's connection, in the page's theme; with `follow` it starts at the end and stays there
-  as rows arrive, which needs no sort. It is its own entry, so an app that does not show one
+  provider's connection, in the page's theme; with `reverse` it shows the last rows first (a
+  tape's newest on top) and with `follow` it starts at the end and stays there as rows arrive,
+  neither of which needs a sort. It is its own entry, so an app that does not show one
   does not carry the grid. A dashboard says where its panels start with `Dashboard`, `Split`,
   and `Panel`, which dock as the Tables page's do (dockview: resized, dragged into tabs or beside
   each other, kept per browser), and `Stats`, so a page of panels looks like the platform's by
-  default (docs/theme.md, Layout); apps style the rest with `@kermodes/theme`'s Tailwind preset.
+  default (docs/theme.md, Layout); `@kermodes/react/chart`'s `<Chart>` draws any table live
+  (§15.4). Apps style the rest with `@kermodes/theme`'s Tailwind preset.
   Every candidate publishes `@kermodes/client`, `grid`, `react`, and `theme` to npm under the
   `dev` tag and every release under `latest` (§16.1, `web/pack.ts`), and an app pins the version
   it was built against like any dependency; a project's `.npmrc` names any private registry and
@@ -1401,11 +1403,38 @@ proven parts.
 - Sort and filter run in the engine, on tables the viewer derives and releases with the view
   (`where` for filters; `sort` for static tables and an incremental sort for ticking ones).
   Fetching rows by position needs a rank index for keyed tables.
+- A table's newest rows need no sort: the grid shows an append table reversed (row 0 its last
+  position) by mapping each row it shows to a position, and asks for the positions behind the
+  rows on screen, so a tape newest-first is a window read by position, as cheap as following
+  the end. A sort from the header shows its own order instead.
 - A sort or filter of a big table takes seconds. The grid numbers each one it sends and the
   engine reports the highest it has applied; until that catches up, the grid dims its rows and
   says "updating…", so nobody reads the old rows as the answer.
 - Targets: 60 fps scrolling over a billion rows; a change reaches the screen within one cycle
   and one frame; no work while nothing changes.
+
+### 15.4 Charts
+
+A chart draws any table the server lists, stored or computed (an app's `agg_by` of its ticks as
+much as `md.ticks`), live: `@kermodes/react`'s `useSeries` gives its points and `<Chart>` (its own
+entry, `@kermodes/react/chart`, so a page without one does not carry Plotly) draws them with
+Plotly's finance bundle in the page's tokens.
+
+- The points are the engine's (`kermodes_core::series`): each `y` against `x`, of the rows a
+  `where` keeps, in x order, every value the table's own. While the rows fit the chart's budget
+  (2000 points by default) every row is sent. Past it, x's range is split into equal buckets and
+  each keeps its rows of lowest and highest x and of each y's lowest and highest value: the
+  line's shape, spikes included, in at most the budget. A text x (a bar per category) is sent
+  whole, up to 100,000 rows.
+- A series reads its table's current rows each time it is sent (a snapshot, which views an
+  append table's chunks without copying), so it follows appends, upserts, and deletes alike. It
+  is sent again after a cycle that changes its rows, at most twice a second: a day of ticks
+  (8.5 million rows) costs tens of milliseconds a frame, and one symbol's of them about one.
+- It travels as a view on the table viewer's socket (`series`, closed, paused, and resumed as a
+  view), its frames the viewer's with the points as the rows and no keys; a stored table is held
+  live while charted, as a sorted view's is.
+- Times are drawn in UTC, as the grid shows them; zoom and pan stay where a person put them as
+  points arrive.
 
 ## 16. Runtime and deployment
 

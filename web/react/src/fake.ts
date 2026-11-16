@@ -1,5 +1,6 @@
 import { tableFromJSON, tableToIPC, Table } from 'apache-arrow';
 import type {
+  SeriesRequest,
   TableInfo,
   ViewerBuffer,
   ViewerChannel,
@@ -20,16 +21,18 @@ export type FakeKermodes = Connection & {
 type View = {
   table: string;
   viewport: { top: number; bottom: number } | null;
+  /** A chart's series of the table, instead of its rows */
+  series?: SeriesRequest;
   state: ViewerState;
   messages: Set<(header: ViewerReply, buffers: readonly ViewerBuffer[]) => void>;
   states: Set<() => void>;
 };
 
 /**
- * A stand-in for a Kermodes server, serving `tables` (name to rows) to `useTable` through the
- * same Arrow decoding as the real one. Rows come in the order given: sorting and filtering are
- * the server's, so tests give the rows a component should see. A table it does not have fails
- * as a missing table does.
+ * A stand-in for a Kermodes server, serving `tables` (name to rows) to `useTable` and charts
+ * through the same Arrow decoding as the real one. Rows come in the order given: sorting,
+ * filtering, and downsampling are the server's, so tests give the rows a component should see.
+ * A table it does not have fails as a missing table does.
  *
  *     const kermodes = fakeKermodes({ 'md.ticks': [{ sym: 'AAPL', price: 189.5 }] });
  *     render(<KermodesProvider connection={kermodes}><Tape /></KermodesProvider>);
@@ -46,7 +49,18 @@ export function fakeKermodes(tables: Readonly<Record<string, readonly TableRow[]
 
   const push = (view: View) => {
     const rows = data.get(view.table);
-    if (rows == null || view.viewport == null) {
+    if (rows == null) {
+      return;
+    }
+    if (view.series != null) {
+      const { x, y } = view.series;
+      const points = rows.map(row => Object.fromEntries([x, ...y].map(name => [name, row[name]])));
+      const ipc = tableToIPC(points.length > 0 ? tableFromJSON(points) : new Table(), 'stream');
+      const header: ViewerReply = { type: 'series', start: 0, total: rows.length, cycle };
+      view.messages.forEach(handler => handler(header, [ipc, new BigUint64Array()]));
+      return;
+    }
+    if (view.viewport == null) {
       return;
     }
     const { top, bottom } = view.viewport;
@@ -66,6 +80,51 @@ export function fakeKermodes(tables: Readonly<Record<string, readonly TableRow[]
     view.states.forEach(handler => handler());
   };
 
+  const add = (table: string, series?: SeriesRequest): ViewerChannel & { close(): void } => {
+    const view: View = {
+      table,
+      viewport: null,
+      series,
+      state: {
+        columns: [],
+        row_count: 0,
+        status: 'loading',
+        sort: [],
+        filters: {},
+        filter_errors: {},
+        applied: 0,
+      },
+      messages: new Set(),
+      states: new Set(),
+    };
+    views.add(view);
+    update(view);
+    // A series sends its points unasked, as the server does once it is open.
+    if (series != null) {
+      queueMicrotask(() => views.has(view) && push(view));
+    }
+    return {
+      send(message: ViewerRequest) {
+        if (message.type === 'viewport') {
+          view.viewport = { top: message.top, bottom: message.bottom };
+          push(view);
+        }
+      },
+      onMessage(handler) {
+        view.messages.add(handler);
+        return () => view.messages.delete(handler);
+      },
+      state: () => view.state,
+      onState(handler) {
+        view.states.add(handler);
+        return () => view.states.delete(handler);
+      },
+      close() {
+        views.delete(view);
+      },
+    };
+  };
+
   return {
     get tables() {
       return listing();
@@ -74,45 +133,8 @@ export function fakeKermodes(tables: Readonly<Record<string, readonly TableRow[]
       changes.add(listener);
       return () => changes.delete(listener);
     },
-    open(table): ViewerChannel & { close(): void } {
-      const view: View = {
-        table,
-        viewport: null,
-        state: {
-          columns: [],
-          row_count: 0,
-          status: 'loading',
-          sort: [],
-          filters: {},
-          filter_errors: {},
-          applied: 0,
-        },
-        messages: new Set(),
-        states: new Set(),
-      };
-      views.add(view);
-      update(view);
-      return {
-        send(message: ViewerRequest) {
-          if (message.type === 'viewport') {
-            view.viewport = { top: message.top, bottom: message.bottom };
-            push(view);
-          }
-        },
-        onMessage(handler) {
-          view.messages.add(handler);
-          return () => view.messages.delete(handler);
-        },
-        state: () => view.state,
-        onState(handler) {
-          view.states.add(handler);
-          return () => view.states.delete(handler);
-        },
-        close() {
-          views.delete(view);
-        },
-      };
-    },
+    open: table => add(table),
+    series: (table, request) => add(table, request),
     close() {
       views.clear();
     },

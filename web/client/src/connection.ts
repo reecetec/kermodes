@@ -1,4 +1,5 @@
 import {
+  type SeriesRequest,
   type ViewerBuffer,
   type ViewerChannel,
   type ViewerReply,
@@ -54,7 +55,7 @@ type TextMessage =
   | StateMessage
   | { type: 'error'; view: number | null; message: string; retry?: boolean };
 
-/** One table open in the viewer over the shared socket */
+/** One table open in the viewer, or one chart's series of it, over the shared socket */
 export class SocketView implements ViewerChannel {
   readonly id: number;
 
@@ -78,7 +79,9 @@ export class SocketView implements ViewerChannel {
     private readonly connection: KermodesConnection,
     id: number,
     table: string,
-    columns: ViewportColumn[]
+    columns: ViewportColumn[],
+    // What a chart asks of the table, instead of rows to view
+    private readonly series?: SeriesRequest
   ) {
     this.id = id;
     this.table = table;
@@ -145,9 +148,11 @@ export class SocketView implements ViewerChannel {
 
   /** @internal The messages that reopen this view on a new socket */
   reopenMessages(): object[] {
-    const { replay } = this;
+    const { replay, series } = this;
     return [
-      { type: 'open', view: this.id, table: this.table },
+      series == null
+        ? { type: 'open', view: this.id, table: this.table }
+        : { type: 'series', view: this.id, table: this.table, ...series },
       ...['filter', 'sort', 'viewport']
         .map(kind => replay.get(kind))
         .filter(message => message != null)
@@ -236,11 +241,20 @@ export class KermodesConnection {
 
   /** Open `table` in a new view */
   open(table: string): SocketView {
+    return this.add(table);
+  }
+
+  /** Open a chart's series of `table`: its points, sent again as the table changes */
+  series(table: string, request: SeriesRequest): SocketView {
+    return this.add(table, request);
+  }
+
+  private add(table: string, series?: SeriesRequest): SocketView {
     const id = this.nextViewId;
     this.nextViewId += 1;
     const columns =
       this.tables.find(info => info.name === table)?.columns ?? [];
-    const view = new SocketView(this, id, table, columns);
+    const view = new SocketView(this, id, table, columns, series);
     this.views.set(id, view);
     if (this.socket?.readyState === OPEN) {
       view.reopenMessages().forEach(message => this.sendText(message));
@@ -343,7 +357,7 @@ export class KermodesConnection {
       return;
     }
     const { header, rows, keys } = parseFrame(data as ArrayBuffer);
-    if (header.type === 'rows' && this.retries.has(header.view)) {
+    if ((header.type === 'rows' || header.type === 'series') && this.retries.has(header.view)) {
       clearTimeout(this.retries.get(header.view)?.timer);
       this.retries.delete(header.view);
     }

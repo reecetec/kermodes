@@ -50,6 +50,13 @@
   --negative: #ff9b94;
   --date: #e5c07b;
   --null: #ffffff0a;
+  /* Chart series, in order: distinct at a glance, none read as a sign */
+  --chart-1: #7aa7ff;
+  --chart-2: #e5c07b;
+  --chart-3: #c39bf0;
+  --chart-4: #67c7d9;
+  --chart-5: #f2a477;
+  --chart-6: #a9b4c2;
 
   --scrollbar: #ffffff2e;
   --scrollbar-hover: #ffffff4d;
@@ -97,6 +104,13 @@
   --negative: #c03a2b;
   --date: #8a5a00;
   --null: #0000000a;
+
+  --chart-1: #2a5fd0;
+  --chart-2: #9a6a00;
+  --chart-3: #7b45c0;
+  --chart-4: #0f7f93;
+  --chart-5: #c25a1c;
+  --chart-6: #5e6b7a;
 
   --scrollbar: #00000033;
   --scrollbar-hover: #00000052;

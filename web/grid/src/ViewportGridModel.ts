@@ -88,6 +88,11 @@ export function changedCells(
  * decoded from Arrow, with the key of each row. Rows outside the window read
  * as empty (still loading). Also holds what the header shows (the sort) and
  * which cells are flashing.
+ *
+ * Reversed, the grid's rows are the table's last first (row 0 is the last
+ * position), as an append table's newest at the top, still read by position;
+ * a sort shows its own order instead. `positionOf` maps a row to its position,
+ * and back, since the mapping is its own inverse.
  */
 export class ViewportGridModel extends GridModel {
   private viewColumns: readonly ViewportColumn[];
@@ -116,10 +121,38 @@ export class ViewportGridModel extends GridModel {
 
   private listeners = new Set<() => void>();
 
+  private reversed = false;
+
   constructor(columns: readonly ViewportColumn[] = [], rowCount = 0) {
     super();
     this.viewColumns = columns;
     this.totalRowCount = rowCount;
+  }
+
+  /** Show the table's rows last first, unless it is sorted */
+  setReversed(reversed: boolean): void {
+    if (reversed !== this.reversed) {
+      this.reversed = reversed;
+      this.textCache.clear();
+      this.notify();
+    }
+  }
+
+  /** The table position a grid row shows (and the row showing a position) */
+  positionOf(row: ModelIndex): number {
+    return this.reversed && this.sort.length === 0 ? this.totalRowCount - 1 - row : row;
+  }
+
+  /** The positions the grid rows `top..bottom` show, lowest first */
+  positionsOf(top: ModelIndex, bottom: ModelIndex): { top: number; bottom: number } {
+    const [a, b] = [this.positionOf(top), this.positionOf(bottom)];
+    return { top: Math.max(0, Math.min(a, b)), bottom: Math.max(0, a, b) };
+  }
+
+  /** The row's index in the window, or -1 when it has not arrived */
+  private indexOf(row: ModelIndex): number {
+    const index = this.positionOf(row) - this.windowStart;
+    return index >= 0 && index < this.windowRowCount ? index : -1;
   }
 
   get rowCount(): number {
@@ -240,23 +273,23 @@ export class ViewportGridModel extends GridModel {
 
   /** Whether the row at `row` has arrived */
   isRowLoaded(row: ModelIndex): boolean {
-    return (
-      row >= this.windowStart && row < this.windowStart + this.windowRowCount
-    );
+    return this.indexOf(row) >= 0;
   }
 
   /** The raw value at a cell: undefined when the row has not arrived, null for a null */
   valueAt(column: ModelIndex, row: ModelIndex): unknown {
-    if (!this.isRowLoaded(row)) {
+    const index = this.indexOf(row);
+    if (index < 0) {
       return undefined;
     }
-    return this.vectors[column]?.get(row - this.windowStart) ?? null;
+    return this.vectors[column]?.get(index) ?? null;
   }
 
   /** Start a flash on one cell, eg. to show it was copied */
   flashCell(column: ModelIndex, row: ModelIndex, now = performance.now()): void {
-    if (this.isRowLoaded(row)) {
-      this.flashes.set(`${this.keys[row - this.windowStart]}:${column}`, now);
+    const index = this.indexOf(row);
+    if (index >= 0) {
+      this.flashes.set(`${this.keys[index]}:${column}`, now);
       this.notify();
     }
   }
@@ -282,7 +315,7 @@ export class ViewportGridModel extends GridModel {
       if (index !== undefined) {
         draw(
           Number(cell.slice(separator + 1)),
-          this.windowStart + index,
+          this.positionOf(this.windowStart + index),
           (now - started) / FLASH_DURATION_MS
         );
       }
@@ -302,10 +335,11 @@ export class ViewportGridModel extends GridModel {
   }
 
   textForCell(column: ModelIndex, row: ModelIndex): string {
-    if (!this.isRowLoaded(row)) {
+    const index = this.indexOf(row);
+    if (index < 0) {
       return '';
     }
-    const key = (row - this.windowStart) * this.viewColumns.length + column;
+    const key = index * this.viewColumns.length + column;
     let text = this.textCache.get(key);
     if (text === undefined) {
       const value = this.valueAt(column, row);

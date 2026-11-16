@@ -11,6 +11,7 @@ mod ops;
 mod order;
 mod parallel;
 mod rolling;
+pub mod series;
 mod session;
 mod slots;
 mod sort;
