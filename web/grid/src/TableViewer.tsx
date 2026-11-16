@@ -439,8 +439,7 @@ export function TableViewer({
       channel.onMessage((header, buffers) => {
         const table = tableFromIPC(toBytes(buffers[0]));
         if (header.type === 'rows') {
-          model.setRowCount(header.total);
-          model.setWindow(header.start, table, toKeys(buffers[1]));
+          model.setWindow(header.start, table, toKeys(buffers[1]), header.total);
           setHasRows(true);
         } else if (header.type === 'fetched') {
           fetcher.receive(header.id, table);

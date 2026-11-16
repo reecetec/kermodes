@@ -130,10 +130,16 @@ export class ViewportGridModel extends GridModel {
 
   private reversed = false;
 
+  // The table's row count when the window was read. Reversed rows are mapped by it, not by the
+  // latest count: a count arriving ahead of its rows would otherwise shift every row shown onto
+  // positions not yet loaded, blanking the top rows for a paint (a flicker on every tick).
+  private windowTotal: number;
+
   constructor(columns: readonly ViewportColumn[] = [], rowCount = 0) {
     super();
     this.viewColumns = columns;
     this.totalRowCount = rowCount;
+    this.windowTotal = rowCount;
   }
 
   /** Show the table's rows last first, unless it is sorted */
@@ -147,7 +153,7 @@ export class ViewportGridModel extends GridModel {
 
   /** The table position a grid row shows (and the row showing a position) */
   positionOf(row: ModelIndex): number {
-    return this.reversed && this.sort.length === 0 ? this.totalRowCount - 1 - row : row;
+    return this.reversed && this.sort.length === 0 ? this.windowTotal - 1 - row : row;
   }
 
   /** The positions the grid rows `top..bottom` show, lowest first */
@@ -198,8 +204,14 @@ export class ViewportGridModel extends GridModel {
     this.notify();
   }
 
-  /** Set the total row count of the table */
+  /**
+   * Set the total row count of the table. Rows already shown stay where they are until a
+   * window read at the new count arrives (`setWindow`).
+   */
   setRowCount(rowCount: number): void {
+    if (this.windowRowCount === 0) {
+      this.windowTotal = rowCount;
+    }
     if (rowCount !== this.totalRowCount) {
       this.totalRowCount = rowCount;
       this.notify();
@@ -208,13 +220,15 @@ export class ViewportGridModel extends GridModel {
 
   /**
    * Replace the window with the rows of `table`, which start at row position
-   * `start`, hold the columns in `columns` order, and have the given keys.
-   * Cells whose value changed since the last window, for the same key, flash.
+   * `start`, hold the columns in `columns` order, and have the given keys, read
+   * when the table had `total` rows. Cells whose value changed since the last
+   * window, for the same key, flash.
    */
   setWindow(
     start: number,
     table: Table,
     keys: BigUint64Array,
+    total: number,
     now = performance.now()
   ): void {
     const vectors = this.viewColumns.map((_, index) => table.getChildAt(index));
@@ -228,6 +242,8 @@ export class ViewportGridModel extends GridModel {
       this.flashes.set(`${keys[index]}:${column}`, now);
     }
 
+    this.totalRowCount = total;
+    this.windowTotal = total;
     this.windowStart = start;
     this.windowRowCount = table.numRows;
     this.vectors = vectors;
@@ -250,6 +266,7 @@ export class ViewportGridModel extends GridModel {
   private clearWindow(): void {
     this.windowStart = 0;
     this.windowRowCount = 0;
+    this.windowTotal = this.totalRowCount;
     this.vectors = [];
     this.keys = new BigUint64Array(0);
     this.keyIndex = new Map();

@@ -78,7 +78,7 @@ describe('ViewportGridModel', () => {
 
   it('formats the window rows by column type', () => {
     const model = new ViewportGridModel(COLUMNS, 1_000_000_000);
-    model.setWindow(500, twoRows(), KEYS);
+    model.setWindow(500, twoRows(), KEYS, 1_000_000_000);
 
     expect(model.textForCell(0, 500)).toBe('true');
     expect(model.textForCell(1, 500)).toBe('1,234,567');
@@ -106,7 +106,7 @@ describe('ViewportGridModel', () => {
 
   it('shows nulls as empty muted cells and rows outside the window as blank', () => {
     const model = new ViewportGridModel(COLUMNS, 1_000);
-    model.setWindow(10, twoRows(), KEYS);
+    model.setWindow(10, twoRows(), KEYS, 1_000);
 
     expect(model.textForCell(4, 11)).toBe('');
     expect(model.backgroundColorForCell(4, 11, theme)).toBe(theme.nullBackgroundColor);
@@ -118,7 +118,7 @@ describe('ViewportGridModel', () => {
 
   it('colours numbers by sign and dates, as Deephaven does', () => {
     const model = new ViewportGridModel(COLUMNS, 2);
-    model.setWindow(0, twoRows(), KEYS);
+    model.setWindow(0, twoRows(), KEYS, 2);
     const color = (column: number, row: number) => model.colorForCell(column, row, theme);
 
     expect([color(1, 0), color(1, 1)]).toEqual([
@@ -148,7 +148,8 @@ describe('ViewportGridModel', () => {
         n: vectorFromArray([BigInt(0)], new Int64()),
         x: vectorFromArray([0], new Float64()),
       }),
-      BigUint64Array.of(BigInt(1))
+      BigUint64Array.of(BigInt(1)),
+      1
     );
     expect([zeros.colorForCell(0, 0, theme), zeros.colorForCell(1, 0, theme)]).toEqual([
       theme.zeroNumberColor,
@@ -158,7 +159,7 @@ describe('ViewportGridModel', () => {
 
   it('drops the window when the columns change', () => {
     const model = new ViewportGridModel(COLUMNS, 2);
-    model.setWindow(0, twoRows(), KEYS);
+    model.setWindow(0, twoRows(), KEYS, 2);
     model.setColumns([{ name: 'sym', type: 'utf8' }]);
 
     expect(model.columnCount).toBe(1);
@@ -171,18 +172,22 @@ describe('ViewportGridModel', () => {
     // The table's last two positions, 998 (AAPL) and 999 (a null sym)
     const model = new ViewportGridModel(COLUMNS, 1_000);
     model.setReversed(true);
-    model.setWindow(998, twoRows(), KEYS);
+    model.setWindow(998, twoRows(), KEYS, 1_000);
     expect([model.valueAt(sym, 0), model.textForCell(sym, 1)]).toEqual([null, 'AAPL']);
     // The rows on screen are asked for as the positions behind them
     expect(model.positionsOf(0, 1)).toEqual({ top: 998, bottom: 999 });
     expect(model.positionsOf(0, 1_500)).toEqual({ top: 0, bottom: 999 });
 
-    // A new row goes on top: the ones shown move down a row until the window catches up
+    // A count arriving ahead of its rows moves nothing shown (each tick sends the count first)
     model.setRowCount(1_001);
-    expect([model.isRowLoaded(0), model.textForCell(sym, 2)]).toEqual([false, 'AAPL']);
+    expect([model.rowCount, model.valueAt(sym, 0), model.textForCell(sym, 1)]).toEqual([1_001, null, 'AAPL']);
+    // The window read at that count puts the new row on top, the others down a row
+    model.setWindow(999, twoRows(), KEYS, 1_001);
+    expect([model.valueAt(sym, 0), model.textForCell(sym, 1), model.isRowLoaded(2)]).toEqual([null, 'AAPL', false]);
+    expect(model.positionsOf(0, 1)).toEqual({ top: 999, bottom: 1_000 });
 
     // A sort shows its own order
-    model.setRowCount(1_000);
+    model.setWindow(998, twoRows(), KEYS, 1_000);
     model.setSort([{ column: 'px', descending: false }]);
     expect([model.textForCell(sym, 998), model.positionsOf(0, 1)]).toEqual(['AAPL', { top: 0, bottom: 1 }]);
   });
@@ -263,7 +268,7 @@ describe('ViewportGridModel change highlighting', () => {
       ),
     });
     const keys = BigUint64Array.from(rows, row => BigInt(row[0]));
-    model.setWindow(start, tableFromIPC(tableToIPC(table, 'stream')), keys, now);
+    model.setWindow(start, tableFromIPC(tableToIPC(table, 'stream')), keys, 100, now);
   }
 
   function flashes(model: ViewportGridModel, now: number): number[][] {
