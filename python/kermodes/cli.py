@@ -209,6 +209,23 @@ def main(argv: list[str] | None = None) -> None:
         type=Path,
         help="an app's built frontend (without one, only its tables are served)",
     )
+    run.add_argument(
+        "--replay",
+        metavar="FIRST..LAST",
+        help="run a deployment or app over past dates as a backtest (2026-11-10..2026-11-14, "
+        "or one date): its tables tick through the stored rows in event-time order, and it "
+        "writes nothing",
+    )
+    run.add_argument(
+        "--speed",
+        type=float,
+        help="with --replay, pace it to this many times event time; as fast as it runs without",
+    )
+    run.add_argument(
+        "--step",
+        default="100ms",
+        help="with --replay, the event time each cycle covers",
+    )
 
     merge = commands.add_parser(
         "merge",
@@ -258,6 +275,16 @@ def main(argv: list[str] | None = None) -> None:
         run_ticker(args.host, args.port, args.rate, args.symbols)
     elif args.command == "manifest":
         print(json.dumps(projects.discover(args.project).manifest(), indent=2))
+    elif args.command == "run" and args.replay:
+        run_backtest(
+            args.project,
+            args.resource,
+            args.server,
+            args.data_dir,
+            args.replay,
+            args.step,
+            args.speed,
+        )
     elif args.command == "run":
         run_resource(
             args.project,
@@ -337,6 +364,38 @@ def run_resource(
         projects.run(resource, db, ready, serving)
     except KeyboardInterrupt:
         pass
+
+
+def run_backtest(
+    project: Path,
+    name: str,
+    server: str | None,
+    data_dir: Path | None,
+    dates: str,
+    step: str,
+    speed: float | None,
+) -> None:
+    """Runs a deployment or app over past `dates` (`FIRST..LAST`, or one date) and says what it
+    ran and what its tables ended with."""
+    first, _, last = dates.partition("..")
+    resource = projects.discover(project).resource(name)
+    db = km.local(data_dir) if data_dir else connect_when_up(server, "kermodes run")
+    replay = db.replay(first, last or first, step=step)
+    print(
+        f"replaying {name} over {first} to {last or first}; Ctrl-C to stop", flush=True
+    )
+    started = time.monotonic()
+    try:
+        tables = projects.backtest(resource, replay, speed)
+    except KeyboardInterrupt:
+        tables = {}
+        print("stopped", flush=True)
+    print(
+        f"{replay.cycles:,} cycles, {replay.rows:,} rows in {time.monotonic() - started:.1f}s",
+        flush=True,
+    )
+    for table_name, table in tables.items():
+        print(f"  {table_name}: {len(table):,} rows", flush=True)
 
 
 def run_dev(

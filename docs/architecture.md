@@ -661,9 +661,31 @@ Anything outside this set runs as Python jobs over Arrow batches.
 The engine is driven by an injectable clock.
 
 - Real-time clock: cycles on a fixed period (default 100 ms) or on input, whichever comes first.
-- Replay clock: feeds historical rows in `ts_column` order at a chosen speed (or as fast as
-  possible). The same graph run under replay is a backtest, and deterministic replay is the basis
-  of pipeline tests (§11.3).
+- Replay clock: feeds stored rows back in event-time order, and the same graph run on it is a
+  backtest; deterministic replay is the basis of pipeline tests (§11.3).
+
+  ```python
+  replay = db.replay("2026-11-10", "2026-11-14")  # finished dates; step="100ms"
+  board = market(replay)  # the deployment's own function, given the replay as its db
+  replay.run()  # or step() a cycle at a time; run(speed=60) paces it
+  ```
+
+  `kermodes run NAME --replay 2026-11-10..2026-11-14` does the same for a project's deployment
+  or app and reports its tables at the end. A replay's `live_table(name, ts="ts")` reads each
+  date through history (merged dates from the lake, the rest from weir), one date in memory per
+  table, and feeds it in a session of its own (`kermodes_core::replay`):
+
+  - Time moves on a grid of `step` from the epoch; each cycle feeds every row due by its time,
+    and a stretch with no rows is skipped, so a night costs nothing. The same rows and step
+    give the same cycles and outputs.
+  - An append table's date is ordered by `ts`, ties as written. A keyed table replays its log
+    in written order (reordering it would change its state), from its first date's checkpoint;
+    a change timed earlier than the one before, or not at all (a delete), happens with it.
+  - A row with no time arrives with the row before it or its date's first timed row.
+  - A replay reads the store and never writes it: `create_table` checks the table is as
+    declared, and `publish` refuses.
+  - The event-time column is named per table (`ts` by default) until tables declare theirs in
+    the catalog with schema versions (§5.4).
 
 Late data policy is per operator: windows declare allowed lateness; as-of joins use the current
 state at cycle time.

@@ -41,7 +41,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from kermodes._native import KermodesError, Session, Table
+from kermodes._native import KermodesError, Replay, Session, Table
+
+# What a resource's function is given: the platform's tables live, or replayed (a backtest).
+type Db = Session | Replay
 
 UPDATES = ("auto", "manual", "on_start")
 ROLLOUTS = ("rolling", "recreate")
@@ -99,7 +102,7 @@ class Deployment:
     platform's tables. The session keeps running after `function` returns."""
 
     name: str
-    function: Callable[[Session], object]
+    function: Callable[[Db], object]
     # The function's name in the entry module, which the manifest names it by.
     function_name: str
     update: Update = "auto"
@@ -118,7 +121,7 @@ class App:
     `/apps/<project>/<name>/`."""
 
     name: str
-    function: Callable[[Session], object]
+    function: Callable[[Db], object]
     function_name: str
     path: str
     update: Update = "auto"
@@ -141,13 +144,13 @@ def app(
     rollout: Rollout = "rolling",
     cpu: float | str = DEFAULT_CPU,
     memory: int | str = DEFAULT_MEMORY,
-) -> Callable[[Callable[[Session], object]], Callable[[Session], object]]:
+) -> Callable[[Callable[[Db], object]], Callable[[Db], object]]:
     """Declares the decorated `function(db)` as the app of the directory it is in: in
     `apps/<name>/app.py`, the app `<name>`, whose page is `apps/<name>/App.tsx`. Its process
     serves the page and the tables the function returns (`{"name": table}`, or nothing), beside
     the platform's; `cpu` and `memory` as for a deployment."""
 
-    def declare(function: Callable[[Session], object]) -> Callable[[Session], object]:
+    def declare(function: Callable[[Db], object]) -> Callable[[Db], object]:
         function_name = getattr(function, "__name__", None)
         if function_name is None:
             raise KermodesError("@km.app() decorates a function")
@@ -208,12 +211,12 @@ def deployment(
     rollout: Rollout = "rolling",
     cpu: float | str = DEFAULT_CPU,
     memory: int | str = DEFAULT_MEMORY,
-) -> Callable[[Callable[[Session], object]], Callable[[Session], object]]:
+) -> Callable[[Callable[[Db], object]], Callable[[Db], object]]:
     """Declares the decorated `function(db)` as a deployment, named after it unless `name`, with
     `cpu` (cores, or a quantity such as "500m") and `memory` (bytes, or a quantity such as
     "2Gi") as its requests and limits."""
 
-    def declare(function: Callable[[Session], object]) -> Callable[[Session], object]:
+    def declare(function: Callable[[Db], object]) -> Callable[[Db], object]:
         function_name = getattr(function, "__name__", None)
         if function_name is None:
             raise KermodesError("@km.deployment() decorates a function")
@@ -438,6 +441,27 @@ def run(
         # Like a persistent query's script: what it built keeps ticking until it is stopped.
         while True:
             time.sleep(3600)
+
+
+def backtest(
+    resource: Resource, replay: Replay, speed: float | None = None
+) -> dict[str, Table]:
+    """Runs a deployment's or an app's function on `replay` (`Session.replay`) to the end of its
+    dates: the code that runs live, run over the past as a backtest (architecture.md §9.4).
+    The tables it returned, as they ended; none for a function returning nothing."""
+    if isinstance(resource, Ingester):
+        raise KermodesError(
+            f"`{resource.name}` is an ingester: it reads a feed, and a replay has none"
+        )
+    tables = resource.function(replay) or {}
+    if not isinstance(tables, dict) or not all(
+        isinstance(k, str) and isinstance(v, Table) for k, v in tables.items()
+    ):
+        raise KermodesError(
+            f"`{resource.name}` returns its tables as {{name: table}}, or nothing"
+        )
+    replay.run(speed)
+    return tables
 
 
 def _check_policy(resource: Resource) -> None:

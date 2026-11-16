@@ -1,6 +1,7 @@
 //! `kermodes._native`: the engine exposed to Python. Engine work runs with the interpreter released.
 
 mod publish;
+mod replay;
 mod stored;
 
 use std::net::SocketAddr;
@@ -540,6 +541,26 @@ impl Session {
             lake: self.lake()?,
             name,
         })
+    }
+
+    /// A replay of the stored tables' past dates `first` to `last` (`YYYY-MM-DD`, before
+    /// today), a `Replay`: its `live_table`s tick as it reaches each row's time, every `step` of
+    /// event time. The same code that runs on this session runs on it as a backtest.
+    #[pyo3(signature = (first, last, step="100ms"))]
+    fn replay(&self, first: &str, last: &str, step: &str) -> PyResult<replay::Replay> {
+        let tables = self.stored()?.clone();
+        let (first, last) = (
+            kermodes_weir::Date::parse(first).map_err(store_error)?,
+            kermodes_weir::Date::parse(last).map_err(store_error)?,
+        );
+        let today = kermodes_weir::Date::of_ns(stored::now_ns());
+        if first > last || last >= today {
+            return Err(PyValueError::new_err(format!(
+                "a replay runs over finished dates, the first no later than the last: not \
+                 {first} to {last} (today, {today}, is still being written)"
+            )));
+        }
+        replay::Replay::new(tables, self.lake()?, first, last, parse_period(step)?)
     }
 
     /// Moves a past `date` (`YYYY-MM-DD`) of the stored table `name` from weir into its
@@ -1694,7 +1715,7 @@ mod _native {
     #[pymodule_export]
     use super::{
         HistoricalTable, Ingest, IngestStats, Server, Session, StoreServer, Table, Ticker, Viewer,
-        Writer, control, merge, publish::Publication, stored::StoredTable, ticker,
+        Writer, control, merge, publish::Publication, replay::Replay, stored::StoredTable, ticker,
     };
 
     use pyo3::prelude::*;

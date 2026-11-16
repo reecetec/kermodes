@@ -149,7 +149,7 @@ impl StoredTable {
     }
 }
 
-fn now_ns() -> i64 {
+pub(crate) fn now_ns() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as i64)

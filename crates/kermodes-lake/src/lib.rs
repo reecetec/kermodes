@@ -12,7 +12,7 @@ mod weir;
 
 pub use bounds::{Bound, Literal, column_bounds, date_bounds};
 pub use files::{
-    Batches, DATE, Lake, TARGET_FILE_BYTES, Written, dated, history_columns, with_date_column,
+    Batches, DATE, Lake, OP, TARGET_FILE_BYTES, Written, dated, history_columns, with_date_column,
     with_op,
 };
 pub use merge::{GARBAGE_GRACE, Merged, collect_garbage, merge};
