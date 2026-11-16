@@ -449,25 +449,33 @@ export function TableViewer({
     [channel, model, fetcher]
   );
 
-  // Redraw on every model change, and keep redrawing while cells flash
+  // Redraw on every model change, and again when a flash's fade next steps: not every frame,
+  // which on a table always changing somewhere kept the canvas repainting at 60 frames a second
   useEffect(() => {
     let frame: number | null = null;
-    const animate = (): void => {
+    let timer: number | undefined;
+    const schedule = (): void => {
+      clearTimeout(timer);
+      const wait = model.msToNextFlashStep();
+      if (wait != null) {
+        timer = window.setTimeout(() => {
+          frame ??= requestAnimationFrame(redraw);
+        }, wait);
+      }
+    };
+    const redraw = (): void => {
       frame = null;
       gridRef.current?.updateCanvas();
-      if (model.hasFlashes()) {
-        frame = requestAnimationFrame(animate);
-      }
+      schedule();
     };
     const unsubscribe = model.subscribe(() => {
       gridRef.current?.forceUpdate();
       setRowCount(model.rowCount);
-      if (frame == null && model.hasFlashes()) {
-        frame = requestAnimationFrame(animate);
-      }
+      schedule();
     });
     return () => {
       unsubscribe();
+      clearTimeout(timer);
       if (frame != null) {
         cancelAnimationFrame(frame);
       }

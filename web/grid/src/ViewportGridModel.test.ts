@@ -19,7 +19,12 @@ import {
 } from 'apache-arrow';
 import theme from './GridTheme';
 import { type ViewportColumn } from '@kermodes/client';
-import ViewportGridModel, { changedCells, FLASH_DURATION_MS, type RowWindow } from './ViewportGridModel';
+import ViewportGridModel, {
+  changedCells,
+  FLASH_DURATION_MS,
+  FLASH_STEPS,
+  type RowWindow,
+} from './ViewportGridModel';
 
 const KEYS = BigUint64Array.of(BigInt(11), BigInt(12));
 
@@ -274,8 +279,34 @@ describe('ViewportGridModel change highlighting', () => {
     push(model, 0, [[3, 'C', 3], [2, 'B', 5], [1, 'A', 1]], 100);
 
     expect(flashes(model, 100)).toEqual([[1, 1]]);
-    expect(model.hasFlashes(100 + FLASH_DURATION_MS - 1)).toBe(true);
-    expect(model.hasFlashes(100 + FLASH_DURATION_MS)).toBe(false);
+    expect(model.msToNextFlashStep(100 + FLASH_DURATION_MS - 1)).toBe(1);
+    expect(model.msToNextFlashStep(100 + FLASH_DURATION_MS)).toBeNull();
+  });
+
+  it('fades in steps, and says when the next one is due', () => {
+    const model = new ViewportGridModel(columns, 100);
+    push(model, 0, [[1, 'A', 1], [2, 'B', 1]], 0);
+    push(model, 0, [[1, 'A', 2], [2, 'B', 1]], 1_000);
+    const step = FLASH_DURATION_MS / FLASH_STEPS;
+    const progress = (now: number) => {
+      let seen = -1;
+      model.forEachFlash(now, (_column, _row, value) => {
+        seen = value;
+      });
+      return seen;
+    };
+    // The same look all through a step: nothing to redraw until the next
+    expect([progress(1_000), progress(1_000 + step - 1), progress(1_000 + step)]).toEqual([
+      0,
+      0,
+      1 / FLASH_STEPS,
+    ]);
+    expect(model.msToNextFlashStep(1_000 + 10)).toBe(step - 10);
+    // Two cells flashing: the next redraw is the earlier of their steps
+    push(model, 0, [[1, 'A', 2], [2, 'B', 2]], 1_000 + 30);
+    expect(model.msToNextFlashStep(1_000 + step - 5)).toBe(5);
+    // Past the first cell's step, the second cell's is next
+    expect(model.msToNextFlashStep(1_000 + step + 10)).toBe(20);
   });
 
   it('does not flash rows scrolled into view', () => {

@@ -7,6 +7,13 @@ import { type SortKey, type ViewportColumn } from '@kermodes/client';
 /** How long a changed or copied cell stays highlighted */
 export const FLASH_DURATION_MS = 600;
 
+/**
+ * The steps a flash fades in. Each step redraws the whole grid, so a smooth fade (a redraw every
+ * frame) on a table always changing somewhere, such as a board, kept the canvas repainting 60
+ * times a second; four steps look the same in a glance at a fraction of the work.
+ */
+export const FLASH_STEPS = 4;
+
 const IS_NUMERIC: Readonly<Record<string, true>> = {
   int32: true,
   int64: true,
@@ -294,15 +301,24 @@ export class ViewportGridModel extends GridModel {
     }
   }
 
-  /** Whether any cell is still flashing at `now` */
-  hasFlashes(now = performance.now()): boolean {
+  /**
+   * Milliseconds until a flash next looks different (its next step, or its end), when the grid
+   * must redraw; null when no cell is flashing.
+   */
+  msToNextFlashStep(now = performance.now()): number | null {
     this.pruneFlashes(now);
-    return this.flashes.size > 0;
+    const step = FLASH_DURATION_MS / FLASH_STEPS;
+    let next: number | null = null;
+    this.flashes.forEach(started => {
+      const wait = step - ((now - started) % step);
+      next = next == null ? wait : Math.min(next, wait);
+    });
+    return next;
   }
 
   /**
    * Call `draw` for each flashing cell in the window with how far its flash has
-   * faded, from 0 (just started) to 1 (gone).
+   * faded, from 0 (just started) toward 1 (gone), in `FLASH_STEPS` steps.
    */
   forEachFlash(
     now: number,
@@ -313,10 +329,11 @@ export class ViewportGridModel extends GridModel {
       const separator = cell.indexOf(':');
       const index = this.keyIndex.get(BigInt(cell.slice(0, separator)));
       if (index !== undefined) {
+        const step = Math.floor(((now - started) / FLASH_DURATION_MS) * FLASH_STEPS);
         draw(
           Number(cell.slice(separator + 1)),
           this.positionOf(this.windowStart + index),
-          (now - started) / FLASH_DURATION_MS
+          step / FLASH_STEPS
         );
       }
     });
