@@ -9,8 +9,9 @@ const percent = new Intl.NumberFormat('en-US', { signDisplay: 'exceptZero', maxi
 
 /**
  * A market dashboard: the day's figures across the top, the board of every symbol (the app's own
- * table), and the tape following md.ticks' end beside the biggest movers. Each table is the
- * platform's own viewer, filling its panel; the panels resize, and keep their sizes.
+ * table), and the tape following md.ticks' end above the biggest movers. Each table is the
+ * platform's own viewer, filling its panel; the panels resize, dock, and tab, and the browser
+ * keeps how they are arranged.
  */
 export default function App() {
   // Only its size: the last row is the least there is to ask for.
@@ -29,11 +30,11 @@ export default function App() {
           sign={leader?.change_pct}
         />
       </Stats>
-      <Split id="market" sizes={[60, 40]}>
+      <Split sizes={[60, 40]}>
         <Panel title="Board" actions={<Status status={ticks.status} />}>
           <Table name="board" />
         </Panel>
-        <Split id="market-side" direction="vertical" sizes={[62, 38]}>
+        <Split direction="vertical" sizes={[62, 38]}>
           <Panel title="Tape">
             <Table name="md.ticks" follow />
           </Panel>
