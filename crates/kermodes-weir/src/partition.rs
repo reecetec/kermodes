@@ -8,6 +8,9 @@
 //! crash left beyond that point is never read. A crash loses at most the batch being written,
 //! which was never acknowledged. Sequence numbers rise strictly; a batch at or below the last one
 //! is a resend and is dropped.
+//!
+//! A stream's schema keeps each column's ID (§5.4), so a segment is read in the shape it was
+//! written in and projected by ID onto whatever shape its reader holds.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Take, Write};
@@ -17,8 +20,9 @@ use arrow::buffer::Buffer;
 use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::{StreamDecoder, StreamReader};
 use arrow::ipc::writer::StreamWriter;
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
+use crate::shape::Shape;
 use crate::{Change, Error};
 
 /// Index file header: magic and format version. A new version is a new header; readers refuse
@@ -92,6 +96,8 @@ impl Entry {
 struct Segment {
     number: u32,
     entries: Vec<Entry>,
+    /// The columns its stream was written with.
+    shape: Shape,
 }
 
 /// The segment taking batches.
@@ -103,7 +109,8 @@ struct Open {
 
 pub(crate) struct Partition {
     dir: PathBuf,
-    schema: SchemaRef,
+    /// The columns new segments are written with.
+    shape: Shape,
     /// Segments no longer taking batches, in order.
     closed: Vec<Segment>,
     open: Option<Open>,
@@ -111,9 +118,10 @@ pub(crate) struct Partition {
 }
 
 impl Partition {
-    /// Opens (creating if needed) the partition in `dir`, recovering its segments. Writing starts
-    /// a new segment: one an earlier process left open is not appended to.
-    pub(crate) fn open(dir: &Path, schema: SchemaRef) -> Result<Self, Error> {
+    /// Opens (creating if needed) the partition in `dir`, recovering its segments; it writes
+    /// `shape`'s columns. Writing starts a new segment: one an earlier process left open is not
+    /// appended to.
+    pub(crate) fn open(dir: &Path, shape: Shape) -> Result<Self, Error> {
         fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
         let mut numbers = Vec::new();
         for entry in fs::read_dir(dir).map_err(|e| Error::io(dir, e))? {
@@ -140,7 +148,7 @@ impl Partition {
             .map(|e| e.seq);
         Ok(Self {
             dir: dir.to_owned(),
-            schema,
+            shape,
             closed,
             open: None,
             last_seq,
@@ -237,6 +245,7 @@ impl Partition {
                 path: data_path(&self.dir, segment.number),
                 end: last.end,
                 entries: segment.entries.clone(),
+                shape: segment.shape.clone(),
             });
         }
         Cursor {
@@ -268,15 +277,16 @@ impl Partition {
             .flat_map(|segment| segment.entries.iter().map(|e| (e.rows, e.ingest_ns)))
     }
 
-    /// The committed batches `first..first + count` (counting from 0), read directly: a batch's
-    /// bytes run from the end of the one before it, or of its segment's schema, to its own end.
-    /// A committed batch never changes, so this reads while writers go on appending.
+    /// The committed batches `first..first + count` (counting from 0) as `to`'s columns, read
+    /// directly: a batch's bytes run from the end of the one before it, or of its segment's
+    /// schema, to its own end. A committed batch never changes, so this reads while writers go
+    /// on appending.
     pub(crate) fn read_batches(
         &self,
         first: usize,
         count: usize,
+        to: &Shape,
     ) -> Result<Vec<RecordBatch>, Error> {
-        let header = schema_header(&self.schema)?;
         let mut batches = Vec::with_capacity(count);
         let mut skip = first;
         for segment in self.segments() {
@@ -288,6 +298,7 @@ impl Partition {
                 skip -= held;
                 continue;
             }
+            let header = schema_header(&segment.shape.segment_schema())?;
             let take = (count - batches.len()).min(held - skip);
             let path = data_path(&self.dir, segment.number);
             let mut file = File::open(&path).map_err(|e| Error::io(&path, e))?;
@@ -322,7 +333,9 @@ impl Partition {
             for entry in &segment.entries[skip..skip + take] {
                 let batch = decoder.decode(&mut body).map_err(arrow)?;
                 match batch {
-                    Some(batch) if batch.num_rows() as u64 == entry.rows => batches.push(batch),
+                    Some(batch) if batch.num_rows() as u64 == entry.rows => {
+                        batches.push(project(&segment.shape, batch, to)?);
+                    }
                     _ => {
                         return Err(Error::Corrupt(format!(
                             "{}: the stream does not hold the batches its index commits",
@@ -362,7 +375,7 @@ impl Partition {
                 .open(path)
                 .map_err(|e| Error::io(path, e))
         };
-        let stream = StreamWriter::try_new(create(&data)?, &self.schema)
+        let stream = StreamWriter::try_new(create(&data)?, &self.shape.segment_schema())
             .map_err(|e| Error::Arrow(format!("{}: {e}", data.display())))?;
         stream
             .get_ref()
@@ -381,11 +394,27 @@ impl Partition {
             segment: Segment {
                 number,
                 entries: Vec::new(),
+                shape: self.shape.clone(),
             },
             stream,
             index: index_file,
         })
     }
+}
+
+/// `batch`, written as `from`'s columns, as `to`'s. When they are the same columns the arrays
+/// are kept and only the schema changes: the stream's carries column IDs, a reader's does not.
+fn project(from: &Shape, batch: RecordBatch, to: &Shape) -> Result<RecordBatch, Error> {
+    if !from.reads_as(to) {
+        return from.project(&batch, to);
+    }
+    let rows = batch.num_rows();
+    RecordBatch::try_new_with_options(
+        to.schema.clone(),
+        batch.columns().to_vec(),
+        &RecordBatchOptions::new().with_row_count(Some(rows)),
+    )
+    .map_err(|e| Error::Arrow(e.to_string()))
 }
 
 /// A segment's committed batches: its stream up to the last committed byte, and each batch's
@@ -394,6 +423,7 @@ struct Committed {
     path: PathBuf,
     end: u64,
     entries: Vec<Entry>,
+    shape: Shape,
 }
 
 /// Committed batches of a partition, read one at a time (`Partition::cursor`).
@@ -410,12 +440,13 @@ impl Cursor {
         self.bytes
     }
 
-    /// The batches in order, decoded one at a time as they are taken.
-    pub(crate) fn batches(self) -> Batches {
+    /// The batches in order as `to`'s columns, decoded one at a time as they are taken.
+    pub(crate) fn batches(self, to: Shape) -> Batches {
         Batches {
             segments: self.segments.into_iter(),
             skip: self.skip,
             current: None,
+            to,
         }
     }
 }
@@ -426,6 +457,8 @@ pub(crate) struct Batches {
     skip: usize,
     /// The segment being read: its stream and the records of its batches still to come.
     current: Option<(Committed, StreamReader<Take<File>>, usize)>,
+    /// The columns delivered.
+    to: Shape,
 }
 
 impl Iterator for Batches {
@@ -483,7 +516,7 @@ impl Iterator for Batches {
                 return Some(Err(corrupt(segment)));
             }
             if *at > self.skip {
-                return Some(Ok((batch, entry.stamp())));
+                return Some(project(&segment.shape, batch, &self.to).map(|b| (b, entry.stamp())));
             }
         }
     }
@@ -498,9 +531,13 @@ pub(crate) struct InOrder {
     primed: bool,
 }
 
-pub(crate) fn in_order(cursors: impl IntoIterator<Item = Cursor>) -> InOrder {
+/// `cursors`' batches in commit order, as `to`'s columns.
+pub(crate) fn in_order(cursors: impl IntoIterator<Item = Cursor>, to: &Shape) -> InOrder {
     InOrder {
-        sources: cursors.into_iter().map(|c| (c.batches(), None)).collect(),
+        sources: cursors
+            .into_iter()
+            .map(|c| (c.batches(to.clone()), None))
+            .collect(),
         primed: false,
     }
 }
@@ -543,11 +580,19 @@ fn index_path(dir: &Path, number: u32) -> PathBuf {
 }
 
 /// The schema message a segment's stream starts with, as its writer wrote it: the same schema
-/// encodes to the same bytes.
+/// encodes to the same bytes (each field has one metadata key, so its order cannot vary).
 fn schema_header(schema: &SchemaRef) -> Result<Vec<u8>, Error> {
     let writer = StreamWriter::try_new(Vec::new(), schema)
         .map_err(|e| Error::Arrow(format!("cannot encode a schema: {e}")))?;
     Ok(writer.get_ref().clone())
+}
+
+/// The columns the stream at `data` was written with: its schema message, read alone.
+fn written_shape(data: &Path) -> Result<Shape, Error> {
+    let file = File::open(data).map_err(|e| Error::io(data, e))?;
+    let reader = StreamReader::try_new(file, None)
+        .map_err(|e| Error::Arrow(format!("{}: {e}", data.display())))?;
+    Ok(Shape::of_segment(&reader.schema()))
 }
 
 /// A segment's committed batches: its index records up to the first that fails its check. A
@@ -595,7 +640,11 @@ fn recover(dir: &Path, number: u32) -> Result<Option<Segment>, Error> {
             last.end
         )));
     }
-    Ok(Some(Segment { number, entries }))
+    Ok(Some(Segment {
+        number,
+        entries,
+        shape: written_shape(&data)?,
+    }))
 }
 
 #[cfg(test)]
@@ -606,6 +655,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Int64Type, Schema};
 
     use super::{Change, Partition};
+    use crate::shape::{ColumnId, Shape};
 
     /// A cursor from any batch delivers exactly the batches from there on, across segments,
     /// and counts their bytes.
@@ -614,7 +664,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("kermodes-cursor-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
-        let mut partition = Partition::open(&dir, schema.clone()).unwrap();
+        let shape = Shape::new(schema.clone(), Arc::new([ColumnId(1)]));
+        let mut partition = Partition::open(&dir, shape.clone()).unwrap();
         // About 24 MiB a batch: three to a 64 MiB segment, so ten batches span four segments of
         // three, three, three, and one.
         let rows = 3 << 20;
@@ -638,7 +689,7 @@ mod tests {
             assert!(cursor.bytes() < last_bytes || from == 10, "from {from}");
             last_bytes = cursor.bytes();
             let read: Vec<i64> = cursor
-                .batches()
+                .batches(shape.clone())
                 .map(|read| {
                     read.unwrap()
                         .0

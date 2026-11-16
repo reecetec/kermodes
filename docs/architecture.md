@@ -539,11 +539,12 @@ their branch, so one bucket holds every branch's history.
 The catalog lives in the control-plane database (Postgres in the cluster, SQLite locally). It is
 the only record of what history exists.
 
-- Tables: ID, branch, namespace, name, location, owning project, current schema version, layout
-  config.
-- Schema versions: columns by ID with name, type, default, and the version that introduced them.
-- Data files: path, first and last date, row count, byte size, schema version, per-column
-  min/max for key and `ts` columns.
+- Tables: ID, branch, namespace, name, location, owning project, layout config, and its columns:
+  each column's name, type, ID, and former names (§5.4). There is no table of versions: a weir
+  segment's schema and a Parquet file's `field_id`s say which columns it was written with, and
+  reads match them to the table's columns by ID. Columns stored before IDs have their positions,
+  counting from 1, as theirs, and so do segments and files written then.
+- Data files: path, first and last date, row count, byte size.
 - Merged dates: which dates of a table the lake serves (the routing flip).
 - A commit is one database transaction: the new files go in, the files they replace go out, and
   the dates written become merged. Replaced files are deleted after a grace period that covers

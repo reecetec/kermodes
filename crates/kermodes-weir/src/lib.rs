@@ -10,6 +10,7 @@ mod catalog;
 mod keyed;
 mod names;
 mod partition;
+mod shape;
 mod store;
 
 use std::fmt;
@@ -18,6 +19,7 @@ use std::path::Path;
 pub use catalog::{Garbage, HistoryCommit, HistoryDate, HistoryFile, TableEntry};
 pub use names::{Date, SourceId, TableName};
 pub use partition::Stamp;
+pub use shape::{ColumnId, Shape, widens};
 pub use store::{BRANCH, Pace, Store, Subscriber, Writer, conform, keys_only};
 
 /// What a batch is (§7.1): an append table's rows, or a keyed table's upserts, deletes, or the

@@ -3,14 +3,15 @@
 //! once it reaches the target size, so a big date lies in several. ZSTD, dictionaries, and
 //! page-level statistics with the page index, so readers skip by date, key, and time.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, Date32Array, Float64Array, Int64Array, RecordBatch, Scalar,
-    StringArray,
+    Array, ArrayRef, AsArray, Date32Array, Float64Array, Int64Array, RecordBatch,
+    RecordBatchOptions, Scalar, StringArray,
 };
 use arrow::compute::kernels::cmp::{gt_eq, lt_eq};
 use arrow::compute::{SortColumn, concat_batches, lexsort_to_indices, take_record_batch};
@@ -18,20 +19,20 @@ use arrow::datatypes::{DataType, Date32Type, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt, TryFutureExt};
-use kermodes_weir::{Change, Date, Error, HistoryDate, HistoryFile, TableEntry};
+use kermodes_weir::{Change, ColumnId, Date, Error, HistoryDate, HistoryFile, Shape, TableEntry};
 use object_store::aws::AmazonS3Builder;
 use object_store::buffered::BufWriter;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use object_store::prefix::PrefixStore;
 use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt};
-use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 use parquet::arrow::arrow_reader::{ArrowReaderOptions, RowSelection, RowSelector};
 use parquet::arrow::async_reader::{
     AsyncFileReader, MetadataSuffixFetch, ParquetRecordBatchStream,
 };
 use parquet::arrow::async_writer::AsyncArrowWriter;
+use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::errors::ParquetError;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
@@ -66,6 +67,63 @@ pub fn history_columns(entry: &TableEntry) -> Result<Schema, Error> {
     let mut fields = vec![Arc::new(Field::new(OP, DataType::Utf8, false))];
     fields.extend(entry.schema.fields().iter().cloned());
     Ok(Schema::new(fields))
+}
+
+/// `history_columns` as a file is written with them: each of the table's columns with its ID
+/// as its Parquet `field_id` (§8.1), so the file reads under the table's later columns.
+pub fn file_columns(entry: &TableEntry) -> Result<Schema, Error> {
+    let history = history_columns(entry)?;
+    let system = history.fields().len() - entry.ids.len();
+    let fields: Vec<Field> = history
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, field)| match i.checked_sub(system) {
+            None => field.as_ref().clone(),
+            Some(at) => field.as_ref().clone().with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_owned(),
+                entry.ids[at].0.to_string(),
+            )])),
+        })
+        .collect();
+    Ok(Schema::new(fields))
+}
+
+/// A history file's batch as the table's history has it now (`Date`, then
+/// `history_columns`): its columns matched by ID, so a file written under earlier columns reads
+/// under the current ones (§5.4); one written before columns had IDs, by position.
+pub fn as_current(entry: &TableEntry, batch: RecordBatch) -> Result<RecordBatch, Error> {
+    let schema = with_date_column(&history_columns(entry)?);
+    // `Date`, and a keyed table's `Op`, are history's own.
+    let system = schema.fields().len() - entry.ids.len();
+    let written = batch.schema();
+    let data = Schema::new(written.fields()[system..].to_vec());
+    let shape = Shape::with_ids(&data, |_, field| {
+        field
+            .metadata()
+            .get(PARQUET_FIELD_ID_META_KEY)
+            .and_then(|id| id.parse().ok())
+            .map(ColumnId)
+    });
+    let mut columns = batch.columns()[..system].to_vec();
+    let current = entry.shape();
+    if shape.reads_as(&current) {
+        columns.extend(batch.columns()[system..].iter().cloned());
+    } else {
+        let data = RecordBatch::try_new_with_options(
+            shape.schema.clone(),
+            batch.columns()[system..].to_vec(),
+            &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+        )
+        .map_err(arrow_error)?;
+        columns.extend(shape.project(&data, &current)?.columns().iter().cloned());
+    }
+    RecordBatch::try_new_with_options(
+        schema,
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+    .map_err(arrow_error)
 }
 
 /// A batch weir holds, as history keeps it (`history_columns`).

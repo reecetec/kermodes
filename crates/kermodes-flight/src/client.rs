@@ -12,8 +12,8 @@ use arrow_flight::utils::batches_to_flight_data;
 use arrow_flight::{Action, FlightData, FlightDescriptor, PutResult, Ticket};
 use futures::{StreamExt, TryStreamExt};
 use kermodes_weir::{
-    Change, Date, Error, Garbage, HistoryCommit, HistoryDate, HistoryFile, Pace, SourceId, Stamp,
-    Subscriber, TableEntry, TableName, conform, keys_only,
+    Change, ColumnId, Date, Error, Garbage, HistoryCommit, HistoryDate, HistoryFile, Pace,
+    SourceId, Stamp, Subscriber, TableEntry, TableName, conform, keys_only,
 };
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
@@ -168,11 +168,37 @@ impl Client {
         let key = names_from_json(&table["key"])?;
         // Absent from a server older than sorted tables: unsorted.
         let sort = names_from_json(&table["sort"])?;
+        let schema = schema_from_json(&table["columns"])?;
+        let columns = schema.fields().len();
+        // Absent from a server older than column IDs: each column's position, as its catalog
+        // has them, and no former names.
+        let ids = match table["ids"].as_array() {
+            None => (1..=columns as u32).map(ColumnId).collect(),
+            Some(ids) => ids
+                .iter()
+                .map(|id| {
+                    id.as_u64()
+                        .and_then(|id| u32::try_from(id).ok())
+                        .map(ColumnId)
+                })
+                .collect::<Option<Vec<_>>>()
+                .filter(|ids| ids.len() == columns)
+                .ok_or_else(|| {
+                    Error::Io(format!("the server's column IDs of {name} are unreadable"))
+                })?,
+        };
+        let was = match &table["was"] {
+            Value::Null => vec![Vec::new(); columns],
+            was => serde_json::from_value(was.clone())
+                .map_err(|e| Error::Io(format!("the server's former names of {name}: {e}")))?,
+        };
         Ok(TableEntry {
             id: table["id"].as_i64().ok_or_else(older)?,
             name: name.clone(),
             location: table["location"].as_str().ok_or_else(older)?.to_owned(),
-            schema: schema_from_json(&table["columns"])?,
+            schema,
+            ids: Arc::<[ColumnId]>::from(ids),
+            was,
             key,
             sort,
         })

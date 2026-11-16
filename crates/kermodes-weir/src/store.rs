@@ -421,6 +421,7 @@ impl Store {
                 }
             }
             let schema = state.entry.schema.clone();
+            let shape = state.entry.shape();
             let under_lock = left <= CATCH_UP_UNDER_LOCK && left_bytes <= CATCH_UP_UNDER_LOCK_BYTES;
             // Held through the delivery when little is left, so no write comes between.
             let (held, pace) = if under_lock {
@@ -435,7 +436,7 @@ impl Store {
                 caught_up.push((key, committed));
                 cursors.push(cursor);
             }
-            for read in in_order(cursors) {
+            for read in in_order(cursors, &shape) {
                 let (batch, stamp) = read?;
                 if !subscriber(&batch, stamp, pace) {
                     return Ok(schema);
@@ -514,7 +515,8 @@ impl Store {
                 .partitions
                 .get(&key)
                 .expect("a position's partition is held");
-            for batch in partition.read_batches(first as usize, count as usize)? {
+            let shape = state.entry.shape();
+            for batch in partition.read_batches(first as usize, count as usize, &shape)? {
                 let len = batch.num_rows() as u64;
                 let from = start.max(before) - before;
                 let to = end.min(before + len).saturating_sub(before);
@@ -576,13 +578,17 @@ impl Store {
         past(date)?;
         let log = self.log(name)?;
         let key = date.to_string();
-        let cursors: Vec<_> = lock(&log.state)
-            .partitions
-            .iter()
-            .filter(|((day, _), _)| *day == key)
-            .map(|(_, partition)| partition.cursor(0))
-            .collect();
-        for read in in_order(cursors) {
+        let (cursors, shape): (Vec<_>, _) = {
+            let state = lock(&log.state);
+            let cursors = state
+                .partitions
+                .iter()
+                .filter(|((day, _), _)| *day == key)
+                .map(|(_, partition)| partition.cursor(0))
+                .collect();
+            (cursors, state.entry.shape())
+        };
+        for read in in_order(cursors, &shape) {
             let (batch, stamp) = read?;
             each(batch, stamp)?;
         }
@@ -636,10 +642,7 @@ impl Store {
         let mut partitions = BTreeMap::new();
         for (date, stream) in partition_dirs(&dir)? {
             let path = dir.join(&date).join(stream.dir_name());
-            partitions.insert(
-                (date, stream),
-                Partition::open(&path, entry.schema.clone())?,
-            );
+            partitions.insert((date, stream), Partition::open(&path, entry.shape())?);
         }
         let clock = partitions
             .values()
@@ -763,7 +766,7 @@ impl Writer {
         let key = (date, Stream::Source(self.source.clone()));
         if !log.partitions.contains_key(&key) {
             let path = log.dir.join(&key.0).join(key.1.dir_name());
-            let partition = Partition::open(&path, log.entry.schema.clone())?;
+            let partition = Partition::open(&path, log.entry.shape())?;
             log.partitions.insert(key.clone(), partition);
         }
         let partition = log.partitions.get_mut(&key).expect("inserted above");
@@ -902,7 +905,7 @@ fn write_checkpoint(log: &mut TableLog, day: &str, state: &RecordBatch) -> Resul
     let key = (day.to_owned(), Stream::Checkpoint);
     if !log.partitions.contains_key(&key) {
         let path = log.dir.join(day).join(Stream::Checkpoint.dir_name());
-        let partition = Partition::open(&path, log.entry.schema.clone())?;
+        let partition = Partition::open(&path, log.entry.shape())?;
         log.partitions.insert(key.clone(), partition);
     }
     let partition = log.partitions.get_mut(&key).expect("inserted above");
@@ -919,7 +922,7 @@ fn fold_latest(log: &TableLog, day: &str, fold: &mut Fold) -> Result<(), Error> 
     let cursors = latest(log, day)
         .into_iter()
         .map(|(key, from)| log.partitions[&key].cursor(from));
-    for read in in_order(cursors.collect::<Vec<_>>()) {
+    for read in in_order(cursors.collect::<Vec<_>>(), &log.entry.shape()) {
         let (batch, stamp) = read?;
         fold.apply(batch, stamp.change)?;
     }

@@ -14,6 +14,7 @@ use arrow::datatypes::{Field, Schema, SchemaRef};
 use kermodes_core::{parse_type, type_name};
 use serde_json::Value;
 
+use crate::shape::{ColumnId, Shape};
 use crate::{Date, Error, SourceId, TableName};
 
 /// The catalog's format; a newer one is a migration, not a silent reinterpretation.
@@ -28,11 +29,22 @@ pub struct TableEntry {
     /// when the table is created (architecture.md §5.1).
     pub location: String,
     pub schema: SchemaRef,
+    /// Each column's ID (§5.4), in `schema`'s order.
+    pub ids: Arc<[ColumnId]>,
+    /// The names each column had before, in `schema`'s order: a rename keeps the column's ID.
+    pub was: Vec<Vec<String>>,
     /// A keyed table's key columns (§5.2), fixed when it is created; empty for an append table.
     pub key: Vec<String>,
     /// The columns history sorts an append table's dates by (§8.1), as it was created; empty
     /// for none, and for a keyed table, whose history is its log in commit order.
     pub sort: Vec<String>,
+}
+
+impl TableEntry {
+    /// The table's columns now, with their IDs.
+    pub fn shape(&self) -> Shape {
+        Shape::new(self.schema.clone(), self.ids.clone())
+    }
 }
 
 /// A file of a table's history: its name within the table's location, the dates it holds, and
@@ -136,7 +148,9 @@ impl Catalog {
         }
         named_columns(name, schema, "key", key)?;
         named_columns(name, schema, "sort", sort)?;
-        let columns = encode(schema).to_string();
+        let ids: Arc<[ColumnId]> = (1..=schema.fields().len() as u32).map(ColumnId).collect();
+        let was = vec![Vec::new(); ids.len()];
+        let columns = encode(schema, &ids, &was).to_string();
         let json =
             |names: &[String]| (!names.is_empty()).then(|| serde_json::json!(names).to_string());
         let (key_json, sort_json) = (json(key), json(sort));
@@ -162,6 +176,8 @@ impl Catalog {
                 name: name.clone(),
                 location,
                 schema: Arc::new(nullable(schema)),
+                ids,
+                was,
                 key: key.to_vec(),
                 sort: sort.to_vec(),
             }),
@@ -185,11 +201,14 @@ impl Catalog {
             Self::Postgres(c) => c.get(branch, name)?,
         };
         row.map(|(id, location, columns, key, sort)| {
+            let (schema, ids, was) = decode(&columns)?;
             Ok(TableEntry {
                 id,
                 name: name.clone(),
                 location,
-                schema: Arc::new(decode(&columns)?),
+                schema: Arc::new(schema),
+                ids,
+                was,
                 key: decode_names(key.as_deref())?,
                 sort: decode_names(sort.as_deref())?,
             })
@@ -205,11 +224,14 @@ impl Catalog {
         };
         rows.into_iter()
             .map(|(id, namespace, table, location, columns, key, sort)| {
+                let (schema, ids, was) = decode(&columns)?;
                 Ok(TableEntry {
                     id,
                     name: TableName::parse(&format!("{namespace}.{table}"))?,
                     location,
-                    schema: Arc::new(decode(&columns)?),
+                    schema: Arc::new(schema),
+                    ids,
+                    was,
                     key: decode_names(key.as_deref())?,
                     sort: decode_names(sort.as_deref())?,
                 })
@@ -428,30 +450,49 @@ fn listed(schema: &Schema) -> String {
         .join(", ")
 }
 
-fn encode(schema: &Schema) -> Value {
+/// `[[name, type, id, [former names]], ...]`, the former names left out when there are none.
+/// Readers from before column IDs read the name and type of each and ignore the rest.
+fn encode(schema: &Schema, ids: &[ColumnId], was: &[Vec<String>]) -> Value {
     Value::Array(
         columns(schema)
             .into_iter()
-            .map(|(name, kind)| serde_json::json!([name, kind]))
+            .zip(ids.iter().zip(was))
+            .map(|((name, kind), (id, was))| match was.as_slice() {
+                [] => serde_json::json!([name, kind, id.0]),
+                was => serde_json::json!([name, kind, id.0, was]),
+            })
             .collect(),
     )
 }
 
-fn decode(text: &str) -> Result<Schema, Error> {
+/// A table's columns as the catalog keeps them: schema, each column's ID, its former names.
+type Columns = (Schema, Arc<[ColumnId]>, Vec<Vec<String>>);
+
+/// A table's columns, IDs, and former names; one stored before columns had IDs has their
+/// positions, counting from 1, and no former names.
+fn decode(text: &str) -> Result<Columns, Error> {
     let corrupt = || Error::Corrupt(format!("catalog columns `{text}` are unreadable"));
     let value: Value = serde_json::from_str(text).map_err(|_| corrupt())?;
-    let fields = value
-        .as_array()
-        .ok_or_else(corrupt)?
-        .iter()
-        .map(|column| {
-            let name = column[0].as_str().ok_or_else(corrupt)?;
-            let kind = column[1].as_str().ok_or_else(corrupt)?;
-            let data_type = parse_type(kind).map_err(|_| corrupt())?;
-            Ok(Field::new(name, data_type, true))
-        })
-        .collect::<Result<Vec<_>, Error>>()?;
-    Ok(Schema::new(fields))
+    let (mut fields, mut ids, mut was) = (Vec::new(), Vec::new(), Vec::new());
+    for (position, column) in value.as_array().ok_or_else(corrupt)?.iter().enumerate() {
+        let name = column[0].as_str().ok_or_else(corrupt)?;
+        let kind = column[1].as_str().ok_or_else(corrupt)?;
+        let data_type = parse_type(kind).map_err(|_| corrupt())?;
+        fields.push(Field::new(name, data_type, true));
+        ids.push(match &column[2] {
+            Value::Null => ColumnId(position as u32 + 1),
+            id => ColumnId(
+                id.as_u64()
+                    .and_then(|id| u32::try_from(id).ok())
+                    .ok_or_else(corrupt)?,
+            ),
+        });
+        was.push(match &column[3] {
+            Value::Null => Vec::new(),
+            names => serde_json::from_value(names.clone()).map_err(|_| corrupt())?,
+        });
+    }
+    Ok((Schema::new(fields), ids.into(), was))
 }
 
 fn nullable(schema: &Schema) -> Schema {

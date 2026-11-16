@@ -493,7 +493,8 @@ impl FlightService for Service {
             "tables" => {
                 let tables = blocking(move || store.tables()).await?;
                 // `id` and `location` since history (a merge Job writes under the location),
-                // `key` since keyed tables (empty for an append table), `sort` since sorted ones.
+                // `key` since keyed tables (empty for an append table), `sort` since sorted ones,
+                // `ids` and `was` since column IDs (§5.4).
                 Value::Array(
                     tables
                         .iter()
@@ -505,6 +506,8 @@ impl FlightService for Service {
                                 "location": t.location,
                                 "key": t.key,
                                 "sort": t.sort,
+                                "ids": t.ids.iter().map(|id| id.0).collect::<Vec<_>>(),
+                                "was": t.was,
                             })
                         })
                         .collect(),

@@ -10,7 +10,7 @@ use arrow::datatypes::SchemaRef;
 use kermodes_weir::{Date, Error, TableName};
 
 use crate::bounds::Bound;
-use crate::files::{Lake, dated, history_columns, with_date_column, with_op};
+use crate::files::{Lake, as_current, dated, history_columns, with_date_column, with_op};
 use crate::weir::Weir;
 
 /// Dates of a table's history, read.
@@ -118,7 +118,10 @@ fn history(
             // A file's footer is read here; its row groups only as the batches are taken.
             let mut batches = lake.read(&entry.location, &file.name, first, last, bounds)?;
             let read = if rows {
-                batches.by_ref().collect::<Result<Vec<_>, _>>()?
+                batches
+                    .by_ref()
+                    .map(|batch| batch.and_then(|batch| as_current(&entry, batch)))
+                    .collect::<Result<Vec<_>, _>>()?
             } else {
                 Vec::new()
             };
