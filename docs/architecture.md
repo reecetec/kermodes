@@ -1,8 +1,9 @@
 # Kermodes architecture
 
-Status: direction. These are ideals, not hard rules; nothing here is implemented yet, and the code
-corrects this document as it teaches us. "Writing a novel is like driving a car at night. You can
-see only as far as your headlights, but you can make the whole trip that way." (E. L. Doctorow)
+Status: direction. These are ideals, not hard rules: much of it runs today, the rest is where it
+is heading, and the code corrects this document as it teaches us. "Writing a novel is like
+driving a car at night. You can see only as far as your headlights, but you can make the whole
+trip that way." (E. L. Doctorow)
 
 The engine's first milestone is designed in more detail in [engine.md](engine.md).
 

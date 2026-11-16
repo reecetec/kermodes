@@ -3,11 +3,14 @@ name: CI
 # Every push and pull request is checked. Every green push to master is a release candidate
 # (architecture.md §16.1): built once, labelled by ci/version, its image and chart pushed to GHCR,
 # and its wheels and npm tarballs kept as this run's artifacts. release.yml publishes the npm
-# packages under `dev`, and a tag later releases the candidate as it is.
+# packages under `dev`, and a tag later releases the candidate as it is. A change to the docs
+# alone is no candidate: docs.yml builds and publishes it.
 on:
   pull_request:
+    paths-ignore: [docs/**, zensical.toml, .github/workflows/docs.yml]
   push:
     branches: [master]
+    paths-ignore: [docs/**, zensical.toml, .github/workflows/docs.yml]
   workflow_dispatch:
 
 permissions:

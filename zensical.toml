@@ -1,0 +1,53 @@
+# The documentation site, built from docs/ by Zensical (.github/workflows/docs.yml) and published
+# to GitHub Pages. Locally: `uv run --group docs zensical serve`.
+[project]
+site_name = "Kermodes"
+site_description = "A cloud-native data platform where live and historical data share one table model."
+site_url = "https://reecetec.github.io/kermodes/"
+repo_url = "https://github.com/reecetec/kermodes"
+edit_uri = "edit/master/docs/"
+docs_dir = "docs"
+site_dir = "site"
+# A broken link or anchor fails the build
+strict = true
+nav = [
+  { "Home" = "index.md" },
+  { "Architecture" = "architecture.md" },
+  { "Engine" = "engine.md" },
+  { "Theme" = "theme.md" },
+]
+
+[project.theme]
+features = [
+  "content.action.copy",
+  "content.action.edit",
+  "content.action.view",
+  "content.code.copy",
+  "navigation.footer",
+  "navigation.top",
+  "search.highlight",
+  "toc.follow",
+]
+
+[[project.theme.palette]]
+scheme = "slate"
+toggle.icon = "lucide/sun"
+toggle.name = "Light"
+
+[[project.theme.palette]]
+scheme = "default"
+toggle.icon = "lucide/moon"
+toggle.name = "Dark"
+
+[project.validation]
+invalid_links = true
+invalid_link_anchors = true
+
+# llms.txt, and a Markdown copy of each page, for agents
+[project.plugins.llmstxt]
+markdown_description = "Kermodes' design documents: the platform's architecture, its incremental engine, and its visual design."
+full_output = "llms-full.txt"
+
+[project.plugins.llmstxt.sections]
+"Overview" = ["index.md"]
+"Design" = ["architecture.md", "engine.md", "theme.md"]

@@ -3,7 +3,7 @@
 Living document: it describes the design as it is and why. Change it in the same commit that
 changes the design; where the code teaches us otherwise, fix this file.
 
-The tokens are [`web/theme/tokens.css`](../web/theme/tokens.css), the one source for the web
+The tokens are [`web/theme/tokens.css`](https://github.com/reecetec/kermodes/blob/master/web/theme/tokens.css), the one source for the web
 UI, the notebook grid, and any app built on Kermodes. `web/theme/tailwind.css` maps them into
 Tailwind under shadcn/ui's names. A rebrand is that file.
 

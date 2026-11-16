@@ -1,0 +1,52 @@
+name: Docs
+
+# The documentation site (zensical.toml): built from docs/ on every pull request and push that
+# touches it, failing on a broken link or anchor, and published to GitHub Pages from master. Its
+# llms.txt lists each page's Markdown copy for agents.
+on:
+  pull_request:
+    paths: [docs/**, zensical.toml, pyproject.toml, uv.lock, .github/workflows/docs.yml]
+  push:
+    branches: [master]
+    paths: [docs/**, zensical.toml, pyproject.toml, uv.lock, .github/workflows/docs.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One publish at a time; a newer push to a pull request replaces its build.
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: 0.13.7
+
+      # Zensical as uv.lock pins it, without the package itself (no Rust build for the docs)
+      - name: Build the site
+        run: uv run --locked --only-group docs zensical build --clean
+
+      - if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

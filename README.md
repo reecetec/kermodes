@@ -5,7 +5,9 @@ incremental engine, a columnar ingest log (weir), a Parquet lake, scheduled jobs
 a feature store, and an agent-first control surface. Built on Arrow, Arrow Flight, and Parquet.
 User projects live in git and reach the cluster through a build-once, promote-everywhere pipeline.
 
-Direction: [docs/architecture.md](docs/architecture.md). Engine: [docs/engine.md](docs/engine.md).
+Docs: [reecetec.github.io/kermodes](https://reecetec.github.io/kermodes/) (also as Markdown for
+agents: [llms.txt](https://reecetec.github.io/kermodes/llms.txt)), from [docs/](docs/):
+[architecture](docs/architecture.md), [engine](docs/engine.md), [theme](docs/theme.md).
 
 ```python
 import pyarrow as pa
@@ -31,7 +33,9 @@ Requires Rust and [uv](https://docs.astral.sh/uv/).
 uv sync                    # builds the engine into .venv; reruns rebuild after Rust changes
 uv run pytest
 cargo test --workspace
+uv run --group docs zensical serve   # the docs site at http://localhost:8000, rebuilt on save
 ```
 
 The CI gate is `.github/workflows/ci.yml`; releases are `.github/workflows/release.yml`
-(architecture.md §16.1).
+(architecture.md §16.1). The docs site is `.github/workflows/docs.yml`: built on every change to
+docs/, failing on a broken link, and published to GitHub Pages from master.

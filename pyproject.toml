@@ -22,6 +22,8 @@ dev = [
     "ruff",
     "ty",
 ]
+# The documentation site (zensical.toml): `uv run --group docs zensical serve`
+docs = ["zensical>=0.1.1"]
 
 [build-system]
 requires = ["maturin>=1.16,<2"]
