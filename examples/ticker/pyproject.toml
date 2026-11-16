@@ -1,7 +1,0 @@
-# The project's own dependencies, locked in uv.lock: the platform builds an environment from them
-# (architecture.md §10.6), over its Python and Kermodes, which are not listed here.
-[project]
-name = "ticker"
-version = "0.0.0"
-requires-python = ">=3.14"
-dependencies = ["humanize>=4.12"]

@@ -1,8 +1,0 @@
-# A synthetic market-data feed, generated and ingested into md.ticks, and a market app over it.
-# Locally: `kermodes dev --project examples/ticker`. In the cluster, `kermodes control` runs it
-# from this repository's master.
-[project]
-name = "ticker"
-entry = "ticker.resources"
-namespaces = ["md"]
-mainline = "master"
