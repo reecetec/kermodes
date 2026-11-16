@@ -1280,8 +1280,10 @@ namespaces).
   Kubernetes routes the app: a Service, and a Gateway API `HTTPRoute` for its path on the
   Gateway and hostnames of the UI's route (`ui.httpRoute`), using only the API's Core features
   (a path prefix to a Service, no rewrite), so any conformant implementation serves it. The UI's
-  server is not on an app's path. `examples/ticker` declares one, `market`: a board its function
-  computes from `md.ticks`, the newest ticks, and two figures.
+  server is not on an app's path. The `ticker` example
+  ([reecetec/kermodes-examples](https://github.com/reecetec/kermodes-examples), a project's own
+  repository as a team would keep it, with its own CI) declares one, `market`: a dashboard its
+  function computes from `md.ticks`, with a tape and live charts.
 - Ticking and large tables: the table viewer (§15.3). Lists of things (deployments, the
   catalog) are plain tables with fixed column widths, so values changing or a panel opening
   never moves a column, and details open in a panel docked beside or below the list.
@@ -1700,7 +1702,7 @@ python/kermodes      SDK, widgets, decorators, `cli.py` (pure Python over `kermo
 web/app           React UI (Bun workspace)
 web/client        @kermodes/client TypeScript package
 deploy/helm/kermodes Helm chart: CRDs, control plane, gateway, weir
-examples/         example projects (toy ticker, toy sportsbook)
+examples/         notebooks (example projects are their own repository, reecetec/kermodes-examples)
 docs/
 ```
 

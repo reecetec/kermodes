@@ -50,6 +50,5 @@ cache-keys = [
 testpaths = ["tests"]
 
 [tool.ty.src]
-# Comparison scripts run against other engines in their own environments, and the example
-# project on the environment its uv.lock builds.
-exclude = ["bench", "examples/ticker"]
+# Comparison scripts run against other engines in their own environments.
+exclude = ["bench"]

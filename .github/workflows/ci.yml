@@ -83,14 +83,6 @@ jobs:
           bun test
           bun run build
 
-      # As a project's own CI checks its apps: against the published @kermodes/* packages it pins.
-      - name: Check the example project's apps (examples/ticker)
-        working-directory: examples/ticker
-        run: |
-          bun install --frozen-lockfile
-          bun run typecheck
-          bun run test
-
       - name: Run Ruff
         run: |
           uv run --no-sync ruff check
