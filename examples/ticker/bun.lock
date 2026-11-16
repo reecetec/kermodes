@@ -5,8 +5,8 @@
     "": {
       "name": "ticker",
       "dependencies": {
-        "@kermodes/react": "0.5.1-dev.12.gdc140ca",
-        "@kermodes/theme": "0.5.1-dev.12.gdc140ca",
+        "@kermodes/react": "0.5.1-dev.14.gee58e68",
+        "@kermodes/theme": "0.5.1-dev.14.gee58e68",
         "react": "^19.0.0",
         "react-dom": "^19.0.0",
       },
@@ -129,13 +129,13 @@
 
     "@jridgewell/trace-mapping": ["@jridgewell/trace-mapping@0.3.31", "", { "dependencies": { "@jridgewell/resolve-uri": "^3.1.0", "@jridgewell/sourcemap-codec": "^1.4.14" } }, "sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw=="],
 
-    "@kermodes/client": ["@kermodes/client@0.5.1-dev.12.gdc140ca", "", {}, "sha512-Dgzr/E3Hv0y5obZNyvCOSvBKjCPn9vNiJBEQgMT4XOyJmBqs6OxLV1XmqhB6rr+ajEHvzmdEGTZ5oXWJJeT33g=="],
+    "@kermodes/client": ["@kermodes/client@0.5.1-dev.14.gee58e68", "", {}, "sha512-G3Tw2BGbeK9xRV63T2DuGoCbFRv6jA1m8hdMhqQyAwVRZnuHDBTbEEMM2HLD2zkdvb9A7P0qiBfg2u67dpJzIw=="],
 
-    "@kermodes/grid": ["@kermodes/grid@0.5.1-dev.12.gdc140ca", "", { "dependencies": { "@kermodes/client": "0.5.1-dev.12.gdc140ca", "apache-arrow": "^21.0.0", "classnames": "^2.5.1", "memoize-one": "^6.0.0" }, "peerDependencies": { "react": "^19.0.0" } }, "sha512-2SICAT/SvahkRGEPiD2YwUxzngbs7ixzZKAUuQlQWaQHzn8jfMyVKlBjV6OdaTlPfQOzbnSoVs0KdPgfskoykQ=="],
+    "@kermodes/grid": ["@kermodes/grid@0.5.1-dev.14.gee58e68", "", { "dependencies": { "@kermodes/client": "0.5.1-dev.14.gee58e68", "apache-arrow": "^21.0.0", "classnames": "^2.5.1", "memoize-one": "^6.0.0" }, "peerDependencies": { "react": "^19.0.0" } }, "sha512-4ogw/uUonPx14ejaRKEL3Ruj5jXFo6qKTOc3PchV/0pXSMq4bE0b0xeOHHNsBOC7ZpdE/WQ3y1GwDEB5EPyxfA=="],
 
-    "@kermodes/react": ["@kermodes/react@0.5.1-dev.12.gdc140ca", "", { "dependencies": { "@kermodes/client": "0.5.1-dev.12.gdc140ca", "@kermodes/grid": "0.5.1-dev.12.gdc140ca", "apache-arrow": "^21.0.0", "dockview-react": "^8.9.0" }, "peerDependencies": { "react": "^19.0.0", "react-dom": "^19.0.0" } }, "sha512-RKHozaYo6ZhjI0VJX0j99VTcoVMwxorbbZow+autCepfCtdRCTezEJxfYL9WnPzdrSXS7+AU5GuAkU80C2kH6Q=="],
+    "@kermodes/react": ["@kermodes/react@0.5.1-dev.14.gee58e68", "", { "dependencies": { "@kermodes/client": "0.5.1-dev.14.gee58e68", "@kermodes/grid": "0.5.1-dev.14.gee58e68", "apache-arrow": "^21.0.0", "dockview-react": "^8.9.0", "plotly.js-finance-dist": "^4.3.0" }, "peerDependencies": { "react": "^19.0.0", "react-dom": "^19.0.0" } }, "sha512-ouTAIPT3bQkao27r/q+812r1+B2fPCorpGSPURXjaS1khXtorXVY99iWQ+ukU0qoUXfLvz3FB/dP2/b0Q5vskQ=="],
 
-    "@kermodes/theme": ["@kermodes/theme@0.5.1-dev.12.gdc140ca", "", {}, "sha512-OCUwgW0y+w04I5RTDVIY6oPAPpmZoFkIQ99bJ9DbQX0GbPSRmR4aiVuUOk/uoAVHWdJ5l+teePB9oOJh2hdmbA=="],
+    "@kermodes/theme": ["@kermodes/theme@0.5.1-dev.14.gee58e68", "", {}, "sha512-xNqNZp4XkPnmD+rrUD1BewJ3yN0OlOIi2+JhIRrXwCBMQRmqJifdsL9faTA6eC3waeMKyqO6jOhqKT/3gSRFoA=="],
 
     "@rolldown/pluginutils": ["@rolldown/pluginutils@1.0.0-rc.3", "", {}, "sha512-eybk3TjzzzV97Dlj5c+XrBFW57eTNhzod66y9HrBlzJ6NsCrWCp/2kaPS3K9wJmurBC0Tdw4yPjXKZqlznim3Q=="],
 
@@ -362,6 +362,8 @@
     "picocolors": ["picocolors@1.1.1", "", {}, "sha512-xceH2snhtb5M9liqDsmEw56le376mTZkEX/jEb/RxNFyegNul7eNslCXP9FDj/Lcu0X8KEyMceP2ntpaHrDEVA=="],
 
     "picomatch": ["picomatch@4.0.7", "", {}, "sha512-qcJu88Q2IWqJsDD529JKMdwGm/dvInW4HvQnRwiH9JtihJvzGOscDtHE3x1pBKeUOTysQ8kVmLnJ2kJu7yhcGA=="],
+
+    "plotly.js-finance-dist": ["plotly.js-finance-dist@4.3.0", "", {}, "sha512-47eIC2bCD9Tb0w+o/B3BK/FEc5Wzhvuydj9EmD4wJM/5vewIshTpgcNZiEbLX9BE+wkW/Oj4AWMNVwbJjJ6e+Q=="],
 
     "postcss": ["postcss@8.5.33", "", { "dependencies": { "nanoid": "^3.3.20", "picocolors": "^1.1.1", "source-map-js": "^1.2.2" } }, "sha512-RVHEU9/Pp1Fnjr/MpAJsZoADukCKhfIi15OunEYiGktIkYLkPVvC1sioWolGDS7XByMTx9m/IGbro0Js13zhnQ=="],
 
