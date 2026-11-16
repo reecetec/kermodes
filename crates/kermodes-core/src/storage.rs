@@ -6,7 +6,7 @@
 //! Deltas carry previous values as their own copies, taken before a cycle is applied.
 
 use ahash::RandomState;
-use arrow::array::{Array, ArrayRef, new_null_array};
+use arrow::array::{Array, ArrayRef, new_empty_array, new_null_array};
 use arrow::compute::{concat_batches, interleave, interleave_record_batch};
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
@@ -170,11 +170,12 @@ impl Storage {
                 len,
                 ..
             } => {
-                let indices = keys
+                let locations = keys
                     .iter()
                     .map(|&key| dense_location(starts, *len, key))
                     .collect::<Result<Vec<_>, _>>()?;
-                let chunks: Vec<&RecordBatch> = chunks.iter().collect();
+                let (touched, indices) = touched(&locations);
+                let chunks: Vec<&RecordBatch> = touched.iter().map(|at| &chunks[*at]).collect();
                 interleave_record_batch(&chunks, &indices)
             }
             Index::Sparse {
@@ -209,21 +210,33 @@ impl Storage {
                 len,
                 ..
             } => {
+                // Nothing to interleave from, and nothing to give
+                if keys.is_empty() {
+                    return Ok(columns
+                        .iter()
+                        .map(|c| new_empty_array(self.schema.field(*c).data_type()))
+                        .collect());
+                }
                 // Missing keys point at a one-row NULL array placed after the chunks.
-                let indices = keys
+                let locations = keys
                     .iter()
                     .map(|key| match key {
                         Some(key) => dense_location(starts, *len, *key),
                         None => Ok((chunks.len(), 0)),
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                let (touched, indices) = touched(&locations);
                 columns
                     .iter()
                     .map(|column| {
                         let null = new_null_array(self.schema.field(*column).data_type(), 1);
-                        let mut arrays: Vec<&dyn Array> =
-                            chunks.iter().map(|c| c.column(*column).as_ref()).collect();
-                        arrays.push(null.as_ref());
+                        let arrays: Vec<&dyn Array> = touched
+                            .iter()
+                            .map(|at| match chunks.get(*at) {
+                                Some(chunk) => chunk.column(*column).as_ref(),
+                                None => null.as_ref(),
+                            })
+                            .collect();
                         interleave(&arrays, &indices)
                     })
                     .collect()
@@ -501,4 +514,18 @@ pub(crate) fn nearest(keys: &mut Vec<RowKey>, end: End, n: usize) {
             }
         }
     }
+}
+
+/// The chunks `locations` (chunk, row) touch, in order, and the locations renumbered into them.
+/// Interleaving costs what it is given: given every chunk, a few rows read from a table appended
+/// to in small batches all day (hundreds of thousands of chunks) cost the whole day's chunk list.
+fn touched(locations: &[(usize, usize)]) -> (Vec<usize>, Vec<(usize, usize)>) {
+    let mut touched: Vec<usize> = locations.iter().map(|(chunk, _)| *chunk).collect();
+    touched.sort_unstable();
+    touched.dedup();
+    let renumbered = locations
+        .iter()
+        .map(|(chunk, row)| (touched.partition_point(|at| at < chunk), *row))
+        .collect();
+    (touched, renumbered)
 }
