@@ -76,30 +76,42 @@ def connect(url: str | None = None, *, manual: bool = False) -> Session:
     return session
 
 
-def boolean() -> str:
-    return "bool"
+type Was = str | list[str] | None
 
 
-def int32() -> str:
-    return "int32"
+def _column(kind: str, was: Was) -> str:
+    """A column's spec: its type, and the names it had before (`float64 was px`), so that
+    `create_table` renames the column it was rather than adding one."""
+    if was is None:
+        return kind
+    names = [was] if isinstance(was, str) else was
+    return f"{kind} was {', '.join(names)}"
 
 
-def int64() -> str:
-    return "int64"
+def boolean(*, was: Was = None) -> str:
+    return _column("bool", was)
 
 
-def float64() -> str:
-    return "float64"
+def int32(*, was: Was = None) -> str:
+    return _column("int32", was)
 
 
-def string() -> str:
-    return "utf8"
+def int64(*, was: Was = None) -> str:
+    return _column("int64", was)
 
 
-def date32() -> str:
-    return "date32"
+def float64(*, was: Was = None) -> str:
+    return _column("float64", was)
 
 
-def timestamp() -> str:
+def string(*, was: Was = None) -> str:
+    return _column("utf8", was)
+
+
+def date32(*, was: Was = None) -> str:
+    return _column("date32", was)
+
+
+def timestamp(*, was: Was = None) -> str:
     """Nanoseconds since the epoch, UTC."""
-    return "timestamp"
+    return _column("timestamp", was)

@@ -237,6 +237,7 @@ fn a_write_up_to_the_batch_limit_lands_whole_and_a_larger_one_is_refused() {
                 seen.lock().unwrap().push(batch.num_rows());
                 true
             }),
+            Box::new(|reason| panic!("{reason}")),
         )
         .unwrap();
     assert_eq!(*batches.lock().unwrap(), [2_000_000, 10]);

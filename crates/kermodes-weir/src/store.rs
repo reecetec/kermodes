@@ -24,6 +24,7 @@ use serde_json::json;
 use crate::catalog::{Catalog, Garbage, HistoryCommit, HistoryDate, HistoryFile, TableEntry};
 use crate::keyed::Fold;
 use crate::partition::{Partition, Stamp, in_order};
+use crate::shape::Shape;
 use crate::{Change, Date, Error, SourceId, TableName};
 
 /// The branch a local store's tables live on (architecture.md §10.1).
@@ -35,6 +36,33 @@ pub const BRANCH: &str = "local";
 /// keyed table. Returning `false` unsubscribes it (its reader is gone, or too far behind).
 /// `Pace` says whether it may wait for its reader before returning.
 pub type Subscriber = Box<dyn FnMut(&RecordBatch, Stamp, Pace) -> bool + Send>;
+
+/// Told why a subscription ended when the store ends it: the table's columns changed in a way
+/// its reader's cannot follow (a column it reads was widened, §5.4).
+pub type Failed = Box<dyn FnOnce(String) + Send>;
+
+/// A subscriber, and the columns it reads: the table's when it subscribed, so a reader keeps its
+/// columns while the table's change.
+struct Subscription {
+    deliver: Subscriber,
+    shape: Shape,
+    failed: Option<Failed>,
+}
+
+impl Subscription {
+    /// Delivers `batch`, of `written`'s columns; `false` once the subscription is over.
+    fn deliver(&mut self, written: &Shape, batch: &RecordBatch, stamp: Stamp) -> bool {
+        match written.convert(batch.clone(), &self.shape) {
+            Ok(batch) => (self.deliver)(&batch, stamp, Pace::MustNotWait),
+            Err(e) => {
+                if let Some(failed) = self.failed.take() {
+                    failed(e.to_string());
+                }
+                false
+            }
+        }
+    }
+}
 
 /// Whether a subscriber may wait before taking the next batch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,7 +110,7 @@ struct TableLog {
     dir: PathBuf,
     /// By date, then stream (a keyed table's checkpoint first, then each source).
     partitions: BTreeMap<(String, Stream), Partition>,
-    subscribers: Vec<Subscriber>,
+    subscribers: Vec<Subscription>,
     /// Sources whose lease a `Writer` holds: one writer per source (§7.4).
     writing: HashSet<SourceId>,
     /// The last ingest time given: each batch's is later, so ingest order is commit order.
@@ -184,13 +212,16 @@ impl Store {
         }
     }
 
-    /// Creates `name` with `schema`, or returns it if it exists with the same columns.
+    /// Creates `name` with `schema`, or brings it to `schema`'s columns if it exists (a
+    /// compatible change, §5.4) and returns it.
     pub fn create_table(&self, name: &TableName, schema: &Schema) -> Result<TableEntry, Error> {
-        lock(&self.catalog).create(&self.branch, name, schema, &[], &[])
+        let entry = lock(&self.catalog).create(&self.branch, name, schema, &[], &[])?;
+        self.adopt(&entry);
+        Ok(entry)
     }
 
     /// Creates `name` as a keyed table (§5.2): one row per value of the `key` columns, written as
-    /// upserts and deletes. Returns it if it exists with the same columns and key.
+    /// upserts and deletes. Brings it to `schema`'s columns if it exists with the same key.
     pub fn create_keyed_table(
         &self,
         name: &TableName,
@@ -202,19 +233,40 @@ impl Store {
                 "a keyed table needs key columns; {name} has none"
             )));
         }
-        lock(&self.catalog).create(&self.branch, name, schema, key, &[])
+        let entry = lock(&self.catalog).create(&self.branch, name, schema, key, &[])?;
+        self.adopt(&entry);
+        Ok(entry)
     }
 
     /// Creates `name` as an append table whose history sorts each date by the `sort` columns
-    /// (§8.1), so reads that filter on them skip most of a date. Returns it if it exists with
-    /// the same columns and sort.
+    /// (§8.1), so reads that filter on them skip most of a date. Brings it to `schema`'s
+    /// columns if it exists with the same sort.
     pub fn create_sorted_table(
         &self,
         name: &TableName,
         schema: &Schema,
         sort: &[String],
     ) -> Result<TableEntry, Error> {
-        lock(&self.catalog).create(&self.branch, name, schema, &[], sort)
+        let entry = lock(&self.catalog).create(&self.branch, name, schema, &[], sort)?;
+        self.adopt(&entry);
+        Ok(entry)
+    }
+
+    /// Takes up `entry`'s columns in its table's log, if it is open and they changed: segments
+    /// written from now on hold them, and writers' rows are brought to them. Readers and
+    /// writers already open keep their own.
+    fn adopt(&self, entry: &TableEntry) {
+        let Some(log) = lock(&self.logs).get(&entry.id).cloned() else {
+            return;
+        };
+        let mut state = lock(&log.state);
+        if state.entry.shape() == entry.shape() {
+            return;
+        }
+        state.entry = entry.clone();
+        for partition in state.partitions.values_mut() {
+            partition.reshape(entry.shape());
+        }
     }
 
     /// Every table, by name.
@@ -357,7 +409,7 @@ impl Store {
         let mut writer = Writer {
             log,
             source: source.clone(),
-            schema: entry.schema,
+            shape: entry.shape(),
             name: entry.name,
             key: entry.key,
             epoch: 0,
@@ -386,8 +438,10 @@ impl Store {
     }
 
     /// Feeds `subscriber` every batch of `name` committed today (UTC), then each new one as it
-    /// commits; returns the table's schema. A live table is intraday (§7.3): earlier days are
-    /// history, read from the lake once merged, not replayed into every reader.
+    /// commits, in the table's columns as they are now, whatever they become; returns them. A
+    /// live table is intraday (§7.3): earlier days are history, read from the lake once merged,
+    /// not replayed into every reader. `failed` is told if the subscription has to end because
+    /// the table's columns changed beyond what these can read.
     ///
     /// The replay reads one batch at a time from disk, without the table's lock, in rounds until
     /// few are left; those it delivers under the lock before joining the writes. Memory is a
@@ -396,15 +450,16 @@ impl Store {
         &self,
         name: &TableName,
         mut subscriber: Subscriber,
+        failed: Failed,
     ) -> Result<SchemaRef, Error> {
         let today = today();
         let log = self.log(name)?;
         // Where the replay starts in each partition: a keyed table's latest checkpoint and the
         // changes after it; every batch of an append table's.
-        let mut delivered = {
+        let (mut delivered, shape) = {
             let mut state = lock(&log.state);
             ensure_checkpoint(&mut state, &today)?;
-            starts(&state, &today)
+            (starts(&state, &today), state.entry.shape())
         };
         loop {
             let state = lock(&log.state);
@@ -420,8 +475,6 @@ impl Store {
                     behind.push((key.clone(), cursor, committed));
                 }
             }
-            let schema = state.entry.schema.clone();
-            let shape = state.entry.shape();
             let under_lock = left <= CATCH_UP_UNDER_LOCK && left_bytes <= CATCH_UP_UNDER_LOCK_BYTES;
             // Held through the delivery when little is left, so no write comes between.
             let (held, pace) = if under_lock {
@@ -439,11 +492,16 @@ impl Store {
             for read in in_order(cursors, &shape) {
                 let (batch, stamp) = read?;
                 if !subscriber(&batch, stamp, pace) {
-                    return Ok(schema);
+                    return Ok(shape.schema);
                 }
             }
             if let Some(mut state) = held {
-                state.subscribers.push(subscriber);
+                let schema = shape.schema.clone();
+                state.subscribers.push(Subscription {
+                    deliver: subscriber,
+                    shape,
+                    failed: Some(failed),
+                });
                 return Ok(schema);
             }
             delivered.extend(caught_up);
@@ -675,7 +733,9 @@ impl Store {
 pub struct Writer {
     log: Arc<Log>,
     source: SourceId,
-    schema: SchemaRef,
+    /// The table's columns when the writer opened: its rows are matched to these, then brought
+    /// to the table's columns as they are when written.
+    shape: Shape,
     name: TableName,
     /// A keyed table's key columns; empty for an append table.
     key: Vec<String>,
@@ -705,20 +765,20 @@ impl Writer {
                 self.name
             )));
         }
-        self.append(&conform(&self.schema, batch)?, seq, Change::Rows)
+        self.append(&conform(&self.shape.schema, batch)?, seq, Change::Rows)
     }
 
     /// Sets each row's key to that row, as `write` does for an append table.
     pub fn upsert(&self, batch: &RecordBatch, seq: Option<u64>) -> Result<bool, Error> {
         self.keyed("upsert")?;
-        self.append(&conform(&self.schema, batch)?, seq, Change::Upsert)
+        self.append(&conform(&self.shape.schema, batch)?, seq, Change::Upsert)
     }
 
     /// Removes the keys of `batch`'s rows; it needs only the key columns.
     pub fn delete(&self, batch: &RecordBatch, seq: Option<u64>) -> Result<bool, Error> {
         self.keyed("delete")?;
         self.append(
-            &keys_only(&self.schema, &self.key, batch)?,
+            &keys_only(&self.shape.schema, &self.key, batch)?,
             seq,
             Change::Delete,
         )
@@ -729,7 +789,11 @@ impl Writer {
     /// larger than one batch follows on in upserts.
     pub fn replace(&self, batch: &RecordBatch, seq: Option<u64>) -> Result<bool, Error> {
         self.keyed("replace")?;
-        self.append(&conform(&self.schema, batch)?, seq, Change::Checkpoint)
+        self.append(
+            &conform(&self.shape.schema, batch)?,
+            seq,
+            Change::Checkpoint,
+        )
     }
 
     fn keyed(&self, action: &str) -> Result<(), Error> {
@@ -745,6 +809,9 @@ impl Writer {
     fn append(&self, batch: &RecordBatch, seq: Option<u64>, change: Change) -> Result<bool, Error> {
         let mut guard = lock(&self.log.state);
         let log = &mut *guard;
+        // Rows of the columns this writer opened with, as the table's are now (§5.4).
+        let current = log.entry.shape();
+        let batch = &self.shape.convert(batch.clone(), &current)?;
         // The day's opening checkpoint is stamped before the write that brings it, then the
         // write: under the lock, so ingest times rise in commit order across sources. Twice only
         // if the clock passed midnight between.
@@ -779,7 +846,7 @@ impl Writer {
         }
         let stamp = Stamp { change, ingest_ns };
         log.subscribers
-            .retain_mut(|subscriber| subscriber(batch, stamp, Pace::MustNotWait));
+            .retain_mut(|subscription| subscription.deliver(&current, batch, stamp));
         if !log.entry.key.is_empty() {
             log.since_checkpoint += batch.get_array_memory_size();
             // Past the last checkpoint's own size too, so folding costs in proportion to the

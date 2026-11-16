@@ -240,7 +240,14 @@ impl Tables {
         match self {
             // The replay is done when it returns.
             Tables::Local(store) => {
-                store.subscribe(name, subscriber)?;
+                let failing = feed.clone();
+                store.subscribe(
+                    name,
+                    subscriber,
+                    Box::new(move |reason| {
+                        failing.fail(reason);
+                    }),
+                )?;
                 feed.ready();
                 Ok(())
             }
@@ -1181,14 +1188,14 @@ fn store_error(error: kermodes_weir::Error) -> PyErr {
     KermodesError::new_err(error.to_string())
 }
 
-/// A schema from column names and type names (`km.int64()` and so on), every column nullable.
+/// A schema from column names and specs (`km.int64()`, `km.float64(was="px")`), every column
+/// nullable; a spec's former names ride along for `create_table` (§5.4).
 fn schema_from(columns: &Bound<'_, PyDict>) -> PyResult<Schema> {
     let mut fields = Vec::with_capacity(columns.len());
-    for (name, type_name) in columns.iter() {
+    for (name, spec) in columns.iter() {
         let name: String = name.extract()?;
-        let type_name: String = type_name.extract()?;
-        let data_type = kermodes_core::parse_type(&type_name).map_err(engine_error)?;
-        fields.push(Field::new(name, data_type, true));
+        let spec: String = spec.extract()?;
+        fields.push(kermodes_weir::column(&name, &spec).map_err(store_error)?);
     }
     Ok(Schema::new(fields))
 }

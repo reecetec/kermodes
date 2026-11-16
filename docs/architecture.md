@@ -232,32 +232,38 @@ odds = km.table(
     columns={
         "game_id": km.string(),
         "book": km.string(),
-        "price": km.float64(),  # renamed from "px": same column ID
+        "price": km.float64(was="px"),  # renamed: same column ID
         "size": km.int64(),  # widened from int32
-        "venue": km.string(default=None),  # added
+        "venue": km.string(),  # added: rows written before read it as null
     },
     keys=["game_id", "book"],
     ts="ts",
 )
 ```
 
+Declaring a table's columns is a sync: `create_table` (and the table declaration it backs) brings
+the stored table to the columns given when that is a compatible change, does nothing when it
+already has them, and refuses anything else, naming the change and its class.
+
 Column identity
 
-- Every column has a stable ID, carried as Arrow field metadata and Parquet `field_id`, and stored
-  in the catalog. Names are labels; data is matched by ID everywhere.
-- Renames are metadata-only; the SDK records a rename explicitly (`km.renamed_from("px")`) so the
-  plan does not read it as drop + add.
+- Every column has a stable ID, kept in the catalog (§8.2), in each weir segment's schema as
+  Arrow field metadata, and in each history file as Parquet `field_id`. Names are labels; data is
+  matched by ID everywhere. Data written before IDs existed has its columns' positions as theirs.
+- A rename is declared on the column, as the names it had (`km.float64(was="px")`, or the spec
+  `"float64 was px"` in a project file): it keeps the column's ID rather than reading as a drop
+  and an add. Renames are never inferred, and `was` can stay in the declaration for good.
 
 Change classes, determined by `plan`
 
 | Change | Class | Effect |
 |---|---|---|
-| Add column (nullable or with default) | compatible | Applies mid-day. Older segments and files read as null/default. |
-| Widen type (int32→int64, float32→float64, new enum value) | compatible | Cast on read. |
+| Add column | compatible | Applies at once. Older segments and files read it as null. |
+| Widen type (int32 → int64 or float64, the lossless ones) | compatible | Cast on read. |
 | Rename column | compatible | Metadata only. Dependents referencing the old name are reported and must change in the same commit or a dependent project's next commit. |
-| Drop column | contract | Hidden from reads immediately; stored data kept until an explicit purge job. |
-| Incompatible type change, recomputed values | rewrite | Backfill DAG with one task per date: rewrite Parquet with a transform expression, commit each date atomically. Resumable. |
-| Sort keys / layout | rewrite (optional) | Applies to future merges; backfill optional. |
+| Drop column | contract | Refused for now. Later: hidden from reads immediately; stored data kept until an explicit purge job. |
+| Incompatible type change, recomputed values | rewrite | Refused for now. Later: backfill DAG with one task per date: rewrite Parquet with a transform expression, commit each date atomically. Resumable. |
+| Key or sort columns renamed or retyped; sort keys / layout | rewrite | Refused for now: keys hash and history files sort by them. |
 
 Dependents
 
@@ -273,20 +279,21 @@ Dependents
 
 Live data
 
-- A new schema version on a live table takes effect at a cycle boundary and opens new weir
-  segments.
-- weir accepts writes at any version compatible with the current one and projects them up by
-  column ID (defaults, casts, dropped columns discarded). Producers and tables upgrade
-  independently.
-- Initial implementation restarts dependent deployments, which rebuild state from weir and
-  history. Hot re-planning for compatible changes comes later.
+- A change takes effect when `create_table` applies it. weir closes each partition's open
+  segment, so every segment holds one set of columns.
+- Readers and writers keep the columns they opened with. weir brings a writer's rows to the
+  current columns by ID (nulls for added columns, casts for widened ones), and a reader gets each
+  batch in its own columns: added columns are left out until it reads the table again, and a
+  rename follows the ID. A reader holding a column that was widened since cannot follow: its table
+  fails, saying to read the table again. Producers and tables upgrade independently.
+- Deployments pick up new columns when restarted, as a rollout does; hot re-planning for
+  compatible changes comes later.
 
 History
 
-- The catalog records the new schema version in the same transaction as the table definition
-  change. Existing Parquet files are not touched; reads map them by column ID.
-- Catalog snapshots (§8.2) keep old schema versions; reading an old snapshot sees the old schema.
-- Merge projects every version present in a date onto the table's current version (§8.3).
+- Existing Parquet files are not touched: reads map them to the current columns by `field_id`.
+- Merge writes every date in the current columns, rewriting neighbouring files by column ID (§8.3).
+- Catalog snapshots (§8.2) will keep old columns; reading an old snapshot sees them.
 
 ## 6. Ingestion
 
@@ -308,9 +315,9 @@ Arrow Flight `DoPut`.
 - Once it holds the lease, the writer reads the action `last_seq` and resumes the source from
   there. For log-structured sources (NATS JetStream, Kafka) the source offset is the `seq`, so
   connectors keep no state of their own.
-- The descriptor's `schema_version` may be any version compatible with the table's current one;
-  weir projects batches up by column ID (§5.4). Incompatible versions are rejected. A new version
-  opens a new segment.
+- A writer writes the table's columns as they were when it opened (a remote writer: when its
+  `DoPut` began); weir brings its rows to the current columns by column ID (§5.4). A new set of
+  columns opens new segments.
 
 Fallback for lightweight producers: WebSocket (and HTTP POST) carrying Arrow IPC or JSON rows,
 coerced to the table schema by weir, same `seq` semantics.
@@ -559,9 +566,9 @@ the only record of what history exists.
    the platform image, under the namespace's restricted pod security, with credentials for the
    lake's bucket alone; it reaches weir by its Service. Locally, `kermodes merge` runs one by
    hand.
-2. The Job reads `D` from weir over Flight and writes it per the plan (§8.1). Later: projecting
-   every schema version present onto the table's current one by column ID (§5.4), and sorting by
-   the table's key columns.
+2. The Job reads `D` from weir over Flight and writes it per the plan (§8.1), every segment and
+   rewritten neighbour brought to the table's current columns by column ID (§5.4). Later:
+   sorting by the table's key columns.
 3. It commits, replacing `D` (a re-run after a crash is the same commit), after checking that
    the rows written equal the rows weir holds of `D`.
 4. Weir then deletes its partitions for `D`, and refuses to unless history holds `D` with as
@@ -687,7 +694,7 @@ The engine is driven by an injectable clock.
   - A replay reads the store and never writes it: `create_table` checks the table is as
     declared, and `publish` refuses.
   - The event-time column is named per table (`ts` by default) until tables declare theirs in
-    the catalog with schema versions (§5.4).
+    the catalog (§5.4).
 
 Late data policy is per operator: windows declare allowed lateness; as-of joins use the current
 state at cycle time.

@@ -234,6 +234,7 @@ fn a_ticker_feed_lands_in_a_store() {
                 missing.fetch_add(null_count as u64, Ordering::Relaxed);
                 true
             }),
+            Box::new(|reason| panic!("{reason}")),
         )
         .unwrap();
     assert_eq!(stored.load(Ordering::Relaxed), rows);
@@ -433,6 +434,7 @@ fn a_numbered_feed_is_written_exactly_once_across_a_handover() {
                     .extend(seq.values().iter().map(|&n| n as u64));
                 true
             }),
+            Box::new(|reason| panic!("{reason}")),
         )
         .unwrap();
     let numbers = numbers.lock().unwrap();

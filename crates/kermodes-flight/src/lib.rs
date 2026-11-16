@@ -30,9 +30,10 @@ mod server;
 
 use std::sync::Arc;
 
-use arrow::datatypes::{Field, Schema, SchemaRef};
-use kermodes_core::{parse_type, type_name};
-use kermodes_weir::{Change, Date, Error, Garbage, HistoryCommit, HistoryDate, HistoryFile, Stamp};
+use arrow::datatypes::{Schema, SchemaRef};
+use kermodes_weir::{
+    Change, Date, Error, Garbage, HistoryCommit, HistoryDate, HistoryFile, Stamp, column, spec,
+};
 use serde_json::{Value, json};
 use tonic::{Code, Status};
 
@@ -44,12 +45,15 @@ pub use server::{Server, serve};
 /// reader's queue (128 MiB), and the server holds at most this per writer while decoding.
 pub const MAX_WRITE_BYTES: usize = 64 << 20;
 
+/// `[[name, spec], ...]`: each column's type, and in a declaration the names it was
+/// (`kermodes_weir::spec`). A server older than column IDs refuses a spec with `was` as a
+/// type it does not know.
 fn columns_json(schema: &Schema) -> Value {
     Value::Array(
         schema
             .fields()
             .iter()
-            .map(|f| json!([f.name(), type_name(f.data_type())]))
+            .map(|f| json!([f.name(), spec(f)]))
             .collect(),
     )
 }
@@ -60,11 +64,11 @@ fn schema_from_json(value: &Value) -> Result<SchemaRef, Error> {
         .as_array()
         .ok_or_else(bad)?
         .iter()
-        .map(|column| {
-            let name = column[0].as_str().ok_or_else(bad)?;
-            let kind = column[1].as_str().ok_or_else(bad)?;
-            let data_type = parse_type(kind).map_err(|e| Error::Schema(e.to_string()))?;
-            Ok(Field::new(name, data_type, true))
+        .map(|c| {
+            column(
+                c[0].as_str().ok_or_else(bad)?,
+                c[1].as_str().ok_or_else(bad)?,
+            )
         })
         .collect::<Result<Vec<_>, Error>>()?;
     Ok(Arc::new(Schema::new(fields)))

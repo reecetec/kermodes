@@ -104,6 +104,7 @@ fn subscribe(store: &Store) -> Vec<(Change, Vec<(String, f64)>)> {
                 sink.lock().unwrap().push((change, rows));
                 true
             }),
+            Box::new(|reason| panic!("{reason}")),
         )
         .unwrap();
     seen.lock().unwrap().clone()
@@ -281,6 +282,7 @@ fn replay(store: &Store) -> (std::collections::BTreeMap<String, f64>, usize, Vec
                 kinds.push(change);
                 true
             }),
+            Box::new(|reason| panic!("{reason}")),
         )
         .unwrap();
     let seen = seen.lock().unwrap();

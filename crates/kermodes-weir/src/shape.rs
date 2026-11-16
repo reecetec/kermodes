@@ -128,6 +128,72 @@ impl Shape {
         )
         .map_err(|e| Error::Arrow(e.to_string()))
     }
+
+    /// `batch`, written in this shape, as one of `to`. When they are the same columns the
+    /// arrays are kept and only the schema changes (names, after a rename; IDs, which a
+    /// segment's schema carries and a reader's does not); otherwise `project`.
+    pub fn convert(&self, batch: RecordBatch, to: &Shape) -> Result<RecordBatch, Error> {
+        if !self.reads_as(to) {
+            return self.project(&batch, to);
+        }
+        if Arc::ptr_eq(&batch.schema(), &to.schema) {
+            return Ok(batch);
+        }
+        let rows = batch.num_rows();
+        RecordBatch::try_new_with_options(
+            to.schema.clone(),
+            batch.columns().to_vec(),
+            &RecordBatchOptions::new().with_row_count(Some(rows)),
+        )
+        .map_err(|e| Error::Arrow(e.to_string()))
+    }
+}
+
+/// The field metadata key a column declared for a table keeps the names it had before under,
+/// as a JSON list: `create_table` renames rather than drops and adds (§5.4).
+pub(crate) const WAS: &str = "kermodes:was";
+
+/// A column declared as `spec`: a type (`float64`), or a type and the names the column had
+/// before (`float64 was px`, `float64 was px, price`), so declaring it renames an existing
+/// column instead of adding one.
+pub fn column(name: &str, spec: &str) -> Result<Field, Error> {
+    let (kind, was) = match spec.split_once(" was ") {
+        Some((kind, was)) => (kind, was.split(',').map(str::trim).collect::<Vec<_>>()),
+        None => (spec, Vec::new()),
+    };
+    let data_type =
+        kermodes_core::parse_type(kind.trim()).map_err(|e| Error::Schema(e.to_string()))?;
+    if was.iter().any(|name| name.is_empty()) {
+        return Err(Error::Schema(format!(
+            "column `{name}` is `{spec}`: name the columns it was, as `float64 was px`"
+        )));
+    }
+    let field = Field::new(name, data_type, true);
+    Ok(match was.as_slice() {
+        [] => field,
+        was => field.with_metadata(HashMap::from([(
+            WAS.to_owned(),
+            serde_json::json!(was).to_string(),
+        )])),
+    })
+}
+
+/// `field` as `column` reads it back: its type, and the names it was, if any.
+pub fn spec(field: &Field) -> String {
+    let kind = kermodes_core::type_name(field.data_type());
+    match former(field).as_slice() {
+        [] => kind,
+        was => format!("{kind} was {}", was.join(", ")),
+    }
+}
+
+/// The names a declared column says it had before.
+pub(crate) fn former(field: &Field) -> Vec<String> {
+    field
+        .metadata()
+        .get(WAS)
+        .and_then(|was| serde_json::from_str(was).ok())
+        .unwrap_or_default()
 }
 
 /// Whether every value of `from` is exactly one of `to`: the type changes a table may make

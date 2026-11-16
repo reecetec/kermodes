@@ -155,6 +155,23 @@ impl Postgres {
             .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4))))
     }
 
+    /// Replaces a table's columns if they are still `current`; whether they were, so a change
+    /// another client made meanwhile is never overwritten.
+    pub(crate) fn update_columns(
+        &mut self,
+        id: i64,
+        current: &str,
+        columns: &str,
+    ) -> Result<bool, Error> {
+        self.client()?
+            .execute(
+                "UPDATE kermodes_tables SET columns = $1 WHERE id = $2 AND columns = $3",
+                &[&columns, &id, &current],
+            )
+            .map(|updated| updated == 1)
+            .map_err(sql)
+    }
+
     pub(crate) fn list(&mut self, branch: &str) -> Result<Vec<Row>, Error> {
         Ok(self
             .client()?

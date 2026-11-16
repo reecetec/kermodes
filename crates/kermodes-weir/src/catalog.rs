@@ -14,7 +14,7 @@ use arrow::datatypes::{Field, Schema, SchemaRef};
 use kermodes_core::{parse_type, type_name};
 use serde_json::Value;
 
-use crate::shape::{ColumnId, Shape};
+use crate::shape::{ColumnId, Shape, former, widens};
 use crate::{Date, Error, SourceId, TableName};
 
 /// The catalog's format; a newer one is a migration, not a silent reinterpretation.
@@ -118,9 +118,9 @@ impl Catalog {
     }
 
     /// Creates `name` on `branch` with `schema`, keyed by `key` (empty for an append table) or,
-    /// for an append table, sorted in history by `sort`; or returns it if it exists with the same
-    /// definition. One with other columns, key, or sort is an error: schema changes are planned
-    /// (§5.4).
+    /// for an append table, sorted in history by `sort`. One that exists is brought to
+    /// `schema`'s columns where that is a compatible change (§5.4: `synced`), and returned; its
+    /// key and sort must be the same.
     pub(crate) fn create(
         &mut self,
         branch: &str,
@@ -134,8 +134,8 @@ impl Catalog {
                 "{name} is keyed: its history is its log, kept in commit order"
             )));
         }
-        if let Some(existing) = self.get(branch, name)? {
-            return same_definition(name, existing, schema, key, sort);
+        if let Some(found) = self.found(branch, name)? {
+            return self.sync(branch, name, found, schema, key, sort);
         }
         for field in schema.fields() {
             let kind = type_name(field.data_type());
@@ -148,9 +148,10 @@ impl Catalog {
         }
         named_columns(name, schema, "key", key)?;
         named_columns(name, schema, "sort", sort)?;
+        let schema = plain(schema);
         let ids: Arc<[ColumnId]> = (1..=schema.fields().len() as u32).map(ColumnId).collect();
         let was = vec![Vec::new(); ids.len()];
-        let columns = encode(schema, &ids, &was).to_string();
+        let columns = encode(&schema, &ids, &was).to_string();
         let json =
             |names: &[String]| (!names.is_empty()).then(|| serde_json::json!(names).to_string());
         let (key_json, sort_json) = (json(key), json(sort));
@@ -175,7 +176,7 @@ impl Catalog {
                 id,
                 name: name.clone(),
                 location,
-                schema: Arc::new(nullable(schema)),
+                schema: Arc::new(schema),
                 ids,
                 was,
                 key: key.to_vec(),
@@ -183,12 +184,51 @@ impl Catalog {
             }),
             // Another catalog client created it first: it must agree.
             None => {
-                let existing = self.get(branch, name)?.ok_or_else(|| {
+                let found = self.found(branch, name)?.ok_or_else(|| {
                     Error::Catalog(format!("{name} was created and then vanished"))
                 })?;
-                same_definition(name, existing, schema, key, sort)
+                self.sync(branch, name, found, &schema, key, sort)
             }
         }
+    }
+
+    /// Brings `found`'s columns to `schema`'s, if they differ: written only if no one changed
+    /// them meanwhile, else worked out again from what they became.
+    fn sync(
+        &mut self,
+        branch: &str,
+        name: &TableName,
+        found: (TableEntry, String),
+        schema: &Schema,
+        key: &[String],
+        sort: &[String],
+    ) -> Result<TableEntry, Error> {
+        let (mut existing, mut stored) = found;
+        for _ in 0..3 {
+            same_layout(name, &existing, key, sort)?;
+            let Some((schema, ids, was)) = synced(name, &existing, schema)? else {
+                return Ok(existing);
+            };
+            let columns = encode(&schema, &ids, &was).to_string();
+            let updated = match self {
+                Self::Sqlite(c) => c.update_columns(existing.id, &stored, &columns)?,
+                Self::Postgres(c) => c.update_columns(existing.id, &stored, &columns)?,
+            };
+            if updated {
+                return Ok(TableEntry {
+                    schema: Arc::new(schema),
+                    ids,
+                    was,
+                    ..existing
+                });
+            }
+            (existing, stored) = self.found(branch, name)?.ok_or_else(|| {
+                Error::Catalog(format!("{name} vanished while its columns changed"))
+            })?;
+        }
+        Err(Error::Busy(format!(
+            "{name}'s columns kept changing under this change; try again"
+        )))
     }
 
     pub(crate) fn get(
@@ -196,13 +236,22 @@ impl Catalog {
         branch: &str,
         name: &TableName,
     ) -> Result<Option<TableEntry>, Error> {
+        Ok(self.found(branch, name)?.map(|(entry, _)| entry))
+    }
+
+    /// A table, and its columns as stored: what a change of them must find still there.
+    fn found(
+        &mut self,
+        branch: &str,
+        name: &TableName,
+    ) -> Result<Option<(TableEntry, String)>, Error> {
         let row = match self {
             Self::Sqlite(c) => c.get(branch, name)?,
             Self::Postgres(c) => c.get(branch, name)?,
         };
         row.map(|(id, location, columns, key, sort)| {
             let (schema, ids, was) = decode(&columns)?;
-            Ok(TableEntry {
+            let entry = TableEntry {
                 id,
                 name: name.clone(),
                 location,
@@ -211,7 +260,8 @@ impl Catalog {
                 was,
                 key: decode_names(key.as_deref())?,
                 sort: decode_names(sort.as_deref())?,
-            })
+            };
+            Ok((entry, columns))
         })
         .transpose()
     }
@@ -364,20 +414,14 @@ fn location(branch: &str, name: &TableName, id: i64) -> String {
     format!("{branch}/{}/{}.{id}", name.namespace(), name.table())
 }
 
-fn same_definition(
+/// Refuses a definition whose key or sort is not the table's: those are fixed when it is
+/// created.
+fn same_layout(
     name: &TableName,
-    existing: TableEntry,
-    schema: &Schema,
+    existing: &TableEntry,
     key: &[String],
     sort: &[String],
-) -> Result<TableEntry, Error> {
-    if columns(&existing.schema) != columns(schema) {
-        return Err(Error::Schema(format!(
-            "{name} already exists with columns ({}), not ({})",
-            listed(&existing.schema),
-            listed(schema)
-        )));
-    }
+) -> Result<(), Error> {
     if existing.key != key {
         let keyed = |key: &[String]| match key {
             [] => "as an append table".to_owned(),
@@ -400,7 +444,88 @@ fn same_definition(
             sorted(sort)
         )));
     }
-    Ok(existing)
+    Ok(())
+}
+
+/// The columns `existing` takes to be `desired`'s (§5.4), `None` when it has them already.
+/// Each desired column is the existing one of its name, or else of a name it says it was (a
+/// rename), keeping that column's ID; or a new column, with an ID never used before. A type
+/// may only widen (`widens`). Leaving a column out would drop it, and a key or sort column
+/// cannot be renamed or retyped (keys hash, and history files are sorted, by them): those are
+/// refused, naming the change.
+fn synced(
+    name: &TableName,
+    existing: &TableEntry,
+    desired: &Schema,
+) -> Result<Option<Columns>, Error> {
+    let current = &existing.schema;
+    let mut taken = vec![false; current.fields().len()];
+    let mut next = existing.ids.iter().map(|id| id.0).max().unwrap_or(0) + 1;
+    let (mut fields, mut ids, mut was) = (Vec::new(), Vec::new(), Vec::new());
+    for field in desired.fields() {
+        let declared = Field::new(field.name(), field.data_type().clone(), true);
+        let at = current.index_of(field.name()).ok().or_else(|| {
+            former(field)
+                .iter()
+                .find_map(|old| current.index_of(old).ok())
+        });
+        let Some(at) = at else {
+            fields.push(declared);
+            ids.push(ColumnId(next));
+            was.push(Vec::new());
+            next += 1;
+            continue;
+        };
+        let column = current.field(at);
+        if std::mem::replace(&mut taken[at], true) {
+            return Err(Error::Schema(format!(
+                "{name}: two of the columns given are its column `{}`",
+                column.name()
+            )));
+        }
+        let fixed = [("key", &existing.key), ("sort", &existing.sort)]
+            .into_iter()
+            .find(|(_, names)| names.contains(column.name()))
+            .map(|(what, _)| what);
+        let renamed = column.name() != field.name();
+        let retyped = column.data_type() != field.data_type();
+        if let Some(what) = fixed.filter(|_| renamed || retyped) {
+            return Err(Error::Schema(format!(
+                "{name}'s {what} column `{}` cannot be renamed or change type: that is a new \
+                 table",
+                column.name()
+            )));
+        }
+        if retyped && !widens(column.data_type(), field.data_type()) {
+            return Err(Error::Schema(format!(
+                "{name}'s column `{}` is {}: making it {} is not a compatible change (int32 \
+                 widens to int64 or float64; anything else is a new table)",
+                column.name(),
+                type_name(column.data_type()),
+                type_name(field.data_type())
+            )));
+        }
+        let mut names = existing.was[at].clone();
+        if renamed {
+            names.push(column.name().clone());
+        }
+        names.retain(|old| old != field.name());
+        fields.push(declared);
+        ids.push(existing.ids[at]);
+        was.push(names);
+    }
+    if let Some(at) = taken.iter().position(|taken| !taken) {
+        return Err(Error::Schema(format!(
+            "{name} has a column `{}` the columns given leave out: dropping a column is not a \
+             compatible change; keep it, or rename it with `was`",
+            current.field(at).name()
+        )));
+    }
+    let schema = Schema::new(fields);
+    if columns(&schema) == columns(current) && ids[..] == existing.ids[..] && was == existing.was {
+        return Ok(None);
+    }
+    Ok(Some((schema, ids.into(), was)))
 }
 
 /// Checks that `names` (a table's key or sort) are columns of `schema`, each once.
@@ -495,12 +620,14 @@ fn decode(text: &str) -> Result<Columns, Error> {
     Ok((Schema::new(fields), ids.into(), was))
 }
 
-fn nullable(schema: &Schema) -> Schema {
+/// `schema`'s columns as a table has them: every column nullable, and nothing beside its name
+/// and type (a declaration's former names are the catalog's to keep, not the schema's).
+fn plain(schema: &Schema) -> Schema {
     Schema::new(
         schema
             .fields()
             .iter()
-            .map(|f| f.as_ref().clone().with_nullable(true))
+            .map(|f| Field::new(f.name(), f.data_type().clone(), true))
             .collect::<Vec<_>>(),
     )
 }

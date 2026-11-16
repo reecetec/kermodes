@@ -76,6 +76,7 @@ fn values(store: &Store) -> Vec<i64> {
                 sink.lock().unwrap().extend(n.values().iter().copied());
                 true
             }),
+            Box::new(|reason| panic!("{reason}")),
         )
         .unwrap();
     seen.lock().unwrap().clone()
@@ -231,6 +232,7 @@ fn subscribers_get_every_committed_batch_once_then_each_new_one() {
                 sink.lock().unwrap().extend(n.values().iter().copied());
                 true
             }),
+            Box::new(|reason| panic!("{reason}")),
         )
         .unwrap();
     // One that unsubscribes at its first new batch is not called again.
@@ -240,6 +242,7 @@ fn subscribers_get_every_committed_batch_once_then_each_new_one() {
         .subscribe(
             &ticks(),
             Box::new(move |_, _, _| counter.fetch_add(1, Ordering::Relaxed) < 2),
+            Box::new(|reason| panic!("{reason}")),
         )
         .unwrap();
     west.write(&batch(4..5), None).unwrap();
@@ -287,6 +290,7 @@ fn a_slow_subscriber_catches_up_without_holding_writers_and_misses_nothing() {
                 pace_sink.lock().unwrap().push(pace);
                 true
             }),
+            Box::new(|reason| panic!("{reason}")),
         )
         .unwrap();
     writing.join().unwrap();
@@ -384,19 +388,19 @@ fn names_definitions_and_columns_are_checked() {
     let store = Store::open(&dir.0).unwrap();
     let first = store.create_table(&ticks(), &schema()).unwrap();
     assert_eq!(first.location, format!("local/md/ticks.{}", first.id));
-    // The same definition again is the same table; a different one is refused.
+    // The same definition again is the same table; an incompatible one is refused.
     assert_eq!(
         store.create_table(&ticks(), &schema()).unwrap().id,
         first.id
     );
-    let other = Schema::new(vec![Field::new("n", DataType::Float64, true)]);
+    let other = Schema::new(vec![
+        Field::new("n", DataType::Float64, true),
+        Field::new("sym", DataType::Utf8, true),
+    ]);
     let Err(Error::Schema(message)) = store.create_table(&ticks(), &other) else {
-        panic!("a conflicting definition should fail");
+        panic!("an incompatible definition should fail");
     };
-    assert!(
-        message.contains("already exists with columns (n int64, sym utf8)"),
-        "{message}"
-    );
+    assert!(message.contains("not a compatible change"), "{message}");
     let odd = Schema::new(vec![Field::new("b", DataType::UInt8, true)]);
     let name = TableName::parse("md.odd").unwrap();
     assert!(matches!(
@@ -476,6 +480,7 @@ fn full_segments_roll_over() {
                     sink.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
                     true
                 }),
+                Box::new(|reason| panic!("{reason}")),
             )
             .unwrap();
         total.load(Ordering::Relaxed)

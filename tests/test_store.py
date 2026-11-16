@@ -49,8 +49,8 @@ def test_a_store_has_one_owner_and_clear_errors(tmp_path):
     with pytest.raises(km.KermodesError, match="no table md.nope"):
         s.live_table("md.nope")
     s.create_table("md.ticks", COLUMNS)
-    with pytest.raises(km.KermodesError, match="already exists with columns"):
-        s.create_table("md.ticks", {"n": km.float64()})
+    with pytest.raises(km.KermodesError, match="not a compatible change"):
+        s.create_table("md.ticks", {**COLUMNS, "n": km.float64()})
     first = s.writer("md.ticks")
     with pytest.raises(km.KermodesError, match="already has a writer"):
         s.writer("md.ticks")

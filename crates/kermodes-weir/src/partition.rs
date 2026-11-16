@@ -20,7 +20,7 @@ use arrow::buffer::Buffer;
 use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::{StreamDecoder, StreamReader};
 use arrow::ipc::writer::StreamWriter;
-use arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use arrow::record_batch::RecordBatch;
 
 use crate::shape::Shape;
 use crate::{Change, Error};
@@ -157,6 +157,15 @@ impl Partition {
 
     pub(crate) fn last_seq(&self) -> Option<u64> {
         self.last_seq
+    }
+
+    /// From now on writes `shape`'s columns: the segment taking batches is closed, so the next
+    /// batch starts one whose schema says what it holds (§5.4).
+    pub(crate) fn reshape(&mut self, shape: Shape) {
+        if let Some(open) = self.open.take() {
+            self.closed.push(open.segment);
+        }
+        self.shape = shape;
     }
 
     /// Appends `batch` as `seq`, a `change` written under lease `epoch`, durably, before
@@ -334,7 +343,7 @@ impl Partition {
                 let batch = decoder.decode(&mut body).map_err(arrow)?;
                 match batch {
                     Some(batch) if batch.num_rows() as u64 == entry.rows => {
-                        batches.push(project(&segment.shape, batch, to)?);
+                        batches.push(segment.shape.convert(batch, to)?);
                     }
                     _ => {
                         return Err(Error::Corrupt(format!(
@@ -400,21 +409,6 @@ impl Partition {
             index: index_file,
         })
     }
-}
-
-/// `batch`, written as `from`'s columns, as `to`'s. When they are the same columns the arrays
-/// are kept and only the schema changes: the stream's carries column IDs, a reader's does not.
-fn project(from: &Shape, batch: RecordBatch, to: &Shape) -> Result<RecordBatch, Error> {
-    if !from.reads_as(to) {
-        return from.project(&batch, to);
-    }
-    let rows = batch.num_rows();
-    RecordBatch::try_new_with_options(
-        to.schema.clone(),
-        batch.columns().to_vec(),
-        &RecordBatchOptions::new().with_row_count(Some(rows)),
-    )
-    .map_err(|e| Error::Arrow(e.to_string()))
 }
 
 /// A segment's committed batches: its stream up to the last committed byte, and each batch's
@@ -516,7 +510,12 @@ impl Iterator for Batches {
                 return Some(Err(corrupt(segment)));
             }
             if *at > self.skip {
-                return Some(project(&segment.shape, batch, &self.to).map(|b| (b, entry.stamp())));
+                return Some(
+                    segment
+                        .shape
+                        .convert(batch, &self.to)
+                        .map(|b| (b, entry.stamp())),
+                );
             }
         }
     }

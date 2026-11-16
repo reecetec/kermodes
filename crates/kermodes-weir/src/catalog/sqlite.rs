@@ -164,6 +164,22 @@ impl Sqlite {
             .map_err(sql)
     }
 
+    /// Replaces a table's columns if they are still `current`; whether they were.
+    pub(crate) fn update_columns(
+        &mut self,
+        id: i64,
+        current: &str,
+        columns: &str,
+    ) -> Result<bool, Error> {
+        self.conn
+            .execute(
+                "UPDATE tables SET columns = ?1 WHERE id = ?2 AND columns = ?3",
+                params![columns, id, current],
+            )
+            .map(|updated| updated == 1)
+            .map_err(sql)
+    }
+
     pub(crate) fn list(&mut self, branch: &str) -> Result<Vec<Row>, Error> {
         let mut statement = self
             .conn

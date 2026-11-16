@@ -419,6 +419,7 @@ impl FlightService for Service {
         // would never end if the stream started only after it.
         tokio::task::spawn_blocking(move || {
             let subscriber = batches.clone();
+            let failing = batches.clone();
             let subscribed = store.subscribe(
                 &name,
                 Box::new(move |batch, stamp, pace| {
@@ -444,6 +445,11 @@ impl FlightService for Service {
                     subscriber
                         .send((Ok(Sent::Batch(batch.clone(), stamp)), size))
                         .is_ok()
+                }),
+                // The table's columns changed beyond the reader's: its stream ends with why.
+                Box::new(move |reason| {
+                    let error = FlightError::Tonic(Box::new(Status::failed_precondition(reason)));
+                    let _ = failing.send((Err(error), 0));
                 }),
             );
             // Everything the table held is sent; what follows is live.
