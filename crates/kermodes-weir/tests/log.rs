@@ -124,9 +124,9 @@ fn state_after(n: i64) -> BTreeMap<i64, i64> {
     (0..n).map(|i| (i % 7, i)).collect()
 }
 
-/// Run as a child process by `a_killed_writer_loses_nothing_acknowledged`: writes both tables in
-/// turn until killed, up to `WINDOW` rounds in flight at once, printing how many rounds are
-/// acknowledged after each acknowledgement.
+/// Run as a child process by `a_killed_writer_loses_nothing_acknowledged`: writes both tables,
+/// each from where its own durable writes end, up to `WINDOW` writes of each in flight, printing
+/// how many of both are acknowledged after each acknowledgement.
 #[test]
 #[ignore = "a child process of a_killed_writer_loses_nothing_acknowledged"]
 fn writer_child() {
@@ -142,29 +142,25 @@ fn writer_child() {
     let feed = SourceId::parse("feed").unwrap();
     let ticks_writer = store.writer(&ticks(), &feed, true).unwrap();
     let quotes_writer = store.writer(&quotes(), &feed, true).unwrap();
-    let mut i = ticks_writer.last_seq().unwrap_or(0) as i64;
-    // The kill may have come between a round's two writes.
-    if quotes_writer.last_seq().unwrap_or(0) as i64 == i - 1 {
-        quotes_writer
-            .upsert(&upserted(i - 1), Some(i as u64))
-            .unwrap();
-    }
+    let mut tick = ticks_writer.last_seq().unwrap_or(0) as i64;
+    let mut quote = quotes_writer.last_seq().unwrap_or(0) as i64;
     let stdout = std::io::stdout();
     let mut in_flight = std::collections::VecDeque::new();
     loop {
-        let tick = ticks_writer
-            .send(Change::Rows, &appended(i), Some(i as u64 + 1))
+        let sent_tick = ticks_writer
+            .send(Change::Rows, &appended(tick), Some(tick as u64 + 1))
             .unwrap();
-        let quote = quotes_writer
-            .send(Change::Upsert, &upserted(i), Some(i as u64 + 1))
+        let sent_quote = quotes_writer
+            .send(Change::Upsert, &upserted(quote), Some(quote as u64 + 1))
             .unwrap();
-        i += 1;
-        in_flight.push_back((i, tick, quote));
+        tick += 1;
+        quote += 1;
+        in_flight.push_back((tick.min(quote), sent_tick, sent_quote));
         if in_flight.len() == WINDOW {
-            let (round, tick, quote) = in_flight.pop_front().unwrap();
-            assert!(tick.wait().unwrap() && quote.wait().unwrap());
+            let (both, sent_tick, sent_quote) = in_flight.pop_front().unwrap();
+            assert!(sent_tick.wait().unwrap() && sent_quote.wait().unwrap());
             let mut out = stdout.lock();
-            writeln!(out, "acked {round}").unwrap();
+            writeln!(out, "acked {both}").unwrap();
             out.flush().unwrap();
         }
     }
@@ -216,12 +212,12 @@ fn a_killed_writer_loses_nothing_acknowledged() {
             "kill after {kill_after}: every write once, in order"
         );
         let quotes_state = state(&read(&store, &quotes()));
-        // Writes are logged in the order sent, a round's append before its upsert, and the
-        // log keeps a prefix: the kill may have come between the last round's two writes.
+        // Each writer's writes are logged in the order sent, so the table holds its first `n`
+        // upserts, all acknowledged ones among them; the two tables' unacknowledged writes
+        // need not agree (§7.1).
         assert!(
-            quotes_state == state_after(written as i64)
-                || quotes_state == state_after(written as i64 - 1),
-            "kill after {kill_after}: {quotes_state:?} after {written} appends"
+            (acked as i64..acked as i64 + 1_000).any(|n| quotes_state == state_after(n)),
+            "kill after {kill_after}: {quotes_state:?} after {acked} acked"
         );
     }
 }
@@ -379,9 +375,11 @@ fn writes_merged_in_flight_leave_what_writing_them_one_by_one_would() {
             .iter()
             .map(|s| store.writer(&quotes(), s, false).unwrap())
             .collect();
-        // The oracle: each write applied alone, in the order sent.
+        // The oracle: each write applied alone, in the order sent. Writers' unacknowledged
+        // writes may be logged in any order but their own (§7.1), so each source writes its own
+        // keys, and tags its ticks with its number.
         let mut last = [[0_u64; 3]; 2];
-        let mut want_ticks = Vec::new();
+        let mut want_ticks: [Vec<i64>; 3] = [vec![], vec![], vec![]];
         let mut want_quotes = BTreeMap::new();
         let mut sent = Vec::new();
         for i in 0..2_000 {
@@ -398,18 +396,22 @@ fn writes_merged_in_flight_leave_what_writing_them_one_by_one_would() {
                 last[table][who] = seq;
             }
             let pending = if table == 0 {
+                let v: Vec<i64> = (i * 10..i * 10 + 10).collect();
                 if fresh {
-                    want_ticks.extend(i * 10..i * 10 + 10);
+                    want_ticks[who].extend(&v);
                 }
                 ticks_writers[who]
-                    .send(Change::Rows, &appended(i), Some(seq))
+                    .send(Change::Rows, &rows(vec![who as i64; 10], v), Some(seq))
                     .unwrap()
             } else {
-                let key = rng.below(9) as i64;
+                let mine = |n: u64| who as i64 * 3 + (n % 3) as i64;
+                let n = rng.below(3);
+                let (key, next) = (mine(n), mine(n + 1));
+                // A checkpoint replaces every source's keys: it stays ordered against them all.
                 let (change, batch) = match rng.below(20) {
-                    0 => (Change::Checkpoint, rows(vec![key, key + 9], vec![i, i])),
+                    0 => (Change::Checkpoint, rows(vec![key, next], vec![i, i])),
                     1..=5 => (Change::Delete, rows(vec![key], vec![0])),
-                    _ => (Change::Upsert, rows(vec![key, (key + 1) % 9], vec![i, -i])),
+                    _ => (Change::Upsert, rows(vec![key, next], vec![i, -i])),
                 };
                 if fresh {
                     let k = batch.column(0).as_primitive::<Int64Type>();
@@ -437,16 +439,36 @@ fn writes_merged_in_flight_leave_what_writing_them_one_by_one_would() {
         }
         drop((ticks_writers, quotes_writers));
         let check = |store: &Store, when: &str| {
+            let ticks_read = read(store, &ticks());
+            let mut by_source = [vec![], vec![], vec![]];
+            for (_, batch) in &ticks_read {
+                let k = batch.column(0).as_primitive::<Int64Type>();
+                let v = batch.column(1).as_primitive::<Int64Type>();
+                for row in 0..batch.num_rows() {
+                    by_source[k.value(row) as usize].push(v.value(row));
+                }
+            }
+            assert_eq!(by_source, want_ticks, "seed {seed} {when}: ticks");
+            let quotes_read = read(store, &quotes());
             assert_eq!(
-                values(&read(store, &ticks())),
-                want_ticks,
-                "seed {seed} {when}: ticks"
-            );
-            assert_eq!(
-                state(&read(store, &quotes())),
+                state(&quotes_read),
                 want_quotes,
                 "seed {seed} {when}: quotes"
             );
+            // Dates and log order agree: ingest times rise with log position.
+            for batches in [&ticks_read, &quotes_read] {
+                let stamps: Vec<_> = batches
+                    .iter()
+                    .filter(|(stamp, _)| stamp.lsn > 0)
+                    .map(|(stamp, _)| (stamp.lsn, stamp.ingest_ns))
+                    .collect();
+                assert!(
+                    stamps
+                        .windows(2)
+                        .all(|w| w[0].0 < w[1].0 && w[0].1 < w[1].1),
+                    "seed {seed} {when}: ingest times rise with the log"
+                );
+            }
         };
         check(&store, "live");
         drop(store);

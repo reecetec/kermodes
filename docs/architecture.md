@@ -407,20 +407,26 @@ catalog as live tables.
   fsync. Log segments are preallocated, so an fsync never has to commit the file's growth.
 - A writer need not wait for one write before sending the next: `write(..., wait=False)` (in
   Rust, `send`) returns at once with a handle to wait on, and `flush` waits for all of them and
-  raises the first that failed. Writes are logged in the order sent, those arriving during an
-  fsync share the next, and so a single producer is not held to one write per fsync. Up to 64 MiB
-  may be unanswered per writer; sending then waits, so a slow store slows its producer instead
-  of filling its memory. Over Flight the writes stream without waiting and are acknowledged in
-  order; one the server refuses fails, and so does every write sent after it.
-- Adjacent writes in a group from one source of a table, of the same change kind and date, are
-  logged as one batch under the last one's `seq`. A resend is recognised by `seq <= last`, so
+  raises the first that failed. Writes arriving during an fsync share the next, and so a single
+  producer is not held to one write per fsync. Up to 64 MiB may be unanswered per writer;
+  sending then waits, so a slow store slows its producer instead of filling its memory. Over
+  Flight the writes stream without waiting and are acknowledged in order; one the server
+  refuses fails, and so does every write sent after it.
+- What is ordered, as Kafka orders a partition: a writer's writes (one source of one table) are
+  logged in the order sent; a write sent after another was acknowledged is logged after it; and
+  a checkpoint is logged in its place among every write of its table, since it replaces them
+  all. Unacknowledged writes of different writers, even one process's writers of two tables,
+  may be logged in either order. A producer that needs one table's write to follow another's
+  waits for the first (`Pending.wait`, `flush`) before sending the second.
+- Each group's writes of one source of a table, of the same change kind and date and not split
+  by another change of that source or a checkpoint of the table, are logged as one batch under
+  the last one's `seq`, where the last of them was. A resend is recognised by `seq <= last`, so
   the batch stands for every write in it and resending any of them is still dropped; a resend
-  and a checkpoint are never merged. Each write is still answered on its own. So a producer
-  sending many small writes has them batched by the load, Kafka's batching without a linger or a
-  batch size to choose: one write alone when it is quiet, thousands under one log entry when it
-  is not. Readers see the same rows in the same order in fewer, larger batches (a keyed batch's
-  later row for a key wins). Only adjacent writes merge, so the log keeps each producer's order
-  across tables.
+  and a checkpoint are never merged. Each write is still answered on its own. So producers
+  sending many small writes have them batched by the load, Kafka's batching without a linger or
+  a batch size to choose: one write alone when it is quiet, thousands under one log entry when
+  it is not, however many producers write the table. Readers see each writer's rows in the same
+  order in fewer, larger batches (a keyed batch's later row for a key wins).
 - A log entry is a batch (partition, source, `seq`, epoch, change kind, ingest time, and the
   rows as an Arrow IPC message) or the columns batches of a table are written in (a shape, with
   column IDs), which each segment carries for itself. An entry is its length, a CRC, its LSN, a

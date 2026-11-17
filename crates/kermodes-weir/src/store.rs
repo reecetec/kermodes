@@ -1164,13 +1164,19 @@ struct Unit {
     answers: Vec<Answer>,
 }
 
-/// Stamps each write of a group with the next ingest time and merges adjacent new writes of one
+/// Stamps each write of a group with the next ingest time and merges the new writes of each
 /// source of a table, of the same change, date, and columns, into one batch: what writing them
 /// one by one would leave, at the cost of one log entry, one index record, and one delivery to
-/// each reader. A producer sending many small writes so has them batched by the load, with no
-/// batch size or linger to choose. Only adjacent writes merge, so the log keeps every
-/// producer's order across tables; a resend and a checkpoint stay alone. Should joining a unit's
-/// batches fail, its writes fail and nothing of them is logged.
+/// each reader. Producers sending many small writes so have them batched by the load, with no
+/// batch size or linger to choose, however many write the table at once.
+///
+/// What stays ordered (§7.1): each writer's writes (one source of one table: a run ends at a
+/// write of the source that cannot join it), and a checkpoint against every write of its table
+/// (it ends every run of the table), which replaces all of them. Writes in one group were all
+/// sent before any of them was answered, so any other order is one they could have arrived in.
+/// A unit is logged where its last write was, stamped with that write's time, so ingest times
+/// still rise with log position. A resend stays alone. Should joining a unit's batches fail,
+/// its writes fail and nothing of them is logged.
 fn merge(group: Vec<Submitted>, clock: &mut i64) -> Vec<Unit> {
     struct Open {
         unit: Submitted,
@@ -1179,12 +1185,15 @@ fn merge(group: Vec<Submitted>, clock: &mut i64) -> Vec<Unit> {
         ingest_ns: i64,
         date: String,
         bytes: usize,
-        merges: bool,
+        /// The group position of its last write: where it is logged.
+        at: usize,
     }
     // Each source's last seq per table and date, as the group's writes before this one leave it.
     let mut known: HashMap<(i64, SourceId, String), Option<u64>> = HashMap::new();
+    // Each source's unit still taking writes, per table.
+    let mut runs: HashMap<(i64, SourceId), usize> = HashMap::new();
     let mut open: Vec<Open> = Vec::new();
-    for submitted in group {
+    for (at, submitted) in group.into_iter().enumerate() {
         *clock = now_ns().max(*clock + 1);
         let date = Date::of_ns(*clock).to_string();
         let last = known
@@ -1200,17 +1209,20 @@ fn merge(group: Vec<Submitted>, clock: &mut i64) -> Vec<Unit> {
             *last = Some(submitted.seq);
         }
         let bytes = submitted.batch.get_array_memory_size();
-        if let Some(previous) = open.last_mut().filter(|previous| {
-            previous.merges
-                && !resend
-                && Arc::ptr_eq(&previous.unit.log, &submitted.log)
-                && previous.unit.source == submitted.source
+        let run = (submitted.table, submitted.source.clone());
+        if submitted.change == Change::Checkpoint {
+            runs.retain(|(table, _), _| *table != submitted.table);
+        }
+        let joins = runs.get(&run).map(|&i| &open[i]).is_some_and(|previous| {
+            !resend
                 && previous.unit.epoch == submitted.epoch
                 && previous.unit.change == submitted.change
                 && previous.date == date
                 && previous.unit.shape == submitted.shape
                 && previous.bytes + bytes <= GROUP_BYTES
-        }) {
+        });
+        if joins {
+            let previous = &mut open[runs[&run]];
             let Submitted {
                 seq, batch, answer, ..
             } = submitted;
@@ -1219,9 +1231,14 @@ fn merge(group: Vec<Submitted>, clock: &mut i64) -> Vec<Unit> {
             previous.answers.push(answer);
             previous.ingest_ns = *clock;
             previous.bytes += bytes;
+            previous.at = at;
             continue;
         }
-        let merges = !resend && submitted.change != Change::Checkpoint;
+        if resend || submitted.change == Change::Checkpoint {
+            runs.remove(&run);
+        } else {
+            runs.insert(run, open.len());
+        }
         open.push(Open {
             unit: submitted,
             more: Vec::new(),
@@ -1229,9 +1246,10 @@ fn merge(group: Vec<Submitted>, clock: &mut i64) -> Vec<Unit> {
             ingest_ns: *clock,
             date,
             bytes,
-            merges,
+            at,
         });
     }
+    open.sort_unstable_by_key(|open| open.at);
     open.into_iter()
         .filter_map(|open| {
             let Submitted {
