@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arrow::datatypes::{Schema, SchemaRef};
+use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteContext, IpcWriteOptions};
 use arrow::record_batch::RecordBatch;
 use arrow_flight::decode::{DecodedPayload, FlightDataDecoder};
 use arrow_flight::error::FlightError;
@@ -722,10 +723,18 @@ impl RemoteWriter {
         };
         let mut sent = lock(&self.sent);
         let seq = seq.unwrap_or_else(|| sent.map_or(1, |last| last + 1));
-        let mut data = batches_to_flight_data(&self.schema, [&batch])
-            .map_err(|e| Error::Arrow(e.to_string()))?
-            .pop()
-            .expect("a batch message");
+        // The batch message alone: the stream's schema went first, when it opened.
+        let (dictionaries, encoded) = IpcDataGenerator::default()
+            .encode(
+                &batch,
+                &mut DictionaryTracker::new(false),
+                &IpcWriteOptions::default(),
+                &mut IpcWriteContext::default(),
+            )
+            .map_err(|e| Error::Arrow(e.to_string()))?;
+        // The column types tables store (kermodes_core::parse_type) have no dictionaries.
+        debug_assert!(dictionaries.is_empty());
+        let mut data = FlightData::from(encoded);
         // A plain write's metadata is its sequence number alone, as servers before keyed tables
         // read it.
         let mut metadata = seq.to_le_bytes().to_vec();

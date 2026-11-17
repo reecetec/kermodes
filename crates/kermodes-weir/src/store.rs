@@ -1080,40 +1080,33 @@ fn commit(mut wal: Wal, mut clock: i64, applied: &AtomicU64, requests: &Receiver
             }
             continue;
         }
-        let stamped: Vec<i64> = group
+        let units = merge(group, &mut clock);
+        let appends: Vec<Append> = units
             .iter()
-            .map(|_| {
-                clock = now_ns().max(clock + 1);
-                clock
-            })
-            .collect();
-        let appends: Vec<Append> = group
-            .iter()
-            .zip(&stamped)
-            .map(|(submitted, &ingest_ns)| Append {
-                table: submitted.table,
-                shape: &submitted.shape,
-                source: &submitted.source,
-                seq: submitted.seq,
-                epoch: submitted.epoch,
-                change: submitted.change,
-                ingest_ns,
-                batch: &submitted.batch,
+            .map(|unit| Append {
+                table: unit.table,
+                shape: &unit.shape,
+                source: &unit.source,
+                seq: unit.seq,
+                epoch: unit.epoch,
+                change: unit.change,
+                ingest_ns: unit.ingest_ns,
+                batch: &unit.batch,
             })
             .collect();
         let lsns = match wal.append(&appends) {
             Ok(lsns) => lsns,
             Err(e) => {
                 broken = Some(e.to_string());
-                for submitted in group {
-                    submitted.answer.send(Err(Error::Io(e.to_string())));
+                for unit in units {
+                    answer_all(unit.answers, Err(Error::Io(e.to_string())));
                 }
                 continue;
             }
         };
         drop(appends);
-        for ((submitted, lsn), ingest_ns) in group.into_iter().zip(lsns).zip(stamped) {
-            let Submitted {
+        for (unit, lsn) in units.into_iter().zip(lsns) {
+            let Unit {
                 log,
                 table,
                 shape,
@@ -1121,9 +1114,10 @@ fn commit(mut wal: Wal, mut clock: i64, applied: &AtomicU64, requests: &Receiver
                 seq,
                 epoch,
                 change,
+                ingest_ns,
                 batch,
-                answer,
-            } = submitted;
+                answers,
+            } = unit;
             let outcome = match &broken {
                 Some(why) => Err(Error::Io(format!(
                     "weir stopped taking writes: {why}; restart it"
@@ -1148,7 +1142,157 @@ fn commit(mut wal: Wal, mut clock: i64, applied: &AtomicU64, requests: &Receiver
                     outcome
                 }
             };
-            answer.send(outcome);
+            answer_all(answers, outcome);
+        }
+    }
+}
+
+/// Writes logged and applied as one batch: one write, or adjacent new writes of one source of a
+/// table (`merge`).
+struct Unit {
+    log: Arc<Log>,
+    table: i64,
+    shape: Shape,
+    source: SourceId,
+    /// The last write's: a resend is recognised by `seq <= last`, so the unit stands for every
+    /// write in it.
+    seq: u64,
+    epoch: u64,
+    change: Change,
+    ingest_ns: i64,
+    batch: RecordBatch,
+    answers: Vec<Answer>,
+}
+
+/// Stamps each write of a group with the next ingest time and merges adjacent new writes of one
+/// source of a table, of the same change, date, and columns, into one batch: what writing them
+/// one by one would leave, at the cost of one log entry, one index record, and one delivery to
+/// each reader. A producer sending many small writes so has them batched by the load, with no
+/// batch size or linger to choose. Only adjacent writes merge, so the log keeps every
+/// producer's order across tables; a resend and a checkpoint stay alone. Should joining a unit's
+/// batches fail, its writes fail and nothing of them is logged.
+fn merge(group: Vec<Submitted>, clock: &mut i64) -> Vec<Unit> {
+    struct Open {
+        unit: Submitted,
+        more: Vec<RecordBatch>,
+        answers: Vec<Answer>,
+        ingest_ns: i64,
+        date: String,
+        bytes: usize,
+        merges: bool,
+    }
+    // Each source's last seq per table and date, as the group's writes before this one leave it.
+    let mut known: HashMap<(i64, SourceId, String), Option<u64>> = HashMap::new();
+    let mut open: Vec<Open> = Vec::new();
+    for submitted in group {
+        *clock = now_ns().max(*clock + 1);
+        let date = Date::of_ns(*clock).to_string();
+        let last = known
+            .entry((submitted.table, submitted.source.clone(), date.clone()))
+            .or_insert_with(|| {
+                lock(&submitted.log.state)
+                    .partitions
+                    .get(&(date.clone(), Stream::Source(submitted.source.clone())))
+                    .and_then(Partition::last_seq)
+            });
+        let resend = last.is_some_and(|last| submitted.seq <= last);
+        if !resend {
+            *last = Some(submitted.seq);
+        }
+        let bytes = submitted.batch.get_array_memory_size();
+        if let Some(previous) = open.last_mut().filter(|previous| {
+            previous.merges
+                && !resend
+                && Arc::ptr_eq(&previous.unit.log, &submitted.log)
+                && previous.unit.source == submitted.source
+                && previous.unit.epoch == submitted.epoch
+                && previous.unit.change == submitted.change
+                && previous.date == date
+                && previous.unit.shape == submitted.shape
+                && previous.bytes + bytes <= GROUP_BYTES
+        }) {
+            let Submitted {
+                seq, batch, answer, ..
+            } = submitted;
+            previous.unit.seq = seq;
+            previous.more.push(batch);
+            previous.answers.push(answer);
+            previous.ingest_ns = *clock;
+            previous.bytes += bytes;
+            continue;
+        }
+        let merges = !resend && submitted.change != Change::Checkpoint;
+        open.push(Open {
+            unit: submitted,
+            more: Vec::new(),
+            answers: Vec::new(),
+            ingest_ns: *clock,
+            date,
+            bytes,
+            merges,
+        });
+    }
+    open.into_iter()
+        .filter_map(|open| {
+            let Submitted {
+                log,
+                table,
+                shape,
+                source,
+                seq,
+                epoch,
+                change,
+                batch,
+                answer,
+            } = open.unit;
+            let mut answers = open.answers;
+            answers.insert(0, answer);
+            let batch = if open.more.is_empty() {
+                batch
+            } else {
+                let schema = batch.schema();
+                let batches = std::iter::once(&batch).chain(&open.more);
+                match arrow::compute::concat_batches(&schema, batches) {
+                    Ok(batch) => batch,
+                    Err(e) => {
+                        answer_all(answers, Err(Error::Arrow(e.to_string())));
+                        return None;
+                    }
+                }
+            };
+            Some(Unit {
+                log,
+                table,
+                shape,
+                source,
+                seq,
+                epoch,
+                change,
+                ingest_ns: open.ingest_ns,
+                batch,
+                answers,
+            })
+        })
+        .collect()
+}
+
+/// Gives every write of a unit the unit's outcome.
+fn answer_all(answers: Vec<Answer>, outcome: Result<bool, Error>) {
+    match outcome {
+        Ok(written) => {
+            for answer in answers {
+                answer.send(Ok(written));
+            }
+        }
+        Err(e) => {
+            let why = e.to_string();
+            let mut answers = answers.into_iter();
+            if let Some(first) = answers.next() {
+                first.send(Err(e));
+            }
+            for answer in answers {
+                answer.send(Err(Error::Io(why.clone())));
+            }
         }
     }
 }

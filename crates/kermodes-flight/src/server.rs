@@ -376,9 +376,12 @@ impl FlightService for Service {
                     return;
                 };
                 let seq = u64::from_le_bytes(seq);
-                let writer = writer.clone();
-                // Waits only while the writer's in-flight budget is full.
-                let pending = blocking(move || writer.send(change, &batch, Some(seq))).await;
+                // On this task rather than a blocking task per write, which cost more than the
+                // send: it takes a few locks, and waits only while the writer's in-flight budget
+                // is full, which `block_in_place` lets the runtime work around.
+                let pending =
+                    tokio::task::block_in_place(|| writer.send(change, &batch, Some(seq)))
+                        .map_err(status);
                 let failed = pending.is_err();
                 if sent.send(pending).is_err() || failed {
                     return;

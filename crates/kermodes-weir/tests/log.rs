@@ -352,3 +352,105 @@ fn a_reader_resumed_after_any_position_gets_exactly_what_followed() {
         check(&store, "after reopening");
     }
 }
+
+/// Writes sent without waiting, many at once, are merged as the store logs them: the store
+/// holds what writing them one at a time would leave, every write is answered as it would have
+/// been (a resend `false`), and the log replays to the same after reopening. Seeded, with
+/// appends, upserts, deletes, checkpoints and resends from three sources, flushed at random.
+#[test]
+fn writes_merged_in_flight_leave_what_writing_them_one_by_one_would() {
+    for seed in 1..=8_u64 {
+        let dir = TempDir::new();
+        let mut rng = Rng(seed * 104_729);
+        let store = Store::open(&dir.0).unwrap();
+        store.create_table(&ticks(), &schema()).unwrap();
+        store
+            .create_keyed_table(&quotes(), &schema(), &["k".to_owned()])
+            .unwrap();
+        let sources: Vec<SourceId> = ["a", "b", "c"]
+            .iter()
+            .map(|s| SourceId::parse(s).unwrap())
+            .collect();
+        let ticks_writers: Vec<_> = sources
+            .iter()
+            .map(|s| store.writer(&ticks(), s, false).unwrap())
+            .collect();
+        let quotes_writers: Vec<_> = sources
+            .iter()
+            .map(|s| store.writer(&quotes(), s, false).unwrap())
+            .collect();
+        // The oracle: each write applied alone, in the order sent.
+        let mut last = [[0_u64; 3]; 2];
+        let mut want_ticks = Vec::new();
+        let mut want_quotes = BTreeMap::new();
+        let mut sent = Vec::new();
+        for i in 0..2_000 {
+            let who = rng.below(3) as usize;
+            let table = usize::from(rng.below(3) != 0);
+            // Mostly the next number; now and then one already written, a resend.
+            let seq = if last[table][who] > 0 && rng.below(10) == 0 {
+                1 + rng.below(last[table][who])
+            } else {
+                last[table][who] + 1
+            };
+            let fresh = seq > last[table][who];
+            if fresh {
+                last[table][who] = seq;
+            }
+            let pending = if table == 0 {
+                if fresh {
+                    want_ticks.extend(i * 10..i * 10 + 10);
+                }
+                ticks_writers[who]
+                    .send(Change::Rows, &appended(i), Some(seq))
+                    .unwrap()
+            } else {
+                let key = rng.below(9) as i64;
+                let (change, batch) = match rng.below(20) {
+                    0 => (Change::Checkpoint, rows(vec![key, key + 9], vec![i, i])),
+                    1..=5 => (Change::Delete, rows(vec![key], vec![0])),
+                    _ => (Change::Upsert, rows(vec![key, (key + 1) % 9], vec![i, -i])),
+                };
+                if fresh {
+                    let k = batch.column(0).as_primitive::<Int64Type>();
+                    let v = batch.column(1).as_primitive::<Int64Type>();
+                    if change == Change::Checkpoint {
+                        want_quotes.clear();
+                    }
+                    for row in 0..batch.num_rows() {
+                        if change == Change::Delete {
+                            want_quotes.remove(&k.value(row));
+                        } else {
+                            want_quotes.insert(k.value(row), v.value(row));
+                        }
+                    }
+                }
+                quotes_writers[who].send(change, &batch, Some(seq)).unwrap()
+            };
+            sent.push((pending, fresh));
+            if rng.below(100) == 0 {
+                ticks_writers[who].flush().unwrap();
+            }
+        }
+        for (n, (pending, fresh)) in sent.into_iter().enumerate() {
+            assert_eq!(pending.wait().unwrap(), fresh, "seed {seed}: write {n}");
+        }
+        drop((ticks_writers, quotes_writers));
+        let check = |store: &Store, when: &str| {
+            assert_eq!(
+                values(&read(store, &ticks())),
+                want_ticks,
+                "seed {seed} {when}: ticks"
+            );
+            assert_eq!(
+                state(&read(store, &quotes())),
+                want_quotes,
+                "seed {seed} {when}: quotes"
+            );
+        };
+        check(&store, "live");
+        drop(store);
+        let store = Store::open(&dir.0).unwrap();
+        check(&store, "after reopening");
+    }
+}
