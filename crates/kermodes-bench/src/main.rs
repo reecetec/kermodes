@@ -18,6 +18,10 @@
 //! every tick and over one symbol's (a ticking `where`), 20 times each.
 //!
 //! Batch generation is never timed.
+//!
+//! `fsync` and `weir` measure the store instead: see `weir.rs`.
+
+mod weir;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -164,6 +168,10 @@ fn report(name: &str, rows_per_cycle: usize, mut cycles: Vec<Duration>) {
 }
 
 fn main() {
+    let workload = std::env::args().nth(1).unwrap_or_default();
+    if workload == "weir" || workload == "fsync" {
+        return weir::run(&workload, std::env::args().skip(2));
+    }
     let args = Args::parse();
     match args.workload.as_str() {
         "book" => book(&args),

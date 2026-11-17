@@ -12,6 +12,7 @@ mod names;
 mod partition;
 mod shape;
 mod store;
+mod wal;
 
 use std::fmt;
 use std::path::Path;
@@ -71,6 +72,8 @@ pub enum Error {
     Catalog(String),
     /// A write over the limit for one batch: split it, it cannot succeed as it is.
     TooLarge(String),
+    /// A subscription asked to resume after rows no longer all held: it must start again.
+    Gone(String),
 }
 
 impl Error {
@@ -90,7 +93,8 @@ impl fmt::Display for Error {
             | Error::Io(m)
             | Error::Arrow(m)
             | Error::Catalog(m)
-            | Error::TooLarge(m) => f.write_str(m),
+            | Error::TooLarge(m)
+            | Error::Gone(m) => f.write_str(m),
         }
     }
 }

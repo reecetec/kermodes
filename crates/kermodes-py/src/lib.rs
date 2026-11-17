@@ -201,18 +201,22 @@ impl Tables {
         }
     }
 
-    /// Feeds `feed` the table's changes, as `taking` says; a remote table whose stream ends
-    /// fails the fed table. (A local store delivers in-process and cannot lose a subscription.)
+    /// Feeds `feed` the table's changes, as `taking` says. A remote table's stream that breaks
+    /// resumes where it stopped; one that cannot fails the fed table, with the reason. (A local
+    /// store delivers in-process and cannot lose a subscription.)
     fn feed(
         &self,
         name: &kermodes_weir::TableName,
         feed: kermodes_core::Feed,
         taking: Fed,
     ) -> Result<(), kermodes_weir::Error> {
+        // A keyed table's replay starts by replacing its state (a checkpoint), so one that
+        // cannot resume may be read again from the start; anything else would hold rows twice.
+        let rebuilds = matches!(taking, Fed::State { keyed: true });
         let rows = feed.clone();
         let subscriber: kermodes_weir::Subscriber = Box::new(move |batch, stamp, _| {
             let fed = match &taking {
-                Fed::State => {
+                Fed::State { .. } => {
                     let batch = std::slice::from_ref(batch);
                     match stamp.change {
                         kermodes_weir::Change::Rows => rows.append(batch),
@@ -261,6 +265,7 @@ impl Tables {
                         Box::new(move |reason| {
                             feed.fail(reason);
                         }),
+                        rebuilds,
                     )
                     .map(drop)
             }
@@ -282,12 +287,12 @@ impl Tables {
     }
 }
 
-/// How a fed table takes a stored table's changes: as the table they make (`live_table`), as
-/// their log, each row with its kind as history keeps it (`changes`), or as an append table's
-/// rows with the `Date` they arrived on, as history has them (`table`; the schema is history's,
-/// `Date` first).
+/// How a fed table takes a stored table's changes: as the table they make (`live_table`; a
+/// keyed table's latest row per key), as their log, each row with its kind as history keeps it
+/// (`changes`), or as an append table's rows with the `Date` they arrived on, as history has
+/// them (`table`; the schema is history's, `Date` first).
 enum Fed {
-    State,
+    State { keyed: bool },
     Log(kermodes_weir::TableEntry),
     Dated(arrow::datatypes::SchemaRef),
 }
@@ -1179,7 +1184,13 @@ fn open_live(
     }
     .map_err(OpenError::Engine)?;
     tables
-        .feed(&name, feed, Fed::State)
+        .feed(
+            &name,
+            feed,
+            Fed::State {
+                keyed: !key.is_empty(),
+            },
+        )
         .map_err(OpenError::Store)?;
     Ok(table)
 }

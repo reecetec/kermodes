@@ -10,7 +10,11 @@
 //!   the source's last sequence number (u64) and whether the batch was written (one byte). A
 //!   batch's message is at most `MAX_WRITE_BYTES`: the client refuses a larger one as `TooLarge`.
 //! - `DoGet` reads: the ticket `{"table"}` streams every committed batch, then each new one;
-//!   `{"table", "date"}` streams a past date's batches and ends (a merge's read, §8.3).
+//!   `{"table", "date"}` streams a past date's batches and ends (a merge's read, §8.3). A
+//!   subscription may ask `"lsn": true` for each batch's log position in its stamp, and
+//!   `"after": n` to resume after a position it had (§7.6): the batches after it, then each new
+//!   one. If they may no longer all be held, the stream fails `Aborted` (`Gone`) and the reader
+//!   must start again.
 //! - Actions, JSON in and out: `create_table` `{"table", "columns": [[name, type]]}`; `tables`;
 //!   `last_seq` `{"table", "source"}` → `{"last_seq", "epoch"}`. A writer asks for it once its
 //!   `DoPut` holds the lease, so nothing can write between the answer and its first batch.
@@ -125,36 +129,50 @@ const MARKS_CAUGHT_UP: &[u8] = b"marks-caught-up";
 const CAUGHT_UP: &[u8] = b"caught-up-v1";
 
 /// A read batch's `app_metadata`: its change kind (one byte, `Change::code`), then when it
-/// arrived (ns, i64 little-endian).
-fn stamp_metadata(stamp: Stamp) -> Vec<u8> {
+/// arrived (ns, i64 little-endian), then, for a reader that asked (`"lsn": true` in its ticket),
+/// its place in the shard log (u64 little-endian), which it may resume after.
+fn stamp_metadata(stamp: Stamp, lsn: bool) -> Vec<u8> {
     let mut metadata = vec![stamp.change.code()];
     metadata.extend_from_slice(&stamp.ingest_ns.to_le_bytes());
+    if lsn {
+        metadata.extend_from_slice(&stamp.lsn.to_le_bytes());
+    }
     metadata
 }
 
 /// A read batch's stamp (`stamp_metadata`). A server before keyed tables sends none (rows), one
 /// before ingest times only the change kind: the batch is then dated by when it was received.
+/// One before the log sends no position: 0, which nothing resumes after.
 fn stamp_of(metadata: &[u8], received_ns: impl FnOnce() -> i64) -> Result<Stamp, Error> {
     let change = |code: u8| {
         Change::from_code(u32::from(code))
             .ok_or_else(|| Error::Io(format!("a change kind ({code}) this client cannot read")))
     };
+    let word = |bytes: &[u8]| -> Result<[u8; 8], Error> {
+        bytes
+            .try_into()
+            .map_err(|_| Error::Io("batch metadata this client cannot read".into()))
+    };
     match metadata {
         [] => Ok(Stamp {
             change: Change::Rows,
             ingest_ns: received_ns(),
+            lsn: 0,
         }),
         [code] => Ok(Stamp {
             change: change(*code)?,
             ingest_ns: received_ns(),
+            lsn: 0,
+        }),
+        [code, rest @ ..] if rest.len() == 16 => Ok(Stamp {
+            change: change(*code)?,
+            ingest_ns: i64::from_le_bytes(word(&rest[..8])?),
+            lsn: u64::from_le_bytes(word(&rest[8..])?),
         }),
         [code, ingest @ ..] => Ok(Stamp {
             change: change(*code)?,
-            ingest_ns: i64::from_le_bytes(
-                ingest
-                    .try_into()
-                    .map_err(|_| Error::Io("batch metadata this client cannot read".into()))?,
-            ),
+            ingest_ns: i64::from_le_bytes(word(ingest)?),
+            lsn: 0,
         }),
     }
 }
@@ -236,6 +254,7 @@ fn status(error: Error) -> Status {
         Error::Busy(_) => Code::AlreadyExists,
         Error::Corrupt(_) => Code::DataLoss,
         Error::TooLarge(_) => Code::OutOfRange,
+        Error::Gone(_) => Code::Aborted,
         Error::Io(_) | Error::Arrow(_) | Error::Catalog(_) => Code::Internal,
     };
     Status::new(code, error.to_string())
@@ -250,6 +269,7 @@ fn error_from_status(status: &Status) -> Error {
         Code::DataLoss => Error::Corrupt(message),
         // Also how tonic refuses a message over the server's limit.
         Code::OutOfRange => Error::TooLarge(message),
+        Code::Aborted => Error::Gone(message),
         _ => Error::Io(format!("kermodes server: {message}")),
     }
 }

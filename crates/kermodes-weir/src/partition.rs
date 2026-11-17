@@ -1,13 +1,16 @@
-//! One internal partition's log: `(table, date, source)`, written by one writer.
+//! One internal partition's batches: `(table, date, source)`, written by one writer.
 //!
 //! A partition is a directory of segments. Each segment is an Arrow IPC stream (`seg-N.arrows`)
-//! and an index (`seg-N.idx`): an 8-byte header, then one fixed-size record per batch. A batch is
-//! committed when its index record is: the batch is written and fsynced to the stream first, then
-//! the record is written and fsynced. Recovery keeps the records whose CRC holds, in order, and
-//! reads each stream only up to the last of them; writing always starts a new segment, so what a
-//! crash left beyond that point is never read. A crash loses at most the batch being written,
-//! which was never acknowledged. Sequence numbers rise strictly; a batch at or below the last one
-//! is a resend and is dropped.
+//! and an index (`seg-N.idx`): an 8-byte header, then one fixed-size record per batch.
+//!
+//! Partition files are derived from the shard log (`wal`, architecture.md §7.6), the only
+//! durable copy of a write until they are flushed: batches are written here without an fsync,
+//! the store flushes every partition in bulk, and only then records how far the files hold the
+//! log. Recovery keeps the records whose CRC holds, in order, up to that point, and the log is
+//! replayed from there; writing always starts a new segment, so what a crash left beyond that
+//! point is never read. Index records written before the log (format 1, without an LSN) were
+//! fsynced one by one and are always kept. Sequence numbers rise strictly; a batch at or below
+//! the last one is a resend and is dropped.
 //!
 //! A stream's schema keeps each column's ID (§5.4), so a segment is read in the shape it was
 //! written in and projected by ID onto whatever shape its reader holds.
@@ -26,15 +29,17 @@ use crate::shape::Shape;
 use crate::{Change, Error};
 
 /// Index file header: magic and format version. A new version is a new header; readers refuse
-/// versions they do not know.
-const HEADER: &[u8; 8] = b"KMWEIR\x00\x01";
-const RECORD: usize = 48;
+/// versions they do not know. Format 1 is from before the log; format 2 adds each batch's LSN.
+const HEADER_1: &[u8; 8] = b"KMWEIR\x00\x01";
+const RECORD_1: usize = 48;
+const HEADER: &[u8; 8] = b"KMWEIR\x00\x02";
+const RECORD: usize = 56;
 /// A segment stops taking batches once its stream reaches this size.
 const SEGMENT_BYTES: u64 = 64 << 20;
 
-/// One committed batch. Its index record (little-endian) is: seq u64, rows u64, ingest time ns
-/// i64, end offset u64, epoch u64 (the lease its writer held, §7.4), change kind u32 (§7.1),
-/// CRC-32 of the preceding 44 bytes.
+/// One batch. Its index record (little-endian) is: seq u64, rows u64, ingest time ns i64, end
+/// offset u64, epoch u64 (the lease its writer held, §7.4), change kind u32 (§7.1), then in
+/// format 2 the LSN u64, then the CRC-32 of everything before it.
 #[derive(Clone, Copy, Debug)]
 struct Entry {
     seq: u64,
@@ -43,14 +48,25 @@ struct Entry {
     /// The stream's length once this batch is in it.
     end: u64,
     change: Change,
+    /// Its place in the shard log; 0 for a batch written before the log.
+    lsn: u64,
 }
 
-/// What a batch was committed as: its change kind, and when it arrived (ns since the epoch, UTC),
-/// which dates it.
+/// What a batch was committed as: its change kind; when it arrived (ns since the epoch, UTC),
+/// which dates it; and its place in the shard log, 0 for a batch written before the log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stamp {
     pub change: Change,
     pub ingest_ns: i64,
+    pub lsn: u64,
+}
+
+impl Stamp {
+    /// Its place in commit order: by LSN, and before the log by ingest time (which a table's
+    /// clock made rise in commit order), so batches from before the log come first.
+    pub fn order(&self) -> (u64, i64) {
+        (self.lsn, self.ingest_ns)
+    }
 }
 
 impl Entry {
@@ -62,17 +78,19 @@ impl Entry {
         record[24..32].copy_from_slice(&self.end.to_le_bytes());
         record[32..40].copy_from_slice(&epoch.to_le_bytes());
         record[40..44].copy_from_slice(&u32::from(self.change.code()).to_le_bytes());
-        let crc = crc32fast::hash(&record[..44]);
-        record[44..48].copy_from_slice(&crc.to_le_bytes());
+        record[44..52].copy_from_slice(&self.lsn.to_le_bytes());
+        let crc = crc32fast::hash(&record[..52]);
+        record[52..56].copy_from_slice(&crc.to_le_bytes());
         record
     }
 
-    /// The record, unless it is torn, zeroed, or of a change kind this version does not know
-    /// (recovery then ends there, as an older version's would).
-    fn decode(record: &[u8; RECORD]) -> Option<Self> {
+    /// The record (of format 1 or 2, by its length), unless it is torn, zeroed, or of a change
+    /// kind this version does not know (recovery then ends there, as an older version's would).
+    fn decode(record: &[u8]) -> Option<Self> {
         let word = |at: usize| u64::from_le_bytes(record[at..at + 8].try_into().expect("8 bytes"));
-        let crc = u32::from_le_bytes(record[44..48].try_into().expect("4 bytes"));
-        if crc32fast::hash(&record[..44]) != crc {
+        let checked = record.len() - 4;
+        let crc = u32::from_le_bytes(record[checked..].try_into().expect("4 bytes"));
+        if crc32fast::hash(&record[..checked]) != crc {
             return None;
         }
         let change = u32::from_le_bytes(record[40..44].try_into().expect("4 bytes"));
@@ -82,6 +100,7 @@ impl Entry {
             ingest_ns: word(16) as i64,
             end: word(24),
             change: Change::from_code(change)?,
+            lsn: if record.len() == RECORD { word(44) } else { 0 },
         })
     }
 
@@ -89,6 +108,7 @@ impl Entry {
         Stamp {
             change: self.change,
             ingest_ns: self.ingest_ns,
+            lsn: self.lsn,
         }
     }
 }
@@ -120,6 +140,8 @@ struct Open {
     segment: Segment,
     stream: StreamWriter<File>,
     index: File,
+    /// Written since the last flush.
+    dirty: bool,
 }
 
 pub(crate) struct Partition {
@@ -130,14 +152,19 @@ pub(crate) struct Partition {
     closed: Vec<Segment>,
     open: Option<Open>,
     last_seq: Option<u64>,
+    /// What the next flush must fsync besides the open segment: segments closed since the last
+    /// one, and directories that gained entries.
+    unsynced: Vec<File>,
+    unsynced_dirs: Vec<PathBuf>,
 }
 
 impl Partition {
-    /// Opens (creating if needed) the partition in `dir`, recovering its segments; it writes
+    /// Opens (creating if needed) the partition in `dir`, recovering its segments as far as the
+    /// files hold the log, `trusted` (the batches after it are the log's to replay); it writes
     /// `shape`'s columns. Writing starts a new segment: one an earlier process left open is not
     /// appended to.
-    pub(crate) fn open(dir: &Path, shape: Shape) -> Result<Self, Error> {
-        fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
+    pub(crate) fn open(dir: &Path, shape: Shape, trusted: u64) -> Result<Self, Error> {
+        let unsynced_dirs = create_dirs(dir)?;
         let mut numbers = Vec::new();
         for entry in fs::read_dir(dir).map_err(|e| Error::io(dir, e))? {
             let name = entry.map_err(|e| Error::io(dir, e))?.file_name();
@@ -153,7 +180,7 @@ impl Partition {
         numbers.sort_unstable();
         let mut closed = Vec::new();
         for number in numbers {
-            if let Some(segment) = recover(dir, number)? {
+            if let Some(segment) = recover(dir, number, trusted)? {
                 closed.push(segment);
             }
         }
@@ -167,6 +194,8 @@ impl Partition {
             closed,
             open: None,
             last_seq,
+            unsynced: Vec::new(),
+            unsynced_dirs,
         })
     }
 
@@ -176,18 +205,20 @@ impl Partition {
 
     /// From now on writes `shape`'s columns: the segment taking batches is closed, so the next
     /// batch starts one whose schema says what it holds (§5.4).
-    pub(crate) fn reshape(&mut self, shape: Shape) {
-        if let Some(open) = self.open.take() {
-            self.closed.push(open.segment);
-        }
+    pub(crate) fn reshape(&mut self, shape: Shape) -> Result<(), Error> {
+        self.close()?;
         self.shape = shape;
+        Ok(())
     }
 
-    /// Appends `batch` as `seq`, a `change` written under lease `epoch`, durably, before
-    /// returning; `false` (and nothing written) when `seq` is not above the last sequence number.
+    /// Appends `batch`, the log's entry `lsn`, as `seq`, a `change` written under lease `epoch`;
+    /// `false` (and nothing written) when `seq` is not above the last sequence number. Not
+    /// fsynced: the log holds it until the store flushes (`unsynced`).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn append(
         &mut self,
         batch: &RecordBatch,
+        lsn: u64,
         seq: u64,
         ingest_ns: i64,
         epoch: u64,
@@ -205,28 +236,57 @@ impl Partition {
             .write(batch)
             .and_then(|()| open.stream.flush())
             .map_err(|e| Error::Arrow(format!("{}: {e}", data.display())))?;
-        let file = open.stream.get_mut();
-        file.sync_data().map_err(|e| Error::io(&data, e))?;
-        let end = file.stream_position().map_err(|e| Error::io(&data, e))?;
+        let end = open
+            .stream
+            .get_mut()
+            .stream_position()
+            .map_err(|e| Error::io(&data, e))?;
         let entry = Entry {
             seq,
             rows: batch.num_rows() as u64,
             ingest_ns,
             end,
             change,
+            lsn,
         };
         let index = index_path(&self.dir, open.segment.number);
         open.index
             .write_all(&entry.encode(epoch))
-            .and_then(|()| open.index.sync_data())
             .map_err(|e| Error::io(&index, e))?;
+        open.dirty = true;
         open.segment.entries.push(entry);
         self.last_seq = Some(seq);
         if end >= SEGMENT_BYTES {
-            let full = self.open.take().expect("open above");
-            self.closed.push(full.segment);
+            self.close()?;
         }
         Ok(true)
+    }
+
+    /// What must be fsynced for this partition's files to hold every batch written so far, for
+    /// the caller to sync outside its lock: the open segment's files if written since, segments
+    /// closed since, and directories that gained entries. The next call returns only what is
+    /// written after this one.
+    pub(crate) fn unsynced(&mut self) -> Result<Vec<File>, Error> {
+        let mut files = std::mem::take(&mut self.unsynced);
+        if let Some(open) = self.open.as_mut().filter(|open| open.dirty) {
+            open.dirty = false;
+            files.extend(handles(&self.dir, open)?);
+        }
+        for dir in self.unsynced_dirs.drain(..) {
+            files.push(File::open(&dir).map_err(|e| Error::io(&dir, e))?);
+        }
+        Ok(files)
+    }
+
+    /// Stops writing the open segment, keeping what the next flush must sync of it.
+    fn close(&mut self) -> Result<(), Error> {
+        if let Some(open) = self.open.take() {
+            if open.dirty {
+                self.unsynced.extend(handles(&self.dir, &open)?);
+            }
+            self.closed.push(open.segment);
+        }
+        Ok(())
     }
 
     /// How many batches are committed.
@@ -279,26 +339,38 @@ impl Partition {
         }
     }
 
-    /// How many committed batches arrived at or before `ingest_ns`. Ingest times rise within a
-    /// partition, so the batches after a point in time are a cursor from here.
-    pub(crate) fn at_or_before(&self, ingest_ns: i64) -> usize {
+    /// How many committed batches come at or before `order` in commit order (`Stamp::order`).
+    /// They rise within a partition, so the batches after a point are a cursor from here.
+    pub(crate) fn at_or_before(&self, order: (u64, i64)) -> usize {
         self.segments()
-            .map(|s| s.entries.partition_point(|e| e.ingest_ns <= ingest_ns))
+            .map(|s| s.entries.partition_point(|e| (e.lsn, e.ingest_ns) <= order))
             .sum()
     }
 
-    /// When the newest committed batch arrived.
-    pub(crate) fn last_ingest_ns(&self) -> Option<i64> {
+    /// The newest committed batch's place in commit order (`Stamp::order`).
+    pub(crate) fn last_order(&self) -> Option<(u64, i64)> {
         self.segments()
             .last()
             .and_then(|segment| segment.entries.last())
-            .map(|entry| entry.ingest_ns)
+            .map(|entry| (entry.lsn, entry.ingest_ns))
     }
 
-    /// Each committed batch's rows and ingest time, in order.
-    pub(crate) fn batch_rows(&self) -> impl Iterator<Item = (u64, i64)> + '_ {
+    /// The smallest LSN of a batch written since the log; `None` if every batch is from before.
+    pub(crate) fn first_lsn(&self) -> Option<u64> {
         self.segments()
-            .flat_map(|segment| segment.entries.iter().map(|e| (e.rows, e.ingest_ns)))
+            .flat_map(|segment| segment.entries.iter())
+            .map(|entry| entry.lsn)
+            .find(|&lsn| lsn > 0)
+    }
+
+    /// Each committed batch's rows and place in commit order, in order.
+    pub(crate) fn batch_rows(&self) -> impl Iterator<Item = (u64, (u64, i64))> + '_ {
+        self.segments().flat_map(|segment| {
+            segment
+                .entries
+                .iter()
+                .map(|e| (e.rows, (e.lsn, e.ingest_ns)))
+        })
     }
 
     /// The committed batches `first..first + count` (counting from 0) as `to`'s columns, read
@@ -388,7 +460,7 @@ impl Partition {
             .filter(|segment| !segment.entries.is_empty())
     }
 
-    fn start(&self) -> Result<Open, Error> {
+    fn start(&mut self) -> Result<Open, Error> {
         let number = self.closed.last().map_or(1, |segment| segment.number + 1);
         let data = data_path(&self.dir, number);
         let index = index_path(&self.dir, number);
@@ -402,23 +474,17 @@ impl Partition {
         let written = self.shape.segment_schema();
         let stream = StreamWriter::try_new(create(&data)?, &written)
             .map_err(|e| Error::Arrow(format!("{}: {e}", data.display())))?;
-        stream
-            .get_ref()
-            .sync_data()
-            .map_err(|e| Error::io(&data, e))?;
         let mut index_file = create(&index)?;
         index_file
             .write_all(HEADER)
-            .and_then(|()| index_file.sync_data())
             .map_err(|e| Error::io(&index, e))?;
-        // The new files' directory entries must survive a crash too.
-        File::open(&self.dir)
-            .and_then(|dir| dir.sync_all())
-            .map_err(|e| Error::io(&self.dir, e))?;
+        // The new files' directory entries must reach the disk with them.
+        self.unsynced_dirs.push(self.dir.clone());
         Ok(Open {
             segment: Segment::new(number, Vec::new(), written),
             stream,
             index: index_file,
+            dirty: true,
         })
     }
 }
@@ -533,9 +599,8 @@ impl Iterator for Batches {
     }
 }
 
-/// Batches of several partitions in the order they were committed: by ingest time, which a
-/// table's clock makes rise across all its partitions (ties, from before it did, go to the
-/// earlier partition). One batch of each partition in memory at a time.
+/// Batches of several partitions in the order they were committed (`Stamp::order`). One batch
+/// of each partition in memory at a time.
 pub(crate) struct InOrder {
     /// Each partition's batches, and its next one once read.
     sources: Vec<(Batches, Option<(RecordBatch, Stamp)>)>,
@@ -570,7 +635,7 @@ impl Iterator for InOrder {
             .sources
             .iter()
             .enumerate()
-            .filter_map(|(i, (_, next))| next.as_ref().map(|(_, stamp)| (stamp.ingest_ns, i)))
+            .filter_map(|(i, (_, next))| next.as_ref().map(|(_, stamp)| (stamp.order(), i)))
             .min()?;
         let (batches, next) = &mut self.sources[earliest];
         let taken = next.take();
@@ -592,7 +657,7 @@ fn index_path(dir: &Path, number: u32) -> PathBuf {
 
 /// The schema message a segment's stream starts with, as its writer wrote it: the same schema
 /// encodes to the same bytes (each field has one metadata key, so its order cannot vary).
-fn schema_header(schema: &SchemaRef) -> Result<Vec<u8>, Error> {
+pub(crate) fn schema_header(schema: &SchemaRef) -> Result<Vec<u8>, Error> {
     let writer = StreamWriter::try_new(Vec::new(), schema)
         .map_err(|e| Error::Arrow(format!("cannot encode a schema: {e}")))?;
     Ok(writer.get_ref().clone())
@@ -606,28 +671,64 @@ fn written_schema(data: &Path) -> Result<SchemaRef, Error> {
     Ok(reader.schema())
 }
 
-/// A segment's committed batches: its index records up to the first that fails its check. A
-/// segment without one (it crashed before its first commit) is deleted, so its number is free.
-fn recover(dir: &Path, number: u32) -> Result<Option<Segment>, Error> {
+/// The files an open segment writes, to fsync.
+fn handles(dir: &Path, open: &Open) -> Result<[File; 2], Error> {
+    let clone = |file: &File, path: PathBuf| file.try_clone().map_err(|e| Error::io(&path, e));
+    Ok([
+        clone(open.stream.get_ref(), data_path(dir, open.segment.number))?,
+        clone(&open.index, index_path(dir, open.segment.number))?,
+    ])
+}
+
+/// Creates `dir` and whatever of its ancestors are missing; the directories whose entries
+/// changed (each created one's parent), to fsync.
+fn create_dirs(dir: &Path) -> Result<Vec<PathBuf>, Error> {
+    let mut missing = Vec::new();
+    let mut at = dir;
+    while !at.exists() {
+        missing.push(at.to_owned());
+        match at.parent() {
+            Some(parent) => at = parent,
+            None => break,
+        }
+    }
+    fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
+    Ok(missing
+        .iter()
+        .filter_map(|created| created.parent().map(Path::to_owned))
+        .collect())
+}
+
+/// A segment's committed batches: its index records up to the first that fails its check, and
+/// of format 2 none after `trusted` (the log's to replay; the index is truncated there). A
+/// segment left without one is deleted, so its number is free.
+fn recover(dir: &Path, number: u32, trusted: u64) -> Result<Option<Segment>, Error> {
     let index = index_path(dir, number);
     let data = data_path(dir, number);
     let bytes = fs::read(&index).map_err(|e| Error::io(&index, e))?;
-    if bytes.len() >= HEADER.len() && &bytes[..HEADER.len()] != HEADER {
-        return Err(Error::Corrupt(format!(
-            "{}: not a weir index this version can read",
-            index.display()
-        )));
-    }
+    let record = match bytes.get(..HEADER.len()) {
+        Some(header) if header == HEADER => RECORD,
+        Some(header) if header == HEADER_1 => RECORD_1,
+        // Created and never flushed: whatever a crash left of it is the log's to replay.
+        None => 0,
+        Some(_) if bytes.iter().all(|&b| b == 0) => 0,
+        Some(_) => {
+            return Err(Error::Corrupt(format!(
+                "{}: not a weir index this version can read",
+                index.display()
+            )));
+        }
+    };
     let mut entries: Vec<Entry> = Vec::new();
-    if bytes.len() > HEADER.len() {
-        for record in bytes[HEADER.len()..].as_chunks::<RECORD>().0 {
-            let Some(entry) = Entry::decode(record) else {
+    if record > 0 {
+        for chunk in bytes[HEADER.len()..].chunks_exact(record) {
+            let Some(entry) = Entry::decode(chunk) else {
                 break;
             };
             let follows = entries
                 .last()
                 .is_none_or(|last| entry.seq > last.seq && entry.end > last.end);
-            if !follows {
+            if !follows || entry.lsn > trusted {
                 break;
             }
             entries.push(entry);
@@ -643,6 +744,15 @@ fn recover(dir: &Path, number: u32) -> Result<Option<Segment>, Error> {
         }
         return Ok(None);
     };
+    let kept = (HEADER.len() + entries.len() * record) as u64;
+    if (bytes.len() as u64) > kept {
+        // Records past the point the files hold the log: dropped, so the replay writes them.
+        OpenOptions::new()
+            .write(true)
+            .open(&index)
+            .and_then(|file| file.set_len(kept).and_then(|()| file.sync_all()))
+            .map_err(|e| Error::io(&index, e))?;
+    }
     let length = fs::metadata(&data).map_err(|e| Error::io(&data, e))?.len();
     if length < last.end {
         return Err(Error::Corrupt(format!(
@@ -675,7 +785,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
         let shape = Shape::new(schema.clone(), Arc::new([ColumnId(1)]));
-        let mut partition = Partition::open(&dir, shape.clone()).unwrap();
+        let mut partition = Partition::open(&dir, shape.clone(), u64::MAX).unwrap();
         // About 24 MiB a batch: three to a 64 MiB segment, so ten batches span four segments of
         // three, three, three, and one.
         let rows = 3 << 20;
@@ -684,7 +794,7 @@ mod tests {
             let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(n)]).unwrap();
             assert!(
                 partition
-                    .append(&batch, v as u64 + 1, 0, 1, Change::Rows)
+                    .append(&batch, v as u64 + 1, v as u64 + 1, 0, 1, Change::Rows)
                     .unwrap()
             );
         }
@@ -739,13 +849,14 @@ mod tests {
                 ingest_ns: seq as i64,
                 end,
                 change: Change::Rows,
+                lsn: seq,
             };
             index.extend_from_slice(&entry.encode(1));
         }
         std::fs::write(index_path(&dir, 1), index).unwrap();
 
         let shape = Shape::new(schema.clone(), Arc::new([ColumnId(1)]));
-        let partition = Partition::open(&dir, shape.clone()).unwrap();
+        let partition = Partition::open(&dir, shape.clone(), u64::MAX).unwrap();
         let first = |batch: &RecordBatch| batch.column(0).as_primitive::<Int64Type>().value(0);
         let by_cursor: Vec<i64> = partition
             .cursor(0)

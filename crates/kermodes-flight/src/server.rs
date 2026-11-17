@@ -174,11 +174,13 @@ enum Sent {
 /// `stamp_metadata`). Large batches still split into several messages, each tagged; an empty
 /// one, which the encoder would drop, is one message (an empty checkpoint clears a keyed table).
 /// With `marks` (a subscription that asked), the schema message says `MARKS_CAUGHT_UP`, and the
-/// end of its replay is an empty batch tagged `CAUGHT_UP`.
+/// end of its replay is an empty batch tagged `CAUGHT_UP`. With `lsn` (asked too), stamps carry
+/// each batch's log position.
 fn tagged(
     schema: arrow::datatypes::SchemaRef,
     rows: impl futures::Stream<Item = Result<Sent, FlightError>> + Send + 'static,
     marks: bool,
+    lsn: bool,
 ) -> Stream<FlightData> {
     let opening = FlightDataEncoderBuilder::new()
         .with_schema(schema.clone())
@@ -194,7 +196,7 @@ fn tagged(
             let schema = schema.clone();
             async move {
                 let (batch, metadata) = match row? {
-                    Sent::Batch(batch, stamp) => (batch, stamp_metadata(stamp)),
+                    Sent::Batch(batch, stamp) => (batch, stamp_metadata(stamp, lsn)),
                     // An empty batch: every reader decodes one.
                     Sent::CaughtUp => (RecordBatch::new_empty(schema.clone()), CAUGHT_UP.to_vec()),
                 };
@@ -386,8 +388,11 @@ impl FlightService for Service {
             let (store, name) = (self.store.clone(), name.clone());
             blocking(move || store.table(&name).map(|entry| entry.schema)).await?
         };
-        // Asked for since the marker; a reader before it would not know one.
+        // Asked for since the marker, and since the log; a reader before either would not
+        // know them.
         let marks = ticket["caught_up"].as_bool() == Some(true);
+        let lsn = ticket["lsn"].as_bool() == Some(true);
+        let after = ticket["after"].as_u64();
         if !ticket["rows"].is_null() {
             return self.rows_at(name, schema, &ticket).await;
         }
@@ -408,7 +413,7 @@ impl FlightService for Service {
                 }
             });
             let rows = futures::stream::poll_fn(move |cx| receiver.poll_recv(cx));
-            return Ok(Response::new(tagged(schema, rows, false)));
+            return Ok(Response::new(tagged(schema, rows, false, lsn)));
         }
         // Batches sent to the reader's stream, and the bytes of them it has not taken yet.
         let (batches, receiver) = mpsc::unbounded_channel::<(Result<Sent, FlightError>, usize)>();
@@ -420,38 +425,39 @@ impl FlightService for Service {
         tokio::task::spawn_blocking(move || {
             let subscriber = batches.clone();
             let failing = batches.clone();
-            let subscribed = store.subscribe(
-                &name,
-                Box::new(move |batch, stamp, pace| {
-                    let size = batch.get_array_memory_size();
-                    match pace {
-                        Pace::MayWait => {
-                            while sent.load(Ordering::Acquire) > CATCH_UP_BYTES {
-                                if subscriber.is_closed() {
-                                    return false;
-                                }
-                                thread::sleep(Duration::from_millis(2));
-                            }
-                        }
-                        // Too far behind to keep up.
-                        Pace::MustNotWait => {
-                            if sent.load(Ordering::Acquire) + size > LIVE_BYTES {
+            let subscriber: kermodes_weir::Subscriber = Box::new(move |batch, stamp, pace| {
+                let size = batch.get_array_memory_size();
+                match pace {
+                    Pace::MayWait => {
+                        while sent.load(Ordering::Acquire) > CATCH_UP_BYTES {
+                            if subscriber.is_closed() {
                                 return false;
                             }
+                            thread::sleep(Duration::from_millis(2));
                         }
                     }
-                    sent.fetch_add(size, Ordering::AcqRel);
-                    // Fails once the reader went.
-                    subscriber
-                        .send((Ok(Sent::Batch(batch.clone(), stamp)), size))
-                        .is_ok()
-                }),
-                // The table's columns changed beyond the reader's: its stream ends with why.
-                Box::new(move |reason| {
-                    let error = FlightError::Tonic(Box::new(Status::failed_precondition(reason)));
-                    let _ = failing.send((Err(error), 0));
-                }),
-            );
+                    // Too far behind to keep up.
+                    Pace::MustNotWait => {
+                        if sent.load(Ordering::Acquire) + size > LIVE_BYTES {
+                            return false;
+                        }
+                    }
+                }
+                sent.fetch_add(size, Ordering::AcqRel);
+                // Fails once the reader went.
+                subscriber
+                    .send((Ok(Sent::Batch(batch.clone(), stamp)), size))
+                    .is_ok()
+            });
+            // The table's columns changed beyond the reader's: its stream ends with why.
+            let failed: kermodes_weir::Failed = Box::new(move |reason| {
+                let error = FlightError::Tonic(Box::new(Status::failed_precondition(reason)));
+                let _ = failing.send((Err(error), 0));
+            });
+            let subscribed = match after {
+                Some(after) => store.resume(&name, after, subscriber, failed),
+                None => store.subscribe(&name, subscriber, failed),
+            };
             // Everything the table held is sent; what follows is live.
             let sent = match subscribed {
                 Ok(_) if marks => Ok(Sent::CaughtUp),
@@ -468,7 +474,7 @@ impl FlightService for Service {
                 Some((batch, receiver))
             }
         });
-        Ok(Response::new(tagged(schema, rows, marks)))
+        Ok(Response::new(tagged(schema, rows, marks, lsn)))
     }
 
     async fn do_action(

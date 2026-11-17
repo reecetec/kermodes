@@ -1,7 +1,7 @@
 //! A process's handle on a served store: the store's operations, over Flight.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -18,8 +18,8 @@ use kermodes_weir::{
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
-use tonic::Streaming;
 use tonic::transport::Channel;
+use tonic::{Code, Streaming};
 
 use crate::{
     CAUGHT_UP, MARKS_CAUGHT_UP, MAX_WRITE_BYTES, columns_json, commit_json, date_from_json,
@@ -47,10 +47,16 @@ impl Client {
         let endpoint = url
             .strip_prefix("grpc://")
             .map_or_else(|| url.to_owned(), |rest| format!("http://{rest}"));
+        // Pings on the HTTP/2 connection, idle or not, find one that died silently (a lost peer,
+        // a dropped route) within about 15 s, so no subscription waits on a dead one.
         let channel = runtime
             .block_on(async {
                 Channel::from_shared(endpoint.clone())
                     .map_err(|e| e.to_string())?
+                    .connect_timeout(Duration::from_secs(5))
+                    .http2_keep_alive_interval(Duration::from_secs(5))
+                    .keep_alive_timeout(Duration::from_secs(10))
+                    .keep_alive_while_idle(true)
                     .connect()
                     .await
                     .map_err(|e| chain(&e))
@@ -413,77 +419,186 @@ impl Client {
     /// Feeds `subscriber` every committed batch of `name`, then each new one, from a background
     /// task until it returns `false`; returns the table's schema. `caught_up` runs once the
     /// batches the table held when it subscribed are all given (at once, from a server too old to
-    /// say). If the stream ends first (the server stopped, the connection broke), `lost` gets the
-    /// reason: the subscriber would otherwise wait forever on rows that cannot come.
+    /// say).
+    ///
+    /// A stream that breaks (the server restarted, the connection dropped) is resumed after the
+    /// last batch the subscriber was given, retrying with backoff, so it sees every batch once.
+    /// Every break and resume is reported on stderr: why, how long the table was not current,
+    /// and how much was replayed. `lost` gets the reason when it cannot go on: the table's
+    /// columns changed beyond the subscriber's, a server too old to give positions, or the
+    /// batches after its position no longer all held. In that last case, with `rebuilds`, the
+    /// subscription starts again from the table's start instead: for a subscriber whose replay
+    /// begins by replacing what it holds (a keyed table's checkpoint).
     pub fn subscribe(
         &self,
         name: &TableName,
         mut subscriber: Subscriber,
         caught_up: Box<dyn FnOnce() + Send>,
         lost: Box<dyn FnOnce(String) + Send>,
+        rebuilds: bool,
     ) -> Result<SchemaRef, Error> {
-        let mut flight = self.flight.clone();
-        let ticket = Ticket {
-            ticket: json!({"table": name.to_string(), "caught_up": true})
-                .to_string()
-                .into(),
-        };
-        let (schema, marks, mut decoded) = self.runtime.block_on(async move {
-            let data = flight
-                .do_get(ticket)
-                .await
-                .map_err(|s| error_from_status(&s))?
-                .into_inner()
-                .map_err(FlightError::from);
-            let mut decoded = FlightDataDecoder::new(data);
-            // The server sends the schema first.
-            loop {
-                match decoded.next().await {
-                    Some(Ok(message)) => {
-                        let marks = message.inner.app_metadata.as_ref() == MARKS_CAUGHT_UP;
-                        if let DecodedPayload::Schema(schema) = message.payload {
-                            return Ok((schema, marks, decoded));
-                        }
-                    }
-                    Some(Err(e)) => return Err(Error::Io(e.to_string())),
-                    None => return Err(Error::Io("the server closed the stream".into())),
-                }
-            }
-        })?;
+        let (schema, marks, decoded) =
+            self.runtime
+                .block_on(open_subscription(self.flight.clone(), name, None))?;
         let mut caught_up = Some(caught_up);
         if !marks && let Some(ready) = caught_up.take() {
             ready();
         }
-        let name = name.to_string();
+        let (flight, name) = (self.flight.clone(), name.clone());
         self.runtime.spawn(async move {
-            let reason = loop {
-                match decoded.next().await {
-                    Some(Ok(message)) => match message.payload {
-                        DecodedPayload::RecordBatch(_)
-                            if message.inner.app_metadata.as_ref() == CAUGHT_UP =>
-                        {
-                            if let Some(ready) = caught_up.take() {
-                                ready();
+            let mut decoded = decoded;
+            // The position of the last batch given: what a resumed stream starts after.
+            let mut last = 0;
+            // A resumed stream: when the old one ended, how many tries it took, batches since.
+            let mut resumed: Option<(Instant, u32, u64)> = None;
+            loop {
+                let ended = loop {
+                    match decoded.next().await {
+                        Some(Ok(message)) => match message.payload {
+                            DecodedPayload::RecordBatch(_)
+                                if message.inner.app_metadata.as_ref() == CAUGHT_UP =>
+                            {
+                                if let Some(ready) = caught_up.take() {
+                                    ready();
+                                }
+                                if let Some((down, tries, batches)) = resumed.take() {
+                                    eprintln!(
+                                        "kermodes: {name} resumed: not current for {:.1} s, \
+                                         {tries} attempt(s), {batches} batch(es) replayed",
+                                        down.elapsed().as_secs_f64()
+                                    );
+                                }
                             }
-                        }
-                        DecodedPayload::RecordBatch(batch) => {
-                            let stamp = match stamp_of(&message.inner.app_metadata, now_ns) {
-                                Ok(stamp) => stamp,
-                                Err(e) => break e.to_string(),
-                            };
-                            if !subscriber(&batch, stamp, Pace::MayWait) {
-                                return;
+                            DecodedPayload::RecordBatch(batch) => {
+                                let stamp = match stamp_of(&message.inner.app_metadata, now_ns) {
+                                    Ok(stamp) => stamp,
+                                    Err(e) => break Ended::Refused(e.to_string()),
+                                };
+                                last = last.max(stamp.lsn);
+                                if let Some((_, _, batches)) = resumed.as_mut() {
+                                    *batches += 1;
+                                }
+                                if !subscriber(&batch, stamp, Pace::MayWait) {
+                                    return;
+                                }
                             }
-                        }
-                        _ => {}
-                    },
-                    Some(Err(e)) => break format!("the stream of {name} broke: {e}"),
-                    None => break format!("the server ended the stream of {name}"),
+                            _ => {}
+                        },
+                        Some(Err(e)) => break Ended::from(e),
+                        None => break Ended::Broke("the server ended it".into()),
+                    }
+                };
+                let down = Instant::now();
+                match ended {
+                    Ended::Refused(why) => return lost(why),
+                    Ended::Gone(why) if rebuilds => {
+                        eprintln!("kermodes: {name}: {why}; reading it again from its start");
+                        last = 0;
+                    }
+                    Ended::Gone(why) => return lost(why),
+                    Ended::Broke(why) if last == 0 && !rebuilds => {
+                        return lost(format!(
+                            "the stream of {name} broke ({why}) before giving a position to \
+                             resume after"
+                        ));
+                    }
+                    Ended::Broke(why) => {
+                        eprintln!(
+                            "kermodes: the stream of {name} broke ({why}); resuming after \
+                             position {last}"
+                        );
+                    }
                 }
-            };
-            lost(reason);
+                let mut backoff = Duration::from_millis(250);
+                let mut tries = 0;
+                decoded = loop {
+                    tries += 1;
+                    let after = (last > 0).then_some(last);
+                    match open_subscription(flight.clone(), &name, after).await {
+                        Ok((_, _, decoded)) => break decoded,
+                        Err(Error::Gone(why)) if rebuilds => {
+                            eprintln!("kermodes: {name}: {why}; reading it again from its start");
+                            last = 0;
+                        }
+                        Err(Error::Gone(why)) => return lost(why),
+                        Err(e) => {
+                            eprintln!(
+                                "kermodes: {name}: cannot resume yet ({e}); trying again in \
+                                 {backoff:?}"
+                            );
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(MAX_BACKOFF);
+                        }
+                    }
+                };
+                resumed = Some((down, tries, 0));
+            }
         });
         Ok(schema)
+    }
+}
+
+/// The longest a broken subscription waits between attempts to resume.
+const MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+/// How a subscription's stream ended.
+enum Ended {
+    /// It broke (the server went, the connection dropped): resume after the last position.
+    Broke(String),
+    /// The server no longer holds everything after the position asked for.
+    Gone(String),
+    /// Nothing resuming helps: the table's columns changed beyond the subscriber's, or the
+    /// stream is one this client cannot read.
+    Refused(String),
+}
+
+impl From<FlightError> for Ended {
+    fn from(error: FlightError) -> Self {
+        match &error {
+            FlightError::Tonic(status) if status.code() == Code::Aborted => {
+                Ended::Gone(status.message().to_owned())
+            }
+            FlightError::Tonic(status) if status.code() == Code::FailedPrecondition => {
+                Ended::Refused(status.message().to_owned())
+            }
+            _ => Ended::Broke(error.to_string()),
+        }
+    }
+}
+
+/// Opens a subscription to `name`, after the position `after` if given: its schema, whether the
+/// server marks the end of its replay, and the rest of the stream.
+async fn open_subscription(
+    mut flight: FlightServiceClient<Channel>,
+    name: &TableName,
+    after: Option<u64>,
+) -> Result<(SchemaRef, bool, FlightDataDecoder), Error> {
+    let mut ticket = json!({"table": name.to_string(), "caught_up": true, "lsn": true});
+    if let Some(after) = after {
+        ticket["after"] = json!(after);
+    }
+    let data = flight
+        .do_get(Ticket {
+            ticket: ticket.to_string().into(),
+        })
+        .await
+        .map_err(|s| error_from_status(&s))?
+        .into_inner()
+        .map_err(FlightError::from);
+    let mut decoded = FlightDataDecoder::new(data);
+    // The server sends the schema first.
+    loop {
+        match decoded.next().await {
+            Some(Ok(message)) => {
+                let marks = message.inner.app_metadata.as_ref() == MARKS_CAUGHT_UP;
+                if let DecodedPayload::Schema(schema) = message.payload {
+                    return Ok((schema, marks, decoded));
+                }
+            }
+            Some(Err(FlightError::Tonic(status))) => return Err(error_from_status(&status)),
+            Some(Err(e)) => return Err(Error::Io(e.to_string())),
+            None => return Err(Error::Io("the server closed the stream".into())),
+        }
     }
 }
 

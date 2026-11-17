@@ -352,12 +352,13 @@ fn a_waiting_writer_takes_the_lease_with_a_new_epoch() {
     assert_eq!(writer.epoch(), 3);
     writer.write(&batch(4..5), None).unwrap();
 
-    // Each index record carries the epoch of the lease its batch was written under.
+    // Each index record (format 2, 56 bytes) carries the epoch of the lease its batch was
+    // written under.
     let epochs: Vec<u64> = segments(&dir.0)
         .iter()
         .flat_map(|(index, _)| {
             let bytes = fs::read(index).unwrap();
-            let (records, _) = bytes[8..].as_chunks::<48>();
+            let (records, _) = bytes[8..].as_chunks::<56>();
             records
                 .iter()
                 .map(|record| u64::from_le_bytes(record[32..40].try_into().unwrap()))

@@ -8,3 +8,5 @@ publish.workspace = true
 [dependencies]
 arrow.workspace = true
 kermodes-core.workspace = true
+kermodes-flight.workspace = true
+kermodes-weir.workspace = true

@@ -46,7 +46,7 @@ impl StoredTable {
     pub(crate) fn rows(&self, predicate: Option<&str>) -> PyResult<kermodes_core::Table> {
         let name = &self.entry.name;
         if !self.entry.key.is_empty() {
-            let state = self.live(name, Fed::State, &self.entry.schema)?;
+            let state = self.live(name, Fed::State { keyed: true }, &self.entry.schema)?;
             return match predicate {
                 Some(predicate) => state.filter(predicate).map_err(engine_error),
                 None => Ok(state),

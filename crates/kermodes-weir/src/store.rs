@@ -4,15 +4,25 @@
 //! ```text
 //! {root}/lock                 held by the owning process
 //! {root}/catalog.sqlite       the catalog
-//! {root}/weir/{location}/{date}/{source}/seg-N.{arrows,idx}
+//! {root}/weir/log/            the shard log (`wal`): every write, in order, durable when acknowledged
+//! {root}/weir/{location}/{date}/{source}/seg-N.{arrows,idx}           derived from the log
 //! {root}/weir/{location}/{date}/@checkpoint/seg-N.{arrows,idx}    a keyed table's day opening
 //! ```
+//!
+//! Writes go to one committer thread, which appends every write waiting to the log under one
+//! fsync, then applies them in log order: to partition files, keyed checkpoints, and
+//! subscribers, then acknowledges each. A flusher thread fsyncs the partition files every
+//! second, records how far they hold the log, and has the log below that point deleted. Opening
+//! the store replays the log from there.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::new_null_array;
 use arrow::datatypes::{Schema, SchemaRef};
@@ -25,10 +35,21 @@ use crate::catalog::{Catalog, Garbage, HistoryCommit, HistoryDate, HistoryFile, 
 use crate::keyed::Fold;
 use crate::partition::{Partition, Stamp, in_order};
 use crate::shape::Shape;
+use crate::wal::{self, Append, Logged, Wal};
 use crate::{Change, Date, Error, SourceId, TableName};
 
 /// The branch a local store's tables live on (architecture.md §10.1).
 pub const BRANCH: &str = "local";
+
+/// How often the partition files are flushed and the log below them deleted. Writes are durable
+/// in the log when acknowledged, so this bounds only how much log a restart replays.
+const FLUSH_EVERY: Duration = Duration::from_secs(1);
+
+/// The most the committer gathers into one fsync: whatever is waiting, up to this.
+const GROUP_BYTES: usize = 64 << 20;
+
+/// The longest a group waits for writers that were in the last one (`commit`).
+const GATHER: Duration = Duration::from_micros(100);
 
 /// Receives a table's batches in order, each with its stamp (change kind and ingest time): every
 /// batch committed today (UTC) when it subscribes (a keyed table's starting with its
@@ -94,8 +115,19 @@ pub struct Store {
     catalog: Mutex<Catalog>,
     /// The catalog branch whose tables this store holds (§10.1).
     branch: String,
-    logs: Mutex<HashMap<i64, Arc<Log>>>,
+    logs: Arc<Mutex<HashMap<i64, Arc<Log>>>>,
+    /// To the committer thread, which logs and applies every write.
+    requests: Sender<Request>,
+    /// The last LSN applied to the partition files (not yet necessarily flushed).
+    applied: Arc<AtomicU64>,
+    /// The log's directory, where the flushed position is recorded.
+    log_dir: PathBuf,
+    committer: Option<JoinHandle<()>>,
+    flusher: Option<(Arc<Stop>, JoinHandle<()>)>,
 }
+
+/// Tells the flusher to stop: set, then notified.
+type Stop = (Mutex<bool>, Condvar);
 
 /// A table's log, and the signal that one of its source leases was released.
 struct Log {
@@ -113,8 +145,11 @@ struct TableLog {
     subscribers: Vec<Subscription>,
     /// Sources whose lease a `Writer` holds: one writer per source (§7.4).
     writing: HashSet<SourceId>,
-    /// The last ingest time given: each batch's is later, so ingest order is commit order.
-    clock: i64,
+    /// The last LSN applied to this table: what a checkpoint folded now holds.
+    last_lsn: u64,
+    /// The oldest position a subscription may resume after: the table's batches up to it may
+    /// have gone with dates merged and dropped.
+    resumable_from: u64,
     /// A keyed table's: bytes of changes written since its last checkpoint, and that
     /// checkpoint's size (unknown, so 0, after a restart).
     since_checkpoint: usize,
@@ -124,11 +159,36 @@ struct TableLog {
 }
 
 impl TableLog {
-    /// The next ingest time: now, or just after the last one if the clock has not moved on.
-    fn tick(&mut self) -> i64 {
-        self.clock = now_ns().max(self.clock + 1);
-        self.clock
+    /// What the next flush must fsync of this table's partitions.
+    fn unsynced(&mut self) -> Result<Vec<File>, Error> {
+        let mut files = Vec::new();
+        for partition in self.partitions.values_mut() {
+            files.extend(partition.unsynced()?);
+        }
+        Ok(files)
     }
+}
+
+/// What the committer thread is asked.
+enum Request {
+    Write(Submitted),
+    /// The partition files hold the log up to this LSN: the segments wholly below it, to delete.
+    Trim(u64, SyncSender<Vec<PathBuf>>),
+    Stop,
+}
+
+/// A write to log and apply, and where its outcome goes: written, or a resend (`false`).
+struct Submitted {
+    log: Arc<Log>,
+    table: i64,
+    /// The columns `batch` has: the table's when it was submitted.
+    shape: Shape,
+    source: SourceId,
+    seq: u64,
+    epoch: u64,
+    change: Change,
+    batch: RecordBatch,
+    reply: SyncSender<Result<bool, Error>>,
 }
 
 /// An append table's day in commit order, for reads by position (§7.2): each batch's partition,
@@ -152,12 +212,13 @@ impl Positions {
             }
             let at = streams.len() as u32;
             streams.push(stream.clone());
-            for (index, (rows, ingest_ns)) in partition.batch_rows().enumerate() {
-                batches.push((ingest_ns, at, index as u32, rows));
+            for (index, (rows, order)) in partition.batch_rows().enumerate() {
+                batches.push((order, at, index as u32, rows));
             }
         }
-        // Ties (from before the table's clock) go to the earlier partition, as a replay's do.
-        batches.sort_unstable_by_key(|&(ingest_ns, at, index, _)| (ingest_ns, at, index));
+        // In commit order (`Stamp::order`); ties, from before the log, go to the earlier
+        // partition, as a replay's do.
+        batches.sort_unstable_by_key(|&(order, at, index, _)| (order, at, index));
         let mut positions = Self {
             day: day.to_owned(),
             streams,
@@ -190,7 +251,7 @@ impl Store {
     pub fn open(root: &Path) -> Result<Self, Error> {
         let lock = lock_dir(root)?;
         let catalog = Catalog::sqlite(&root.join("catalog.sqlite"))?;
-        Ok(Self::new(root, lock, catalog, BRANCH))
+        Self::new(root, lock, catalog, BRANCH)
     }
 
     /// Opens the store in `root` with its catalog in Postgres at `url`, as the cluster's weir:
@@ -199,24 +260,82 @@ impl Store {
     pub fn open_with_catalog(root: &Path, url: &str, branch: &str) -> Result<Self, Error> {
         let lock = lock_dir(root)?;
         let catalog = Catalog::postgres(url)?;
-        Ok(Self::new(root, lock, catalog, branch))
+        Self::new(root, lock, catalog, branch)
     }
 
-    fn new(root: &Path, lock: File, catalog: Catalog, branch: &str) -> Self {
-        Self {
+    /// Recovers every table's partitions as far as their files hold the log, replays the log
+    /// from there, and starts the committer and the flusher.
+    fn new(root: &Path, lock: File, mut catalog: Catalog, branch: &str) -> Result<Self, Error> {
+        let weir = root.join("weir");
+        let log_dir = weir.join("log");
+        fs::create_dir_all(&log_dir).map_err(|e| Error::io(&log_dir, e))?;
+        let flushed = wal::read_applied(&log_dir)?;
+        let mut logs = HashMap::new();
+        let mut clock = 0;
+        for entry in catalog.list(branch)? {
+            let log = open_log(&weir, entry, flushed, flushed)?;
+            let id = {
+                let state = lock_log(&log);
+                clock = clock.max(last_ingest(&state));
+                state.entry.id
+            };
+            logs.insert(id, log);
+        }
+        let wal = Wal::open(&log_dir, flushed, &mut |logged: Logged| {
+            let log = logs.get(&logged.table).ok_or_else(|| {
+                Error::Corrupt(format!(
+                    "the log holds a write of table {}, which the catalog does not",
+                    logged.table
+                ))
+            })?;
+            clock = clock.max(logged.ingest_ns);
+            apply(log, logged).map(drop)
+        })?;
+        let logs = Arc::new(Mutex::new(logs));
+        let applied = Arc::new(AtomicU64::new(wal.next_lsn() - 1));
+        // The replay's writes reach the disk now, so another crash need not replay them.
+        flush(&logs, &log_dir, &applied)?;
+        let (requests, received) = mpsc::channel();
+        let committer = {
+            let applied = applied.clone();
+            std::thread::Builder::new()
+                .name("kermodes-weir-commit".into())
+                .spawn(move || commit(wal, clock, &applied, &received))
+                .map_err(|e| Error::Io(format!("cannot start weir's committer: {e}")))?
+        };
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let flusher = {
+            let (logs, log_dir, applied, requests, stop) = (
+                logs.clone(),
+                log_dir.clone(),
+                applied.clone(),
+                requests.clone(),
+                stop.clone(),
+            );
+            std::thread::Builder::new()
+                .name("kermodes-weir-flush".into())
+                .spawn(move || flush_every(&logs, &log_dir, &applied, &requests, &stop))
+                .map_err(|e| Error::Io(format!("cannot start weir's flusher: {e}")))?
+        };
+        Ok(Self {
             root: root.to_owned(),
             _lock: lock,
             catalog: Mutex::new(catalog),
             branch: branch.to_owned(),
-            logs: Mutex::new(HashMap::new()),
-        }
+            logs,
+            requests,
+            applied,
+            log_dir,
+            committer: Some(committer),
+            flusher: Some((stop, flusher)),
+        })
     }
 
     /// Creates `name` with `schema`, or brings it to `schema`'s columns if it exists (a
     /// compatible change, §5.4) and returns it.
     pub fn create_table(&self, name: &TableName, schema: &Schema) -> Result<TableEntry, Error> {
         let entry = lock(&self.catalog).create(&self.branch, name, schema, &[], &[])?;
-        self.adopt(&entry);
+        self.adopt(&entry)?;
         Ok(entry)
     }
 
@@ -234,7 +353,7 @@ impl Store {
             )));
         }
         let entry = lock(&self.catalog).create(&self.branch, name, schema, key, &[])?;
-        self.adopt(&entry);
+        self.adopt(&entry)?;
         Ok(entry)
     }
 
@@ -248,25 +367,26 @@ impl Store {
         sort: &[String],
     ) -> Result<TableEntry, Error> {
         let entry = lock(&self.catalog).create(&self.branch, name, schema, &[], sort)?;
-        self.adopt(&entry);
+        self.adopt(&entry)?;
         Ok(entry)
     }
 
     /// Takes up `entry`'s columns in its table's log, if it is open and they changed: segments
     /// written from now on hold them, and writers' rows are brought to them. Readers and
     /// writers already open keep their own.
-    fn adopt(&self, entry: &TableEntry) {
+    fn adopt(&self, entry: &TableEntry) -> Result<(), Error> {
         let Some(log) = lock(&self.logs).get(&entry.id).cloned() else {
-            return;
+            return Ok(());
         };
         let mut state = lock(&log.state);
         if state.entry.shape() == entry.shape() {
-            return;
+            return Ok(());
         }
         state.entry = entry.clone();
         for partition in state.partitions.values_mut() {
-            partition.reshape(entry.shape());
+            partition.reshape(entry.shape())?;
         }
+        Ok(())
     }
 
     /// Every table, by name.
@@ -408,11 +528,13 @@ impl Store {
         // If taking the epoch fails, dropping this writer releases the source again.
         let mut writer = Writer {
             log,
+            requests: self.requests.clone(),
             source: source.clone(),
             shape: entry.shape(),
             name: entry.name,
             key: entry.key,
             epoch: 0,
+            last_seq: Mutex::new(None),
         };
         writer.epoch = lock(&self.catalog).next_epoch(entry.id, source)?;
         Ok(writer)
@@ -449,17 +571,64 @@ impl Store {
     pub fn subscribe(
         &self,
         name: &TableName,
+        subscriber: Subscriber,
+        failed: Failed,
+    ) -> Result<SchemaRef, Error> {
+        self.follow(name, None, subscriber, failed)
+    }
+
+    /// As `subscribe`, for a reader that has every batch up to the log position `after`
+    /// (`Stamp::lsn`): the table's batches after it, whatever their date, then each new one;
+    /// a keyed table's checkpoints are not repeated. `Gone` if batches after it may have gone
+    /// with a date merged and dropped: the reader must start again.
+    pub fn resume(
+        &self,
+        name: &TableName,
+        after: u64,
+        subscriber: Subscriber,
+        failed: Failed,
+    ) -> Result<SchemaRef, Error> {
+        self.follow(name, Some(after), subscriber, failed)
+    }
+
+    fn follow(
+        &self,
+        name: &TableName,
+        after: Option<u64>,
         mut subscriber: Subscriber,
         failed: Failed,
     ) -> Result<SchemaRef, Error> {
         let today = today();
         let log = self.log(name)?;
         // Where the replay starts in each partition: a keyed table's latest checkpoint and the
-        // changes after it; every batch of an append table's.
+        // changes after it, and every batch of an append table's; or, resuming, the first batch
+        // after the reader's position.
         let (mut delivered, shape) = {
             let mut state = lock(&log.state);
-            ensure_checkpoint(&mut state, &today)?;
-            (starts(&state, &today), state.entry.shape())
+            let delivered = match after {
+                None => {
+                    ensure_checkpoint(&mut state, &today, now_ns())?;
+                    starts(&state, &today)
+                }
+                Some(after) if after < state.resumable_from => {
+                    return Err(Error::Gone(format!(
+                        "{name}'s rows after position {after} are no longer all held (merged \
+                         dates are dropped): read the table again"
+                    )));
+                }
+                Some(after) => state
+                    .partitions
+                    .iter()
+                    .map(|(key, partition)| {
+                        let from = match key.1 {
+                            Stream::Checkpoint => partition.committed(),
+                            Stream::Source(_) => partition.at_or_before((after, i64::MAX)),
+                        };
+                        (key.clone(), from)
+                    })
+                    .collect(),
+            };
+            (delivered, state.entry.shape())
         };
         loop {
             let state = lock(&log.state);
@@ -468,7 +637,7 @@ impl Store {
             for (key, partition) in &state.partitions {
                 let from = delivered.get(key).copied().unwrap_or(0);
                 let committed = partition.committed();
-                if key.0 >= today && committed > from {
+                if (after.is_some() || key.0 >= today) && committed > from {
                     let cursor = partition.cursor(from);
                     left += committed - from;
                     left_bytes += cursor.bytes();
@@ -666,7 +835,7 @@ impl Store {
         let log = self.log(name)?;
         let mut state = lock(&log.state);
         // A keyed table's state must not depend on the date going: today's checkpoint holds it.
-        ensure_checkpoint(&mut state, &Date::of_ns(now_ns()).to_string())?;
+        ensure_checkpoint(&mut state, &Date::of_ns(now_ns()).to_string(), now_ns())?;
         let key = date.to_string();
         let rows: u64 = state
             .partitions
@@ -680,6 +849,16 @@ impl Store {
                  merge the date before dropping it"
             )));
         }
+        // A reader resuming from before the date's last batch would miss what goes.
+        let gone = state
+            .partitions
+            .iter()
+            .filter(|((day, stream), _)| *day == key && *stream != Stream::Checkpoint)
+            .filter_map(|(_, partition)| partition.last_order())
+            .map(|(lsn, _)| lsn)
+            .max()
+            .unwrap_or(0);
+        state.resumable_from = state.resumable_from.max(gone);
         state.partitions.retain(|(day, _), _| *day != key);
         let dir = state.dir.join(&key);
         match fs::remove_dir_all(&dir) {
@@ -689,40 +868,339 @@ impl Store {
         }
     }
 
-    /// The table's log, opened (and its partitions recovered) on first use.
+    /// The table's log: opened when the store was, or (a table created since) on first use.
     fn log(&self, name: &TableName) -> Result<Arc<Log>, Error> {
         let entry = self.table(name)?;
         let mut logs = lock(&self.logs);
         if let Some(log) = logs.get(&entry.id) {
             return Ok(log.clone());
         }
-        let dir = self.root.join("weir").join(&entry.location);
-        let mut partitions = BTreeMap::new();
-        for (date, stream) in partition_dirs(&dir)? {
-            let path = dir.join(&date).join(stream.dir_name());
-            partitions.insert((date, stream), Partition::open(&path, entry.shape())?);
-        }
-        let clock = partitions
-            .values()
-            .filter_map(Partition::last_ingest_ns)
-            .max()
-            .unwrap_or(0);
-        let log = Arc::new(Log {
-            state: Mutex::new(TableLog {
-                entry: entry.clone(),
-                dir,
-                partitions,
-                subscribers: Vec::new(),
-                writing: HashSet::new(),
-                clock,
-                since_checkpoint: 0,
-                checkpoint_bytes: 0,
-                positions: None,
-            }),
-            released: Condvar::new(),
-        });
-        logs.insert(entry.id, log.clone());
+        let id = entry.id;
+        // Created since the store opened: no partitions yet, and nothing of it in the log.
+        let log = open_log(&self.root.join("weir"), entry, u64::MAX, 0)?;
+        logs.insert(id, log.clone());
         Ok(log)
+    }
+}
+
+impl Drop for Store {
+    /// Stops the flusher, then the committer (writes already sent are logged and answered,
+    /// later ones refused), then flushes what was applied, so reopening replays nothing.
+    fn drop(&mut self) {
+        if let Some((stop, flusher)) = self.flusher.take() {
+            let (stopped, wake) = &*stop;
+            *lock(stopped) = true;
+            wake.notify_all();
+            let _ = flusher.join();
+        }
+        let _ = self.requests.send(Request::Stop);
+        if let Some(committer) = self.committer.take() {
+            let _ = committer.join();
+        }
+        if let Err(e) = flush(&self.logs, &self.log_dir, &self.applied) {
+            eprintln!("kermodes weir: closing, cannot flush partition files: {e}");
+        }
+    }
+}
+
+/// A table's log: its partitions recovered as far as their files hold the log, `trusted`. With
+/// no partitions it may resume readers only from `floor` on: whatever it held before may have
+/// gone with dates merged and dropped.
+fn open_log(weir: &Path, entry: TableEntry, trusted: u64, floor: u64) -> Result<Arc<Log>, Error> {
+    let dir = weir.join(&entry.location);
+    let mut partitions = BTreeMap::new();
+    for (date, stream) in partition_dirs(&dir)? {
+        let path = dir.join(&date).join(stream.dir_name());
+        partitions.insert(
+            (date, stream),
+            Partition::open(&path, entry.shape(), trusted)?,
+        );
+    }
+    let last_lsn = partitions
+        .values()
+        .filter_map(Partition::last_order)
+        .map(|(lsn, _)| lsn)
+        .max()
+        .unwrap_or(0);
+    // Its sources' batches below the first it holds may have gone with a dropped date, unless
+    // it still holds batches from before the log (position 0): then nothing with a position
+    // ever went.
+    let sources = || {
+        partitions
+            .iter()
+            .filter(|((_, stream), _)| *stream != Stream::Checkpoint)
+            .map(|(_, partition)| partition)
+    };
+    let resumable_from = if sources().any(|p| p.at_or_before((0, i64::MAX)) > 0) {
+        0
+    } else {
+        sources()
+            .filter_map(Partition::first_lsn)
+            .min()
+            .map_or(floor, |first| first - 1)
+    };
+    Ok(Arc::new(Log {
+        state: Mutex::new(TableLog {
+            entry,
+            dir,
+            partitions,
+            subscribers: Vec::new(),
+            writing: HashSet::new(),
+            last_lsn,
+            resumable_from,
+            since_checkpoint: 0,
+            checkpoint_bytes: 0,
+            positions: None,
+        }),
+        released: Condvar::new(),
+    }))
+}
+
+fn lock_log(log: &Log) -> MutexGuard<'_, TableLog> {
+    lock(&log.state)
+}
+
+/// The newest ingest time a table's partitions hold.
+fn last_ingest(log: &TableLog) -> i64 {
+    log.partitions
+        .values()
+        .filter_map(Partition::last_order)
+        .map(|(_, ingest_ns)| ingest_ns)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Applies a logged write to its table: the partition of its date and source (or, a resend,
+/// nothing), the table's readers, and a keyed table's checkpoints. Whether it was written.
+fn apply(log: &Log, logged: Logged) -> Result<bool, Error> {
+    let mut guard = lock(&log.state);
+    let state = &mut *guard;
+    let date = Date::of_ns(logged.ingest_ns).to_string();
+    // A keyed table's day opens with its checkpoint, before any change of the day.
+    ensure_checkpoint(state, &date, logged.ingest_ns)?;
+    // Logged in the columns the table had when it was written; applied in today's (§5.4).
+    let current = state.entry.shape();
+    let batch = logged.shape.convert(logged.batch, &current)?;
+    let key = (date, Stream::Source(logged.source));
+    if !state.partitions.contains_key(&key) {
+        let path = state.dir.join(&key.0).join(key.1.dir_name());
+        let partition = Partition::open(&path, current.clone(), u64::MAX)?;
+        state.partitions.insert(key.clone(), partition);
+    }
+    let partition = state.partitions.get_mut(&key).expect("inserted above");
+    let written = partition.append(
+        &batch,
+        logged.lsn,
+        logged.seq,
+        logged.ingest_ns,
+        logged.epoch,
+        logged.change,
+    )?;
+    if !written {
+        return Ok(false);
+    }
+    state.last_lsn = logged.lsn;
+    let committed = partition.committed();
+    if let Some(positions) = state.positions.as_mut().filter(|p| p.day == key.0) {
+        positions.push(&key.1, committed - 1, batch.num_rows() as u64);
+    }
+    let stamp = Stamp {
+        change: logged.change,
+        ingest_ns: logged.ingest_ns,
+        lsn: logged.lsn,
+    };
+    state
+        .subscribers
+        .retain_mut(|subscription| subscription.deliver(&current, &batch, stamp));
+    if !state.entry.key.is_empty() {
+        state.since_checkpoint += batch.get_array_memory_size();
+        // Past the last checkpoint's own size too, so folding costs in proportion to the
+        // changes written however large the state.
+        if state.since_checkpoint >= CHECKPOINT_BYTES.max(state.checkpoint_bytes) {
+            let mut fold = Fold::new(&state.entry.schema, &state.entry.key)?;
+            fold_latest(state, &key.0, &mut fold)?;
+            write_checkpoint(state, &key.0, &fold.state()?, logged.ingest_ns)?;
+        }
+    }
+    Ok(true)
+}
+
+/// The committer thread: takes every write waiting (up to `GROUP_BYTES`), stamps each with
+/// the next ingest time (rising across every table, so dates and commit order agree), logs them
+/// under one fsync, applies them in log order, and answers each. A failure to log or apply
+/// leaves what is durable in the log, to replay on the next open, and refuses every write after
+/// it: the partition files no longer follow the log.
+///
+/// Writers answered together come back together, a few microseconds apart: a group waits up to
+/// `GATHER` for as many writes as the last one held, so they share the next fsync instead of
+/// alternating between groups of one and the rest. A lone writer never waits.
+fn commit(mut wal: Wal, mut clock: i64, applied: &AtomicU64, requests: &Receiver<Request>) {
+    let mut broken: Option<String> = None;
+    let mut stop = false;
+    let mut last_group = 1;
+    while !stop {
+        let Ok(first) = requests.recv() else {
+            return;
+        };
+        let gather_until = Instant::now() + GATHER;
+        let mut group = Vec::new();
+        let mut bytes = 0;
+        let mut next = Some(first);
+        while let Some(request) = next.take() {
+            match request {
+                Request::Write(submitted) => {
+                    bytes += submitted.batch.get_array_memory_size();
+                    group.push(submitted);
+                }
+                Request::Trim(flushed, reply) => {
+                    let _ = reply.send(wal.trim(flushed));
+                }
+                Request::Stop => stop = true,
+            }
+            if !stop && bytes < GROUP_BYTES {
+                next = requests.try_recv().ok().or_else(|| {
+                    let left = gather_until.checked_duration_since(Instant::now())?;
+                    (group.len() < last_group)
+                        .then(|| requests.recv_timeout(left).ok())
+                        .flatten()
+                });
+            }
+        }
+        if group.is_empty() {
+            continue;
+        }
+        last_group = group.len();
+        if let Some(why) = &broken {
+            for submitted in group {
+                let _ = submitted.reply.send(Err(Error::Io(format!(
+                    "weir stopped taking writes: {why}; restart it"
+                ))));
+            }
+            continue;
+        }
+        let stamped: Vec<i64> = group
+            .iter()
+            .map(|_| {
+                clock = now_ns().max(clock + 1);
+                clock
+            })
+            .collect();
+        let appends: Vec<Append> = group
+            .iter()
+            .zip(&stamped)
+            .map(|(submitted, &ingest_ns)| Append {
+                table: submitted.table,
+                shape: &submitted.shape,
+                source: &submitted.source,
+                seq: submitted.seq,
+                epoch: submitted.epoch,
+                change: submitted.change,
+                ingest_ns,
+                batch: &submitted.batch,
+            })
+            .collect();
+        let lsns = match wal.append(&appends) {
+            Ok(lsns) => lsns,
+            Err(e) => {
+                broken = Some(e.to_string());
+                for submitted in group {
+                    let _ = submitted.reply.send(Err(Error::Io(e.to_string())));
+                }
+                continue;
+            }
+        };
+        drop(appends);
+        for ((submitted, lsn), ingest_ns) in group.into_iter().zip(lsns).zip(stamped) {
+            let outcome = match &broken {
+                Some(why) => Err(Error::Io(format!(
+                    "weir stopped taking writes: {why}; restart it"
+                ))),
+                None => {
+                    let logged = Logged {
+                        lsn,
+                        table: submitted.table,
+                        shape: submitted.shape,
+                        source: submitted.source,
+                        seq: submitted.seq,
+                        epoch: submitted.epoch,
+                        change: submitted.change,
+                        ingest_ns,
+                        batch: submitted.batch,
+                    };
+                    let outcome = apply(&submitted.log, logged);
+                    match &outcome {
+                        Ok(_) => applied.store(lsn, Ordering::Release),
+                        Err(e) => broken = Some(e.to_string()),
+                    }
+                    outcome
+                }
+            };
+            let _ = submitted.reply.send(outcome);
+        }
+    }
+}
+
+/// Fsyncs every partition file written so far, then records that the files hold the log up to
+/// what was applied before: what the next open replays from. That position.
+fn flush(
+    logs: &Mutex<HashMap<i64, Arc<Log>>>,
+    log_dir: &Path,
+    applied: &AtomicU64,
+) -> Result<u64, Error> {
+    let through = applied.load(Ordering::Acquire);
+    let open: Vec<Arc<Log>> = lock(logs).values().cloned().collect();
+    let mut files = Vec::new();
+    for log in open {
+        files.extend(lock(&log.state).unsynced()?);
+    }
+    // Outside every lock: writers and readers go on meanwhile.
+    for file in files {
+        file.sync_all()
+            .map_err(|e| Error::Io(format!("cannot sync a partition file: {e}")))?;
+    }
+    wal::write_applied(log_dir, through)?;
+    Ok(through)
+}
+
+/// The flusher thread: flushes every `FLUSH_EVERY`, then has the log below the flushed point
+/// deleted, until stopped. A flush that fails is not retried: the files may have lost what the
+/// failed fsync held, so the log is kept whole, to replay on the next open.
+fn flush_every(
+    logs: &Mutex<HashMap<i64, Arc<Log>>>,
+    log_dir: &Path,
+    applied: &AtomicU64,
+    requests: &Sender<Request>,
+    stop: &(Mutex<bool>, Condvar),
+) {
+    loop {
+        let (stopped, wake) = stop;
+        let guard = lock(stopped);
+        let (guard, _) = wake
+            .wait_timeout_while(guard, FLUSH_EVERY, |stopped| !*stopped)
+            .expect("kermodes store poisoned by an earlier panic");
+        if *guard {
+            return;
+        }
+        drop(guard);
+        let flushed = match flush(logs, log_dir, applied) {
+            Ok(flushed) => flushed,
+            Err(e) => {
+                eprintln!(
+                    "kermodes weir: cannot flush partition files ({e}); the log keeps every \
+                     write until weir restarts"
+                );
+                return;
+            }
+        };
+        let (reply, answer) = mpsc::sync_channel(1);
+        if requests.send(Request::Trim(flushed, reply)).is_err() {
+            return;
+        }
+        for path in answer.recv().unwrap_or_default() {
+            if let Err(e) = fs::remove_file(&path) {
+                eprintln!("kermodes weir: cannot delete {}: {e}", path.display());
+            }
+        }
     }
 }
 
@@ -732,6 +1210,7 @@ impl Store {
 /// `delete`.
 pub struct Writer {
     log: Arc<Log>,
+    requests: Sender<Request>,
     source: SourceId,
     /// The table's columns when the writer opened: its rows are matched to these, then brought
     /// to the table's columns as they are when written.
@@ -740,6 +1219,9 @@ pub struct Writer {
     /// A keyed table's key columns; empty for an append table.
     key: Vec<String>,
     epoch: u64,
+    /// The highest seq this writer has written: the next unnumbered write's is one above. Its
+    /// lock also keeps the writer's writes in order when shared between threads.
+    last_seq: Mutex<Option<u64>>,
 }
 
 impl Writer {
@@ -806,58 +1288,37 @@ impl Writer {
         Ok(())
     }
 
+    /// Logs and applies `batch` (to the committer), returning once it is durable and applied.
     fn append(&self, batch: &RecordBatch, seq: Option<u64>, change: Change) -> Result<bool, Error> {
-        let mut guard = lock(&self.log.state);
-        let log = &mut *guard;
+        let mut last = lock(&self.last_seq);
+        let (current, table, seq) = {
+            let state = lock(&self.log.state);
+            let seq = seq.unwrap_or_else(|| {
+                last.or_else(|| newest(&state, &self.source).and_then(Partition::last_seq))
+                    .map_or(1, |last| last + 1)
+            });
+            (state.entry.shape(), state.entry.id, seq)
+        };
         // Rows of the columns this writer opened with, as the table's are now (§5.4).
-        let current = log.entry.shape();
-        let batch = &self.shape.convert(batch.clone(), &current)?;
-        // The day's opening checkpoint is stamped before the write that brings it, then the
-        // write: under the lock, so ingest times rise in commit order across sources. Twice only
-        // if the clock passed midnight between.
-        let ingest_ns = loop {
-            let date = Date::of_ns(now_ns().max(log.clock + 1));
-            ensure_checkpoint(log, &date.to_string())?;
-            let ingest_ns = log.tick();
-            if Date::of_ns(ingest_ns) == date {
-                break ingest_ns;
-            }
-        };
-        let date = Date::of_ns(ingest_ns).to_string();
-        let seq = match seq {
-            Some(seq) => seq,
-            None => newest(log, &self.source)
-                .and_then(Partition::last_seq)
-                .map_or(1, |last| last + 1),
-        };
-        let key = (date, Stream::Source(self.source.clone()));
-        if !log.partitions.contains_key(&key) {
-            let path = log.dir.join(&key.0).join(key.1.dir_name());
-            let partition = Partition::open(&path, log.entry.shape())?;
-            log.partitions.insert(key.clone(), partition);
-        }
-        let partition = log.partitions.get_mut(&key).expect("inserted above");
-        if !partition.append(batch, seq, ingest_ns, self.epoch, change)? {
-            return Ok(false);
-        }
-        let committed = partition.committed();
-        if let Some(positions) = log.positions.as_mut().filter(|p| p.day == key.0) {
-            positions.push(&key.1, committed - 1, batch.num_rows() as u64);
-        }
-        let stamp = Stamp { change, ingest_ns };
-        log.subscribers
-            .retain_mut(|subscription| subscription.deliver(&current, batch, stamp));
-        if !log.entry.key.is_empty() {
-            log.since_checkpoint += batch.get_array_memory_size();
-            // Past the last checkpoint's own size too, so folding costs in proportion to the
-            // changes written however large the state.
-            if log.since_checkpoint >= CHECKPOINT_BYTES.max(log.checkpoint_bytes) {
-                let mut fold = Fold::new(&log.entry.schema, &log.entry.key)?;
-                fold_latest(log, &key.0, &mut fold)?;
-                write_checkpoint(log, &key.0, &fold.state()?)?;
-            }
-        }
-        Ok(true)
+        let batch = self.shape.convert(batch.clone(), &current)?;
+        let (reply, answer) = mpsc::sync_channel(1);
+        let closed = || Error::Io(format!("the store holding {} is closed", self.name));
+        self.requests
+            .send(Request::Write(Submitted {
+                log: self.log.clone(),
+                table,
+                shape: current,
+                source: self.source.clone(),
+                seq,
+                epoch: self.epoch,
+                change,
+                batch,
+                reply,
+            }))
+            .map_err(|_| closed())?;
+        let written = answer.recv().map_err(|_| closed())??;
+        *last = Some(last.map_or(seq, |last| last.max(seq)));
+        Ok(written)
     }
 }
 
@@ -941,7 +1402,7 @@ fn partition_dirs(dir: &Path) -> Result<Vec<(String, Stream)>, Error> {
 /// folded from the latest earlier day weir holds (§7.3). Under the table's lock, since nothing
 /// may write the day before its checkpoint; it happens on the day's first write or
 /// subscription, or before an earlier day is dropped.
-fn ensure_checkpoint(log: &mut TableLog, today: &str) -> Result<(), Error> {
+fn ensure_checkpoint(log: &mut TableLog, today: &str, ingest_ns: i64) -> Result<(), Error> {
     let opening = (today.to_owned(), Stream::Checkpoint);
     if log.entry.key.is_empty()
         || log
@@ -962,22 +1423,26 @@ fn ensure_checkpoint(log: &mut TableLog, today: &str) -> Result<(), Error> {
     if let Some(day) = earlier {
         fold_latest(log, &day, &mut fold)?;
     }
-    write_checkpoint(log, today, &fold.state()?)
+    write_checkpoint(log, today, &fold.state()?, ingest_ns)
 }
 
-/// Appends `state` to `day`'s checkpoints. Subscribers are not told: a reader already following
-/// the table has every row it repeats.
-fn write_checkpoint(log: &mut TableLog, day: &str, state: &RecordBatch) -> Result<(), Error> {
-    let ingest_ns = log.tick();
+/// Appends `state`, the table as of the last LSN applied to it, to `day`'s checkpoints.
+/// Subscribers are not told: a reader already following the table has every row it repeats.
+fn write_checkpoint(
+    log: &mut TableLog,
+    day: &str,
+    state: &RecordBatch,
+    ingest_ns: i64,
+) -> Result<(), Error> {
     let key = (day.to_owned(), Stream::Checkpoint);
     if !log.partitions.contains_key(&key) {
         let path = log.dir.join(day).join(Stream::Checkpoint.dir_name());
-        let partition = Partition::open(&path, log.entry.shape())?;
+        let partition = Partition::open(&path, log.entry.shape(), u64::MAX)?;
         log.partitions.insert(key.clone(), partition);
     }
     let partition = log.partitions.get_mut(&key).expect("inserted above");
     let seq = partition.last_seq().map_or(1, |last| last + 1);
-    partition.append(state, seq, ingest_ns, 0, Change::Checkpoint)?;
+    partition.append(state, log.last_lsn, seq, ingest_ns, 0, Change::Checkpoint)?;
     log.since_checkpoint = 0;
     log.checkpoint_bytes = state.get_array_memory_size();
     Ok(())
@@ -1004,8 +1469,8 @@ fn latest(log: &TableLog, day: &str) -> Vec<((String, Stream), usize)> {
         .get(&(day.to_owned(), Stream::Checkpoint))
         .filter(|partition| partition.committed() > 0);
     let after = checkpoint
-        .and_then(Partition::last_ingest_ns)
-        .unwrap_or(i64::MIN);
+        .and_then(Partition::last_order)
+        .unwrap_or((0, i64::MIN));
     log.partitions
         .iter()
         .filter(|((date, _), _)| date == day)

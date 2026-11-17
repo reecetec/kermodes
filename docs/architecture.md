@@ -390,19 +390,32 @@ catalog as live tables.
 ### 7.1 Storage
 
 ```
+{store}/weir/log/                               the shard log (§7.6)
+  00000000000000000001.log   segments of entries, preallocated; 256 MiB each
+  applied                    the partition files hold every entry up to this LSN
 {store}/weir/{location}/{date}/{source_id}/     location = {branch}/{namespace}/{table}.{id} (§5.1)
-  seg-000042.arrows     Arrow IPC stream: the segment's batches, appended and fsynced
+  seg-000042.arrows     Arrow IPC stream: the segment's batches, derived from the log
   seg-000042.idx        format header, then per batch: seq, rows, ingest time, end offset,
-                        epoch, change kind, CRC
+                        epoch, change kind, LSN, CRC
 ```
 
-- A batch is committed when its index record is: the batch is appended and fsynced to the
-  stream, then its record is appended and fsynced, then the writer is acknowledged and
-  subscribers get the batch. The index is the commit record; there is no separate state file.
-- Crash recovery reads each index up to the first record that fails its CRC (or does not follow
-  the one before) and reads its stream only that far. `last_seq` is the last good record's.
-  Writing after a restart starts a new segment, so what a crash left beyond the last commit is
-  never read; a segment with no committed batch is deleted.
+- Every write goes through the shard log, the only durable copy until the partition files are
+  flushed. One committer appends every write waiting, from every table and producer, under one
+  `fdatasync`, then applies them in log order: to the partition files (written without an fsync),
+  keyed checkpoints, and subscribers, and only then acknowledges each writer. A group waits up to
+  100 µs for as many writes as the last one held, so writers answered together share the next
+  fsync. Log segments are preallocated, so an fsync never has to commit the file's growth.
+- A log entry is a batch (partition, source, `seq`, epoch, change kind, ingest time, and the
+  rows as an Arrow IPC message) or the columns batches of a table are written in (a shape, with
+  column IDs), which each segment carries for itself. An entry is its length, a CRC, its LSN, a
+  kind, and its body; the log ends at the first that is empty, fails its CRC, or does not
+  follow the one before. Writing after a restart starts a new segment, so a torn tail is never
+  written over.
+- Every second the partition files written since are fsynced, `applied` records how far they
+  hold the log, and the log's segments wholly below that are deleted. Opening the store drops
+  index records past `applied` (they may be torn) and replays the log from there; a resend is
+  recognised by `(source, seq)` as it is applied. Index records written before the log (format
+  1, without an LSN, fsynced one by one) are always kept.
 - A segment takes batches until its stream reaches 64 MiB. Later: sealing rewrites a full
   segment as an Arrow IPC file with its footer, so it can be memory-mapped and copied to S3.
 - One write is one batch under one `seq`, never split, so it is atomic. Over Flight it is at most
@@ -411,18 +424,15 @@ catalog as live tables.
   far below that. One maximal batch fits a live reader's queue (§7.2).
 - Row positions within an internal partition are stable (append-only), which maps onto add-only
   tables in the engine.
-- Per-batch metadata (`seq`, ingest time) lives in the index, not in user columns. An
+- Per-batch metadata (`seq`, ingest time, LSN) lives in the index, not in user columns. An
   `IngestTime` column can be materialized per table if requested.
 - The change-kind field says what a batch is: 0 rows (an append table's), 1 upserts, 2 deletes
   (the rows' key columns name what goes), 3 a checkpoint: the table's whole state, replacing every
   key before it (§7.3). The epoch field is written from the start, so fencing (§17) needs no
   format change either.
-- Ingest times come from one clock per table, read under its lock: they rise in commit order
-  across all its sources, so replays and folds can merge partitions back into that order.
-- This is the single-replica format. With replication (§7.6) a shard's replicated log becomes the
-  only durable copy and these partition files are derived from it, written in the background
-  without an fsync per batch; their layout stays, so merges, dropping dates, and reads by
-  position do not change.
+- Commit order is LSN order, the same across every table and source of the store; ingest times,
+  stamped by the committer from one clock, rise with it, so dates and commit order agree.
+  Batches from before the log come first, in ingest-time order.
 
 ### 7.2 Serving
 
@@ -452,11 +462,18 @@ catalog as live tables.
 - Reads by position, for viewers that show a table without holding it (§15.3): rows
   `[start, start + n)` of a table's day in commit order, the columns asked for only, and the
   day's row count as batches commit. Positions come from the index alone: the day's batches
-  merged by ingest time (one clock per table, so ingest order is commit order) with their
-  running row counts, a binary search to a batch, and that batch read from its segment. A
-  subscription can ask for some columns only, so a viewer sorting one column moves that column.
-- Later: sealed segments over `DoGet` with the engine caching them locally; subscriptions resumed
-  by log position (§7.6) on any replica.
+  merged in commit order with their running row counts, a binary search to a batch, and that
+  batch read from its segment. A subscription can ask for some columns only, so a viewer
+  sorting one column moves that column.
+- A subscription resumes by log position: a reader that asks is given each batch's LSN, and one
+  whose stream broke asks for everything after the last it had, whatever its date (a keyed
+  table's checkpoints are not repeated). The client does this by itself, retrying with backoff,
+  and reports every break and resume: why, how long the table was not current, and how much was
+  replayed. A position whose batches may have gone with a merged date is refused; a keyed
+  table's reader then reads it again from its start (a checkpoint replaces its state), any
+  other fails, saying so. Flight connections ping every 5 s, so one that died silently is found
+  within about 15 s rather than looking current.
+- Later: sealed segments over `DoGet` with the engine caching them locally.
 - Co-located workers may memory-map sealed segments directly; this is an optimization only.
 
 ### 7.3 Day roll
@@ -499,8 +516,9 @@ outlive what Kubernetes believes.
 
 ### 7.5 Durability
 
-- Initial: single writer per internal partition on a replicated PVC (block storage such as
-  Longhorn). weir is a StatefulSet with one replica; draining its node is a brief outage (§17.1).
+- Initial: one weir, its log fsynced per group before any writer is acknowledged, on a
+  replicated PVC (block storage such as Longhorn). weir is a StatefulSet with one replica;
+  draining its node is a brief outage (§17.1), which readers resume across by position.
 - With replication (§7.6), its volumes become local and unreplicated (a single-replica storage
   class, or local disks): the storage's replicas under weir's own would add network round-trips
   to every acknowledged write and triple the storage. The switch lands with replication, never
@@ -509,10 +527,11 @@ outlive what Kubernetes believes.
 
 ### 7.6 Replication
 
-Not built yet; the direction, decided before any of it is written. weir replicates itself so
-that losing a node loses no acknowledged write, a planned restart (a rollout, a drain) costs
-writers a pause of milliseconds and readers nothing, and producing and consuming depend on
-nothing outside weir.
+Built: the single-replica shard log (§7.1) and readers resuming by LSN (§7.2), step 1 below.
+Not built yet: replication, the rest of this section; the direction, decided before it is
+written. weir replicates itself so that losing a node loses no acknowledged write, a planned
+restart (a rollout, a drain) costs writers a pause of milliseconds and readers nothing, and
+producing and consuming depend on nothing outside weir.
 
 The model is the one databases use: one replicated write-ahead log per shard, the only durable
 copy, and everything else derived from it.

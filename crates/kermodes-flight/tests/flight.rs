@@ -68,7 +68,7 @@ fn eventually(seen: &Mutex<Vec<i64>>, want: &[i64]) {
 fn clients_share_a_served_store() {
     let dir = TempDir::new();
     let store = Arc::new(Store::open(&dir.0).unwrap());
-    let server = serve(store, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let server = serve(store.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
     let url = format!("grpc://{}", server.addr());
 
     let producer = Client::connect(&url).unwrap();
@@ -105,6 +105,7 @@ fn clients_share_a_served_store() {
             }),
             Box::new(move || *ready.lock().unwrap() = Some(had.lock().unwrap().clone())),
             Box::new(move |why| *reason.lock().unwrap() = Some(why)),
+            false,
         )
         .unwrap();
     assert_eq!(schema.field(1).name(), "sym");
@@ -164,15 +165,19 @@ fn clients_share_a_served_store() {
             .unwrap();
     assert!(matches!(resumed.write(&wrong, None), Err(Error::Schema(_))));
 
-    // A subscriber learns when the server goes rather than waiting forever.
-    assert_eq!(*lost.lock().unwrap(), None);
+    // The server restarts: the subscriber resumes after the last batch it had, given every
+    // batch once, those written while the server was away and after.
+    let addr = server.addr();
     let mut server = server;
     server.stop();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while lost.lock().unwrap().is_none() {
-        assert!(Instant::now() < deadline, "the subscriber was never told");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    let local = store
+        .writer(&ticks(), &SourceId::parse("local").unwrap(), false)
+        .unwrap();
+    local.write(&batch(5..6), None).unwrap();
+    let _server = serve(store.clone(), addr).unwrap();
+    local.write(&batch(6..7), None).unwrap();
+    eventually(&seen, &[0, 1, 2, 3, 4, 5, 6]);
+    assert_eq!(*lost.lock().unwrap(), None);
 }
 
 /// A rolling handover between processes: the new writer waits for the source's lease, and resumes
@@ -281,6 +286,7 @@ fn a_long_history_reaches_a_remote_reader_once_while_writes_go_on() {
             }),
             Box::new(|| {}),
             Box::new(|why| panic!("lost the stream: {why}")),
+            false,
         )
         .unwrap();
     for v in 60..70 {
@@ -347,6 +353,7 @@ fn keyed_changes_cross_the_wire_with_their_kind() {
             }),
             Box::new(|| {}),
             Box::new(|_| {}),
+            false,
         )
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
