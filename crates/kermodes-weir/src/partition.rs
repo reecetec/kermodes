@@ -96,8 +96,23 @@ impl Entry {
 struct Segment {
     number: u32,
     entries: Vec<Entry>,
+    /// Its stream's schema exactly as written: with column IDs, or without, before tables had
+    /// them. A read by position finds where the batches start by encoding it again.
+    written: SchemaRef,
     /// The columns its stream was written with.
     shape: Shape,
+}
+
+impl Segment {
+    fn new(number: u32, entries: Vec<Entry>, written: SchemaRef) -> Self {
+        let shape = Shape::of_segment(&written);
+        Self {
+            number,
+            entries,
+            written,
+            shape,
+        }
+    }
 }
 
 /// The segment taking batches.
@@ -307,7 +322,7 @@ impl Partition {
                 skip -= held;
                 continue;
             }
-            let header = schema_header(&segment.shape.segment_schema())?;
+            let header = schema_header(&segment.written)?;
             let take = (count - batches.len()).min(held - skip);
             let path = data_path(&self.dir, segment.number);
             let mut file = File::open(&path).map_err(|e| Error::io(&path, e))?;
@@ -384,7 +399,8 @@ impl Partition {
                 .open(path)
                 .map_err(|e| Error::io(path, e))
         };
-        let stream = StreamWriter::try_new(create(&data)?, &self.shape.segment_schema())
+        let written = self.shape.segment_schema();
+        let stream = StreamWriter::try_new(create(&data)?, &written)
             .map_err(|e| Error::Arrow(format!("{}: {e}", data.display())))?;
         stream
             .get_ref()
@@ -400,11 +416,7 @@ impl Partition {
             .and_then(|dir| dir.sync_all())
             .map_err(|e| Error::io(&self.dir, e))?;
         Ok(Open {
-            segment: Segment {
-                number,
-                entries: Vec::new(),
-                shape: self.shape.clone(),
-            },
+            segment: Segment::new(number, Vec::new(), written),
             stream,
             index: index_file,
         })
@@ -586,12 +598,12 @@ fn schema_header(schema: &SchemaRef) -> Result<Vec<u8>, Error> {
     Ok(writer.get_ref().clone())
 }
 
-/// The columns the stream at `data` was written with: its schema message, read alone.
-fn written_shape(data: &Path) -> Result<Shape, Error> {
+/// The schema the stream at `data` was written with: its schema message, read alone.
+fn written_schema(data: &Path) -> Result<SchemaRef, Error> {
     let file = File::open(data).map_err(|e| Error::io(data, e))?;
     let reader = StreamReader::try_new(file, None)
         .map_err(|e| Error::Arrow(format!("{}: {e}", data.display())))?;
-    Ok(Shape::of_segment(&reader.schema()))
+    Ok(reader.schema())
 }
 
 /// A segment's committed batches: its index records up to the first that fails its check. A
@@ -639,21 +651,20 @@ fn recover(dir: &Path, number: u32) -> Result<Option<Segment>, Error> {
             last.end
         )));
     }
-    Ok(Some(Segment {
-        number,
-        entries,
-        shape: written_shape(&data)?,
-    }))
+    Ok(Some(Segment::new(number, entries, written_schema(&data)?)))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+    use std::io::Seek;
     use std::sync::Arc;
 
     use arrow::array::{AsArray, Int64Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Int64Type, Schema};
+    use arrow::ipc::writer::StreamWriter;
 
-    use super::{Change, Partition};
+    use super::{Change, Entry, HEADER, Partition, data_path, index_path};
     use crate::shape::{ColumnId, Shape};
 
     /// A cursor from any batch delivers exactly the batches from there on, across segments,
@@ -700,6 +711,57 @@ mod tests {
             assert_eq!(read, (from as i64..10).collect::<Vec<_>>(), "from {from}");
         }
         assert_eq!(partition.cursor(10).bytes(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A segment written before column IDs (its schema has none) reads both ways: by cursor,
+    /// and by position, which finds where its batches start from its schema message.
+    #[test]
+    fn a_segment_written_before_column_ids_reads_by_cursor_and_by_position() {
+        let dir = std::env::temp_dir().join(format!("kermodes-old-seg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
+        // As the version before column IDs wrote it: the plain schema, then the index.
+        let mut stream =
+            StreamWriter::try_new(File::create(data_path(&dir, 1)).unwrap(), &schema).unwrap();
+        let mut index = HEADER.to_vec();
+        for seq in 1..=3_u64 {
+            let n = Int64Array::from(vec![seq as i64 * 10; 4]);
+            stream
+                .write(&RecordBatch::try_new(schema.clone(), vec![Arc::new(n)]).unwrap())
+                .unwrap();
+            stream.flush().unwrap();
+            let end = stream.get_mut().stream_position().unwrap();
+            let entry = Entry {
+                seq,
+                rows: 4,
+                ingest_ns: seq as i64,
+                end,
+                change: Change::Rows,
+            };
+            index.extend_from_slice(&entry.encode(1));
+        }
+        std::fs::write(index_path(&dir, 1), index).unwrap();
+
+        let shape = Shape::new(schema.clone(), Arc::new([ColumnId(1)]));
+        let partition = Partition::open(&dir, shape.clone()).unwrap();
+        let first = |batch: &RecordBatch| batch.column(0).as_primitive::<Int64Type>().value(0);
+        let by_cursor: Vec<i64> = partition
+            .cursor(0)
+            .batches(shape.clone())
+            .map(|read| first(&read.unwrap().0))
+            .collect();
+        assert_eq!(by_cursor, [10, 20, 30]);
+        for (from, count) in [(0, 3), (1, 2), (2, 1)] {
+            let by_position: Vec<i64> = partition
+                .read_batches(from, count, &shape)
+                .unwrap()
+                .iter()
+                .map(first)
+                .collect();
+            assert_eq!(by_position, [10, 20, 30][from..], "from {from}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
