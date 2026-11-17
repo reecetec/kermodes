@@ -293,7 +293,8 @@ History
 
 - Existing Parquet files are not touched: reads map them to the current columns by `field_id`.
 - Merge writes every date in the current columns, rewriting neighbouring files by column ID (§8.3).
-- Catalog snapshots (§8.2) will keep old columns; reading an old snapshot sees them.
+- Later, if catalog snapshots are added (§8.2), they keep old columns; reading an old snapshot
+  sees them.
 
 ## 6. Ingestion
 
@@ -418,6 +419,10 @@ catalog as live tables.
   format change either.
 - Ingest times come from one clock per table, read under its lock: they rise in commit order
   across all its sources, so replays and folds can merge partitions back into that order.
+- This is the single-replica format. With replication (§7.6) a shard's replicated log becomes the
+  only durable copy and these partition files are derived from it, written in the background
+  without an fsync per batch; their layout stays, so merges, dropping dates, and reads by
+  position do not change.
 
 ### 7.2 Serving
 
@@ -450,8 +455,8 @@ catalog as live tables.
   merged by ingest time (one clock per table, so ingest order is commit order) with their
   running row counts, a binary search to a batch, and that batch read from its segment. A
   subscription can ask for some columns only, so a viewer sorting one column moves that column.
-- Later: sealed segments over `DoGet` with the engine caching them locally, the tail over
-  `DoExchange` resumed by row position (§17).
+- Later: sealed segments over `DoGet` with the engine caching them locally; subscriptions resumed
+  by log position (§7.6) on any replica.
 - Co-located workers may memory-map sealed segments directly; this is an optimization only.
 
 ### 7.3 Day roll
@@ -481,7 +486,9 @@ outlive what Kubernetes believes.
   for the current holder to go; without `wait`, a taken source fails at once.
 - Taking a lease increments the source's epoch, kept in the catalog, so epochs rise across
   restarts. weir accepts writes only on the holder's stream, and each batch's index record carries
-  its epoch, so a replicated weir (§17) can reject a fenced holder's writes as well.
+  its epoch, so a replicated weir (§17) can reject a fenced holder's writes as well. With
+  replication (§7.6), taking and releasing a lease are entries in the shard's log, so writing
+  needs no catalog call at all.
 - A lease is released when its writer closes or its connection drops. A holder that vanishes
   without closing (a crashed or partitioned node) is found by HTTP/2 keepalive pings within about
   30 s.
@@ -494,12 +501,100 @@ outlive what Kubernetes believes.
 
 - Initial: single writer per internal partition on a replicated PVC (block storage such as
   Longhorn). weir is a StatefulSet with one replica; draining its node is a brief outage (§17.1).
-- Later: copy sealed segments to object storage so node loss costs at most the open segment (§17).
-- Once weir replicates itself (§17), its volumes become local and unreplicated (a single-replica
-  storage class, or local disks): the storage's replicas under weir's own would add network
-  round-trips to every acknowledged write and triple the storage. The switch lands with
-  replication, never before, and measured acknowledgement latency on both storage classes decides it.
+- With replication (§7.6), its volumes become local and unreplicated (a single-replica storage
+  class, or local disks): the storage's replicas under weir's own would add network round-trips
+  to every acknowledged write and triple the storage. The switch lands with replication, never
+  before, and measured acknowledgement latency on both storage classes decides it.
 - Retention: intraday partitions are deleted N days after their merge validates.
+
+### 7.6 Replication
+
+Not built yet; the direction, decided before any of it is written. weir replicates itself so
+that losing a node loses no acknowledged write, a planned restart (a rollout, a drain) costs
+writers a pause of milliseconds and readers nothing, and producing and consuming depend on
+nothing outside weir.
+
+The model is the one databases use: one replicated write-ahead log per shard, the only durable
+copy, and everything else derived from it.
+
+```
+writers ─► leader ── append + fsync ─────────────┐
+              └─► followers ── append + fsync ───┤ a majority holds it: committed
+                                                 ▼
+         acknowledge the writer; deliver to subscribers (from memory)
+                                                 │ applied in log order, on every replica
+                                                 ▼
+         partition files (date, source): derived, written in the background
+         keyed checkpoints: each replica's own, folded from the log
+         the log is trimmed below the position the files hold
+```
+
+- **Shards.** A shard is a replication group of 3 replicas on separate nodes, each with its own
+  local disk; it holds the internal partitions the placement map in Postgres gives it (§17).
+  There is one shard to begin with. Each shard's log is replicated by Raft: a majority of
+  replicas must accept a leader's term before it serves, and an entry is committed once a
+  majority hold it durably, so an acknowledged write survives any election and an old leader
+  cannot commit after being replaced. Safety comes from these quorums among the replicas, not
+  from clocks or from Postgres, which is why weir does not elect its leader through Postgres:
+  membership changed only in an external store, without fencing at the replicas, is how
+  ZooKeeper-era Kafka lost acknowledged writes.
+- **What Postgres holds.** What changes rarely: tables and their columns, shards and their
+  members, which shard holds which partitions, and history (§8.2). A Postgres outage stops none
+  of producing, consuming, or failing over; it blocks creating tables, changing columns, and
+  moving partitions until it is back.
+- **Log entries.** A batch: its partition, source, `seq`, change kind (§7.1), the ingest time
+  the leader stamps (rising across leaders, since a new leader starts above the last committed
+  one), and the rows as Arrow IPC. Commands are entries too, so every replica does the same
+  thing at the same position: taking and releasing a source lease (§7.4), changing a table's
+  columns (§5.4), dropping a merged date (§8.3). Entries are versioned; a change to their format
+  is a Parallel Change across two releases, so old and new replicas run side by side during a
+  rollout.
+- **Writes.** The leader assigns each batch the next log position (LSN), appends it, and
+  replicates it while it fsyncs; one fsync covers every batch waiting, from every producer, so
+  commit is grouped by construction. The writer is acknowledged once the batch is committed:
+  one fsync and one round trip to a follower. A resend is recognised when the entry is applied,
+  by `(source, seq)` (§6.1), so every replica decides it alike.
+- **Positions.** The LSN is the same on every replica: a shard's entries are in one total order,
+  across all its producers, identical live, on a follower, and in a replay. A subscriber's
+  position is one LSN per shard it reads; reconnecting, to the same replica or another, it asks
+  for the entries after it and misses or repeats none. A position whose entries were trimmed and
+  dropped is refused, and the reader rebuilds from the start, which is recorded, never silent.
+- **Reads.** Every replica serves subscriptions up to the commit position it knows, so readers
+  add no load to the leader and a change of leader does not touch them. Live delivery is from
+  memory as entries commit; catching up and reads by position (§7.2) read the partition files
+  and, past them, the log.
+- **Partition files** keep the layout of §7.1, so dates, merges, reads by position, and dropping
+  merged dates are unchanged. Each replica writes them from the log in the background and flushes
+  them in bulk; recovery replays the log from the position the files hold. Keyed checkpoints
+  (§7.3) are each replica's own, folded from the log, never replicated. A new or replaced
+  replica copies partition files from a peer, then the log from their position. Writing every
+  byte twice is the price of the clean split, small at our volumes.
+- **Planned restarts.** A rollout or drain restarts one replica at a time, under a
+  PodDisruptionBudget, each only once the previous one has caught up. Before the leader
+  restarts it hands leadership to an up-to-date follower; writers are redirected, and the batch
+  in flight is resent with its `seq`, so nothing is lost or written twice. Readers on the
+  restarting replica reconnect and resume by position, each reconnect recorded.
+- **Unplanned failure.** Losing the leader stalls writes for an election timeout (about a
+  second), losing no acknowledged write. Losing a follower changes nothing for writers. With two
+  of three replicas gone, writes stop until one returns, and the committed log is still served.
+- **`kermodes dev`** runs the same code as a shard of one replica.
+- **Testing.** Replication is proven by deterministic simulation before it serves anything: every
+  replica in one process over a simulated network and disk, faults injected from a seed (lost,
+  delayed, and reordered messages, crashes mid-fsync, torn writes, partitions), and invariants
+  checked over millions of runs: no committed entry lost, none applied twice, every replica's log
+  a prefix of the same log. Then real processes: `kill -9` on the leader under load, and node
+  drains.
+- **Raft itself.** Either openraft, which takes our log and state storage, or a Raft core of our
+  own, as Redpanda and TigerBeetle wrote; prototyped first on openraft under the simulator, and
+  kept only if it can be driven deterministically.
+- **Order of work**, each step useful alone:
+  1. One replica: the shard log, partition files derived from it, grouped commit, subscriptions
+     resumed by LSN, and existing segments still read. Its latency, produce to subscriber, is
+     measured (p50, p99, p999).
+  2. The simulator; then replication over 3 replicas with fixed membership.
+  3. Leadership transfer for rollouts, reads from followers, leases as log entries.
+  4. Local disks, one replica per node.
+  5. Later: more shards, and changing a shard's members.
 
 ## 8. Lake
 
@@ -758,7 +853,9 @@ Table resolution
   Parquet and is static; if only today's date survives, it reads only weir. A keyed table is its
   latest state.
 - `live.ns.table` and `hist.ns.table` pin one side explicitly.
-- `FOR SYSTEM_TIME AS OF '<timestamp>'` reads history at a catalog snapshot (§8.2).
+- Later, maybe: `FOR SYSTEM_TIME AS OF '<timestamp>'`, reading history at a catalog snapshot.
+  Not built: history keeps no replaced files (§8.2), so its correctness rests on each commit, not
+  on time travel.
 - Tables in Python are passed by keyword and read under that name:
   `db.sql("SELECT ... FROM board", board=board)`. Keywords, not the caller's variables, so a query
   reads only what it is given.
@@ -1665,16 +1762,16 @@ is fixed:
 ## 17. Scaling and high availability
 
 Not built initially: one weir, restart-based recovery. These invariants are built from M1 so that
-sharding and HA are additive later instead of a redesign.
+sharding and HA are additive later instead of a redesign. weir's replication is designed in §7.6.
 
 | Invariant | Enables |
 |---|---|
 | Clients resolve endpoints per internal partition via Flight `GetFlightInfo`; no client hardcodes a weir address | Moving partitions between weir shards without client changes |
 | Placement unit is the internal partition `(table, date, source_id)`; weir never coordinates across partitions | Spreading partitions over any number of shards |
-| Each partition's owner holds an epoch (fencing token) from the control plane; segments and acks record it; stale-epoch writes are rejected | Failover without split-brain |
+| Each shard's log is replicated by Raft (§7.6): a leader serves only with a majority's acceptance of its term, and an entry commits only on a majority | Failover without split-brain, losing no acknowledged write |
 | Writers hold a lease per `(table, source)`; taking it bumps the source's epoch and fences the previous holder (§7.4) | Rolling replacement, drains, and standbys without two writers |
-| Sealed segments are immutable and self-describing (schema version, seq range, row range, epoch) | Serving them from any node or from S3 |
-| Subscriptions resume by `(partition, row position)` | Readers reconnecting to a different weir mid-stream |
+| Log entries are versioned and self-describing (partition, source, seq, change kind, ingest time) | Old and new replicas side by side during a rollout |
+| Subscriptions resume by log position (one LSN per shard read), the same on every replica | Readers reconnecting to any replica mid-stream, missing and repeating nothing |
 | Derived publications record the input positions they cover | Restarted workers resuming output without duplicates |
 | Control plane and gateway hold no local state | Horizontal replicas behind leader election |
 
@@ -1684,7 +1781,7 @@ failure; `plan` warns when a non-replayable source has no replicated ack.
 
 | Component | Initial behaviour on failure | Later |
 |---|---|---|
-| weir | Single StatefulSet on a Longhorn-replicated volume; pod reschedules and volume reattaches (minutes); writers buffer and resume from `last_seq` | Shards via a placement map in Postgres; sealed segments copied to S3; `ack: replicated` (primary + follower for open segments) |
+| weir | Single StatefulSet on a Longhorn-replicated volume; pod reschedules and volume reattaches (minutes); writers buffer and resume from `last_seq` | A shard of 3 replicas on local disks (§7.6): losing a node loses no acknowledged write, a leader's loss stalls writes for about a second; more shards via the placement map in Postgres |
 | Ingesters | Restart; replayable sources lose nothing; non-replayable sources lose the outage window | Replicated ack; standby ingester |
 | Engine deployments | Rollouts and drains replace runs without downtime (§11.4, §17.1); a crash restarts and rebuilds from weir and history, so recovery time = rebuild time | State checkpoints; hot standby (`replicas=2`) with input-driven (deterministic) cycles |
 | Sessions | Lost with the pod | — |
@@ -1714,7 +1811,7 @@ down until its replacement has rebuilt. Kermodes moves runs before they are evic
 | Gateway, `kermodes ui` | No downtime: stateless, 2+ replicas and a PodDisruptionBudget |
 | Control plane | No downtime for the API; the loops hand over to the other replica within a second (a PodDisruptionBudget keeps one up) |
 | Postgres (CNPG) | No downtime: CNPG switches the primary over before eviction |
-| weir | A brief outage until it is replicated: the pod reschedules and its volume reattaches. Writers buffer and resume from `last_seq`; readers restart and rebuild until subscriptions resume by row position (§7.2) |
+| weir | A brief outage until it is replicated: the pod reschedules and its volume reattaches. Writers buffer and resume from `last_seq`; readers restart and rebuild. Replicated (§7.6): no downtime: one replica at a time, the leader handing over first, readers resuming by log position |
 
 ## 18. Technology choices
 
@@ -1795,7 +1892,7 @@ Verified against maturin 1.16, PyO3 0.30, and uv.
 |---|---|---|
 | M0 | Engine library: row sets, update graph, static + incremental operators, expressions; PyO3 module; notebook widget; oracle tests; benchmarks ([engine.md](engine.md)) | Random-walk ticker → rolling mean/vol, live in Jupyter |
 | M1 | weir (DoPut, segments, seq dedup, epochs, snapshot + tail); `db.live_table`; WebSocket connector; `kermodes dev`; Helm chart (weir + engine) | Synthetic ticker over WebSocket → weir → engine, on a laptop and in the cluster |
-| M2 | Parquet writer and pruned reader, catalog with snapshots, merge job, `db.historical_table`, `db.table`, replay clock; SQL frontend with `EXPLAIN`; column IDs and compatible schema changes | Same SQL query over last month (static) and today (ticking); ticker merged nightly, replayed as a backtest |
+| M2 | Parquet writer and pruned reader, catalog, merge job, `db.historical_table`, `db.table`, replay clock; SQL frontend with `EXPLAIN`; column IDs and compatible schema changes | Same SQL query over last month (static) and today (ticking); ticker merged nightly, replayed as a backtest |
 | M3 | Projects and the pipeline: `kermodes init` / `run` / `dev` / `test` / `plan`, manifest discovery, environments, git sync from any host, rollouts (`auto` / `manual` / `on_start`; `rolling` / `recreate`) on weir source leases, a drain-aware controller on Kubernetes Deployments, scheduler and `sys.*` tables | Toy ticker project: merging to `main` rolls it out with no gap in its output, and draining its node moves it with none either |
 | M4 | Multi-user: OIDC, RBAC, gateway, worker classes, `--live` local runs on prod's inputs, PR previews in shadow; ranger MCP; web UI v1 with monitoring v1 (§16.7) | Two users with their own sessions; a developer runs a deployment locally on prod's live inputs; an agent opens a PR that previews in shadow; the UI shows each worker's CPU, memory, and table space |
 | M5 | den: register sklearn LinearRegression → ONNX → `predict`; torch MLP; aliases, shadow mode | Live prediction; swap champion without restart |
