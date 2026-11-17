@@ -563,6 +563,27 @@ writers ─► leader ── append + fsync ────────────
   add no load to the leader and a change of leader does not touch them. Live delivery is from
   memory as entries commit; catching up and reads by position (§7.2) read the partition files
   and, past them, the log.
+- **Latency and throughput, per table.** A firm's trading signal and its full-depth market feed
+  want opposite trade-offs, and both are first-class. A table declares them; defaults are safe
+  and fast (majority fsynced, no producer batching, apps cycling on input).
+  - Durability: `fsync` (committed once a majority has fsynced it) or `memory` (committed once a
+    majority holds it in memory, fsynced moments later; it survives any one node's crash and
+    loses the last milliseconds only if a majority lose power together). The leader keeps two
+    watermarks, received and fsynced by a majority, and each entry's acknowledgement and
+    visibility follow its table's choice. Both preserve the log's order.
+  - Producer batching (a linger time, and rows or bytes per batch) and acknowledgement (wait for
+    commit, or return a handle at once and wait on it later) are the writer's.
+  - Placement isolates: a shard's entries share its leader, its network, and its fsync, so a
+    table whose bursts would delay another's (head-of-line, at p99) or whose latency is
+    critical gets a shard of its own, on its own nodes and disks if need be. The placement map
+    (§17) makes this a declaration, not a mechanism.
+  - Readers choose how often their engine cycles (§9.4) and, later, whether to see a provisional
+    tier ahead of commit.
+  - Hardware sets the floor. With `fsync`, every acknowledgement waits on the slowest disk of a
+    majority: drives with power-loss protection fsync in tens of microseconds, consumer drives
+    in up to milliseconds with spikes. A target near 1 ms at p99, produce to subscriber, needs
+    the former, or `memory` durability on the latter; the latency benchmark (step 1 below)
+    measures each disk rather than assuming it.
 - **Partition files** keep the layout of §7.1, so dates, merges, reads by position, and dropping
   merged dates are unchanged. Each replica writes them from the log in the background and flushes
   them in bulk; recovery replays the log from the position the files hold. Keyed checkpoints
