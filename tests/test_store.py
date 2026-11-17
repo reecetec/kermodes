@@ -40,6 +40,26 @@ def test_stored_tables_tick_and_survive_the_process(tmp_path):
     assert w.last_seq == 2
 
 
+def test_writes_sent_without_waiting_land_in_order_locally_and_remotely(tmp_path):
+    owner = km.local(tmp_path / "store", manual=True)
+    owner.create_table("md.ticks", COLUMNS)
+    server = owner.serve_store()
+    for session, source, values in [
+        (owner, "local", range(300)),
+        (km.connect(server.url, manual=True), "remote", range(300, 600)),
+    ]:
+        w = session.writer("md.ticks", source=source)
+        sent = [w.write(rows([v]), wait=False) for v in values]
+        w.flush()
+        assert all(pending.wait() for pending in sent)
+        assert w.last_seq == 300
+        # A resend among writes in flight is dropped.
+        assert not w.write(rows([-1]), seq=300, wait=False).wait()
+    live = owner.live_table("md.ticks")
+    owner.step()
+    assert pa.table(live)["n"].to_pylist() == list(range(600))
+
+
 def test_a_store_has_one_owner_and_clear_errors(tmp_path):
     s = km.local(tmp_path, manual=True)
     with pytest.raises(km.KermodesError, match="open in another process"):

@@ -10,6 +10,7 @@ mod catalog;
 mod keyed;
 mod names;
 mod partition;
+mod pending;
 mod shape;
 mod store;
 mod wal;
@@ -20,6 +21,7 @@ use std::path::Path;
 pub use catalog::{Garbage, HistoryCommit, HistoryDate, HistoryFile, TableEntry};
 pub use names::{Date, SourceId, TableName};
 pub use partition::Stamp;
+pub use pending::{Answer, IN_FLIGHT_BYTES, InFlight, Pending};
 pub use shape::{ColumnId, Shape, column, spec, widens};
 pub use store::{BRANCH, Failed, Pace, Store, Subscriber, Writer, conform, keys_only};
 

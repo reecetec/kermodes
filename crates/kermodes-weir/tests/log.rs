@@ -125,10 +125,12 @@ fn state_after(n: i64) -> BTreeMap<i64, i64> {
 }
 
 /// Run as a child process by `a_killed_writer_loses_nothing_acknowledged`: writes both tables in
-/// turn until killed, printing how many of each are acknowledged after each acknowledgement.
+/// turn until killed, up to `WINDOW` rounds in flight at once, printing how many rounds are
+/// acknowledged after each acknowledgement.
 #[test]
 #[ignore = "a child process of a_killed_writer_loses_nothing_acknowledged"]
 fn writer_child() {
+    const WINDOW: usize = 16;
     let Some(dir) = std::env::var_os("KERMODES_LOG_TEST_DIR") else {
         return;
     };
@@ -141,18 +143,30 @@ fn writer_child() {
     let ticks_writer = store.writer(&ticks(), &feed, true).unwrap();
     let quotes_writer = store.writer(&quotes(), &feed, true).unwrap();
     let mut i = ticks_writer.last_seq().unwrap_or(0) as i64;
-    let stdout = std::io::stdout();
-    loop {
-        ticks_writer
-            .write(&appended(i), Some(i as u64 + 1))
-            .unwrap();
+    // The kill may have come between a round's two writes.
+    if quotes_writer.last_seq().unwrap_or(0) as i64 == i - 1 {
         quotes_writer
-            .upsert(&upserted(i), Some(i as u64 + 1))
+            .upsert(&upserted(i - 1), Some(i as u64))
+            .unwrap();
+    }
+    let stdout = std::io::stdout();
+    let mut in_flight = std::collections::VecDeque::new();
+    loop {
+        let tick = ticks_writer
+            .send(Change::Rows, &appended(i), Some(i as u64 + 1))
+            .unwrap();
+        let quote = quotes_writer
+            .send(Change::Upsert, &upserted(i), Some(i as u64 + 1))
             .unwrap();
         i += 1;
-        let mut out = stdout.lock();
-        writeln!(out, "acked {i}").unwrap();
-        out.flush().unwrap();
+        in_flight.push_back((i, tick, quote));
+        if in_flight.len() == WINDOW {
+            let (round, tick, quote) = in_flight.pop_front().unwrap();
+            assert!(tick.wait().unwrap() && quote.wait().unwrap());
+            let mut out = stdout.lock();
+            writeln!(out, "acked {round}").unwrap();
+            out.flush().unwrap();
+        }
     }
 }
 
@@ -202,12 +216,12 @@ fn a_killed_writer_loses_nothing_acknowledged() {
             "kill after {kill_after}: every write once, in order"
         );
         let quotes_state = state(&read(&store, &quotes()));
-        // The upsert after the last acknowledged append may have landed too, or not.
+        // Writes are logged in the order sent, a round's append before its upsert, and the
+        // log keeps a prefix: the kill may have come between the last round's two writes.
         assert!(
-            quotes_state == state_after(acked as i64)
-                || quotes_state == state_after(acked as i64 + 1)
-                || quotes_state == state_after(written as i64),
-            "kill after {kill_after}: {quotes_state:?} after {acked} acked"
+            quotes_state == state_after(written as i64)
+                || quotes_state == state_after(written as i64 - 1),
+            "kill after {kill_after}: {quotes_state:?} after {written} appends"
         );
     }
 }

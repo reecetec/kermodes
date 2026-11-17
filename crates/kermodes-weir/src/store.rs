@@ -34,6 +34,7 @@ use serde_json::json;
 use crate::catalog::{Catalog, Garbage, HistoryCommit, HistoryDate, HistoryFile, TableEntry};
 use crate::keyed::Fold;
 use crate::partition::{Partition, Stamp, in_order};
+use crate::pending::{Answer, InFlight, Pending};
 use crate::shape::Shape;
 use crate::wal::{self, Append, Logged, Wal};
 use crate::{Change, Date, Error, SourceId, TableName};
@@ -188,7 +189,7 @@ struct Submitted {
     epoch: u64,
     change: Change,
     batch: RecordBatch,
-    reply: SyncSender<Result<bool, Error>>,
+    answer: Answer,
 }
 
 /// An append table's day in commit order, for reads by position (§7.2): each batch's partition,
@@ -535,6 +536,7 @@ impl Store {
             key: entry.key,
             epoch: 0,
             last_seq: Mutex::new(None),
+            in_flight: Arc::default(),
         };
         writer.epoch = lock(&self.catalog).next_epoch(entry.id, source)?;
         Ok(writer)
@@ -1072,7 +1074,7 @@ fn commit(mut wal: Wal, mut clock: i64, applied: &AtomicU64, requests: &Receiver
         last_group = group.len();
         if let Some(why) = &broken {
             for submitted in group {
-                let _ = submitted.reply.send(Err(Error::Io(format!(
+                submitted.answer.send(Err(Error::Io(format!(
                     "weir stopped taking writes: {why}; restart it"
                 ))));
             }
@@ -1104,13 +1106,24 @@ fn commit(mut wal: Wal, mut clock: i64, applied: &AtomicU64, requests: &Receiver
             Err(e) => {
                 broken = Some(e.to_string());
                 for submitted in group {
-                    let _ = submitted.reply.send(Err(Error::Io(e.to_string())));
+                    submitted.answer.send(Err(Error::Io(e.to_string())));
                 }
                 continue;
             }
         };
         drop(appends);
         for ((submitted, lsn), ingest_ns) in group.into_iter().zip(lsns).zip(stamped) {
+            let Submitted {
+                log,
+                table,
+                shape,
+                source,
+                seq,
+                epoch,
+                change,
+                batch,
+                answer,
+            } = submitted;
             let outcome = match &broken {
                 Some(why) => Err(Error::Io(format!(
                     "weir stopped taking writes: {why}; restart it"
@@ -1118,16 +1131,16 @@ fn commit(mut wal: Wal, mut clock: i64, applied: &AtomicU64, requests: &Receiver
                 None => {
                     let logged = Logged {
                         lsn,
-                        table: submitted.table,
-                        shape: submitted.shape,
-                        source: submitted.source,
-                        seq: submitted.seq,
-                        epoch: submitted.epoch,
-                        change: submitted.change,
+                        table,
+                        shape,
+                        source,
+                        seq,
+                        epoch,
+                        change,
                         ingest_ns,
-                        batch: submitted.batch,
+                        batch,
                     };
-                    let outcome = apply(&submitted.log, logged);
+                    let outcome = apply(&log, logged);
                     match &outcome {
                         Ok(_) => applied.store(lsn, Ordering::Release),
                         Err(e) => broken = Some(e.to_string()),
@@ -1135,7 +1148,7 @@ fn commit(mut wal: Wal, mut clock: i64, applied: &AtomicU64, requests: &Receiver
                     outcome
                 }
             };
-            let _ = submitted.reply.send(outcome);
+            answer.send(outcome);
         }
     }
 }
@@ -1205,9 +1218,9 @@ fn flush_every(
 }
 
 /// Writes one source's rows of a table, holding the source's lease (§7.4) until dropped. Each
-/// batch lands in the partition for the UTC date it arrives (its ingest time) and is durable
-/// before it returns: an append table's rows by `write`, a keyed table's by `upsert` and
-/// `delete`.
+/// batch lands in the partition for the UTC date it arrives (its ingest time): an append table's
+/// rows by `write`, a keyed table's by `upsert` and `delete`. Those return once the batch is
+/// durable; `send` returns at once, so many writes can be in flight and share an fsync.
 pub struct Writer {
     log: Arc<Log>,
     requests: Sender<Request>,
@@ -1219,14 +1232,15 @@ pub struct Writer {
     /// A keyed table's key columns; empty for an append table.
     key: Vec<String>,
     epoch: u64,
-    /// The highest seq this writer has written: the next unnumbered write's is one above. Its
-    /// lock also keeps the writer's writes in order when shared between threads.
+    /// The highest seq this writer has sent: the next unnumbered write's is one above. Its lock
+    /// also keeps the writer's writes in order when shared between threads.
     last_seq: Mutex<Option<u64>>,
+    in_flight: Arc<InFlight>,
 }
 
 impl Writer {
-    /// The source's last sequence number: of its newest partition, since sequence numbers rise
-    /// within a partition and a writer resumes from where its source left off.
+    /// The source's last sequence number written: of its newest partition, since sequence
+    /// numbers rise within a partition and a writer resumes from where its source left off.
     pub fn last_seq(&self) -> Option<u64> {
         let state = lock(&self.log.state);
         newest(&state, &self.source).and_then(Partition::last_seq)
@@ -1241,55 +1255,56 @@ impl Writer {
     /// Appends `batch` (columns matched by name to the table's) as `seq`, or the next number after
     /// the last; `false` when `seq` was already written (a resend), which writes nothing.
     pub fn write(&self, batch: &RecordBatch, seq: Option<u64>) -> Result<bool, Error> {
-        if !self.key.is_empty() {
-            return Err(Error::Schema(format!(
-                "{} is a keyed table: upsert or delete its rows",
-                self.name
-            )));
-        }
-        self.append(&conform(&self.shape.schema, batch)?, seq, Change::Rows)
+        self.send(Change::Rows, batch, seq)?.wait()
     }
 
     /// Sets each row's key to that row, as `write` does for an append table.
     pub fn upsert(&self, batch: &RecordBatch, seq: Option<u64>) -> Result<bool, Error> {
-        self.keyed("upsert")?;
-        self.append(&conform(&self.shape.schema, batch)?, seq, Change::Upsert)
+        self.send(Change::Upsert, batch, seq)?.wait()
     }
 
     /// Removes the keys of `batch`'s rows; it needs only the key columns.
     pub fn delete(&self, batch: &RecordBatch, seq: Option<u64>) -> Result<bool, Error> {
-        self.keyed("delete")?;
-        self.append(
-            &keys_only(&self.shape.schema, &self.key, batch)?,
-            seq,
-            Change::Delete,
-        )
+        self.send(Change::Delete, batch, seq)?.wait()
     }
 
     /// Replaces the table's state with `batch`: every key not in it is gone (a checkpoint). A
     /// publisher starts this way, so keys it no longer holds do not outlive its restart; a state
     /// larger than one batch follows on in upserts.
     pub fn replace(&self, batch: &RecordBatch, seq: Option<u64>) -> Result<bool, Error> {
-        self.keyed("replace")?;
-        self.append(
-            &conform(&self.shape.schema, batch)?,
-            seq,
-            Change::Checkpoint,
-        )
+        self.send(Change::Checkpoint, batch, seq)?.wait()
     }
 
-    fn keyed(&self, action: &str) -> Result<(), Error> {
-        if self.key.is_empty() {
-            return Err(Error::Schema(format!(
-                "{} is an append table: write its rows; only keyed tables {action}",
-                self.name
-            )));
-        }
-        Ok(())
-    }
-
-    /// Logs and applies `batch` (to the committer), returning once it is durable and applied.
-    fn append(&self, batch: &RecordBatch, seq: Option<u64>, change: Change) -> Result<bool, Error> {
+    /// Sends `batch` as a `change` (as `write`, `upsert`, `delete`, or `replace` would) without
+    /// waiting for it: its `Pending` says when it is durable. A writer's writes are logged in
+    /// the order sent; sending waits only while `IN_FLIGHT_BYTES` of them are unanswered.
+    pub fn send(
+        &self,
+        change: Change,
+        batch: &RecordBatch,
+        seq: Option<u64>,
+    ) -> Result<Pending, Error> {
+        let batch = match change {
+            Change::Rows if !self.key.is_empty() => {
+                return Err(Error::Schema(format!(
+                    "{} is a keyed table: upsert or delete its rows",
+                    self.name
+                )));
+            }
+            Change::Rows => conform(&self.shape.schema, batch)?,
+            Change::Upsert => {
+                self.keyed("upsert")?;
+                conform(&self.shape.schema, batch)?
+            }
+            Change::Delete => {
+                self.keyed("delete")?;
+                keys_only(&self.shape.schema, &self.key, batch)?
+            }
+            Change::Checkpoint => {
+                self.keyed("replace")?;
+                conform(&self.shape.schema, batch)?
+            }
+        };
         let mut last = lock(&self.last_seq);
         let (current, table, seq) = {
             let state = lock(&self.log.state);
@@ -1300,9 +1315,11 @@ impl Writer {
             (state.entry.shape(), state.entry.id, seq)
         };
         // Rows of the columns this writer opened with, as the table's are now (§5.4).
-        let batch = self.shape.convert(batch.clone(), &current)?;
-        let (reply, answer) = mpsc::sync_channel(1);
-        let closed = || Error::Io(format!("the store holding {} is closed", self.name));
+        let batch = self.shape.convert(batch, &current)?;
+        let gone = format!("the store holding {} closed", self.name);
+        let (pending, answer) = self
+            .in_flight
+            .send(batch.get_array_memory_size(), gone.clone());
         self.requests
             .send(Request::Write(Submitted {
                 log: self.log.clone(),
@@ -1313,12 +1330,27 @@ impl Writer {
                 epoch: self.epoch,
                 change,
                 batch,
-                reply,
+                answer,
             }))
-            .map_err(|_| closed())?;
-        let written = answer.recv().map_err(|_| closed())??;
+            .map_err(|_| Error::Io(gone))?;
         *last = Some(last.map_or(seq, |last| last.max(seq)));
-        Ok(written)
+        Ok(pending)
+    }
+
+    /// Waits until every write sent is durable or refused; the first that failed since the
+    /// last flush, as an error, whether or not its `Pending` was waited for.
+    pub fn flush(&self) -> Result<(), Error> {
+        self.in_flight.flush()
+    }
+
+    fn keyed(&self, action: &str) -> Result<(), Error> {
+        if self.key.is_empty() {
+            return Err(Error::Schema(format!(
+                "{} is an append table: write its rows; only keyed tables {action}",
+                self.name
+            )));
+        }
+        Ok(())
     }
 }
 

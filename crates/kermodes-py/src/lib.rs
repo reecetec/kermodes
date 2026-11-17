@@ -15,7 +15,7 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit, TimestampNanosecondTyp
 use arrow::error::ArrowError;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use pyo3::create_exception;
-use pyo3::exceptions::{PyException, PyValueError};
+use pyo3::exceptions::{PyException, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyCapsule, PyDict};
 use pyo3_arrow::error::PyArrowError;
@@ -709,7 +709,7 @@ impl Session {
                     let writer = tables.writer(&name, &source, wait)?;
                     let last = writer.last_seq();
                     let write = move |batch: &RecordBatch, seq| {
-                        writer.write(batch, seq, kermodes_weir::Change::Rows)
+                        writer.send(kermodes_weir::Change::Rows, batch, seq)?.wait()
                     };
                     Ok((Box::new(write) as kermodes_ingest::Write, last))
                 }),
@@ -931,23 +931,50 @@ pub struct Writer(SourceWriter);
 #[pymethods]
 impl Writer {
     /// Writes `data` (any Arrow table or batch; columns matched by name) as one batch with
-    /// sequence number `seq`, or the next after `last_seq`. Returns once it is durable; `False`
-    /// when `seq` was already written, which writes nothing (a resend after a restart).
-    #[pyo3(signature = (data, seq=None))]
-    fn write(&self, py: Python<'_>, data: AnyRecordBatch, seq: Option<u64>) -> PyResult<bool> {
-        self.put(py, data, seq, kermodes_weir::Change::Rows)
+    /// sequence number `seq`, or the next after the last sent. Returns once it is durable;
+    /// `False` when `seq` was already written, which writes nothing (a resend after a restart).
+    /// With `wait=False` it returns at once, a `Pending` to wait on: writes in flight together
+    /// share the store's fsyncs, so one producer sending many small writes is not held to one
+    /// per fsync. Writes are durable in the order sent.
+    #[pyo3(signature = (data, seq=None, *, wait=true))]
+    fn write(
+        &self,
+        py: Python<'_>,
+        data: AnyRecordBatch,
+        seq: Option<u64>,
+        wait: bool,
+    ) -> PyResult<Py<PyAny>> {
+        self.put(py, data, seq, wait, kermodes_weir::Change::Rows)
     }
 
     /// Sets each row's key of a keyed table to that row, as `write` does for an append table.
-    #[pyo3(signature = (data, seq=None))]
-    fn upsert(&self, py: Python<'_>, data: AnyRecordBatch, seq: Option<u64>) -> PyResult<bool> {
-        self.put(py, data, seq, kermodes_weir::Change::Upsert)
+    #[pyo3(signature = (data, seq=None, *, wait=true))]
+    fn upsert(
+        &self,
+        py: Python<'_>,
+        data: AnyRecordBatch,
+        seq: Option<u64>,
+        wait: bool,
+    ) -> PyResult<Py<PyAny>> {
+        self.put(py, data, seq, wait, kermodes_weir::Change::Upsert)
     }
 
     /// Removes the keys of `data`'s rows from a keyed table; `data` needs only the key columns.
-    #[pyo3(signature = (data, seq=None))]
-    fn delete(&self, py: Python<'_>, data: AnyRecordBatch, seq: Option<u64>) -> PyResult<bool> {
-        self.put(py, data, seq, kermodes_weir::Change::Delete)
+    #[pyo3(signature = (data, seq=None, *, wait=true))]
+    fn delete(
+        &self,
+        py: Python<'_>,
+        data: AnyRecordBatch,
+        seq: Option<u64>,
+        wait: bool,
+    ) -> PyResult<Py<PyAny>> {
+        self.put(py, data, seq, wait, kermodes_weir::Change::Delete)
+    }
+
+    /// Waits until every write sent is durable or refused; raises the first that failed since
+    /// the last flush, whether or not its `Pending` was waited on.
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| self.0.flush()).map_err(store_error)
     }
 
     /// The last sequence number this source wrote (in its newest partition), or `None`.
@@ -973,33 +1000,59 @@ impl Writer {
         py: Python<'_>,
         data: AnyRecordBatch,
         seq: Option<u64>,
+        wait: bool,
         change: kermodes_weir::Change,
-    ) -> PyResult<bool> {
+    ) -> PyResult<Py<PyAny>> {
         let (schema, batches) = read_batches(data)?;
-        py.detach(|| {
+        let pending = py.detach(|| {
             let batch = arrow::compute::concat_batches(&schema, &batches).map_err(arrow_error)?;
-            self.0.write(&batch, seq, change).map_err(store_error)
-        })
+            self.0.send(change, &batch, seq).map_err(store_error)
+        })?;
+        if wait {
+            let written = py.detach(|| pending.wait()).map_err(store_error)?;
+            Ok(written.into_pyobject(py)?.to_owned().into_any().unbind())
+        } else {
+            Ok(Py::new(py, Pending(Mutex::new(Some(pending))))?.into_any())
+        }
+    }
+}
+
+/// A write sent with `wait=False`.
+#[pyclass(module = "kermodes", name = "Pending", frozen)]
+pub struct Pending(Mutex<Option<kermodes_weir::Pending>>);
+
+#[pymethods]
+impl Pending {
+    /// Waits until the write is durable (`True`) or dropped as a resend (`False`); raises if it
+    /// failed. Once only.
+    fn wait(&self, py: Python<'_>) -> PyResult<bool> {
+        let pending = self
+            .0
+            .lock()
+            .expect("kermodes write poisoned by an earlier panic")
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("this write was already waited on"))?;
+        py.detach(|| pending.wait()).map_err(store_error)
     }
 }
 
 impl SourceWriter {
-    fn write(
+    fn send(
         &self,
+        change: kermodes_weir::Change,
         batch: &RecordBatch,
         seq: Option<u64>,
-        change: kermodes_weir::Change,
-    ) -> Result<bool, kermodes_weir::Error> {
-        use kermodes_weir::Change::{Checkpoint, Delete, Rows, Upsert};
-        match (self, change) {
-            (SourceWriter::Local(writer), Rows) => writer.write(batch, seq),
-            (SourceWriter::Local(writer), Upsert) => writer.upsert(batch, seq),
-            (SourceWriter::Local(writer), Delete) => writer.delete(batch, seq),
-            (SourceWriter::Local(writer), Checkpoint) => writer.replace(batch, seq),
-            (SourceWriter::Remote(writer), Rows) => writer.write(batch, seq),
-            (SourceWriter::Remote(writer), Upsert) => writer.upsert(batch, seq),
-            (SourceWriter::Remote(writer), Delete) => writer.delete(batch, seq),
-            (SourceWriter::Remote(writer), Checkpoint) => writer.replace(batch, seq),
+    ) -> Result<kermodes_weir::Pending, kermodes_weir::Error> {
+        match self {
+            SourceWriter::Local(writer) => writer.send(change, batch, seq),
+            SourceWriter::Remote(writer) => writer.send(change, batch, seq),
+        }
+    }
+
+    fn flush(&self) -> Result<(), kermodes_weir::Error> {
+        match self {
+            SourceWriter::Local(writer) => writer.flush(),
+            SourceWriter::Remote(writer) => writer.flush(),
         }
     }
 
@@ -1777,8 +1830,9 @@ impl Viewer {
 mod _native {
     #[pymodule_export]
     use super::{
-        HistoricalTable, Ingest, IngestStats, Server, Session, StoreServer, Table, Ticker, Viewer,
-        Writer, control, merge, publish::Publication, replay::Replay, stored::StoredTable, ticker,
+        HistoricalTable, Ingest, IngestStats, Pending, Server, Session, StoreServer, Table, Ticker,
+        Viewer, Writer, control, merge, publish::Publication, replay::Replay, stored::StoredTable,
+        ticker,
     };
 
     use pyo3::prelude::*;

@@ -3,13 +3,13 @@
 //! `kermodes-bench fsync [--dir PATH] [--count 2000]`: appends 4 KiB and `fdatasync`s it,
 //! `--count` times, on the disk holding `--dir`: the floor under every durable write there.
 //!
-//! `kermodes-bench weir [--dir PATH] [--writers 1] [--rate 1000] [--rows 1] [--seconds 10]
-//! [--flight]`: `--writers` writers, each writing `--rows`-row batches `--rate` times a second
-//! (0: as fast as it can), to a store in `--dir`, with one subscriber; over Flight on localhost
-//! with `--flight`, in-process without. Each batch carries the time it was due, so a writer
-//! that falls behind counts its wait (no coordinated omission). Reports, after a second of
-//! warm-up: the time from due to durable (the write's acknowledgement), and from due to the
-//! subscriber having it.
+//! `kermodes-bench weir [--dir PATH] [--writers 1] [--rate 1000] [--rows 1] [--window 1]
+//! [--seconds 10] [--flight]`: `--writers` writers, each writing `--rows`-row batches `--rate`
+//! times a second (0: as fast as it can) with up to `--window` writes in flight, to a store in
+//! `--dir`, with one subscriber; over Flight on localhost with `--flight`, in-process without.
+//! Each batch carries the time it was due, so a writer that falls behind counts its wait (no
+//! coordinated omission). Reports, after a second of warm-up: the time from due to durable (the
+//! write's acknowledgement), and from due to the subscriber having it.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Int64Type, Schema};
 use kermodes_flight::Client;
-use kermodes_weir::{Error, SourceId, Store, TableName};
+use kermodes_weir::{Change, Error, Pending, SourceId, Store, TableName};
 
 struct Args {
     dir: PathBuf,
@@ -27,6 +27,7 @@ struct Args {
     writers: usize,
     rate: u64,
     rows: usize,
+    window: usize,
     seconds: u64,
     flight: bool,
 }
@@ -39,6 +40,7 @@ impl Args {
             writers: 1,
             rate: 1000,
             rows: 1,
+            window: 1,
             seconds: 10,
             flight: false,
         };
@@ -62,10 +64,11 @@ impl Args {
                 "--writers" => args.writers = number() as usize,
                 "--rate" => args.rate = number(),
                 "--rows" => args.rows = number() as usize,
+                "--window" => args.window = (number() as usize).max(1),
                 "--seconds" => args.seconds = number(),
                 other => panic!(
                     "unknown flag {other}; expected --dir, --count, --writers, --rate, --rows, \
-                     --seconds, --flight"
+                     --window, --seconds, --flight"
                 ),
             }
         }
@@ -113,7 +116,7 @@ fn now_ns() -> i64 {
 }
 
 /// A write to the bench table, local or remote.
-type Write = Box<dyn Fn(&RecordBatch) -> Result<bool, Error> + Send>;
+type Write = Box<dyn Fn(&RecordBatch) -> Result<Pending, Error> + Send>;
 
 fn weir(args: &Args) {
     let dir = args
@@ -182,19 +185,36 @@ fn weir(args: &Args) {
                 Some(url) => {
                     let client = Client::connect(url).expect("connected");
                     let writer = client.writer(&name, &source, false).expect("a writer");
-                    Box::new(move |batch| writer.write(batch, None))
+                    Box::new(move |batch| writer.send(Change::Rows, batch, None))
                 }
                 None => {
                     let writer = store.writer(&name, &source, false).expect("a writer");
-                    Box::new(move |batch| writer.write(batch, None))
+                    Box::new(move |batch| writer.send(Change::Rows, batch, None))
                 }
             };
             let (stop, acked, written) = (stop.clone(), acked.clone(), written.clone());
-            let (rate, rows) = (args.rate, args.rows);
+            let (rate, rows, window) = (args.rate, args.rows, args.window);
             std::thread::spawn(move || {
                 let begun = Instant::now();
                 let interval = (rate > 0).then(|| Duration::from_nanos(1_000_000_000 / rate));
-                let mut mine = Vec::new();
+                // A write takes one of `window` slots, given back when it is answered; its own
+                // thread waits for the answers, so each is timed as it comes.
+                let (free, slots) = std::sync::mpsc::sync_channel(window);
+                for _ in 0..window {
+                    free.send(()).expect("a slot");
+                }
+                let (sent, answers) = std::sync::mpsc::channel::<(Instant, i64, Pending)>();
+                let waiter = std::thread::spawn(move || {
+                    let mut mine = Vec::new();
+                    for (due_at, due_ns, pending) in answers {
+                        assert!(pending.wait().expect("written"));
+                        if due_ns >= warm_ns {
+                            mine.push(Instant::now().duration_since(due_at));
+                        }
+                        let _ = free.send(());
+                    }
+                    mine
+                });
                 let mut count = 0_u64;
                 for i in 0_u64.. {
                     if stop.load(Ordering::Relaxed) {
@@ -211,6 +231,7 @@ fn weir(args: &Args) {
                         }
                         None => Instant::now(),
                     };
+                    slots.recv().expect("a slot");
                     let due_ns = now_ns() - Instant::now().duration_since(due_at).as_nanos() as i64;
                     let batch = RecordBatch::try_from_iter([
                         (
@@ -220,13 +241,15 @@ fn weir(args: &Args) {
                         ("n", Arc::new(Int64Array::from(vec![i as i64; rows]))),
                     ])
                     .expect("a batch");
-                    write(&batch).expect("written");
+                    let pending = write(&batch).expect("sent");
+                    sent.send((due_at, due_ns, pending)).expect("the waiter");
                     count += rows as u64;
-                    if due_ns >= warm_ns {
-                        mine.push(Instant::now().duration_since(due_at));
-                    }
                 }
-                acked.lock().unwrap().extend(mine);
+                drop(sent);
+                acked
+                    .lock()
+                    .unwrap()
+                    .extend(waiter.join().expect("the waiter"));
                 *written.lock().unwrap() += count;
             })
         })
@@ -240,7 +263,8 @@ fn weir(args: &Args) {
     let elapsed = (now_ns() - start_ns) as f64 / 1e9;
     let rows = *written.lock().unwrap();
     println!(
-        "weir {}: {} writer(s) x {} x {}-row batches, {:.0} rows/s over {:.1} s, on {}",
+        "weir {}: {} writer(s) x {} x {}-row batches, {} in flight, {:.0} rows/s over {:.1} s, \
+         on {}",
         if args.flight {
             "over Flight"
         } else {
@@ -253,6 +277,7 @@ fn weir(args: &Args) {
             format!("{}/s", args.rate)
         },
         args.rows,
+        args.window,
         rows as f64 / elapsed,
         elapsed,
         args.dir.display()

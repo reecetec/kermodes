@@ -16,7 +16,7 @@ use arrow_flight::{
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
 use futures::stream::{self, StreamExt, TryStreamExt};
-use kermodes_weir::{Change, Date, Error, Pace, SourceId, Stamp, Store, TableName};
+use kermodes_weir::{Change, Date, Error, Pace, Pending, SourceId, Stamp, Store, TableName};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -321,6 +321,25 @@ impl FlightService for Service {
             .boxed();
         let mut decoded = FlightDataDecoder::new(messages);
         let (acks, out) = mpsc::unbounded_channel::<Result<PutResult, Status>>();
+        // Writes are sent to the store as they arrive, so many are in flight and share its
+        // fsyncs; a second task answers them in the order they came. A bad message is answered
+        // in its turn too, after the writes before it.
+        let (sent, answering) = std::sync::mpsc::channel::<Result<Pending, Status>>();
+        tokio::task::spawn_blocking({
+            let writer = writer.clone();
+            move || {
+                for sent in answering {
+                    let result = sent.and_then(|pending| {
+                        let written = pending.wait().map_err(status)?;
+                        Ok(ack(writer.last_seq(), written))
+                    });
+                    let failed = result.is_err();
+                    if acks.send(result).is_err() || failed {
+                        return;
+                    }
+                }
+            }
+        });
         tokio::spawn(async move {
             while let Some(message) = decoded.next().await {
                 let message = match message {
@@ -332,7 +351,7 @@ impl FlightService for Service {
                             FlightError::Tonic(status) => *status,
                             e => Status::invalid_argument(e.to_string()),
                         };
-                        let _ = acks.send(Err(status));
+                        let _ = sent.send(Err(status));
                         return;
                     }
                 };
@@ -350,7 +369,7 @@ impl FlightService for Service {
                     <[u8; 8]>::try_from(&metadata[..metadata.len().min(8)]),
                     change,
                 ) else {
-                    let _ = acks.send(Err(Status::invalid_argument(
+                    let _ = sent.send(Err(Status::invalid_argument(
                         "each batch's app_metadata is its sequence number (8 bytes), then its \
                          change kind (one byte)",
                     )));
@@ -358,18 +377,10 @@ impl FlightService for Service {
                 };
                 let seq = u64::from_le_bytes(seq);
                 let writer = writer.clone();
-                let result = blocking(move || {
-                    let written = match change {
-                        Change::Rows => writer.write(&batch, Some(seq))?,
-                        Change::Upsert => writer.upsert(&batch, Some(seq))?,
-                        Change::Delete => writer.delete(&batch, Some(seq))?,
-                        Change::Checkpoint => writer.replace(&batch, Some(seq))?,
-                    };
-                    Ok(ack(writer.last_seq(), written))
-                })
-                .await;
-                let failed = result.is_err();
-                if acks.send(result).is_err() || failed {
+                // Waits only while the writer's in-flight budget is full.
+                let pending = blocking(move || writer.send(change, &batch, Some(seq))).await;
+                let failed = pending.is_err();
+                if sent.send(pending).is_err() || failed {
                     return;
                 }
             }

@@ -405,6 +405,13 @@ catalog as live tables.
   keyed checkpoints, and subscribers, and only then acknowledges each writer. A group waits up to
   100 µs for as many writes as the last one held, so writers answered together share the next
   fsync. Log segments are preallocated, so an fsync never has to commit the file's growth.
+- A writer need not wait for one write before sending the next: `write(..., wait=False)` (in
+  Rust, `send`) returns at once with a handle to wait on, and `flush` waits for all of them and
+  raises the first that failed. Writes are logged in the order sent, those arriving during an
+  fsync share the next, and so a single producer is not held to one write per fsync. Up to 64 MiB
+  may be unanswered per writer; sending then waits, so a slow store slows its producer instead
+  of filling its memory. Over Flight the writes stream without waiting and are acknowledged in
+  order; one the server refuses fails, and so does every write sent after it.
 - A log entry is a batch (partition, source, `seq`, epoch, change kind, ingest time, and the
   rows as an Arrow IPC message) or the columns batches of a table are written in (a shape, with
   column IDs), which each segment carries for itself. An entry is its length, a CRC, its LSN, a

@@ -1,5 +1,6 @@
 //! A process's handle on a served store: the store's operations, over Flight.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -9,17 +10,18 @@ use arrow_flight::decode::{DecodedPayload, FlightDataDecoder};
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::utils::batches_to_flight_data;
-use arrow_flight::{Action, FlightData, FlightDescriptor, PutResult, Ticket};
+use arrow_flight::{Action, FlightData, FlightDescriptor, Ticket};
 use futures::{StreamExt, TryStreamExt};
 use kermodes_weir::{
-    Change, ColumnId, Date, Error, Garbage, HistoryCommit, HistoryDate, HistoryFile, Pace,
-    SourceId, Stamp, Subscriber, TableEntry, TableName, conform, keys_only,
+    Answer, Change, ColumnId, Date, Error, Garbage, HistoryCommit, HistoryDate, HistoryFile,
+    InFlight, Pace, Pending, SourceId, Stamp, Subscriber, TableEntry, TableName, conform,
+    keys_only,
 };
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
+use tonic::Code;
 use tonic::transport::Channel;
-use tonic::{Code, Streaming};
 
 use crate::{
     CAUGHT_UP, MARKS_CAUGHT_UP, MAX_WRITE_BYTES, columns_json, commit_json, date_from_json,
@@ -392,7 +394,7 @@ impl Client {
         });
         let mut flight = self.flight.clone();
         // Returns once the server holds the lease for us.
-        let acks = self
+        let mut acks = self
             .runtime
             .block_on(async move { flight.do_put(outgoing).await })
             .map_err(|s| error_from_status(&s))?
@@ -402,17 +404,57 @@ impl Client {
             "last_seq",
             json!({"table": name.to_string(), "source": source.as_str()}),
         )?;
+        let acked = Arc::new(Mutex::new(state["last_seq"].as_u64()));
+        let waiting = Arc::new(Mutex::new(Waiting::default()));
+        // The server acknowledges writes in the order they were sent: each answers the oldest
+        // write waiting. When the stream ends, every write still waiting fails with why.
+        self.runtime.spawn({
+            let (acked, waiting) = (acked.clone(), waiting.clone());
+            async move {
+                let closed = loop {
+                    let outcome = match acks.message().await {
+                        Ok(Some(ack)) => match ack.app_metadata.as_ref() {
+                            [last @ .., written] if last.len() == 8 => {
+                                let last = u64::from_le_bytes(last.try_into().expect("8 bytes"));
+                                *lock(&acked) = Some(last);
+                                Ok(*written == 1)
+                            }
+                            _ => Err(Error::Io(
+                                "an acknowledgement this client cannot read".into(),
+                            )),
+                        },
+                        Ok(None) => break "the server closed the write stream".to_owned(),
+                        Err(status) => {
+                            let error = error_from_status(&status);
+                            let why = error.to_string();
+                            if let Some(answer) = lock(&waiting).answers.pop_front() {
+                                answer.send(Err(error));
+                            }
+                            break why;
+                        }
+                    };
+                    if let Some(answer) = lock(&waiting).answers.pop_front() {
+                        answer.send(outcome);
+                    }
+                };
+                let mut waiting = lock(&waiting);
+                for answer in waiting.answers.drain(..) {
+                    answer.send(Err(Error::Io(format!("the write stream closed: {closed}"))));
+                }
+                waiting.closed = Some(closed);
+            }
+        });
         Ok(RemoteWriter {
-            runtime: self.runtime.clone(),
+            _runtime: self.runtime.clone(),
             table: name.clone(),
             schema,
             key,
             sender,
             epoch: state["epoch"].as_u64(),
-            state: Mutex::new(WriterState {
-                acks,
-                last: state["last_seq"].as_u64(),
-            }),
+            sent: Mutex::new(state["last_seq"].as_u64()),
+            acked,
+            waiting,
+            in_flight: Arc::default(),
         })
     }
 
@@ -602,29 +644,42 @@ async fn open_subscription(
     }
 }
 
-/// Writes one source's rows of a served table (`Client::writer`).
+/// Writes one source's rows of a served table (`Client::writer`), many in flight at once.
 pub struct RemoteWriter {
-    runtime: Arc<Runtime>,
+    /// Runs the write stream and its acknowledgements, outliving the `Client` it came from.
+    _runtime: Arc<Runtime>,
     table: TableName,
     schema: SchemaRef,
     /// A keyed table's key columns; empty for an append table.
     key: Vec<String>,
     sender: mpsc::UnboundedSender<FlightData>,
     epoch: Option<u64>,
-    state: Mutex<WriterState>,
+    /// The highest seq sent; its lock keeps sends in order when shared between threads.
+    sent: Mutex<Option<u64>>,
+    /// The source's last seq the server acknowledged.
+    acked: Arc<Mutex<Option<u64>>>,
+    waiting: Arc<Mutex<Waiting>>,
+    in_flight: Arc<InFlight>,
 }
 
-struct WriterState {
-    acks: Streaming<PutResult>,
-    last: Option<u64>,
+/// A remote writer's writes sent and not yet acknowledged, oldest first, and why its stream
+/// closed, once it has.
+#[derive(Default)]
+struct Waiting {
+    answers: VecDeque<Answer>,
+    closed: Option<String>,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .expect("kermodes writer poisoned by an earlier panic")
 }
 
 impl RemoteWriter {
+    /// The source's last sequence number the server acknowledged.
     pub fn last_seq(&self) -> Option<u64> {
-        self.state
-            .lock()
-            .expect("kermodes writer poisoned by an earlier panic")
-            .last
+        *lock(&self.acked)
     }
 
     /// This writer's lease epoch (§7.4); `None` from a server older than leases (0.1.1).
@@ -635,35 +690,39 @@ impl RemoteWriter {
     /// As `kermodes_weir::Writer::write`: returns once the server has the batch durably, or
     /// dropped it as a resend (`false`).
     pub fn write(&self, batch: &RecordBatch, seq: Option<u64>) -> Result<bool, Error> {
-        self.send(&conform(&self.schema, batch)?, seq, Change::Rows)
+        self.send(Change::Rows, batch, seq)?.wait()
     }
 
     /// As `kermodes_weir::Writer::upsert`.
     pub fn upsert(&self, batch: &RecordBatch, seq: Option<u64>) -> Result<bool, Error> {
-        self.send(&conform(&self.schema, batch)?, seq, Change::Upsert)
+        self.send(Change::Upsert, batch, seq)?.wait()
     }
 
     /// As `kermodes_weir::Writer::delete`: `batch` needs only the key columns.
     pub fn delete(&self, batch: &RecordBatch, seq: Option<u64>) -> Result<bool, Error> {
-        self.send(
-            &keys_only(&self.schema, &self.key, batch)?,
-            seq,
-            Change::Delete,
-        )
+        self.send(Change::Delete, batch, seq)?.wait()
     }
 
     /// As `kermodes_weir::Writer::replace`.
     pub fn replace(&self, batch: &RecordBatch, seq: Option<u64>) -> Result<bool, Error> {
-        self.send(&conform(&self.schema, batch)?, seq, Change::Checkpoint)
+        self.send(Change::Checkpoint, batch, seq)?.wait()
     }
 
-    fn send(&self, batch: &RecordBatch, seq: Option<u64>, change: Change) -> Result<bool, Error> {
-        let mut state = self
-            .state
-            .lock()
-            .expect("kermodes writer poisoned by an earlier panic");
-        let seq = seq.unwrap_or_else(|| state.last.map_or(1, |last| last + 1));
-        let mut data = batches_to_flight_data(&self.schema, [batch])
+    /// As `kermodes_weir::Writer::send`: sends without waiting for the acknowledgement, so
+    /// many writes are in flight on the stream and the server groups them.
+    pub fn send(
+        &self,
+        change: Change,
+        batch: &RecordBatch,
+        seq: Option<u64>,
+    ) -> Result<Pending, Error> {
+        let batch = match change {
+            Change::Delete => keys_only(&self.schema, &self.key, batch)?,
+            _ => conform(&self.schema, batch)?,
+        };
+        let mut sent = lock(&self.sent);
+        let seq = seq.unwrap_or_else(|| sent.map_or(1, |last| last + 1));
+        let mut data = batches_to_flight_data(&self.schema, [&batch])
             .map_err(|e| Error::Arrow(e.to_string()))?
             .pop()
             .expect("a batch message");
@@ -684,23 +743,29 @@ impl RemoteWriter {
                 MAX_WRITE_BYTES >> 20
             )));
         }
-        self.sender
-            .send(data)
-            .map_err(|_| Error::Io("the write stream closed".into()))?;
-        let ack = self
-            .runtime
-            .block_on(state.acks.message())
-            .map_err(|s| error_from_status(&s))?
-            .ok_or_else(|| Error::Io("the server closed the write stream".into()))?;
-        let bytes = ack.app_metadata.as_ref();
-        if bytes.len() != 9 {
-            return Err(Error::Io(
-                "an acknowledgement this client cannot read".into(),
-            ));
+        let gone = format!("the write stream of {} closed", self.table);
+        let (pending, answer) = self.in_flight.send(bytes, gone);
+        {
+            // Waiting before it is sent: its acknowledgement may come back at once.
+            let mut waiting = lock(&self.waiting);
+            if let Some(closed) = &waiting.closed {
+                answer.send(Err(Error::Io(format!("the write stream closed: {closed}"))));
+                return Ok(pending);
+            }
+            waiting.answers.push_back(answer);
         }
-        let last = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));
-        state.last = Some(last);
-        Ok(bytes[8] == 1)
+        if self.sender.send(data).is_err()
+            && let Some(answer) = lock(&self.waiting).answers.pop_back()
+        {
+            answer.send(Err(Error::Io("the write stream closed".into())));
+        }
+        *sent = Some(sent.map_or(seq, |last| last.max(seq)));
+        Ok(pending)
+    }
+
+    /// As `kermodes_weir::Writer::flush`.
+    pub fn flush(&self) -> Result<(), Error> {
+        self.in_flight.flush()
     }
 }
 

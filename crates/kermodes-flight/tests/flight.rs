@@ -248,6 +248,54 @@ fn a_write_up_to_the_batch_limit_lands_whole_and_a_larger_one_is_refused() {
     assert_eq!(*batches.lock().unwrap(), [2_000_000, 10]);
 }
 
+/// Many writes in flight on one stream are answered in the order sent; a resend among them is
+/// dropped; a write the server refuses fails, and so does every write sent after it, while the
+/// ones before it stay written.
+#[test]
+fn writes_in_flight_are_answered_in_order_and_a_refused_one_fails_those_after_it() {
+    let dir = TempDir::new();
+    let store = Arc::new(Store::open(&dir.0).unwrap());
+    let server = serve(store.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+    let client = Client::connect(&format!("grpc://{}", server.addr())).unwrap();
+    client.create_table(&ticks(), &schema()).unwrap();
+    let writer = client
+        .writer(&ticks(), &SourceId::parse("feed").unwrap(), false)
+        .unwrap();
+
+    let sent: Vec<_> = (0..500)
+        .map(|n| writer.send(Change::Rows, &batch(n..n + 1), None).unwrap())
+        .collect();
+    writer.flush().unwrap();
+    assert!(sent.into_iter().all(|pending| pending.wait().unwrap()));
+    assert_eq!(writer.last_seq(), Some(500));
+    let resend = writer.send(Change::Rows, &batch(0..1), Some(500)).unwrap();
+    assert!(!resend.wait().unwrap());
+
+    let before = writer.send(Change::Rows, &batch(500..501), None).unwrap();
+    // An append table takes no upserts: the server refuses it.
+    let refused = writer.send(Change::Upsert, &batch(501..502), None).unwrap();
+    let after = writer.send(Change::Rows, &batch(502..503), None).unwrap();
+    assert!(before.wait().unwrap());
+    assert!(refused.wait().is_err());
+    assert!(after.wait().is_err());
+    assert!(writer.flush().is_err());
+
+    let rows = Arc::new(Mutex::new(Vec::new()));
+    let seen = rows.clone();
+    store
+        .subscribe(
+            &ticks(),
+            Box::new(move |batch, _, _| {
+                let n = batch.column(0).as_primitive::<Int64Type>();
+                seen.lock().unwrap().extend(n.values().iter().copied());
+                true
+            }),
+            Box::new(|reason| panic!("{reason}")),
+        )
+        .unwrap();
+    assert_eq!(*rows.lock().unwrap(), (0..501).collect::<Vec<_>>());
+}
+
 /// A reader whose history is far larger than the server's queue (about 150 MiB, against 16 MiB)
 /// gets all of it, in order and once, while a writer goes on: the server's replay waits for the
 /// reader instead of holding the day.

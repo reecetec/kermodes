@@ -159,11 +159,13 @@ fn write(
         } else {
             writes(&told, schema, key).map_err(|e| e.to_string())?
         };
+        // A cycle's writes go out together and share the store's fsyncs.
         for (batch, change) in writes {
             writer
-                .write(&batch, None, change)
+                .send(change, &batch, None)
                 .map_err(|e| e.to_string())?;
         }
+        writer.flush().map_err(|e| e.to_string())?;
     }
 }
 
