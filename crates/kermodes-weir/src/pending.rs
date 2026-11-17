@@ -2,8 +2,10 @@
 //! so that writes arriving during an fsync share the next one, and batching follows the load
 //! with no batch size or linger to choose. In flight is bounded in bytes, so a slow store slows
 //! its producer rather than filling the producer's memory.
+//!
+//! Answering is on the committer's path, once per write, so it is kept to filling a slot: a
+//! unit's writes give their bytes back under one lock and wake the writer's waiters once.
 
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use crate::Error;
@@ -12,17 +14,43 @@ use crate::Error;
 /// this goes alone.
 pub const IN_FLIGHT_BYTES: usize = 64 << 20;
 
-/// A write sent and not yet necessarily durable.
-pub struct Pending {
-    answer: Receiver<Result<bool, Error>>,
-    /// What to say if the store went before answering.
-    gone: String,
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .expect("kermodes writer poisoned by an earlier panic")
 }
+
+/// Where one write's outcome is put, and its `Pending` waits.
+#[derive(Default)]
+struct Slot {
+    outcome: Mutex<Option<Result<bool, Error>>>,
+    filled: Condvar,
+}
+
+impl Slot {
+    fn fill(&self, outcome: Result<bool, Error>) {
+        *lock(&self.outcome) = Some(outcome);
+        self.filled.notify_one();
+    }
+}
+
+/// A write sent and not yet necessarily durable.
+pub struct Pending(Arc<Slot>);
 
 impl Pending {
     /// Waits until the write is durable (`true`) or dropped as a resend (`false`).
     pub fn wait(self) -> Result<bool, Error> {
-        self.answer.recv().map_err(|_| Error::Io(self.gone))?
+        let mut outcome = lock(&self.0.outcome);
+        loop {
+            if let Some(outcome) = outcome.take() {
+                return outcome;
+            }
+            outcome = self
+                .0
+                .filled
+                .wait(outcome)
+                .expect("kermodes writer poisoned by an earlier panic");
+        }
     }
 }
 
@@ -38,8 +66,8 @@ impl InFlight {
     /// Takes `bytes` for a write about to be sent, waiting while `IN_FLIGHT_BYTES` are
     /// unanswered: the write's `Pending`, and the `Answer` the store gives its outcome to.
     /// `gone` is what the write says if the store goes before answering it.
-    pub fn send(self: &Arc<Self>, bytes: usize, gone: String) -> (Pending, Answer) {
-        let mut state = self.lock();
+    pub fn send(self: &Arc<Self>, bytes: usize, gone: &Arc<str>) -> (Pending, Answer) {
+        let mut state = lock(&self.state);
         while state.0 > 0 && state.0 + bytes > IN_FLIGHT_BYTES {
             state = self
                 .answered
@@ -47,26 +75,21 @@ impl InFlight {
                 .expect("kermodes writer poisoned by an earlier panic");
         }
         state.0 += bytes;
-        let (reply, answer) = sync_channel(1);
-        let pending = Pending {
-            answer,
+        drop(state);
+        let slot = Arc::new(Slot::default());
+        let answer = Answer {
+            slot: slot.clone(),
+            in_flight: Some(self.clone()),
+            bytes,
             gone: gone.clone(),
         };
-        let answer = Answer {
-            reply,
-            in_flight: self.clone(),
-            bytes,
-            failed: None,
-            gone,
-            answered: false,
-        };
-        (pending, answer)
+        (Pending(slot), answer)
     }
 
     /// Waits until every write sent is answered; the first that failed since the last flush,
     /// as an error.
     pub fn flush(&self) -> Result<(), Error> {
-        let mut state = self.lock();
+        let mut state = lock(&self.state);
         while state.0 > 0 {
             state = self
                 .answered
@@ -79,47 +102,74 @@ impl InFlight {
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, (usize, Option<String>)> {
-        self.state
-            .lock()
-            .expect("kermodes writer poisoned by an earlier panic")
+    /// Gives back `bytes` answered, noting `failed` if it is the first failure since a flush.
+    fn release(&self, bytes: usize, failed: Option<String>) {
+        let mut state = lock(&self.state);
+        state.0 -= bytes;
+        if state.1.is_none() {
+            state.1 = failed;
+        }
+        drop(state);
+        self.answered.notify_all();
     }
 }
 
 /// Where a write's outcome goes: to its `Pending`, and its bytes back to its writer's
 /// `InFlight`. Dropped unanswered (the store went), the write fails.
 pub struct Answer {
-    reply: SyncSender<Result<bool, Error>>,
-    in_flight: Arc<InFlight>,
+    slot: Arc<Slot>,
+    /// Taken once the bytes are given back.
+    in_flight: Option<Arc<InFlight>>,
     bytes: usize,
-    failed: Option<String>,
-    gone: String,
-    answered: bool,
+    gone: Arc<str>,
 }
 
 impl Answer {
-    pub fn send(mut self, outcome: Result<bool, Error>) {
-        if let Err(e) = &outcome {
-            self.failed = Some(e.to_string());
+    pub fn send(self, outcome: Result<bool, Error>) {
+        Self::send_all(vec![self], outcome);
+    }
+
+    /// Gives every write of `answers` the same outcome; writes of one writer next to each
+    /// other give their bytes back together.
+    pub fn send_all(mut answers: Vec<Answer>, outcome: Result<bool, Error>) {
+        let failed = outcome.as_ref().err().map(ToString::to_string);
+        let mut outcome = Some(outcome);
+        let count = answers.len();
+        for (i, answer) in answers.iter().enumerate() {
+            let this = match (&outcome, &failed) {
+                (Some(Ok(written)), _) => Ok(*written),
+                (_, Some(why)) if i + 1 < count => Err(Error::Io(why.clone())),
+                // The last is given the error itself.
+                _ => outcome.take().expect("the outcome, once"),
+            };
+            answer.slot.fill(this);
         }
-        self.answered = true;
-        let _ = self.reply.send(outcome);
+        let mut run: Option<(Arc<InFlight>, usize)> = None;
+        for answer in &mut answers {
+            let in_flight = answer.in_flight.take().expect("bytes given back once");
+            match &mut run {
+                Some((current, bytes)) if Arc::ptr_eq(current, &in_flight) => {
+                    *bytes += answer.bytes;
+                }
+                _ => {
+                    if let Some((current, bytes)) = run.replace((in_flight, answer.bytes)) {
+                        current.release(bytes, failed.clone());
+                    }
+                }
+            }
+        }
+        if let Some((current, bytes)) = run {
+            current.release(bytes, failed);
+        }
     }
 }
 
 impl Drop for Answer {
     fn drop(&mut self) {
-        let failed = match self.failed.take() {
-            Some(failed) => Some(failed),
-            None if !self.answered => Some(self.gone.clone()),
-            None => None,
-        };
-        let mut state = self.in_flight.lock();
-        state.0 -= self.bytes;
-        if state.1.is_none() {
-            state.1 = failed;
+        if let Some(in_flight) = self.in_flight.take() {
+            let gone = self.gone.to_string();
+            self.slot.fill(Err(Error::Io(gone.clone())));
+            in_flight.release(self.bytes, Some(gone));
         }
-        drop(state);
-        self.in_flight.answered.notify_all();
     }
 }

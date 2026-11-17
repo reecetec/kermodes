@@ -532,11 +532,12 @@ impl Store {
             requests: self.requests.clone(),
             source: source.clone(),
             shape: entry.shape(),
-            name: entry.name,
+            name: entry.name.clone(),
             key: entry.key,
             epoch: 0,
             last_seq: Mutex::new(None),
             in_flight: Arc::default(),
+            gone: format!("the store holding {} closed", entry.name).into(),
         };
         writer.epoch = lock(&self.catalog).next_epoch(entry.id, source)?;
         Ok(writer)
@@ -1099,7 +1100,7 @@ fn commit(mut wal: Wal, mut clock: i64, applied: &AtomicU64, requests: &Receiver
             Err(e) => {
                 broken = Some(e.to_string());
                 for unit in units {
-                    answer_all(unit.answers, Err(Error::Io(e.to_string())));
+                    Answer::send_all(unit.answers, Err(Error::Io(e.to_string())));
                 }
                 continue;
             }
@@ -1142,7 +1143,7 @@ fn commit(mut wal: Wal, mut clock: i64, applied: &AtomicU64, requests: &Receiver
                     outcome
                 }
             };
-            answer_all(answers, outcome);
+            Answer::send_all(answers, outcome);
         }
     }
 }
@@ -1183,25 +1184,28 @@ fn merge(group: Vec<Submitted>, clock: &mut i64) -> Vec<Unit> {
         more: Vec<RecordBatch>,
         answers: Vec<Answer>,
         ingest_ns: i64,
-        date: String,
+        date: Date,
         bytes: usize,
         /// The group position of its last write: where it is logged.
         at: usize,
     }
     // Each source's last seq per table and date, as the group's writes before this one leave it.
-    let mut known: HashMap<(i64, SourceId, String), Option<u64>> = HashMap::new();
+    let mut known: HashMap<(i64, SourceId, Date), Option<u64>> = HashMap::new();
     // Each source's unit still taking writes, per table.
     let mut runs: HashMap<(i64, SourceId), usize> = HashMap::new();
     let mut open: Vec<Open> = Vec::new();
+    // One reading of the clock for the group, which is logged at one instant: its writes are
+    // stamped a nanosecond apart from there.
+    let now = now_ns();
     for (at, submitted) in group.into_iter().enumerate() {
-        *clock = now_ns().max(*clock + 1);
-        let date = Date::of_ns(*clock).to_string();
+        *clock = now.max(*clock + 1);
+        let date = Date::of_ns(*clock);
         let last = known
-            .entry((submitted.table, submitted.source.clone(), date.clone()))
+            .entry((submitted.table, submitted.source.clone(), date))
             .or_insert_with(|| {
                 lock(&submitted.log.state)
                     .partitions
-                    .get(&(date.clone(), Stream::Source(submitted.source.clone())))
+                    .get(&(date.to_string(), Stream::Source(submitted.source.clone())))
                     .and_then(Partition::last_seq)
             });
         let resend = last.is_some_and(|last| submitted.seq <= last);
@@ -1273,7 +1277,7 @@ fn merge(group: Vec<Submitted>, clock: &mut i64) -> Vec<Unit> {
                 match arrow::compute::concat_batches(&schema, batches) {
                     Ok(batch) => batch,
                     Err(e) => {
-                        answer_all(answers, Err(Error::Arrow(e.to_string())));
+                        Answer::send_all(answers, Err(Error::Arrow(e.to_string())));
                         return None;
                     }
                 }
@@ -1292,27 +1296,6 @@ fn merge(group: Vec<Submitted>, clock: &mut i64) -> Vec<Unit> {
             })
         })
         .collect()
-}
-
-/// Gives every write of a unit the unit's outcome.
-fn answer_all(answers: Vec<Answer>, outcome: Result<bool, Error>) {
-    match outcome {
-        Ok(written) => {
-            for answer in answers {
-                answer.send(Ok(written));
-            }
-        }
-        Err(e) => {
-            let why = e.to_string();
-            let mut answers = answers.into_iter();
-            if let Some(first) = answers.next() {
-                first.send(Err(e));
-            }
-            for answer in answers {
-                answer.send(Err(Error::Io(why.clone())));
-            }
-        }
-    }
 }
 
 /// Fsyncs every partition file written so far, then records that the files hold the log up to
@@ -1398,6 +1381,8 @@ pub struct Writer {
     /// also keeps the writer's writes in order when shared between threads.
     last_seq: Mutex<Option<u64>>,
     in_flight: Arc<InFlight>,
+    /// What a write says if the store closes before answering it.
+    gone: Arc<str>,
 }
 
 impl Writer {
@@ -1478,10 +1463,9 @@ impl Writer {
         };
         // Rows of the columns this writer opened with, as the table's are now (§5.4).
         let batch = self.shape.convert(batch, &current)?;
-        let gone = format!("the store holding {} closed", self.name);
         let (pending, answer) = self
             .in_flight
-            .send(batch.get_array_memory_size(), gone.clone());
+            .send(batch.get_array_memory_size(), &self.gone);
         self.requests
             .send(Request::Write(Submitted {
                 log: self.log.clone(),
@@ -1494,7 +1478,7 @@ impl Writer {
                 batch,
                 answer,
             }))
-            .map_err(|_| Error::Io(gone))?;
+            .map_err(|_| Error::Io(self.gone.to_string()))?;
         *last = Some(last.map_or(seq, |last| last.max(seq)));
         Ok(pending)
     }

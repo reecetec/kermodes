@@ -456,6 +456,7 @@ impl Client {
             acked,
             waiting,
             in_flight: Arc::default(),
+            gone: format!("the write stream of {name} closed").into(),
         })
     }
 
@@ -661,6 +662,8 @@ pub struct RemoteWriter {
     acked: Arc<Mutex<Option<u64>>>,
     waiting: Arc<Mutex<Waiting>>,
     in_flight: Arc<InFlight>,
+    /// What a write says if the stream closes before it is acknowledged.
+    gone: Arc<str>,
 }
 
 /// A remote writer's writes sent and not yet acknowledged, oldest first, and why its stream
@@ -752,8 +755,7 @@ impl RemoteWriter {
                 MAX_WRITE_BYTES >> 20
             )));
         }
-        let gone = format!("the write stream of {} closed", self.table);
-        let (pending, answer) = self.in_flight.send(bytes, gone);
+        let (pending, answer) = self.in_flight.send(bytes, &self.gone);
         {
             // Waiting before it is sent: its acknowledgement may come back at once.
             let mut waiting = lock(&self.waiting);
