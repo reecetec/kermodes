@@ -397,6 +397,7 @@ catalog as live tables.
   seg-000042.arrows     Arrow IPC stream: the segment's batches, derived from the log
   seg-000042.idx        format header, then per batch: seq, rows, ingest time, end offset,
                         epoch, change kind, LSN, CRC
+{store}/weir/{location}/@sources               each source's last seq on dates since dropped
 ```
 
 - Every write goes through the shard log, the only durable copy until the partition files are
@@ -443,6 +444,24 @@ catalog as live tables.
   index records past `applied` (they may be torn) and replays the log from there; a resend is
   recognised by `(source, seq)` as it is applied. Index records written before the log (format
   1, without an LSN, fsynced one by one) are always kept.
+- A resend is recognised whatever its date: a source's seqs rise across its dates, so one at or
+  below its last is a resend. Its last outlives the dates it was written on, as Redpanda keeps
+  producer state apart from the segments it came from: before a merged date is dropped, each
+  source's last seq on it is recorded durably in `@sources`.
+- Recovery trusts only what is durable, since a killed process leaves its last writes in the
+  page cache, where the next one reads them and a later power loss takes them. The log segments
+  it replays from are fsynced before anything is built on them. A directory is durable only once
+  its parent is fsynced: a process's first segment in a partition has the flush fsync every
+  directory from the store down to it, and opening the log does the same for the log's, whoever
+  created them. A segment whose stream or log header a killed process left half-made commits
+  nothing and is written over.
+- A flush that fails is the process's last: the files it took to sync may not hold what they
+  were given, and a later flush would not sync them again, so no later one (not even closing)
+  records a position; the next open replays the log from the last one recorded.
+- Every file weir writes or reads goes through one interface (`Disk`): the machine's file
+  system, or a simulated one (§7.6), with the guarantees POSIX gives and no more. The committer
+  and the flusher are steps a thread drives with the system clock, or a simulation drives with
+  its own.
 - A segment takes batches until its stream reaches 64 MiB. Later: sealing rewrites a full
   segment as an Arrow IPC file with its footer, so it can be memory-mapped and copied to S3.
 - One write is one batch under one `seq`, never split, so it is atomic. Over Flight it is at most
@@ -515,8 +534,14 @@ data, in a partition of its own (`{date}/@checkpoint/`, a name no source can tak
 key's latest row as the day began. Weir folds the latest earlier day it holds (its latest
 checkpoint, then the upserts and deletes committed after it) into the new day's checkpoint on the
 day's first write or subscription, and always before a merge drops the earlier day, so a key
-never depends on a day weir no longer has. A busy day gets checkpoints as it goes: once the
-changes since the last checkpoint pass 64 MiB and that checkpoint's own size, the write that
+never depends on a day weir no longer has. The checkpoint sits in commit order where the earlier
+day ends, which is what it holds: it is written after the flush that covers that position, so a
+crash can take it, or leave its index without its stream (recovery drops what is missing, as it
+never does for a source's batches), and the one folded again on reopening is the same
+checkpoint in the same place, before the day's changes. Dropping a merged day waits until a flush covers its last batch
+(the log must not replay part of it back), fsyncs the checkpoint, which could no longer be folded
+once the day is gone, and fsyncs the day's going. A busy day gets checkpoints as it goes: once
+the changes since the last checkpoint pass 64 MiB and that checkpoint's own size, the write that
 crosses it folds a new one, so folding costs in proportion to the bytes written. A publisher's
 first write is a checkpoint too (§5.2). Weir keeps no state per key in memory.
 
@@ -551,11 +576,22 @@ outlive what Kubernetes believes.
   to every acknowledged write and triple the storage. The switch lands with replication, never
   before, and measured acknowledgement latency on both storage classes decides it.
 - Retention: intraday partitions are deleted N days after their merge validates.
+- A failed fsync stops weir, and weir will not open again on that boot. After an fsync fails,
+  Linux marks the pages it held clean: they may never reach the disk, while every process still
+  reads them until the machine restarts, so recovery would trust what a power loss later takes
+  away (Postgres lost data this way; Redpanda avoids it by bypassing the page cache). The
+  committer refuses writes and the flusher stops. The disk records the boot in
+  `{store}/weir/fsync-failed` within the call that saw the fsync fail, so a process killed a
+  moment later still leaves it; opening on the same boot fails, saying to restart the machine or
+  move the volume to another, after which what weir reads is what the disk holds. A full disk
+  (a failed write) does not fence: freeing space is enough. With replication the fenced replica
+  is a failed follower, rebuilt from its peers if its log diverged.
 
 ### 7.6 Replication
 
-Built: the single-replica shard log (§7.1) and readers resuming by LSN (§7.2), step 1 below.
-Not built yet: replication, the rest of this section; the direction, decided before it is
+Built: the single-replica shard log (§7.1), readers resuming by LSN (§7.2), and the simulator
+for one replica and its disk (step 2's first half). Not built yet: replication, the rest of this
+section; the direction, decided before it is
 written. weir replicates itself so that losing a node loses no acknowledged write, a planned
 restart (a rollout, a drain) costs writers a pause of milliseconds and readers nothing, and
 producing and consuming depend on nothing outside weir.
@@ -650,7 +686,16 @@ writers ─► leader ── append + fsync ────────────
   delayed, and reordered messages, crashes mid-fsync, torn writes, partitions), and invariants
   checked over millions of runs: no committed entry lost, none applied twice, every replica's log
   a prefix of the same log. Then real processes: `kill -9` on the leader under load, and node
-  drains.
+  drains. Built so far, for one replica: the store runs stepped (§7.1) on a simulated disk that
+  keeps what a running process sees apart from what is durable. From a seed the process is
+  killed (the page cache staying) or the power goes, between operations or in the middle of
+  one (keeping a random prefix of each file's unsynced writes, the last torn); fsyncs fail as
+  Linux's do; and weir, stopped by a failure, is restarted as Kubernetes would, the machine only
+  when weir refuses to open. Seeded writers send, resend, upsert, delete, and replace across
+  midnight, and past dates are merged and dropped; after every crash and restart every
+  acknowledged write must be there once, in order, keyed state equal to a model's, and a write
+  whose answer the crash took must be there wholly or not at all. The same seed gives the same
+  disk, byte for byte.
 - **Raft itself.** Either openraft, which takes our log and state storage, or a Raft core of our
   own, as Redpanda and TigerBeetle wrote; prototyped first on openraft under the simulator, and
   kept only if it can be driven deterministically.
@@ -658,7 +703,8 @@ writers ─► leader ── append + fsync ────────────
   1. One replica: the shard log, partition files derived from it, grouped commit, subscriptions
      resumed by LSN, and existing segments still read. Its latency, produce to subscriber, is
      measured (p50, p99, p999).
-  2. The simulator; then replication over 3 replicas with fixed membership.
+  2. The simulator (built: one replica and its disk); then replication over 3 replicas with
+     fixed membership.
   3. Leadership transfer for rollouts, reads from followers, leases as log entries.
   4. Local disks, one replica per node.
   5. Later: more shards, and changing a shard's members.

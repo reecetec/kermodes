@@ -21,7 +21,6 @@
 //!   message, read against its shape's schema.
 
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -32,6 +31,7 @@ use arrow::ipc::writer::{
 };
 use arrow::record_batch::RecordBatch;
 
+use crate::disk::{self, DiskFile, DiskRef};
 use crate::partition::schema_header;
 use crate::shape::Shape;
 use crate::{Change, Error, SourceId};
@@ -74,9 +74,10 @@ pub(crate) struct Logged {
 
 /// The log, open for appending.
 pub(crate) struct Wal {
+    disk: DiskRef,
     dir: PathBuf,
     /// The segment taking entries, and where the next one goes in it.
-    file: File,
+    file: Box<dyn DiskFile>,
     offset: u64,
     /// The first LSN of each segment, the one taking entries last.
     segments: Vec<u64>,
@@ -89,25 +90,26 @@ pub(crate) struct Wal {
 }
 
 impl Wal {
-    /// Opens the log in `dir` (creating it), handing each batch logged after `after` to `each`,
-    /// in order. Appending continues in a new segment.
+    /// Opens the log in `dir` (creating it, under the store's directory `root`), handing each
+    /// batch logged after `after` to `each`, in order. Appending continues in a new segment.
     pub(crate) fn open(
+        disk: &DiskRef,
+        root: &Path,
         dir: &Path,
         after: u64,
         each: &mut dyn FnMut(Logged) -> Result<(), Error>,
     ) -> Result<Self, Error> {
-        fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
-        let mut firsts: Vec<u64> = Vec::new();
-        for found in fs::read_dir(dir).map_err(|e| Error::io(dir, e))? {
-            let name = found.map_err(|e| Error::io(dir, e))?.file_name();
-            if let Some(first) = name
-                .to_str()
-                .and_then(|n| n.strip_suffix(".log"))
-                .and_then(|n| n.parse().ok())
-            {
-                firsts.push(first);
-            }
+        // Its directory durable before anything in it is acknowledged: a segment's fsync and
+        // its own directory's make nothing durable in a directory a power loss takes away.
+        for parent in disk::create_dirs(&**disk, root, dir).map_err(|e| Error::io(dir, e))? {
+            disk.sync_dir(&parent).map_err(|e| Error::io(&parent, e))?;
         }
+        let mut firsts: Vec<u64> = disk
+            .list(dir)
+            .map_err(|e| Error::io(dir, e))?
+            .iter()
+            .filter_map(|name| name.strip_suffix(".log")?.parse().ok())
+            .collect();
         firsts.sort_unstable();
         // The log may have been trimmed to nothing: LSNs go on above what the files hold.
         let mut next = firsts.first().copied().unwrap_or(after + 1);
@@ -127,19 +129,26 @@ impl Wal {
                 )));
             }
             let path = segment_path(dir, first);
-            next = read_segment(&path, first, after, each)?;
+            next = read_segment(disk, &path, first, after, each)?;
             if next == first {
                 // No entry committed in it (opened, then closed or crashed before its first
                 // write): nothing to keep, and its name is the next segment's.
-                fs::remove_file(&path).map_err(|e| Error::io(&path, e))?;
+                disk.remove_file(&path).map_err(|e| Error::io(&path, e))?;
             } else {
+                // What is replayed must be durable before anything is built on it: a process
+                // that was killed leaves its last entries in the page cache, read here, and lost
+                // to a later power loss unless fsynced now.
+                disk.open(&path, false)
+                    .and_then(|file| file.sync_data())
+                    .map_err(|e| Error::io(&path, e))?;
                 kept.push(first);
             }
         }
         kept.push(next);
         Ok(Self {
+            disk: disk.clone(),
             dir: dir.to_owned(),
-            file: start_segment(dir, next)?,
+            file: start_segment(disk, dir, next)?,
             offset: HEADER.len() as u64,
             segments: kept,
             next,
@@ -230,7 +239,7 @@ impl Wal {
     }
 
     fn roll(&mut self) -> Result<(), Error> {
-        self.file = start_segment(&self.dir, self.next)?;
+        self.file = start_segment(&self.disk, &self.dir, self.next)?;
         self.offset = HEADER.len() as u64;
         self.segments.push(self.next);
         self.shapes.clear();
@@ -242,35 +251,18 @@ fn segment_path(dir: &Path, first: u64) -> PathBuf {
     dir.join(format!("{first:020}.log"))
 }
 
-/// A new segment for entries from `first` on: preallocated where the system can (so an fsync
-/// need not also commit the file's growth), its header and directory entry durable.
-fn start_segment(dir: &Path, first: u64) -> Result<File, Error> {
+/// A new segment for entries from `first` on: preallocated (so an fsync need not also commit
+/// the file's growth), its header and directory entry durable.
+fn start_segment(disk: &DiskRef, dir: &Path, first: u64) -> Result<Box<dyn DiskFile>, Error> {
     let path = segment_path(dir, first);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .map_err(|e| Error::io(&path, e))?;
-    preallocate(&file, &path)?;
+    let mut file = disk.create(&path, true).map_err(|e| Error::io(&path, e))?;
+    file.allocate(SEGMENT_BYTES)
+        .map_err(|e| Error::Io(format!("{}: cannot preallocate: {e}", path.display())))?;
     file.write_all(HEADER)
         .and_then(|()| file.sync_all())
         .map_err(|e| Error::io(&path, e))?;
-    File::open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(|e| Error::io(dir, e))?;
+    disk.sync_dir(dir).map_err(|e| Error::io(dir, e))?;
     Ok(file)
-}
-
-#[cfg(target_os = "linux")]
-fn preallocate(file: &File, path: &Path) -> Result<(), Error> {
-    nix::fcntl::posix_fallocate(file, 0, SEGMENT_BYTES as i64)
-        .map_err(|e| Error::Io(format!("{}: cannot preallocate: {e}", path.display())))
-}
-
-/// Elsewhere (macOS in development), only extended: reads past the last entry still find zeros.
-#[cfg(not(target_os = "linux"))]
-fn preallocate(file: &File, path: &Path) -> Result<(), Error> {
-    file.set_len(SEGMENT_BYTES).map_err(|e| Error::io(path, e))
 }
 
 fn frame(buffer: &mut Vec<u8>, lsn: u64, kind: u8, body: &[u8]) {
@@ -305,15 +297,32 @@ fn encode_rows(batch: &RecordBatch) -> Result<Vec<u8>, Error> {
 /// Reads the segment at `path`, whose first entry is `first`, handing each batch after `after`
 /// to `each`; the LSN after its last entry.
 fn read_segment(
+    disk: &DiskRef,
     path: &Path,
     first: u64,
     after: u64,
     each: &mut dyn FnMut(Logged) -> Result<(), Error>,
 ) -> Result<u64, Error> {
-    let file = File::open(path).map_err(|e| Error::io(path, e))?;
+    let file = disk.open(path, false).map_err(|e| Error::io(path, e))?;
     let mut reader = BufReader::with_capacity(1 << 20, file);
-    let mut header = [0; HEADER.len()];
-    if reader.read_exact(&mut header).is_err() || &header != HEADER {
+    let mut header = Vec::with_capacity(HEADER.len());
+    (&mut reader)
+        .take(HEADER.len() as u64)
+        .read_to_end(&mut header)
+        .map_err(|e| Error::io(path, e))?;
+    if header != HEADER {
+        // A process that died creating it left its header unwritten, or part of it: it commits
+        // nothing, since the header is fsynced before anything is appended. So anything past
+        // it but the preallocation's zeros is corruption.
+        if HEADER.starts_with(&header) || header.iter().all(|&b| b == 0) {
+            let mut rest = Vec::new();
+            reader
+                .read_to_end(&mut rest)
+                .map_err(|e| Error::io(path, e))?;
+            if rest.iter().all(|&b| b == 0) {
+                return Ok(first);
+            }
+        }
         return Err(Error::Corrupt(format!(
             "{}: not a log segment this version can read",
             path.display()
@@ -422,9 +431,9 @@ fn decode_batch(
 }
 
 /// The LSN the partition files hold everything up to: 0 for a store before the log.
-pub(crate) fn read_applied(dir: &Path) -> Result<u64, Error> {
+pub(crate) fn read_applied(disk: &DiskRef, dir: &Path) -> Result<u64, Error> {
     let path = dir.join("applied");
-    match fs::read(&path) {
+    match disk.read(&path) {
         Ok(bytes) => {
             let bytes: [u8; 12] = bytes
                 .try_into()
@@ -441,19 +450,20 @@ pub(crate) fn read_applied(dir: &Path) -> Result<u64, Error> {
 }
 
 /// Records that the partition files hold everything up to `lsn`, atomically and durably.
-pub(crate) fn write_applied(dir: &Path, lsn: u64) -> Result<(), Error> {
+pub(crate) fn write_applied(disk: &DiskRef, dir: &Path, lsn: u64) -> Result<(), Error> {
     let path = dir.join("applied");
     let staged = dir.join("applied.new");
     let mut bytes = lsn.to_le_bytes().to_vec();
     bytes.extend_from_slice(&crc32fast::hash(&lsn.to_le_bytes()).to_le_bytes());
-    let mut file = File::create(&staged).map_err(|e| Error::io(&staged, e))?;
+    let mut file = disk
+        .create(&staged, false)
+        .map_err(|e| Error::io(&staged, e))?;
     file.write_all(&bytes)
         .and_then(|()| file.sync_all())
         .map_err(|e| Error::io(&staged, e))?;
-    fs::rename(&staged, &path).map_err(|e| Error::io(&path, e))?;
-    File::open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(|e| Error::io(dir, e))
+    disk.rename(&staged, &path)
+        .map_err(|e| Error::io(&path, e))?;
+    disk.sync_dir(dir).map_err(|e| Error::io(dir, e))
 }
 
 #[cfg(test)]
@@ -464,6 +474,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     use super::{Append, Wal, read_applied, write_applied};
+    use crate::disk::{DiskRef, real};
     use crate::shape::{ColumnId, Shape};
     use crate::{Change, SourceId};
 
@@ -478,9 +489,9 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![n, n + 1]))]).unwrap()
     }
 
-    fn read(dir: &std::path::Path, after: u64) -> Vec<(u64, i64, u64)> {
+    fn read(disk: &DiskRef, dir: &std::path::Path, after: u64) -> Vec<(u64, i64, u64)> {
         let mut seen = Vec::new();
-        Wal::open(dir, after, &mut |logged| {
+        Wal::open(disk, dir, dir, after, &mut |logged| {
             let n = logged
                 .batch
                 .column(0)
@@ -499,10 +510,11 @@ mod tests {
     #[test]
     fn appended_batches_read_back_and_a_torn_tail_ends_the_log() {
         let dir = dir("torn");
+        let disk = real(&dir.join("fsync-failed"));
         let schema = batch(0).schema();
         let shape = Shape::new(schema, Arc::new([ColumnId(1)]));
         let source = SourceId::parse("feed").unwrap();
-        let mut wal = Wal::open(&dir, 0, &mut |_| unreachable!()).unwrap();
+        let mut wal = Wal::open(&disk, &dir, &dir, 0, &mut |_| unreachable!()).unwrap();
         let rows: Vec<RecordBatch> = (0..3).map(|i| batch(i * 10)).collect();
         let appends: Vec<Append> = rows
             .iter()
@@ -521,8 +533,8 @@ mod tests {
         // The shape takes LSN 1; the batches 2, 3, 4.
         assert_eq!(wal.append(&appends).unwrap(), [2, 3, 4]);
         drop(wal);
-        assert_eq!(read(&dir, 0), [(2, 0, 1), (3, 10, 2), (4, 20, 3)]);
-        assert_eq!(read(&dir, 3), [(4, 20, 3)]);
+        assert_eq!(read(&disk, &dir, 0), [(2, 0, 1), (3, 10, 2), (4, 20, 3)]);
+        assert_eq!(read(&disk, &dir, 3), [(4, 20, 3)]);
 
         // Tear the last entry of the first segment: the log ends before it, and the segments
         // opened since (one per open) start where it ends.
@@ -537,8 +549,8 @@ mod tests {
                 std::fs::remove_file(path).unwrap();
             }
         }
-        assert_eq!(read(&dir, 0), [(2, 0, 1), (3, 10, 2)]);
-        let mut wal = Wal::open(&dir, 0, &mut |_| Ok(())).unwrap();
+        assert_eq!(read(&disk, &dir, 0), [(2, 0, 1), (3, 10, 2)]);
+        let mut wal = Wal::open(&disk, &dir, &dir, 0, &mut |_| Ok(())).unwrap();
         assert_eq!(wal.next_lsn(), 4);
         let again = batch(30);
         let lsn = wal
@@ -556,11 +568,11 @@ mod tests {
         // The new segment writes its shape again.
         assert_eq!(lsn, [5]);
         drop(wal);
-        assert_eq!(read(&dir, 0), [(2, 0, 1), (3, 10, 2), (5, 30, 3)]);
+        assert_eq!(read(&disk, &dir, 0), [(2, 0, 1), (3, 10, 2), (5, 30, 3)]);
 
-        assert_eq!(read_applied(&dir).unwrap(), 0);
-        write_applied(&dir, 3).unwrap();
-        assert_eq!(read_applied(&dir).unwrap(), 3);
+        assert_eq!(read_applied(&disk, &dir).unwrap(), 0);
+        write_applied(&disk, &dir, 3).unwrap();
+        assert_eq!(read_applied(&disk, &dir).unwrap(), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

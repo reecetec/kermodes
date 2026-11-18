@@ -7,11 +7,13 @@
 #![forbid(unsafe_code)]
 
 mod catalog;
+pub mod disk;
 mod keyed;
 mod names;
 mod partition;
 mod pending;
 mod shape;
+pub mod sim;
 mod store;
 mod wal;
 
@@ -23,7 +25,9 @@ pub use names::{Date, SourceId, TableName};
 pub use partition::Stamp;
 pub use pending::{Answer, IN_FLIGHT_BYTES, InFlight, Pending};
 pub use shape::{ColumnId, Shape, column, spec, widens};
-pub use store::{BRANCH, Failed, Pace, Store, Subscriber, Writer, conform, keys_only};
+pub use store::{
+    BRANCH, Clock, Failed, Pace, Store, Subscriber, Writer, conform, keys_only, system_clock,
+};
 
 /// What a batch is (§7.1): an append table's rows, or a keyed table's upserts, deletes, or the
 /// checkpoint of its state a day begins with.

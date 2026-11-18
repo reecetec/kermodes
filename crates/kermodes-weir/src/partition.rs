@@ -15,7 +15,6 @@
 //! A stream's schema keeps each column's ID (§5.4), so a segment is read in the shape it was
 //! written in and projected by ID onto whatever shape its reader holds.
 
-use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Take, Write};
 use std::path::{Path, PathBuf};
 
@@ -25,6 +24,7 @@ use arrow::ipc::reader::{StreamDecoder, StreamReader};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 
+use crate::disk::{DiskFile, DiskRef, create_dirs};
 use crate::shape::Shape;
 use crate::{Change, Error};
 
@@ -138,13 +138,14 @@ impl Segment {
 /// The segment taking batches.
 struct Open {
     segment: Segment,
-    stream: StreamWriter<File>,
-    index: File,
+    stream: StreamWriter<Box<dyn DiskFile>>,
+    index: Box<dyn DiskFile>,
     /// Written since the last flush.
     dirty: bool,
 }
 
 pub(crate) struct Partition {
+    disk: DiskRef,
     dir: PathBuf,
     /// The columns new segments are written with.
     shape: Shape,
@@ -154,33 +155,68 @@ pub(crate) struct Partition {
     last_seq: Option<u64>,
     /// What the next flush must fsync besides the open segment: segments closed since the last
     /// one, and directories that gained entries.
-    unsynced: Vec<File>,
-    unsynced_dirs: Vec<PathBuf>,
+    unsynced: Vec<ToSync>,
+    /// The directories leading down to this one, until this process first writes here: then the
+    /// next flush fsyncs them, so what it writes outlasts a power loss with its directory.
+    parents: Vec<PathBuf>,
+}
+
+/// What a flush must fsync: a file, by a handle of its own, or a directory whose entries
+/// changed.
+pub(crate) enum ToSync {
+    File(Box<dyn DiskFile>),
+    Dir(PathBuf),
+}
+
+impl ToSync {
+    pub(crate) fn sync(self, disk: &DiskRef) -> std::io::Result<()> {
+        match self {
+            ToSync::File(file) => file.sync_all(),
+            ToSync::Dir(dir) => disk.sync_dir(&dir),
+        }
+    }
+}
+
+/// How a partition's batches came to be. Each the log's own entry (`FromLog`), covered by the
+/// flush that records its position, so recovery trusts it up to that position. Or folded from
+/// the log (`Folded`: a keyed table's checkpoints), which holds a position the flush covering it
+/// may have recorded before it was written: a crash can leave its index without its stream, and
+/// recovery drops what is missing, to be folded again.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Written {
+    FromLog,
+    Folded,
 }
 
 impl Partition {
-    /// Opens (creating if needed) the partition in `dir`, recovering its segments as far as the
-    /// files hold the log, `trusted` (the batches after it are the log's to replay); it writes
-    /// `shape`'s columns. Writing starts a new segment: one an earlier process left open is not
-    /// appended to.
-    pub(crate) fn open(dir: &Path, shape: Shape, trusted: u64) -> Result<Self, Error> {
-        let unsynced_dirs = create_dirs(dir)?;
-        let mut numbers = Vec::new();
-        for entry in fs::read_dir(dir).map_err(|e| Error::io(dir, e))? {
-            let name = entry.map_err(|e| Error::io(dir, e))?.file_name();
-            let name = name.to_string_lossy();
-            if let Some(number) = name
-                .strip_prefix("seg-")
-                .and_then(|n| n.strip_suffix(".idx"))
-                .and_then(|n| n.parse::<u32>().ok())
-            {
-                numbers.push(number);
-            }
-        }
+    /// Opens (creating if needed, under the store's directory `root`) the partition in `dir`,
+    /// recovering its segments as far as the files hold the log, `trusted` (the batches after
+    /// it are the log's to replay); it writes `shape`'s columns. Writing starts a new segment:
+    /// one an earlier process left open is not appended to.
+    pub(crate) fn open(
+        disk: &DiskRef,
+        root: &Path,
+        dir: &Path,
+        shape: Shape,
+        trusted: u64,
+        written: Written,
+    ) -> Result<Self, Error> {
+        let parents = create_dirs(&**disk, root, dir).map_err(|e| Error::io(dir, e))?;
+        let mut numbers: Vec<u32> = disk
+            .list(dir)
+            .map_err(|e| Error::io(dir, e))?
+            .iter()
+            .filter_map(|name| {
+                name.strip_prefix("seg-")?
+                    .strip_suffix(".idx")?
+                    .parse()
+                    .ok()
+            })
+            .collect();
         numbers.sort_unstable();
         let mut closed = Vec::new();
         for number in numbers {
-            if let Some(segment) = recover(dir, number, trusted)? {
+            if let Some(segment) = recover(disk, dir, number, trusted, written)? {
                 closed.push(segment);
             }
         }
@@ -189,13 +225,14 @@ impl Partition {
             .and_then(|s: &Segment| s.entries.last())
             .map(|e| e.seq);
         Ok(Self {
+            disk: disk.clone(),
             dir: dir.to_owned(),
             shape,
             closed,
             open: None,
             last_seq,
             unsynced: Vec::new(),
-            unsynced_dirs,
+            parents,
         })
     }
 
@@ -266,16 +303,36 @@ impl Partition {
     /// the caller to sync outside its lock: the open segment's files if written since, segments
     /// closed since, and directories that gained entries. The next call returns only what is
     /// written after this one.
-    pub(crate) fn unsynced(&mut self) -> Result<Vec<File>, Error> {
-        let mut files = std::mem::take(&mut self.unsynced);
+    pub(crate) fn unsynced(&mut self) -> Result<Vec<ToSync>, Error> {
+        let mut unsynced = std::mem::take(&mut self.unsynced);
         if let Some(open) = self.open.as_mut().filter(|open| open.dirty) {
             open.dirty = false;
-            files.extend(handles(&self.dir, open)?);
+            unsynced.extend(handles(&self.dir, open)?);
         }
-        for dir in self.unsynced_dirs.drain(..) {
-            files.push(File::open(&dir).map_err(|e| Error::io(&dir, e))?);
+        Ok(unsynced)
+    }
+
+    /// Fsyncs every file of the partition and the directories from `root` down to it, now,
+    /// whichever process wrote them: for what must be durable before something it was folded
+    /// from goes.
+    pub(crate) fn sync_now(&self, root: &Path) -> Result<(), Error> {
+        for segment in self.segments() {
+            for path in [
+                data_path(&self.dir, segment.number),
+                index_path(&self.dir, segment.number),
+            ] {
+                self.disk
+                    .open(&path, false)
+                    .and_then(|file| file.sync_all())
+                    .map_err(|e| Error::io(&path, e))?;
+            }
         }
-        Ok(files)
+        let parents =
+            create_dirs(&*self.disk, root, &self.dir).map_err(|e| Error::io(&self.dir, e))?;
+        for dir in [self.dir.clone()].into_iter().chain(parents) {
+            self.disk.sync_dir(&dir).map_err(|e| Error::io(&dir, e))?;
+        }
+        Ok(())
     }
 
     /// Stops writing the open segment, keeping what the next flush must sync of it.
@@ -333,6 +390,7 @@ impl Partition {
             });
         }
         Cursor {
+            disk: self.disk.clone(),
             segments,
             skip: first_skip,
             bytes,
@@ -397,7 +455,10 @@ impl Partition {
             let header = schema_header(&segment.written)?;
             let take = (count - batches.len()).min(held - skip);
             let path = data_path(&self.dir, segment.number);
-            let mut file = File::open(&path).map_err(|e| Error::io(&path, e))?;
+            let mut file = self
+                .disk
+                .open(&path, false)
+                .map_err(|e| Error::io(&path, e))?;
             let begin = match skip {
                 0 => header.len() as u64,
                 _ => segment.entries[skip - 1].end,
@@ -464,11 +525,12 @@ impl Partition {
         let number = self.closed.last().map_or(1, |segment| segment.number + 1);
         let data = data_path(&self.dir, number);
         let index = index_path(&self.dir, number);
+        // Over whatever is there: a number past the last segment recovered commits nothing,
+        // and a process killed between creating a segment's stream and its index leaves the
+        // stream with no index to find it by.
         let create = |path: &Path| {
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
+            self.disk
+                .create(path, false)
                 .map_err(|e| Error::io(path, e))
         };
         let written = self.shape.segment_schema();
@@ -478,8 +540,11 @@ impl Partition {
         index_file
             .write_all(HEADER)
             .map_err(|e| Error::io(&index, e))?;
-        // The new files' directory entries must reach the disk with them.
-        self.unsynced_dirs.push(self.dir.clone());
+        // The new files' directory entries must reach the disk with them, and on this process's
+        // first segment here, those of the directories leading down to them.
+        self.unsynced.push(ToSync::Dir(self.dir.clone()));
+        self.unsynced
+            .extend(self.parents.drain(..).map(ToSync::Dir));
         Ok(Open {
             segment: Segment::new(number, Vec::new(), written),
             stream,
@@ -500,6 +565,7 @@ struct Committed {
 
 /// Committed batches of a partition, read one at a time (`Partition::cursor`).
 pub(crate) struct Cursor {
+    disk: DiskRef,
     segments: Vec<Committed>,
     /// Batches of the first segment already delivered.
     skip: usize,
@@ -515,6 +581,7 @@ impl Cursor {
     /// The batches in order as `to`'s columns, decoded one at a time as they are taken.
     pub(crate) fn batches(self, to: Shape) -> Batches {
         Batches {
+            disk: self.disk,
             segments: self.segments.into_iter(),
             skip: self.skip,
             current: None,
@@ -523,12 +590,16 @@ impl Cursor {
     }
 }
 
+/// A segment's stream, read up to its last committed byte.
+type SegmentReader = StreamReader<Take<Box<dyn DiskFile>>>;
+
 /// A cursor's batches, pulled one at a time (`Cursor::batches`).
 pub(crate) struct Batches {
+    disk: DiskRef,
     segments: std::vec::IntoIter<Committed>,
     skip: usize,
     /// The segment being read: its stream and the records of its batches still to come.
-    current: Option<(Committed, StreamReader<Take<File>>, usize)>,
+    current: Option<(Committed, SegmentReader, usize)>,
     /// The columns delivered.
     to: Shape,
 }
@@ -540,7 +611,7 @@ impl Iterator for Batches {
         loop {
             if self.current.is_none() {
                 let segment = self.segments.next()?;
-                let file = match File::open(&segment.path) {
+                let file = match self.disk.open(&segment.path, false) {
                     Ok(file) => file,
                     Err(e) => return Some(Err(Error::io(&segment.path, e))),
                 };
@@ -664,54 +735,66 @@ pub(crate) fn schema_header(schema: &SchemaRef) -> Result<Vec<u8>, Error> {
 }
 
 /// The schema the stream at `data` was written with: its schema message, read alone.
-fn written_schema(data: &Path) -> Result<SchemaRef, Error> {
-    let file = File::open(data).map_err(|e| Error::io(data, e))?;
+fn written_schema(disk: &DiskRef, data: &Path) -> Result<SchemaRef, Error> {
+    let file = disk.open(data, false).map_err(|e| Error::io(data, e))?;
     let reader = StreamReader::try_new(file, None)
         .map_err(|e| Error::Arrow(format!("{}: {e}", data.display())))?;
     Ok(reader.schema())
 }
 
 /// The files an open segment writes, to fsync.
-fn handles(dir: &Path, open: &Open) -> Result<[File; 2], Error> {
-    let clone = |file: &File, path: PathBuf| file.try_clone().map_err(|e| Error::io(&path, e));
+fn handles(dir: &Path, open: &Open) -> Result<[ToSync; 2], Error> {
+    let clone = |file: &dyn DiskFile, path: PathBuf| {
+        file.try_clone()
+            .map(ToSync::File)
+            .map_err(|e| Error::io(&path, e))
+    };
     Ok([
-        clone(open.stream.get_ref(), data_path(dir, open.segment.number))?,
-        clone(&open.index, index_path(dir, open.segment.number))?,
+        clone(
+            &**open.stream.get_ref(),
+            data_path(dir, open.segment.number),
+        )?,
+        clone(&*open.index, index_path(dir, open.segment.number))?,
     ])
-}
-
-/// Creates `dir` and whatever of its ancestors are missing; the directories whose entries
-/// changed (each created one's parent), to fsync.
-fn create_dirs(dir: &Path) -> Result<Vec<PathBuf>, Error> {
-    let mut missing = Vec::new();
-    let mut at = dir;
-    while !at.exists() {
-        missing.push(at.to_owned());
-        match at.parent() {
-            Some(parent) => at = parent,
-            None => break,
-        }
-    }
-    fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
-    Ok(missing
-        .iter()
-        .filter_map(|created| created.parent().map(Path::to_owned))
-        .collect())
 }
 
 /// A segment's committed batches: its index records up to the first that fails its check, and
 /// of format 2 none after `trusted` (the log's to replay; the index is truncated there). A
 /// segment left without one is deleted, so its number is free.
-fn recover(dir: &Path, number: u32, trusted: u64) -> Result<Option<Segment>, Error> {
+fn recover(
+    disk: &DiskRef,
+    dir: &Path,
+    number: u32,
+    trusted: u64,
+    written: Written,
+) -> Result<Option<Segment>, Error> {
     let index = index_path(dir, number);
     let data = data_path(dir, number);
-    let bytes = fs::read(&index).map_err(|e| Error::io(&index, e))?;
+    let bytes = disk.read(&index).map_err(|e| Error::io(&index, e))?;
     let record = match bytes.get(..HEADER.len()) {
         Some(header) if header == HEADER => RECORD,
         Some(header) if header == HEADER_1 => RECORD_1,
         // Created and never flushed: whatever a crash left of it is the log's to replay.
         None => 0,
-        Some(_) if bytes.iter().all(|&b| b == 0) => 0,
+        // Its header never reached the disk (a failed fsync dropped it, and records written
+        // after it did): no flush covered the segment, so nothing in it can be trusted. A
+        // trusted record behind it means the header was lost later, to corruption, unless the
+        // records are folded (`Written::Folded`) and so folded again.
+        Some(header) if header.iter().all(|&b| b == 0) => {
+            let trusted_behind = bytes[HEADER.len()..]
+                .as_chunks::<RECORD>()
+                .0
+                .iter()
+                .filter_map(|record| Entry::decode(record))
+                .any(|entry| entry.lsn <= trusted);
+            if trusted_behind && written == Written::FromLog {
+                return Err(Error::Corrupt(format!(
+                    "{}: its header is gone, and the batches after it are trusted",
+                    index.display()
+                )));
+            }
+            0
+        }
         Some(_) => {
             return Err(Error::Corrupt(format!(
                 "{}: not a weir index this version can read",
@@ -734,9 +817,18 @@ fn recover(dir: &Path, number: u32, trusted: u64) -> Result<Option<Segment>, Err
             entries.push(entry);
         }
     }
+    if written == Written::Folded {
+        // A folded batch whose stream did not reach the disk is folded again, with those after.
+        let length = match disk.len(&data) {
+            Ok(length) => length,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(Error::io(&data, e)),
+        };
+        entries.truncate(entries.partition_point(|entry| entry.end <= length));
+    }
     let Some(last) = entries.last() else {
         for path in [&index, &data] {
-            match fs::remove_file(path) {
+            match disk.remove_file(path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(Error::io(path, e)),
@@ -747,13 +839,11 @@ fn recover(dir: &Path, number: u32, trusted: u64) -> Result<Option<Segment>, Err
     let kept = (HEADER.len() + entries.len() * record) as u64;
     if (bytes.len() as u64) > kept {
         // Records past the point the files hold the log: dropped, so the replay writes them.
-        OpenOptions::new()
-            .write(true)
-            .open(&index)
+        disk.open(&index, true)
             .and_then(|file| file.set_len(kept).and_then(|()| file.sync_all()))
             .map_err(|e| Error::io(&index, e))?;
     }
-    let length = fs::metadata(&data).map_err(|e| Error::io(&data, e))?.len();
+    let length = disk.len(&data).map_err(|e| Error::io(&data, e))?;
     if length < last.end {
         return Err(Error::Corrupt(format!(
             "{}: the index commits {} bytes, the stream has {length}",
@@ -761,7 +851,11 @@ fn recover(dir: &Path, number: u32, trusted: u64) -> Result<Option<Segment>, Err
             last.end
         )));
     }
-    Ok(Some(Segment::new(number, entries, written_schema(&data)?)))
+    Ok(Some(Segment::new(
+        number,
+        entries,
+        written_schema(disk, &data)?,
+    )))
 }
 
 #[cfg(test)]
@@ -774,7 +868,8 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Int64Type, Schema};
     use arrow::ipc::writer::StreamWriter;
 
-    use super::{Change, Entry, HEADER, Partition, data_path, index_path};
+    use super::{Change, Entry, HEADER, Partition, Written, data_path, index_path};
+    use crate::disk::real;
     use crate::shape::{ColumnId, Shape};
 
     /// A cursor from any batch delivers exactly the batches from there on, across segments,
@@ -785,7 +880,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
         let shape = Shape::new(schema.clone(), Arc::new([ColumnId(1)]));
-        let mut partition = Partition::open(&dir, shape.clone(), u64::MAX).unwrap();
+        let disk = real(&dir.join("fsync-failed"));
+        let mut partition =
+            Partition::open(&disk, &dir, &dir, shape.clone(), u64::MAX, Written::FromLog).unwrap();
         // About 24 MiB a batch: three to a 64 MiB segment, so ten batches span four segments of
         // three, three, three, and one.
         let rows = 3 << 20;
@@ -856,7 +953,9 @@ mod tests {
         std::fs::write(index_path(&dir, 1), index).unwrap();
 
         let shape = Shape::new(schema.clone(), Arc::new([ColumnId(1)]));
-        let partition = Partition::open(&dir, shape.clone(), u64::MAX).unwrap();
+        let disk = real(&dir.join("fsync-failed"));
+        let partition =
+            Partition::open(&disk, &dir, &dir, shape.clone(), u64::MAX, Written::FromLog).unwrap();
         let first = |batch: &RecordBatch| batch.column(0).as_primitive::<Int64Type>().value(0);
         let by_cursor: Vec<i64> = partition
             .cursor(0)
