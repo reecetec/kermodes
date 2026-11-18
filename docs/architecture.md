@@ -411,7 +411,12 @@ catalog as live tables.
   producer is not held to one write per fsync. Up to 64 MiB may be unanswered per writer;
   sending then waits, so a slow store slows its producer instead of filling its memory. Over
   Flight the writes stream without waiting and are acknowledged in order; one the server
-  refuses fails, and so does every write sent after it.
+  refuses fails, and so does every write sent after it. A stream that breaks (weir restarted, the
+  connection dropped) is opened again with backoff, waiting for the source's lease (the server
+  holds the old stream's until it notices it gone); the writes it had not acknowledged are
+  answered as written up to the source's last `seq`, and the rest resent, so each is written
+  once. Writes sent meanwhile wait in the budget. Every break and reconnect is reported: why,
+  how long writes waited, how many were resent.
 - What is ordered, as Kafka orders a partition: a writer's writes (one source of one table) are
   logged in the order sent; a write sent after another was acknowledged is logged after it; and
   a checkpoint is logged in its place among every write of its table, since it replaces them
@@ -1873,7 +1878,7 @@ down until its replacement has rebuilt. Kermodes moves runs before they are evic
 | Gateway, `kermodes ui` | No downtime: stateless, 2+ replicas and a PodDisruptionBudget |
 | Control plane | No downtime for the API; the loops hand over to the other replica within a second (a PodDisruptionBudget keeps one up) |
 | Postgres (CNPG) | No downtime: CNPG switches the primary over before eviction |
-| weir | A brief outage until it is replicated: the pod reschedules and its volume reattaches. Writers buffer and resume from `last_seq`; readers restart and rebuild. Replicated (§7.6): no downtime: one replica at a time, the leader handing over first, readers resuming by log position |
+| weir | A brief outage until it is replicated: the pod reschedules and its volume reattaches. Writers and readers reconnect by themselves, writers resending what was not acknowledged and readers resuming by log position, each reconnect reported. Replicated (§7.6): no downtime: one replica at a time, the leader handing over first |
 
 ## 18. Technology choices
 

@@ -9,7 +9,9 @@
 //! `--dir`, with one subscriber; over Flight on localhost with `--flight`, in-process without.
 //! Each batch carries the time it was due, so a writer that falls behind counts its wait (no
 //! coordinated omission). Reports, after a second of warm-up: the time from due to durable (the
-//! write's acknowledgement), and from due to the subscriber having it.
+//! write's acknowledgement), and from due to the subscriber having it; and the process's CPU
+//! time per row written, the bench's own writers and subscriber included, so comparable between
+//! builds and machines rather than a cost of weir alone.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -115,6 +117,19 @@ fn now_ns() -> i64 {
         .map_or(0, |d| d.as_nanos() as i64)
 }
 
+/// The CPU time, user and system, this process has used.
+fn cpu_seconds() -> f64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: getrusage writes a whole `rusage` to the pointer it is given, which points at
+    // enough memory for one, and reports failure (only for a bad `who`) without writing.
+    let usage = unsafe {
+        assert_eq!(libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()), 0);
+        usage.assume_init()
+    };
+    let seconds = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    seconds(usage.ru_utime) + seconds(usage.ru_stime)
+}
+
 /// A write to the bench table, local or remote.
 type Write = Box<dyn Fn(&RecordBatch) -> Result<Pending, Error> + Send>;
 
@@ -138,6 +153,7 @@ fn weir(args: &Args) {
 
     // A second's warm-up: batches due before it are not counted.
     let start_ns = now_ns();
+    let start_cpu = cpu_seconds();
     let warm_ns = start_ns + 1_000_000_000;
     let delivered = Arc::new(Mutex::new(Vec::new()));
     let subscriber: kermodes_weir::Subscriber = {
@@ -261,10 +277,11 @@ fn weir(args: &Args) {
     }
     std::thread::sleep(Duration::from_millis(500));
     let elapsed = (now_ns() - start_ns) as f64 / 1e9;
+    let cpu = cpu_seconds() - start_cpu;
     let rows = *written.lock().unwrap();
     println!(
         "weir {}: {} writer(s) x {} x {}-row batches, {} in flight, {:.0} rows/s over {:.1} s, \
-         on {}",
+         {:.2} us CPU per row ({:.1} cores), on {}",
         if args.flight {
             "over Flight"
         } else {
@@ -280,6 +297,8 @@ fn weir(args: &Args) {
         args.window,
         rows as f64 / elapsed,
         elapsed,
+        cpu * 1e6 / rows.max(1) as f64,
+        cpu / elapsed,
         args.dir.display()
     );
     print_latency("due to durable", std::mem::take(&mut acked.lock().unwrap()));

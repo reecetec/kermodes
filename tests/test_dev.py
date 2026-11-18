@@ -1,15 +1,17 @@
 """`kermodes dev` as people use it: one server, processes connecting to it, the server killed."""
 
+import queue
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 import kermodes as km
 import pyarrow as pa
 import pytest
 
-_WRITE_UNTIL_THE_SERVER_GOES = """
+_WRITE_UNTIL_KILLED = """
 import sys
 import pyarrow as pa
 import kermodes as km
@@ -56,45 +58,58 @@ def batches_of(session: km.Session, table: km.Table, count: int) -> list[int]:
         time.sleep(0.01)
 
 
-def test_processes_share_kermodes_dev_and_a_killed_server_loses_nothing(tmp_path):
+def test_a_writer_rides_out_a_killed_kermodes_dev_and_loses_nothing(tmp_path):
     port, flight_port = free_port(), free_port()
     url = f"grpc://127.0.0.1:{flight_port}"
     dev = start_dev(tmp_path, port, flight_port)
     writer = subprocess.Popen(
-        [sys.executable, "-c", _WRITE_UNTIL_THE_SERVER_GOES, url],
+        [sys.executable, "-c", _WRITE_UNTIL_KILLED, url],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
     )
-    assert writer.stdout is not None
+    stdout = writer.stdout
+    assert stdout is not None
+    lines: queue.Queue[int] = queue.Queue()
+    threading.Thread(
+        target=lambda: [lines.put(int(line)) for line in stdout], daemon=True
+    ).start()
     acknowledged = 0
-    while acknowledged < 30:
-        acknowledged = int(writer.stdout.readline())
 
-    # A third process reads the table while it ticks.
-    reader = km.connect(url, manual=True)
-    live = reader.live_table("md.ticks")
-    assert batches_of(reader, live, 30)[:30] == list(range(1, 31))
+    def acknowledge_past(n: int) -> None:
+        nonlocal acknowledged
+        while acknowledged < n:
+            acknowledged = lines.get(timeout=30)
 
-    dev.kill()  # SIGKILL, mid-write
-    dev.wait()
-    writer.wait(timeout=30)  # its next write fails: the server is gone
-    for line in writer.stdout:
-        acknowledged = int(line)
-    del live, reader
-
-    dev = start_dev(tmp_path, port, flight_port)
     try:
+        acknowledge_past(30)
+        # A third process reads the table while it ticks.
+        reader = km.connect(url, manual=True)
+        live = reader.live_table("md.ticks")
+        assert batches_of(reader, live, 30)[:30] == list(range(1, 31))
+        del live, reader
+
+        dev.kill()  # SIGKILL, mid-write
+        dev.wait()
+        dev = start_dev(tmp_path, port, flight_port)
+        # The writer reconnects by itself and goes on from where it was.
+        acknowledge_past(acknowledged + 30)
+        writer.kill()
+        writer.wait()
+        while not lines.empty():
+            acknowledged = lines.get()
+
         s = km.connect(url, manual=True)
-        w = s.writer("md.ticks", source="feed")
+        w = s.writer("md.ticks", source="feed", wait=True)
         committed = w.last_seq
         assert committed is not None and committed >= acknowledged
         table = s.live_table("md.ticks")
         assert batches_of(s, table, committed) == list(range(1, committed + 1))
-        # The writer resumes where the source left off.
+        # A new writer resumes where the source left off.
         assert w.write(pa.table({"n": pa.array([committed + 1] * 100, pa.int64())}))
         assert batches_of(s, table, committed + 1) == list(range(1, committed + 2))
     finally:
+        writer.kill()
         dev.kill()
         dev.wait()
 

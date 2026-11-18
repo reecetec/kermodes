@@ -11,7 +11,7 @@ use arrow_flight::decode::{DecodedPayload, FlightDataDecoder};
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::utils::batches_to_flight_data;
-use arrow_flight::{Action, FlightData, FlightDescriptor, Ticket};
+use arrow_flight::{Action, FlightData, FlightDescriptor, PutResult, Ticket};
 use futures::{StreamExt, TryStreamExt};
 use kermodes_weir::{
     Answer, Change, ColumnId, Date, Error, Garbage, HistoryCommit, HistoryDate, HistoryFile,
@@ -21,7 +21,6 @@ use kermodes_weir::{
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
-use tonic::Code;
 use tonic::transport::Channel;
 
 use crate::{
@@ -72,25 +71,7 @@ impl Client {
     }
 
     fn action(&self, kind: &str, body: Value) -> Result<Value, Error> {
-        let mut flight = self.flight.clone();
-        self.runtime.block_on(async move {
-            let action = Action {
-                r#type: kind.into(),
-                body: body.to_string().into(),
-            };
-            let mut results = flight
-                .do_action(action)
-                .await
-                .map_err(|s| error_from_status(&s))?
-                .into_inner();
-            let result = results
-                .message()
-                .await
-                .map_err(|s| error_from_status(&s))?
-                .ok_or_else(|| Error::Io(format!("no answer to `{kind}`")))?;
-            serde_json::from_slice(&result.body)
-                .map_err(|e| Error::Io(format!("unreadable answer to `{kind}`: {e}")))
-        })
+        self.runtime.block_on(call(self.flight.clone(), kind, body))
     }
 
     /// Creates `name`, or checks it exists with the same columns; its schema.
@@ -374,6 +355,13 @@ impl Client {
     /// A writer for `source`'s rows of `name`, holding the source's lease server-wide until it
     /// is dropped: with `wait`, once the current writer goes; without, failing with `Busy` if
     /// there is one.
+    ///
+    /// A stream that breaks (the server restarted, the connection dropped) is opened again,
+    /// retrying with backoff, and the writes it had not acknowledged are resent after the
+    /// source's last seq, so each is written once; writes sent meanwhile wait in the writer's
+    /// in-flight budget. Every break and reconnect is reported on stderr: why, how long writes
+    /// waited, how many were resent. A write the server refuses fails, and so does every write
+    /// after it.
     pub fn writer(
         &self,
         name: &TableName,
@@ -381,80 +369,38 @@ impl Client {
         wait: bool,
     ) -> Result<RemoteWriter, Error> {
         let TableEntry { schema, key, .. } = self.entry(name)?;
-        let mut first: FlightData = batches_to_flight_data(&schema, [])
-            .map_err(|e| Error::Arrow(e.to_string()))?
-            .remove(0);
-        let target = json!({"table": name.to_string(), "source": source.as_str(), "wait": wait});
-        first.flight_descriptor = Some(FlightDescriptor::new_cmd(target.to_string()));
-        let (sender, outgoing) = mpsc::unbounded_channel::<FlightData>();
-        sender
-            .send(first)
-            .map_err(|_| Error::Io("the write stream closed".into()))?;
-        let outgoing = futures::stream::unfold(outgoing, |mut outgoing| async move {
-            outgoing.recv().await.map(|data| (data, outgoing))
-        });
-        let mut flight = self.flight.clone();
+        let target = WriteTarget {
+            flight: self.flight.clone(),
+            name: name.clone(),
+            source: source.clone(),
+            schema: schema.clone(),
+        };
         // Returns once the server holds the lease for us.
-        let mut acks = self
-            .runtime
-            .block_on(async move { flight.do_put(outgoing).await })
-            .map_err(|s| error_from_status(&s))?
-            .into_inner();
-        // Only now: a writer before us may have written until it let go.
-        let state = self.action(
-            "last_seq",
-            json!({"table": name.to_string(), "source": source.as_str()}),
-        )?;
-        let acked = Arc::new(Mutex::new(state["last_seq"].as_u64()));
-        let waiting = Arc::new(Mutex::new(Waiting::default()));
-        // The server acknowledges writes in the order they were sent: each answers the oldest
-        // write waiting. When the stream ends, every write still waiting fails with why.
-        self.runtime.spawn({
-            let (acked, waiting) = (acked.clone(), waiting.clone());
-            async move {
-                let closed = loop {
-                    let outcome = match acks.message().await {
-                        Ok(Some(ack)) => match ack.app_metadata.as_ref() {
-                            [last @ .., written] if last.len() == 8 => {
-                                let last = u64::from_le_bytes(last.try_into().expect("8 bytes"));
-                                *lock(&acked) = Some(last);
-                                Ok(*written == 1)
-                            }
-                            _ => Err(Error::Io(
-                                "an acknowledgement this client cannot read".into(),
-                            )),
-                        },
-                        Ok(None) => break "the server closed the write stream".to_owned(),
-                        Err(status) => {
-                            let error = error_from_status(&status);
-                            let why = error.to_string();
-                            if let Some(answer) = lock(&waiting).answers.pop_front() {
-                                answer.send(Err(error));
-                            }
-                            break why;
-                        }
-                    };
-                    if let Some(answer) = lock(&waiting).answers.pop_front() {
-                        answer.send(outcome);
-                    }
-                };
-                let mut waiting = lock(&waiting);
-                for answer in waiting.answers.drain(..) {
-                    answer.send(Err(Error::Io(format!("the write stream closed: {closed}"))));
-                }
-                waiting.closed = Some(closed);
-            }
-        });
+        let opened = self.runtime.block_on(target.open(wait))?;
+        let stream = Arc::new(Mutex::new(Stream {
+            sender: Some(opened.sender),
+            unacked: VecDeque::new(),
+            sent: opened.last_seq,
+            refused: None,
+            dropped: false,
+        }));
+        let acked = Arc::new(Mutex::new(opened.last_seq));
+        let epoch = Arc::new(Mutex::new(opened.epoch));
+        self.runtime.spawn(keep_writing(
+            target,
+            opened.acks,
+            stream.clone(),
+            acked.clone(),
+            epoch.clone(),
+        ));
         Ok(RemoteWriter {
             _runtime: self.runtime.clone(),
             table: name.clone(),
             schema,
             key,
-            sender,
-            epoch: state["epoch"].as_u64(),
-            sent: Mutex::new(state["last_seq"].as_u64()),
+            stream,
             acked,
-            waiting,
+            epoch,
             in_flight: Arc::default(),
             gone: format!("the write stream of {name} closed").into(),
         })
@@ -646,6 +592,252 @@ async fn open_subscription(
     }
 }
 
+/// What a remote writer writes to: enough to open its stream again after a break.
+struct WriteTarget {
+    flight: FlightServiceClient<Channel>,
+    name: TableName,
+    source: SourceId,
+    schema: SchemaRef,
+}
+
+/// A write stream just opened, the source's lease held.
+struct Opened {
+    sender: mpsc::UnboundedSender<FlightData>,
+    acks: Streaming<PutResult>,
+    /// The source's last seq and lease epoch once the lease is ours.
+    last_seq: Option<u64>,
+    epoch: Option<u64>,
+}
+
+impl WriteTarget {
+    /// Opens a write stream: returns once the server holds the source's lease for it, with
+    /// `wait` once the writer holding it goes, without failing with `Busy` if one does.
+    async fn open(&self, wait: bool) -> Result<Opened, Error> {
+        let mut first: FlightData = batches_to_flight_data(&self.schema, [])
+            .map_err(|e| Error::Arrow(e.to_string()))?
+            .remove(0);
+        let target = json!({
+            "table": self.name.to_string(),
+            "source": self.source.as_str(),
+            "wait": wait,
+        });
+        first.flight_descriptor = Some(FlightDescriptor::new_cmd(target.to_string()));
+        let (sender, outgoing) = mpsc::unbounded_channel::<FlightData>();
+        sender
+            .send(first)
+            .map_err(|_| Error::Io("the write stream closed".into()))?;
+        let outgoing = futures::stream::unfold(outgoing, |mut outgoing| async move {
+            outgoing.recv().await.map(|data| (data, outgoing))
+        });
+        let acks = self
+            .flight
+            .clone()
+            .do_put(outgoing)
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        // Only now: a writer before us may have written until it let go.
+        let state = call(
+            self.flight.clone(),
+            "last_seq",
+            json!({"table": self.name.to_string(), "source": self.source.as_str()}),
+        )
+        .await?;
+        Ok(Opened {
+            sender,
+            acks,
+            last_seq: state["last_seq"].as_u64(),
+            epoch: state["epoch"].as_u64(),
+        })
+    }
+}
+
+/// A remote writer's stream and the writes it has not acknowledged. Its lock keeps writes in
+/// the order sent, across a reconnect's resending too.
+struct Stream {
+    /// Where writes go; none while the stream is being opened again.
+    sender: Option<mpsc::UnboundedSender<FlightData>>,
+    /// Writes not yet acknowledged, oldest first: each one's seq, message (its buffers shared,
+    /// not copied), and answer. Resent after a break.
+    unacked: VecDeque<(u64, FlightData, Answer)>,
+    /// The highest seq sent: the next unnumbered write's is one above.
+    sent: Option<u64>,
+    /// Why writing stopped for good: the server refused a write.
+    refused: Option<String>,
+    /// The writer was dropped: its stream is closed, and is not opened again.
+    dropped: bool,
+}
+
+/// How a write stream stopped.
+enum Stopped {
+    /// It broke: open it again and resend.
+    Broke(String),
+    /// The server refused a write, or the stream: nothing resending would change.
+    Refused(Error),
+}
+
+/// A remote writer's background task: answers each write as the server acknowledges it (in the
+/// order sent); on a break, opens the stream again and resends what was not acknowledged; on a
+/// refusal, fails the refused write and every one after it.
+async fn keep_writing(
+    target: WriteTarget,
+    mut acks: Streaming<PutResult>,
+    stream: Arc<Mutex<Stream>>,
+    acked: Arc<Mutex<Option<u64>>>,
+    epoch: Arc<Mutex<Option<u64>>>,
+) {
+    let who = format!("{} ({})", target.name, target.source.as_str());
+    loop {
+        let stopped = loop {
+            match acks.message().await {
+                Ok(Some(ack)) => {
+                    let Some((written, last)) = ack.app_metadata.split_last() else {
+                        break Stopped::Refused(Error::Io(
+                            "an acknowledgement this client cannot read".into(),
+                        ));
+                    };
+                    let Ok(last) = <[u8; 8]>::try_from(last) else {
+                        break Stopped::Refused(Error::Io(
+                            "an acknowledgement this client cannot read".into(),
+                        ));
+                    };
+                    *lock(&acked) = Some(u64::from_le_bytes(last));
+                    if let Some((_, _, answer)) = lock(&stream).unacked.pop_front() {
+                        answer.send(Ok(*written == 1));
+                    }
+                }
+                Ok(None) => break Stopped::Broke("the server closed the stream".into()),
+                Err(status) => {
+                    break match status.code() {
+                        Code::InvalidArgument
+                        | Code::NotFound
+                        | Code::OutOfRange
+                        | Code::DataLoss
+                        | Code::AlreadyExists
+                        | Code::FailedPrecondition => Stopped::Refused(error_from_status(&status)),
+                        _ => Stopped::Broke(error_from_status(&status).to_string()),
+                    };
+                }
+            }
+        };
+        let why = match stopped {
+            Stopped::Refused(error) => return refuse(&stream, error),
+            Stopped::Broke(why) => why,
+        };
+        let down = Instant::now();
+        {
+            let mut stream = lock(&stream);
+            stream.sender = None;
+            if stream.dropped {
+                // Dropped and done: the server answers every write before closing.
+                for (_, _, answer) in stream.unacked.drain(..) {
+                    answer.send(Err(Error::Io(format!(
+                        "the write stream of {who} broke ({why}) after its writer was dropped"
+                    ))));
+                }
+                return;
+            }
+            eprintln!(
+                "kermodes: the write stream of {who} broke ({why}); {} write(s) not yet \
+                 acknowledged; reconnecting",
+                stream.unacked.len()
+            );
+        }
+        let mut backoff = Duration::from_millis(250);
+        let mut tries = 0;
+        let opened = loop {
+            tries += 1;
+            // Waiting for the lease: after a connection drops, the server holds the old
+            // stream's lease until it notices, up to its pings' timeout.
+            match target.open(true).await {
+                Ok(opened) => break opened,
+                Err(error @ (Error::Schema(_) | Error::NotFound(_) | Error::Corrupt(_))) => {
+                    eprintln!("kermodes: the write stream of {who} cannot reconnect: {error}");
+                    return refuse(&stream, error);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "kermodes: {who}: cannot reconnect yet ({error}); trying again in \
+                         {backoff:?}"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                }
+            }
+        };
+        let mut stream = lock(&stream);
+        *lock(&acked) = opened.last_seq;
+        *lock(&epoch) = opened.epoch;
+        // Written before the break, their acknowledgements lost with it.
+        let mut found = 0;
+        while let Some((seq, _, _)) = stream.unacked.front()
+            && opened.last_seq.is_some_and(|last| *seq <= last)
+        {
+            let (_, _, answer) = stream.unacked.pop_front().expect("a front");
+            answer.send(Ok(true));
+            found += 1;
+        }
+        for (_, data, _) in &stream.unacked {
+            let _ = opened.sender.send(data.clone());
+        }
+        eprintln!(
+            "kermodes: the write stream of {who} reconnected: writes waited {:.1} s, {tries} \
+             attempt(s), {} write(s) resent, {found} found already written",
+            down.elapsed().as_secs_f64(),
+            stream.unacked.len()
+        );
+        // A writer dropped meanwhile closes its new stream at once: the server answers what was
+        // resent, then ends it.
+        if !stream.dropped {
+            stream.sender = Some(opened.sender);
+        }
+        drop(stream);
+        acks = opened.acks;
+    }
+}
+
+/// Fails the oldest unacknowledged write with `error`, every other one as following it, and
+/// every later write too.
+fn refuse(stream: &Mutex<Stream>, error: Error) {
+    let mut stream = lock(stream);
+    let why = error.to_string();
+    stream.sender = None;
+    stream.refused = Some(why.clone());
+    let mut unacked = stream.unacked.drain(..);
+    if let Some((_, _, answer)) = unacked.next() {
+        answer.send(Err(error));
+    }
+    for (_, _, answer) in unacked {
+        answer.send(Err(Error::Io(format!(
+            "not written: an earlier write was refused ({why})"
+        ))));
+    }
+}
+
+/// Runs the action `kind` with `body`: the server's answer.
+async fn call(
+    mut flight: FlightServiceClient<Channel>,
+    kind: &str,
+    body: Value,
+) -> Result<Value, Error> {
+    let action = Action {
+        r#type: kind.into(),
+        body: body.to_string().into(),
+    };
+    let mut results = flight
+        .do_action(action)
+        .await
+        .map_err(|s| error_from_status(&s))?
+        .into_inner();
+    let result = results
+        .message()
+        .await
+        .map_err(|s| error_from_status(&s))?
+        .ok_or_else(|| Error::Io(format!("no answer to `{kind}`")))?;
+    serde_json::from_slice(&result.body)
+        .map_err(|e| Error::Io(format!("unreadable answer to `{kind}`: {e}")))
+}
+
 /// Writes one source's rows of a served table (`Client::writer`), many in flight at once.
 pub struct RemoteWriter {
     /// Runs the write stream and its acknowledgements, outliving the `Client` it came from.
@@ -654,24 +846,14 @@ pub struct RemoteWriter {
     schema: SchemaRef,
     /// A keyed table's key columns; empty for an append table.
     key: Vec<String>,
-    sender: mpsc::UnboundedSender<FlightData>,
-    epoch: Option<u64>,
-    /// The highest seq sent; its lock keeps sends in order when shared between threads.
-    sent: Mutex<Option<u64>>,
+    stream: Arc<Mutex<Stream>>,
     /// The source's last seq the server acknowledged.
     acked: Arc<Mutex<Option<u64>>>,
-    waiting: Arc<Mutex<Waiting>>,
+    /// The lease epoch, new with each stream opened.
+    epoch: Arc<Mutex<Option<u64>>>,
     in_flight: Arc<InFlight>,
     /// What a write says if the stream closes before it is acknowledged.
     gone: Arc<str>,
-}
-
-/// A remote writer's writes sent and not yet acknowledged, oldest first, and why its stream
-/// closed, once it has.
-#[derive(Default)]
-struct Waiting {
-    answers: VecDeque<Answer>,
-    closed: Option<String>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -686,9 +868,10 @@ impl RemoteWriter {
         *lock(&self.acked)
     }
 
-    /// This writer's lease epoch (§7.4); `None` from a server older than leases (0.1.1).
+    /// This writer's lease epoch (§7.4), new each time its stream is opened again; `None` from
+    /// a server older than leases (0.1.1).
     pub fn epoch(&self) -> Option<u64> {
-        self.epoch
+        *lock(&self.epoch)
     }
 
     /// As `kermodes_weir::Writer::write`: returns once the server has the batch durably, or
@@ -724,8 +907,6 @@ impl RemoteWriter {
             Change::Delete => keys_only(&self.schema, &self.key, batch)?,
             _ => conform(&self.schema, batch)?,
         };
-        let mut sent = lock(&self.sent);
-        let seq = seq.unwrap_or_else(|| sent.map_or(1, |last| last + 1));
         // The batch message alone: the stream's schema went first, when it opened.
         let (dictionaries, encoded) = IpcDataGenerator::default()
             .encode(
@@ -738,13 +919,6 @@ impl RemoteWriter {
         // The column types tables store (kermodes_core::parse_type) have no dictionaries.
         debug_assert!(dictionaries.is_empty());
         let mut data = FlightData::from(encoded);
-        // A plain write's metadata is its sequence number alone, as servers before keyed tables
-        // read it.
-        let mut metadata = seq.to_le_bytes().to_vec();
-        if change != Change::Rows {
-            metadata.push(change.code());
-        }
-        data.app_metadata = metadata.into();
         let bytes = data.data_header.len() + data.data_body.len();
         if bytes > MAX_WRITE_BYTES {
             return Err(Error::TooLarge(format!(
@@ -755,28 +929,49 @@ impl RemoteWriter {
                 MAX_WRITE_BYTES >> 20
             )));
         }
+        // Waits while the budget is full: a stream long broken slows its producer this way.
         let (pending, answer) = self.in_flight.send(bytes, &self.gone);
-        {
-            // Waiting before it is sent: its acknowledgement may come back at once.
-            let mut waiting = lock(&self.waiting);
-            if let Some(closed) = &waiting.closed {
-                answer.send(Err(Error::Io(format!("the write stream closed: {closed}"))));
-                return Ok(pending);
-            }
-            waiting.answers.push_back(answer);
+        let mut stream = lock(&self.stream);
+        if let Some(why) = &stream.refused {
+            answer.send(Err(Error::Io(format!(
+                "{} cannot be written: {why}",
+                self.table
+            ))));
+            return Ok(pending);
         }
-        if self.sender.send(data).is_err()
-            && let Some(answer) = lock(&self.waiting).answers.pop_back()
-        {
-            answer.send(Err(Error::Io("the write stream closed".into())));
+        let seq = seq.unwrap_or_else(|| stream.sent.map_or(1, |last| last + 1));
+        // A plain write's metadata is its sequence number alone, as servers before keyed tables
+        // read it.
+        let mut metadata = seq.to_le_bytes().to_vec();
+        if change != Change::Rows {
+            metadata.push(change.code());
         }
-        *sent = Some(sent.map_or(seq, |last| last.max(seq)));
+        data.app_metadata = metadata.into();
+        // While the stream is being opened again, the write waits with those unacknowledged,
+        // to be sent with them.
+        if let Some(sender) = &stream.sender
+            && sender.send(data.clone()).is_err()
+        {
+            stream.sender = None;
+        }
+        stream.unacked.push_back((seq, data, answer));
+        stream.sent = Some(stream.sent.map_or(seq, |last| last.max(seq)));
         Ok(pending)
     }
 
     /// As `kermodes_weir::Writer::flush`.
     pub fn flush(&self) -> Result<(), Error> {
         self.in_flight.flush()
+    }
+}
+
+impl Drop for RemoteWriter {
+    /// Closes the stream: the server answers the writes on it, then ends it and lets the
+    /// source's lease go.
+    fn drop(&mut self) {
+        let mut stream = lock(&self.stream);
+        stream.dropped = true;
+        stream.sender = None;
     }
 }
 

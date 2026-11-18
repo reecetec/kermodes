@@ -296,6 +296,48 @@ fn writes_in_flight_are_answered_in_order_and_a_refused_one_fails_those_after_it
     assert_eq!(*rows.lock().unwrap(), (0..501).collect::<Vec<_>>());
 }
 
+/// A remote writer whose server goes away mid-stream reconnects by itself: every write sent is
+/// written once, in order, those the old stream had not acknowledged and those sent while the
+/// server was away included, each answered as written.
+#[test]
+fn a_remote_writer_rides_out_a_server_restart() {
+    let dir = TempDir::new();
+    let store = Arc::new(Store::open(&dir.0).unwrap());
+    let mut server = serve(store.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = server.addr();
+    let client = Client::connect(&format!("grpc://{addr}")).unwrap();
+    client.create_table(&ticks(), &schema()).unwrap();
+    let writer = client
+        .writer(&ticks(), &SourceId::parse("feed").unwrap(), false)
+        .unwrap();
+    let send = |n: i64| writer.send(Change::Rows, &batch(n..n + 1), None).unwrap();
+
+    // Stopped with writes in flight, some acknowledged and some not.
+    let mut sent: Vec<_> = (0..2_000).map(send).collect();
+    server.stop();
+    sent.extend((2_000..2_500).map(send));
+    let _server = serve(store.clone(), addr).unwrap();
+    sent.extend((2_500..3_000).map(send));
+    writer.flush().unwrap();
+    assert!(sent.into_iter().all(|pending| pending.wait().unwrap()));
+    assert_eq!(writer.last_seq(), Some(3_000));
+
+    let rows = Arc::new(Mutex::new(Vec::new()));
+    let seen = rows.clone();
+    store
+        .subscribe(
+            &ticks(),
+            Box::new(move |batch, _, _| {
+                let n = batch.column(0).as_primitive::<Int64Type>();
+                seen.lock().unwrap().extend(n.values().iter().copied());
+                true
+            }),
+            Box::new(|reason| panic!("{reason}")),
+        )
+        .unwrap();
+    assert_eq!(*rows.lock().unwrap(), (0..3_000).collect::<Vec<_>>());
+}
+
 /// A reader whose history is far larger than the server's queue (about 150 MiB, against 16 MiB)
 /// gets all of it, in order and once, while a writer goes on: the server's replay waits for the
 /// reader instead of holding the day.

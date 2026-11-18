@@ -10,3 +10,5 @@ arrow.workspace = true
 kermodes-core.workspace = true
 kermodes-flight.workspace = true
 kermodes-weir.workspace = true
+# The process's CPU time (getrusage), for CPU per row: std has no way to read it.
+libc = "0.2"

@@ -60,6 +60,24 @@ def test_writes_sent_without_waiting_land_in_order_locally_and_remotely(tmp_path
     assert pa.table(live)["n"].to_pylist() == list(range(600))
 
 
+def test_a_remote_writer_rides_out_a_server_restart(tmp_path):
+    owner = km.local(tmp_path / "store", manual=True)
+    owner.create_table("md.ticks", COLUMNS)
+    server = owner.serve_store()
+    port = int(server.url.rsplit(":", 1)[1])
+    w = km.connect(server.url, manual=True).writer("md.ticks", source="feed")
+    sent = [w.write(rows([v]), wait=False) for v in range(1_000)]
+    server.stop()
+    # Sent while the server is away: they wait, then go with those not acknowledged.
+    sent += [w.write(rows([v]), wait=False) for v in range(1_000, 1_200)]
+    _server = owner.serve_store(port=port)
+    w.flush()
+    assert all(pending.wait() for pending in sent)
+    live = owner.live_table("md.ticks")
+    owner.step()
+    assert pa.table(live)["n"].to_pylist() == list(range(1_200))
+
+
 def test_a_store_has_one_owner_and_clear_errors(tmp_path):
     s = km.local(tmp_path, manual=True)
     with pytest.raises(km.KermodesError, match="open in another process"):
