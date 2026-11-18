@@ -22,6 +22,7 @@ use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tonic::transport::Channel;
+use tonic::{Code, Streaming};
 
 use crate::{
     CAUGHT_UP, MARKS_CAUGHT_UP, MAX_WRITE_BYTES, columns_json, commit_json, date_from_json,

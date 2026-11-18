@@ -1519,6 +1519,7 @@ dependencies = [
  "kermodes-core",
  "kermodes-flight",
  "kermodes-weir",
+ "libc",
 ]
 
 [[package]]
