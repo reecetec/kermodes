@@ -65,7 +65,11 @@ pub fn serve(store: Arc<Store>, addr: SocketAddr) -> std::io::Result<Server> {
             runtime.block_on(async move {
                 let listener =
                     tokio::net::TcpListener::from_std(listener).expect("a bound listener converts");
-                let incoming = tonic::transport::server::TcpIncoming::from(listener);
+                // Without TCP_NODELAY (unset by `TcpIncoming::from`, unlike `Server::serve`), a
+                // small response waits for the client to acknowledge the last one: up to the
+                // 40 ms Linux delays an acknowledgement, a write's or delivery's p99.9.
+                let incoming =
+                    tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
                 // HTTP/2 pings find a vanished client (a crashed or partitioned node) within
                 // about half a minute, and closing its connection releases its writer's lease.
                 let serving = tonic::transport::Server::builder()
