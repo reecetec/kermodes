@@ -1,0 +1,27 @@
+[package]
+name = "kermodes-raft"
+description = "raft-rs, vendored: see README.md"
+version.workspace = true
+# Upstream's edition: vendored code stays as upstream wrote it, so its fixes port cleanly.
+edition = "2021"
+rust-version.workspace = true
+publish.workspace = true
+license = "Apache-2.0"
+
+[lib]
+# Upstream's name, which its code and tests use.
+name = "raft"
+
+[dependencies]
+bytes = "1.11"
+raft-proto = { package = "kermodes-raft-proto", path = "proto" }
+rand = "0.9"
+rustc-hash = "2"
+# Core only: upstream logs through it; `nested-values` would bring erased-serde.
+slog = { version = "2.7", default-features = false, features = ["std"] }
+thiserror = "2"
+
+[dev-dependencies]
+anyhow = "1"
+itertools = "0.15"
+datadriven = { package = "kermodes-raft-datadriven", path = "datadriven" }

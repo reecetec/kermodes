@@ -1,0 +1,16 @@
+[package]
+name = "kermodes-raft-datadriven"
+description = "raft-rs's data-driven test runner: see ../README.md"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+publish.workspace = true
+license = "Apache-2.0"
+
+[lib]
+name = "datadriven"
+
+[dependencies]
+anyhow = "1"
+regex = "1"
+slog = { version = "2.7", default-features = false, features = ["std"] }

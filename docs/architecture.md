@@ -164,6 +164,14 @@ the web app's JSON messages. The WebSocket connector is a tokio-tungstenite clie
 crate axum's WebSocket is, and decodes JSON records with `arrow-json` straight into Arrow
 columns.
 
+raft-rs (TiKV's port of etcd's raft) is vendored as `crates/kermodes-raft` for weir's replication
+(§7.6): a consensus core proven at scale is less risk than one of our own, and it is a pure state
+machine, which the simulator drives. Vendored rather than a git dependency because its messages
+come from protobuf (rust-protobuf 2, flagged by RUSTSEC-2024-0437, or prost 0.11 with `protoc` at
+build time); here they are written out with their wire encoding, and the rest is upstream's as
+it is (its README lists every difference). It brings `slog` (core only, no dependencies) for
+upstream's log statements, `rustc-hash`, `rand`, and `thiserror`.
+
 No embedded query engines (DataFusion, DuckDB, Polars). A new data-path dependency needs a written
 reason in this section.
 
@@ -696,9 +704,10 @@ writers ─► leader ── append + fsync ────────────
   acknowledged write must be there once, in order, keyed state equal to a model's, and a write
   whose answer the crash took must be there wholly or not at all. The same seed gives the same
   disk, byte for byte.
-- **Raft itself.** Either openraft, which takes our log and state storage, or a Raft core of our
-  own, as Redpanda and TigerBeetle wrote; prototyped first on openraft under the simulator, and
-  kept only if it can be driven deterministically.
+- **Raft itself.** raft-rs, vendored (§4.1, `crates/kermodes-raft`): etcd's raft as TiKV runs
+  it, a pure state machine (ticks, messages, and a `Ready` of what to persist and send) with no
+  I/O, clock, or network of its own, so the simulator drives every replica. Its messages are
+  ours, protobuf-encoded by hand. Upstream's tests (200 integration cases) run with it.
 - **Order of work**, each step useful alone:
   1. One replica: the shard log, partition files derived from it, grouped commit, subscriptions
      resumed by LSN, and existing segments still read. Its latency, produce to subscriber, is

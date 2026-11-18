@@ -1632,6 +1632,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "kermodes-raft"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "itertools",
+ "kermodes-raft-datadriven",
+ "kermodes-raft-proto",
+ "rand 0.9.5",
+ "rustc-hash",
+ "slog",
+ "thiserror",
+]
+
+[[package]]
+name = "kermodes-raft-datadriven"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "regex",
+ "slog",
+]
+
+[[package]]
+name = "kermodes-raft-harness"
+version = "0.0.0"
+dependencies = [
+ "kermodes-raft",
+ "kermodes-raft-proto",
+ "rand 0.9.5",
+ "rustc-hash",
+ "slog",
+]
+
+[[package]]
+name = "kermodes-raft-proto"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+]
+
+[[package]]
 name = "kermodes-weir"
 version = "0.0.0"
 dependencies = [
@@ -3067,6 +3109,17 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "slog"
+version = "2.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b3b8565691b22d2bdfc066426ed48f837fc0c5f2c8cad8d9718f7f99d6995c1"
+dependencies = [
+ "anyhow",
+ "rustversion",
+ "serde_core",
+]
 
 [[package]]
 name = "smallvec"

@@ -1,0 +1,20 @@
+[package]
+name = "kermodes-raft-harness"
+description = "raft-rs's test harness and integration tests: see ../README.md"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+publish.workspace = true
+license = "Apache-2.0"
+
+[lib]
+name = "harness"
+
+[dependencies]
+raft = { package = "kermodes-raft", path = ".." }
+raft-proto = { package = "kermodes-raft-proto", path = "../proto" }
+rand = "0.9"
+slog = { version = "2.7", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+rustc-hash = "2"

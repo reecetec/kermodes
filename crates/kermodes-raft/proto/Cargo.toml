@@ -1,0 +1,14 @@
+[package]
+name = "kermodes-raft-proto"
+description = "raft-rs's messages, written out with their protobuf wire encoding: see ../README.md"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+publish.workspace = true
+license = "Apache-2.0"
+
+[lib]
+name = "raft_proto"
+
+[dependencies]
+bytes = "1.11"
