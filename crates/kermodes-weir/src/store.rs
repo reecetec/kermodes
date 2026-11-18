@@ -1502,6 +1502,9 @@ impl Writer {
 
 impl Drop for Writer {
     fn drop(&mut self) {
+        // Every write sent is logged or refused before the source is let go: a writer taking it
+        // over numbers its writes after what the partitions hold, which must include these.
+        let _ = self.in_flight.flush();
         lock(&self.log.state).writing.remove(&self.source);
         self.log.released.notify_all();
     }

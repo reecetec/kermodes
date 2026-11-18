@@ -476,3 +476,28 @@ fn writes_merged_in_flight_leave_what_writing_them_one_by_one_would() {
         check(&store, "after reopening");
     }
 }
+
+/// A writer let go with writes still in flight hands its source over only once they are
+/// logged: the next writer numbers its writes after them, and none of its writes is taken for a
+/// resend of theirs.
+#[test]
+fn a_writer_let_go_with_writes_in_flight_hands_over_after_them() {
+    let dir = TempDir::new();
+    let store = Arc::new(Store::open(&dir.0).unwrap());
+    store.create_table(&ticks(), &schema()).unwrap();
+    let feed = SourceId::parse("feed").unwrap();
+    let mut want = Vec::new();
+    for round in 0..5_i64 {
+        let writer = store.writer(&ticks(), &feed, true).unwrap();
+        for i in round * 2_000..(round + 1) * 2_000 {
+            // Not waited for: dropping the writer is what has to wait.
+            drop(
+                writer
+                    .send(Change::Rows, &rows(vec![0], vec![i]), None)
+                    .unwrap(),
+            );
+            want.push(i);
+        }
+    }
+    assert_eq!(values(&read(&store, &ticks())), want);
+}
