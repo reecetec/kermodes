@@ -3,20 +3,27 @@
 //! staying), and power losses that keep a random part of what was not fsynced and tear the last
 //! write. Whatever the seed, after every reopen the store holds exactly the writes it
 //! acknowledged, each once and in order; and the same seed does exactly the same, so any
-//! failure replays. Each test runs seeds 1 to 64; `KERMODES_SIM_SEEDS=N` runs 1 to N, for a
-//! longer search.
+//! failure replays.
+//!
+//! Then a shard of three replicas, each on its own simulated disk, their Raft messages on a
+//! simulated network that drops, duplicates, and reorders them and cuts a replica off, with
+//! every replica's process killed or its power lost at any point, the leader's included.
+//! Whenever they come to agree, every replica holds exactly the writes acknowledged, each once
+//! and in order.
+//!
+//! Each test runs seeds 1 to 64; `KERMODES_SIM_SEEDS=N` runs 1 to N, for a longer search.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Int64Type, Schema};
 use kermodes_weir::{
-    Change, Clock, Date, HistoryCommit, HistoryDate, HistoryFile, Pending, SourceId, Store,
-    TableName, Writer, sim,
+    Change, Clock, Date, HistoryCommit, HistoryDate, HistoryFile, Pending, Replica, SourceId,
+    Store, TableName, Writer, sim,
 };
 
 const SOURCES: usize = 3;
@@ -362,52 +369,7 @@ fn simulate(seed: u64, actions: usize, failing_syncs: u64) -> (u64, Vec<u64>) {
         // Weir stopped (a flush failed): it is restarted, as Kubernetes would.
         let mut stopped = false;
         match rng.below(100) {
-            // Send a write.
-            0..=59 => {
-                let who = rng.below(SOURCES as u64) as usize;
-                let table = usize::from(rng.below(2) == 1);
-                let last = model.sent[table][who];
-                // Now and then one already sent: a resend.
-                let resend = last > 0 && rng.below(8) == 0;
-                let seq = if resend {
-                    1 + rng.below(last)
-                } else {
-                    model.sent[table][who] += 1;
-                    model.sent[table][who]
-                };
-                let (change, batch, effect) = if table == 0 {
-                    let n = 1 + rng.below(3) as usize;
-                    let values: Vec<i64> = (value..value + n as i64).collect();
-                    value += n as i64;
-                    let batch = rows(vec![who as i64; n], values.clone());
-                    (Change::Rows, batch, Effect::Ticks(who, values))
-                } else {
-                    let key = |n: u64| who as i64 * 4 + (n % 4) as i64;
-                    let n = rng.below(4);
-                    value += 1;
-                    let (change, ks, vs) = match rng.below(10) {
-                        0 => (Change::Checkpoint, vec![key(n), key(n + 1)], vec![value; 2]),
-                        1..=3 => (Change::Delete, vec![key(n)], vec![0]),
-                        _ => (
-                            Change::Upsert,
-                            vec![key(n), key(n + 2)],
-                            vec![value, -value],
-                        ),
-                    };
-                    let effect =
-                        Effect::Quotes(change, ks.iter().copied().zip(vs.clone()).collect());
-                    (change, rows(ks, vs), effect)
-                };
-                // A new write unnumbered, as a producer sends one; a resend with its seq.
-                let pending = at.writers[who][table]
-                    .send(change, &batch, resend.then_some(seq))
-                    .unwrap();
-                sent.push(Sent {
-                    pending,
-                    by: (table, who, seq),
-                    effect: (!resend).then_some(effect),
-                });
-            }
+            0..=59 => send(&mut rng, &mut model, &mut value, &at.writers, &mut sent),
             // Commit what was sent.
             60..=79 => {
                 at.store.step();
@@ -517,6 +479,405 @@ fn simulate(seed: u64, actions: usize, failing_syncs: u64) -> (u64, Vec<u64>) {
     (disk.fingerprint(&root), trace)
 }
 
+/// Sends a write by a random writer: new, or now and then one already sent (a resend).
+fn send(
+    rng: &mut Rng,
+    model: &mut Model,
+    value: &mut i64,
+    writers: &[[Writer; 2]],
+    sent: &mut Vec<Sent>,
+) {
+    let who = rng.below(SOURCES as u64) as usize;
+    let table = usize::from(rng.below(2) == 1);
+    let last = model.sent[table][who];
+    let resend = last > 0 && rng.below(8) == 0;
+    let seq = if resend {
+        1 + rng.below(last)
+    } else {
+        model.sent[table][who] += 1;
+        model.sent[table][who]
+    };
+    let (change, batch, effect) = if table == 0 {
+        let n = 1 + rng.below(3) as usize;
+        let values: Vec<i64> = (*value..*value + n as i64).collect();
+        *value += n as i64;
+        let batch = rows(vec![who as i64; n], values.clone());
+        (Change::Rows, batch, Effect::Ticks(who, values))
+    } else {
+        let key = |n: u64| who as i64 * 4 + (n % 4) as i64;
+        let n = rng.below(4);
+        *value += 1;
+        let (change, ks, vs) = match rng.below(10) {
+            0 => (
+                Change::Checkpoint,
+                vec![key(n), key(n + 1)],
+                vec![*value; 2],
+            ),
+            1..=3 => (Change::Delete, vec![key(n)], vec![0]),
+            _ => (
+                Change::Upsert,
+                vec![key(n), key(n + 2)],
+                vec![*value, -*value],
+            ),
+        };
+        let effect = Effect::Quotes(change, ks.iter().copied().zip(vs.clone()).collect());
+        (change, rows(ks, vs), effect)
+    };
+    // A new write unnumbered, as a producer sends one; a resend with its seq.
+    let pending = writers[who][table]
+        .send(change, &batch, resend.then_some(seq))
+        .unwrap();
+    sent.push(Sent {
+        pending,
+        by: (table, who, seq),
+        effect: (!resend).then_some(effect),
+    });
+}
+
+const REPLICAS: usize = 3;
+
+/// A shard's replicas, each on its own simulated disk, and the network between them.
+struct Shard {
+    dir: PathBuf,
+    seed: u64,
+    clock: Clock,
+    disks: Vec<sim::Disk>,
+    /// Replica `i + 1`'s store at `i`; `None` while its process is down.
+    stores: Vec<Option<Store>>,
+    /// Messages sent and not yet delivered: from, to, and the message.
+    wire: Vec<(u64, u64, Vec<u8>)>,
+    /// The replica cut off from the others, if one is.
+    cut: Option<u64>,
+    /// The writers, one per source and table, on the replica (its index) that led when they
+    /// opened.
+    writers: Option<(usize, Vec<[Writer; 2]>)>,
+}
+
+impl Shard {
+    /// Starts every replica, then creates the tables: a follower finds them when the first
+    /// writes reach it.
+    fn new(dir: &Path, seed: u64, clock: Clock) -> Self {
+        let disks = (0..REPLICAS)
+            .map(|i| {
+                let root = dir.join(format!("r{}", i + 1));
+                fs::create_dir_all(&root).unwrap();
+                sim::Disk::new(seed * 8 + i as u64, 0, &root)
+            })
+            .collect();
+        let mut shard = Self {
+            dir: dir.to_owned(),
+            seed,
+            clock,
+            disks,
+            stores: (0..REPLICAS).map(|_| None).collect(),
+            wire: Vec::new(),
+            cut: None,
+            writers: None,
+        };
+        for i in 0..REPLICAS {
+            shard.start(i);
+        }
+        let store = shard.stores[0].as_ref().unwrap();
+        store.create_table(&ticks(), &schema()).unwrap();
+        store
+            .create_keyed_table(&quotes(), &schema(), &["k".to_owned()])
+            .unwrap();
+        shard
+    }
+
+    /// Starts replica `i`'s process, which recovers from what its disk holds. Should it crash
+    /// while it recovers (a crash still armed), the next recovers again from what that left.
+    fn start(&mut self, i: usize) {
+        let disk = &self.disks[i];
+        let store = loop {
+            let crashes = disk.crashes();
+            let replica = Replica {
+                id: i as u64 + 1,
+                voters: (1..=REPLICAS as u64).collect(),
+                seed: Some(self.seed * 8 + i as u64),
+            };
+            let root = self.dir.join(format!("r{}", i + 1));
+            let catalog = self.dir.join("catalog.sqlite");
+            match Store::open_replica(&root, disk.handle(), self.clock.clone(), &catalog, replica) {
+                Ok(store) => break store,
+                Err(_) if disk.crashes() > crashes => continue,
+                Err(e) => panic!("seed {}: replica {}: reopening: {e}", self.seed, i + 1),
+            }
+        };
+        disk.disarm();
+        self.stores[i] = Some(store);
+    }
+
+    /// Replica `i`'s process is gone: its store first, whose closing answers every write it
+    /// had, then the writers on it, which wait for those answers.
+    fn stop(&mut self, i: usize) {
+        drop(self.stores[i].take());
+        if self.writers.as_ref().is_some_and(|(at, _)| *at == i) {
+            self.writers = None;
+        }
+    }
+
+    /// Puts what replica `i` has to send on the wire.
+    fn collect(&mut self, i: usize) {
+        if let Some(store) = &self.stores[i] {
+            for (to, message) in store.take_messages() {
+                self.wire.push((i as u64 + 1, to, message));
+            }
+        }
+    }
+
+    /// Delivers a message, unless its sender or receiver is cut off or its receiver is down.
+    fn deliver(&mut self, (from, to, message): (u64, u64, Vec<u8>)) {
+        if self.cut.is_some_and(|cut| cut == from || cut == to) {
+            return;
+        }
+        let i = to as usize - 1;
+        if let Some(store) = &self.stores[i] {
+            store.receive(&message).unwrap();
+            self.collect(i);
+        }
+    }
+
+    /// One tick of every running replica's Raft clock.
+    fn tick(&mut self) {
+        for i in 0..REPLICAS {
+            if let Some(store) = &self.stores[i] {
+                store.tick();
+            }
+            self.collect(i);
+        }
+    }
+
+    /// Every replica whose process died since `before` (each disk's crashes) is down.
+    fn reap(&mut self, before: &[u64]) {
+        for (i, &crashes) in before.iter().enumerate() {
+            if self.disks[i].crashes() > crashes {
+                self.stop(i);
+            }
+            self.disks[i].disarm();
+        }
+    }
+
+    /// Every replica up and connected until they agree: one leader, every replica applied as
+    /// far as it, for rounds on end, and every write sent answered. The leader.
+    fn agree(&mut self, sent: &[Sent]) -> usize {
+        for i in 0..REPLICAS {
+            if self.stores[i].is_none() {
+                self.start(i);
+            }
+        }
+        self.cut = None;
+        let mut last = None;
+        let mut same = 0;
+        for _ in 0..2_000 {
+            for i in 0..REPLICAS {
+                self.stores[i].as_ref().unwrap().step();
+                self.collect(i);
+            }
+            self.tick();
+            while !self.wire.is_empty() {
+                let message = self.wire.remove(0);
+                self.deliver(message);
+            }
+            let stores: Vec<&Store> = self.stores.iter().map(|s| s.as_ref().unwrap()).collect();
+            let leaders: Vec<usize> = (0..REPLICAS).filter(|&i| stores[i].is_leader()).collect();
+            let applied: Vec<u64> = stores.iter().map(|store| store.applied()).collect();
+            let now = (leaders.clone(), applied.clone());
+            let agreed = leaders.len() == 1
+                && applied.iter().all(|&a| a == applied[0])
+                && sent.iter().all(|s| s.pending.is_answered());
+            same = if agreed && last.as_ref() == Some(&now) {
+                same + 1
+            } else {
+                0
+            };
+            if same == 2 {
+                return leaders[0];
+            }
+            last = Some(now);
+        }
+        panic!("seed {}: the replicas never came to agree", self.seed);
+    }
+
+    /// Once the replicas agree (`agree`): of the writes whose fate was open, those that
+    /// reached the log are written, which their writers' last seq on the leader says (each
+    /// source's writes reach the log in the order sent, so a prefix of them did). The writers
+    /// open again on the leader, and every replica must hold exactly what was acknowledged
+    /// and those.
+    fn resolve(
+        &mut self,
+        mut maybes: Vec<Maybe>,
+        sent: &mut Vec<Sent>,
+        model: &mut Model,
+        trace: &mut Vec<u64>,
+    ) {
+        let leader = self.agree(sent);
+        maybes.extend(answers(sent, model, trace, self.seed));
+        self.writers = None;
+        let store = self.stores[leader].as_ref().unwrap();
+        let writers: Vec<[Writer; 2]> = (0..SOURCES)
+            .map(|who| {
+                let source = SourceId::parse(&format!("s{who}")).unwrap();
+                [
+                    store.writer(&ticks(), &source, false).unwrap(),
+                    store.writer(&quotes(), &source, false).unwrap(),
+                ]
+            })
+            .collect();
+        for ((table, who, seq), effect) in maybes {
+            let held = writers[who][table].last_seq().unwrap_or(0);
+            if let Some(effect) = effect.filter(|_| seq <= held) {
+                model.acked[table][who] = model.acked[table][who].max(seq);
+                model.apply(effect);
+            }
+        }
+        model.sent = model.acked;
+        self.writers = Some((leader, writers));
+        for (i, store) in self.stores.iter().enumerate() {
+            let when = format!("replica {} once agreed", i + 1);
+            check(store.as_ref().unwrap(), model, self.seed, &when);
+        }
+    }
+}
+
+/// Takes the answers in so far: written as the model says, or a fate left open (a replica
+/// refused it, lost the lead, or crashed), to resolve once the replicas agree.
+fn answers(sent: &mut Vec<Sent>, model: &mut Model, trace: &mut Vec<u64>, seed: u64) -> Vec<Maybe> {
+    let mut maybes = Vec::new();
+    let mut waiting = Vec::new();
+    for one in sent.drain(..) {
+        if !one.pending.is_answered() {
+            waiting.push(one);
+            continue;
+        }
+        let Sent {
+            pending,
+            by: (table, who, seq),
+            effect,
+        } = one;
+        let Ok(written) = pending.wait() else {
+            maybes.push(((table, who, seq), effect));
+            continue;
+        };
+        assert_eq!(
+            written,
+            effect.is_some(),
+            "seed {seed}: the answer to table {table}, source {who}, seq {seq} (acked up to {})",
+            model.acked[table][who]
+        );
+        trace.push(u64::from(written));
+        if let Some(effect) = effect {
+            model.acked[table][who] = model.acked[table][who].max(seq);
+            model.apply(effect);
+        }
+    }
+    *sent = waiting;
+    maybes
+}
+
+/// Runs a shard of three for `seed`, `actions` actions; what it left: each disk's fingerprint,
+/// and the answers.
+fn simulate_shard(seed: u64, actions: usize) -> (Vec<u64>, Vec<u64>) {
+    let dir = TempDir::new();
+    let now = Arc::new(AtomicI64::new(1_767_225_540_000_000_000));
+    let clock: Clock = {
+        let now = now.clone();
+        Arc::new(move || now.load(Ordering::Relaxed))
+    };
+    let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+    let mut model = Model::default();
+    let mut trace = Vec::new();
+    let mut sent: Vec<Sent> = Vec::new();
+    let mut value = 0_i64;
+    let mut shard = Shard::new(&dir.0, seed, clock);
+    shard.resolve(Vec::new(), &mut sent, &mut model, &mut trace);
+    for _ in 0..actions {
+        now.fetch_add(1_000_000 * (1 + rng.below(500)) as i64, Ordering::Relaxed);
+        let before: Vec<u64> = shard.disks.iter().map(sim::Disk::crashes).collect();
+        let victim = rng.below(REPLICAS as u64) as usize;
+        // Now and then a replica's process dies, or its power goes, in the middle of what it
+        // does next.
+        match rng.below(64) {
+            0 => shard.disks[victim].power_loss_after(rng.below(24)),
+            1 => shard.disks[victim].kill_after(rng.below(24)),
+            _ => {}
+        }
+        match rng.below(100) {
+            0..=34 => {
+                let (_, writers) = shard.writers.as_ref().expect("resolved");
+                send(&mut rng, &mut model, &mut value, writers, &mut sent);
+            }
+            // The writers' replica takes what they sent: proposes it, if it leads.
+            35..=42 => {
+                let (at, _) = shard.writers.as_ref().expect("resolved");
+                let at = *at;
+                shard.stores[at].as_ref().unwrap().step();
+                shard.collect(at);
+            }
+            // Messages arrive, in any order; some are lost, some come twice.
+            43..=74 => {
+                for _ in 0..1 + rng.below(6) {
+                    if shard.wire.is_empty() {
+                        break;
+                    }
+                    let at = rng.below(shard.wire.len() as u64) as usize;
+                    match rng.below(20) {
+                        0 => drop(shard.wire.swap_remove(at)),
+                        1 => shard.deliver(shard.wire[at].clone()),
+                        _ => {
+                            let message = shard.wire.swap_remove(at);
+                            shard.deliver(message);
+                        }
+                    }
+                }
+            }
+            75..=86 => shard.tick(),
+            // A replica is cut off from the others, or the network heals.
+            87..=88 => shard.cut = (victim > 0).then_some(victim as u64),
+            89..=91 => {
+                if let Some(store) = &shard.stores[victim] {
+                    let flushed = store.flush_now();
+                    let crashed = shard.disks[victim].crashes() > before[victim];
+                    assert!(
+                        flushed.is_ok() || crashed,
+                        "seed {seed}: flushing: {flushed:?}"
+                    );
+                }
+            }
+            // A clean restart.
+            92..=93 => {
+                if shard.stores[victim].is_some() {
+                    shard.stop(victim);
+                    shard.start(victim);
+                }
+            }
+            // The process dies between two operations (`kill -9`).
+            94..=95 => shard.disks[victim].kill(),
+            // The power goes between two operations.
+            96 => shard.disks[victim].power_loss(),
+            // The replicas that are down start again.
+            _ => {
+                for i in 0..REPLICAS {
+                    if shard.stores[i].is_none() {
+                        shard.start(i);
+                    }
+                }
+            }
+        }
+        shard.reap(&before);
+        let maybes = answers(&mut sent, &mut model, &mut trace, seed);
+        if !maybes.is_empty() || shard.writers.is_none() {
+            shard.resolve(maybes, &mut sent, &mut model, &mut trace);
+        }
+    }
+    shard.resolve(Vec::new(), &mut sent, &mut model, &mut trace);
+    let fingerprints = (0..REPLICAS)
+        .map(|i| shard.disks[i].fingerprint(&dir.0.join(format!("r{}", i + 1))))
+        .collect();
+    drop(shard);
+    (fingerprints, trace)
+}
+
 /// The seeds each test runs (module docs).
 fn seeds() -> std::ops::RangeInclusive<u64> {
     let last = std::env::var("KERMODES_SIM_SEEDS")
@@ -548,6 +909,24 @@ fn the_same_seed_does_the_same() {
         assert_eq!(
             simulate(seed, 300, 30),
             simulate(seed, 300, 30),
+            "seed {seed}"
+        );
+    }
+}
+
+#[test]
+fn a_shard_of_three_loses_no_acknowledged_write_to_crashes_or_the_network() {
+    for seed in seeds() {
+        simulate_shard(seed, 600);
+    }
+}
+
+#[test]
+fn the_same_seed_does_the_same_to_a_shard() {
+    for seed in [5, 23] {
+        assert_eq!(
+            simulate_shard(seed, 300),
+            simulate_shard(seed, 300),
             "seed {seed}"
         );
     }

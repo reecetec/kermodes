@@ -12,6 +12,7 @@ mod keyed;
 mod names;
 mod partition;
 mod pending;
+mod replica;
 mod shape;
 pub mod sim;
 mod store;
@@ -24,6 +25,7 @@ pub use catalog::{Garbage, HistoryCommit, HistoryDate, HistoryFile, TableEntry};
 pub use names::{Date, SourceId, TableName};
 pub use partition::Stamp;
 pub use pending::{Answer, IN_FLIGHT_BYTES, InFlight, Pending};
+pub use replica::Replica;
 pub use shape::{ColumnId, Shape, column, spec, widens};
 pub use store::{
     BRANCH, Clock, Failed, Pace, Store, Subscriber, Writer, conform, keys_only, system_clock,

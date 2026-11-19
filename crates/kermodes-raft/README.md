@@ -44,6 +44,8 @@ build files.
 - `tracker::Configuration::to_conf_state` and the majority configuration's `Display` sort their
   IDs, as etcd's do: upstream's order was fxhash's, which a different hasher changes.
 - `quorum/majority.rs` builds its small stack array safely instead of with `MaybeUninit`.
+- `Config::random_seed` seeds the randomized election timeouts (`None`: from the operating
+  system), where upstream draws them from the thread's RNG: a simulation must run the same twice.
 - A few lints of a newer clippy are fixed in place; the harness tests allow the ones that come
   from `Vec` fields where upstream had rust-protobuf's containers.
 

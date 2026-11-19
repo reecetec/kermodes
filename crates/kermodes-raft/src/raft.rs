@@ -23,7 +23,8 @@ use crate::eraftpb::{
 };
 use raft_proto::protocompat::*;
 use raft_proto::ConfChangeI;
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use slog::Logger;
 
 use slog::{debug, error, info, o, trace, warn};
@@ -240,6 +241,8 @@ pub struct RaftCore<T: Storage> {
     randomized_election_timeout: usize,
     min_election_timeout: usize,
     max_election_timeout: usize,
+    /// Draws the randomized election timeouts (`Config::random_seed`).
+    rng: StdRng,
 
     /// The logger for the raft structure.
     pub(crate) logger: slog::Logger,
@@ -350,6 +353,10 @@ impl<T: Storage> Raft<T> {
                 randomized_election_timeout: Default::default(),
                 min_election_timeout: c.min_election_tick(),
                 max_election_timeout: c.max_election_tick(),
+                rng: match c.random_seed {
+                    Some(seed) => StdRng::seed_from_u64(seed),
+                    None => StdRng::from_os_rng(),
+                },
                 skip_bcast_commit: c.skip_bcast_commit,
                 batch_append: c.batch_append,
                 logger,
@@ -2845,8 +2852,8 @@ impl<T: Storage> Raft<T> {
     /// Regenerates and stores the election timeout.
     pub fn reset_randomized_election_timeout(&mut self) {
         let prev_timeout = self.randomized_election_timeout;
-        let timeout =
-            rand::rng().random_range(self.min_election_timeout..self.max_election_timeout);
+        let (min, max) = (self.min_election_timeout, self.max_election_timeout);
+        let timeout = self.rng.random_range(min..max);
         debug!(
             self.logger,
             "reset election timeout {prev_timeout} -> {timeout} at {election_elapsed}",

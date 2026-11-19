@@ -52,6 +52,11 @@ impl Pending {
                 .expect("kermodes writer poisoned by an earlier panic");
         }
     }
+
+    /// Whether the write has its answer: `wait` returns at once.
+    pub fn is_answered(&self) -> bool {
+        lock(&self.0.outcome).is_some()
+    }
 }
 
 /// A writer's writes in flight: the bytes not yet answered, and the first failure since the

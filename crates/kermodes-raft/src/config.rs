@@ -105,6 +105,10 @@ pub struct Config {
 
     /// If enable, followers will not forward proposal to leader.
     pub disable_proposal_forwarding: bool,
+
+    /// Seeds the randomized election timeouts, so a simulation runs the same twice; `None`
+    /// draws a seed from the operating system. (Not upstream's: it uses the thread's RNG.)
+    pub random_seed: Option<u64>,
 }
 
 impl Default for Config {
@@ -129,6 +133,7 @@ impl Default for Config {
             max_committed_size_per_ready: NO_LIMIT,
             max_apply_unpersisted_log_limit: 0,
             disable_proposal_forwarding: false,
+            random_seed: None,
         }
     }
 }

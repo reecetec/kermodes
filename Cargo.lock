@@ -1678,8 +1678,10 @@ name = "kermodes-weir"
 version = "0.0.0"
 dependencies = [
  "arrow",
+ "bytes",
  "crc32fast",
  "kermodes-core",
+ "kermodes-raft",
  "nix",
  "postgres",
  "rusqlite",

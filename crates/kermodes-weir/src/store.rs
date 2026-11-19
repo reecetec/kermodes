@@ -9,13 +9,15 @@
 //! {root}/weir/{location}/{date}/@checkpoint/seg-N.{arrows,idx}    a keyed table's day opening
 //! ```
 //!
-//! Writes go to one committer thread, which appends every write waiting to the log under one
-//! fsync, then applies them in log order: to partition files, keyed checkpoints, and
-//! subscribers, then acknowledges each. A flusher thread fsyncs the partition files every
-//! second, records how far they hold the log, and has the log below that point deleted. Opening
-//! the store replays the log from there.
+//! Writes go to one committer thread, which proposes every write waiting to Raft as one group
+//! and persists Raft's entries in the log under one fsync; once a quorum of the shard's replicas
+//! holds them (on its own, a shard of one), it applies them in log order: to partition files,
+//! keyed checkpoints, and subscribers, then acknowledges each. Every replica applies the same
+//! entries in the same order. A flusher thread fsyncs the partition files every second, records
+//! how far they hold the log, and has the log below that point deleted. Opening the store
+//! replays the log from there.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -28,14 +30,19 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arrow::array::new_null_array;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use bytes::Bytes;
 use kermodes_core::type_name;
+use raft::eraftpb::{Entry, EntryType, Message};
+use raft::protocompat::PbMessage;
+use raft::{RawNode, StateRole};
 use serde_json::json;
 
 use crate::catalog::{Catalog, Garbage, HistoryCommit, HistoryDate, HistoryFile, TableEntry};
 use crate::disk::{self, DiskRef};
 use crate::keyed::Fold;
-use crate::partition::{Partition, Stamp, ToSync, Written, in_order};
+use crate::partition::{Partition, Stamp, ToSync, Written, in_order, schema_header};
 use crate::pending::{Answer, InFlight, Pending};
+use crate::replica::{LogStore, Replica};
 use crate::shape::Shape;
 use crate::wal::{self, Append, Logged, Wal};
 use crate::{Change, Date, Error, SourceId, TableName};
@@ -123,15 +130,13 @@ pub struct Store {
     root: PathBuf,
     /// Held for the store's life: the OS releases the lock when the process ends, however.
     _lock: File,
-    catalog: Mutex<Catalog>,
+    catalog: Arc<Mutex<Catalog>>,
     /// The catalog branch whose tables this store holds (§10.1).
     branch: String,
     disk: DiskRef,
     logs: Arc<Mutex<HashMap<i64, Arc<Log>>>>,
-    /// To the committer, which logs and applies every write.
+    /// To the committer, which proposes, logs, and applies every write.
     requests: Sender<Request>,
-    /// The last LSN applied to the partition files (not yet necessarily flushed).
-    applied: Arc<AtomicU64>,
     flusher: Arc<Flusher>,
     clock: Clock,
     driver: Driver,
@@ -301,6 +306,7 @@ impl Store {
             BRANCH,
             disk::real(&root.join(FSYNC_FAILED)),
             system_clock(),
+            Replica::alone(),
             false,
         )
     }
@@ -318,6 +324,7 @@ impl Store {
             branch,
             disk::real(&root.join(FSYNC_FAILED)),
             system_clock(),
+            Replica::alone(),
             false,
         )
     }
@@ -330,13 +337,40 @@ impl Store {
     pub fn open_stepped(root: &Path, disk: DiskRef, clock: Clock) -> Result<Self, Error> {
         let lock = lock_dir(root)?;
         let catalog = Catalog::sqlite(&root.join("catalog.sqlite"))?;
-        Self::new(root, lock, catalog, BRANCH, disk, clock, true)
+        Self::new(
+            root,
+            lock,
+            catalog,
+            BRANCH,
+            disk,
+            clock,
+            Replica::alone(),
+            true,
+        )
     }
 
-    /// Recovers every table's partitions as far as their files hold the log, replays the log
-    /// from there, and starts the committer and the flusher, or (`stepped`) leaves them to the
-    /// caller. Not on a boot an fsync failed on (`Disk::untrusted`): until the machine restarts,
-    /// what it reads may not be what the disk holds, and a power loss would take it away.
+    /// As `open_stepped`, as `replica` of its shard, with the catalog every replica shares in
+    /// SQLite at `catalog`. Its Raft clock goes on as `tick` says and its messages to other
+    /// replicas go as whoever carries them says (`take_messages`, `receive`): a simulation runs
+    /// a shard's replicas this way. Only the leader takes writes (`is_leader`).
+    pub fn open_replica(
+        root: &Path,
+        disk: DiskRef,
+        clock: Clock,
+        catalog: &Path,
+        replica: Replica,
+    ) -> Result<Self, Error> {
+        let lock = lock_dir(root)?;
+        let catalog = Catalog::sqlite(catalog)?;
+        Self::new(root, lock, catalog, BRANCH, disk, clock, replica, true)
+    }
+
+    /// Recovers every table's partitions as far as their files hold the log, replays the
+    /// committed entries from there, starts Raft as `replica` (a shard of one leads at once,
+    /// committing whatever the last run left uncommitted), and starts the committer and the
+    /// flusher, or (`stepped`) leaves them to the caller. Not on a boot an fsync failed on
+    /// (`Disk::untrusted`): until the machine restarts, what it reads may not be what the disk
+    /// holds, and a power loss would take it away.
     #[allow(clippy::too_many_arguments)]
     fn new(
         root: &Path,
@@ -345,6 +379,7 @@ impl Store {
         branch: &str,
         disk: DiskRef,
         clock: Clock,
+        replica: Replica,
         stepped: bool,
     ) -> Result<Self, Error> {
         let untrusted = disk.untrusted().map_err(|e| {
@@ -374,18 +409,63 @@ impl Store {
             };
             logs.insert(id, log);
         }
-        let wal = Wal::open(&disk, root, &log_dir, flushed, &mut |logged: Logged| {
-            let log = logs.get(&logged.table).ok_or_else(|| {
-                Error::Corrupt(format!(
-                    "the log holds a write of table {}, which the catalog does not",
-                    logged.table
-                ))
-            })?;
-            stamped = stamped.max(logged.ingest_ns);
-            apply(log, logged).map(drop)
+        let mut tables = Tables {
+            logs: Arc::new(Mutex::new(logs)),
+            catalog: Arc::new(Mutex::new(catalog)),
+            branch: branch.to_owned(),
+            disk: disk.clone(),
+            root: root.to_owned(),
+            known: Vec::new(),
+        };
+        // A shard of one keeps no entry once applied: no replica will ask for it.
+        let keep_after = if replica.is_alone() { flushed } else { 0 };
+        let (wal, recovered) = Wal::open(
+            &disk,
+            root,
+            &log_dir,
+            flushed,
+            keep_after,
+            &mut |logged: Logged| {
+                stamped = stamped.max(logged.ingest_ns);
+                let log = tables.log_for(logged.table, &logged.shape)?;
+                apply(&log, logged).map(drop)
+            },
+        )?;
+        // The committed entries the partition files do not hold yet, before Raft starts.
+        let from = flushed.max(recovered.start.0);
+        let mut applied = from;
+        for entry in &recovered.entries {
+            if entry.index > from && entry.index <= recovered.state.commit {
+                if !entry.data.is_empty() {
+                    tables.apply(entry, &mut stamped)?;
+                }
+                applied = entry.index;
+            }
+        }
+        let mut store = LogStore::new(recovered, applied, replica.voters.clone());
+        if replica.is_alone() {
+            store.compact(applied);
+        }
+        let config = raft::Config {
+            id: replica.id,
+            election_tick: 10,
+            heartbeat_tick: 1,
+            applied,
+            max_size_per_msg: 1 << 20,
+            max_inflight_msgs: 256,
+            // A leader cut off from a quorum steps down, and a replica cut off cannot force an
+            // election when it comes back: etcd's and TiKV's settings.
+            check_quorum: true,
+            pre_vote: true,
+            random_seed: replica.seed,
+            ..raft::Config::default()
+        };
+        let node = RawNode::new(&config, store, &raft::default_logger()).map_err(|e| {
+            Error::Corrupt(format!("{}: cannot start Raft: {e}", log_dir.display()))
         })?;
-        let logs = Arc::new(Mutex::new(logs));
-        let applied = Arc::new(AtomicU64::new(wal.next_lsn() - 1));
+        let logs = tables.logs.clone();
+        let catalog = tables.catalog.clone();
+        let applied = Arc::new(AtomicU64::new(applied));
         let flusher = Arc::new(Flusher {
             disk: disk.clone(),
             logs: logs.clone(),
@@ -393,14 +473,32 @@ impl Store {
             applied: applied.clone(),
             failed: Mutex::new(false),
         });
-        // The replay's writes reach the disk now, so another crash need not replay them.
-        flusher.flush()?;
-        let committer = Committer {
+        let mut committer = Committer {
+            node,
             wal,
+            replica,
             clock: clock.clone(),
             stamped,
+            tables,
+            applied: applied.clone(),
+            proposed: VecDeque::new(),
+            waiting: Vec::new(),
+            schemas: Vec::new(),
+            outbox: Vec::new(),
             broken: None,
         };
+        if committer.replica.is_alone() {
+            committer
+                .node
+                .campaign()
+                .map_err(|e| Error::Io(format!("weir cannot lead its shard: {e}")))?;
+            committer.drive();
+            if let Some(why) = committer.broken {
+                return Err(Error::Io(why));
+            }
+        }
+        // The replay's writes reach the disk now, so another crash need not replay them.
+        flusher.flush()?;
         let (requests, received) = mpsc::channel();
         let driver = if stepped {
             Driver::Stepped {
@@ -408,13 +506,10 @@ impl Store {
                 received: Mutex::new(received),
             }
         } else {
-            let committer = {
-                let applied = applied.clone();
-                std::thread::Builder::new()
-                    .name("kermodes-weir-commit".into())
-                    .spawn(move || commit_every(committer, &applied, &received))
-                    .map_err(|e| Error::Io(format!("cannot start weir's committer: {e}")))?
-            };
+            let committer = std::thread::Builder::new()
+                .name("kermodes-weir-commit".into())
+                .spawn(move || commit_every(committer, &received))
+                .map_err(|e| Error::Io(format!("cannot start weir's committer: {e}")))?;
             let stop = Arc::new((Mutex::new(false), Condvar::new()));
             let flusher = {
                 let (flusher, requests, stop) = (flusher.clone(), requests.clone(), stop.clone());
@@ -431,12 +526,11 @@ impl Store {
         Ok(Self {
             root: root.to_owned(),
             _lock: lock,
-            catalog: Mutex::new(catalog),
+            catalog,
             branch: branch.to_owned(),
             disk,
             logs,
             requests,
-            applied,
             flusher,
             clock,
             driver,
@@ -444,7 +538,8 @@ impl Store {
     }
 
     /// A stepped store's (`open_stepped`) committer: commits every write sent so far as one
-    /// group, answering each; how many. A store with threads commits by itself: none here.
+    /// group, answering each (a replica's, once a quorum holds them); how many. A store with
+    /// threads commits by itself: none here.
     pub fn step(&self) -> usize {
         let Driver::Stepped {
             committer,
@@ -463,9 +558,61 @@ impl Store {
             .collect();
         let count = group.len();
         if count > 0 {
-            lock(committer).commit(group, &self.applied);
+            lock(committer).submit(group);
         }
         count
+    }
+
+    /// A stepped replica's (`open_replica`) Raft clock: one tick. A leader sends heartbeats
+    /// every tick; a replica that hears from no leader for 10 to 20 ticks starts an election.
+    pub fn tick(&self) {
+        if let Driver::Stepped { committer, .. } = &self.driver {
+            lock(committer).tick();
+        }
+    }
+
+    /// Takes a message another replica of the shard sent this one (`take_messages`).
+    pub fn receive(&self, message: &[u8]) -> Result<(), Error> {
+        let mut decoded = Message::default();
+        decoded
+            .merge_from_bytes(message)
+            .map_err(|e| Error::Corrupt(format!("a message from another replica: {e}")))?;
+        if let Driver::Stepped { committer, .. } = &self.driver {
+            lock(committer).receive(decoded);
+        }
+        Ok(())
+    }
+
+    /// The messages for other replicas since the last call, each with the replica's ID, for
+    /// whoever carries them. A shard of one sends none.
+    pub fn take_messages(&self) -> Vec<(u64, Vec<u8>)> {
+        let Driver::Stepped { committer, .. } = &self.driver else {
+            return Vec::new();
+        };
+        let messages = std::mem::take(&mut lock(committer).outbox);
+        messages
+            .into_iter()
+            .map(|message| {
+                let mut bytes = Vec::with_capacity(message.encoded_len());
+                message.encode(&mut bytes);
+                (message.to, bytes)
+            })
+            .collect()
+    }
+
+    /// Whether this replica leads its shard: only the leader takes writes.
+    pub fn is_leader(&self) -> bool {
+        match &self.driver {
+            Driver::Stepped { committer, .. } => lock(committer).is_leader(),
+            // A shard of one, which leads from its open.
+            Driver::Threads { .. } => true,
+        }
+    }
+
+    /// The last index of the shard log this replica has applied to its tables: how far behind
+    /// the leader it is.
+    pub fn applied(&self) -> u64 {
+        self.flusher.applied.load(Ordering::Acquire)
     }
 
     /// What the flusher does every second, now: fsyncs the partition files, records how far
@@ -473,7 +620,7 @@ impl Store {
     pub fn flush_now(&self) -> Result<(), Error> {
         let flushed = self.flusher.flush()?;
         let gone = match &self.driver {
-            Driver::Stepped { committer, .. } => lock(committer).wal.trim(flushed),
+            Driver::Stepped { committer, .. } => lock(committer).trim(flushed),
             Driver::Threads { .. } => trim(&self.requests, flushed),
         };
         delete_segments(&self.disk, gone);
@@ -543,22 +690,12 @@ impl Store {
         Ok(entry)
     }
 
-    /// Takes up `entry`'s columns in its table's log, if it is open and they changed: segments
-    /// written from now on hold them, and writers' rows are brought to them. Readers and
-    /// writers already open keep their own.
+    /// Takes up `entry`'s columns in its table's log, if it is open (`adopt`).
     fn adopt(&self, entry: &TableEntry) -> Result<(), Error> {
         let Some(log) = lock(&self.logs).get(&entry.id).cloned() else {
             return Ok(());
         };
-        let mut state = lock(&log.state);
-        if state.entry.shape() == entry.shape() {
-            return Ok(());
-        }
-        state.entry = entry.clone();
-        for partition in state.partitions.values_mut() {
-            partition.reshape(entry.shape())?;
-        }
-        Ok(())
+        adopt(&log, entry)
     }
 
     /// Every table, by name.
@@ -1258,76 +1395,321 @@ fn apply(log: &Log, logged: Logged) -> Result<bool, Error> {
     Ok(true)
 }
 
-/// What the committer carries from one group of writes to the next.
+/// Takes up `entry`'s columns in its table's log, if they changed: segments written from now on
+/// hold them, and writers' rows are brought to them. Readers and writers already open keep
+/// their own.
+fn adopt(log: &Log, entry: &TableEntry) -> Result<(), Error> {
+    let mut state = lock(&log.state);
+    if state.entry.shape() == entry.shape() {
+        return Ok(());
+    }
+    state.entry = entry.clone();
+    for partition in state.partitions.values_mut() {
+        partition.reshape(entry.shape())?;
+    }
+    Ok(())
+}
+
+/// Every table's log by ID, and what opens or updates them for the writes of any table that
+/// come from another replica, or from the log on open.
+struct Tables {
+    logs: Arc<Mutex<HashMap<i64, Arc<Log>>>>,
+    catalog: Arc<Mutex<Catalog>>,
+    branch: String,
+    disk: DiskRef,
+    root: PathBuf,
+    /// The columns each table's writes came in that its log has taken up (`log_for`).
+    known: Vec<(i64, Shape)>,
+}
+
+impl Tables {
+    /// Applies the write an entry holds (`apply`). Whether it was written.
+    fn apply(&mut self, entry: &Entry, stamped: &mut i64) -> Result<bool, Error> {
+        if entry.get_entry_type() != EntryType::EntryNormal {
+            return Err(Error::Corrupt(format!(
+                "the shard log holds a {:?} at index {}, which this version cannot apply",
+                entry.get_entry_type(),
+                entry.index
+            )));
+        }
+        let logged = wal::decode(entry.index, &entry.data)
+            .map_err(|e| Error::Corrupt(format!("the shard log: {e}")))?;
+        *stamped = (*stamped).max(logged.ingest_ns);
+        let log = self.log_for(logged.table, &logged.shape)?;
+        apply(&log, logged)
+    }
+
+    /// The log of `table`, whose write came in `shape`: opened if the table was created since
+    /// this replica opened, its columns taken up if they changed since (§5.4), as the leader
+    /// took them up when they did.
+    fn log_for(&mut self, table: i64, shape: &Shape) -> Result<Arc<Log>, Error> {
+        let open = lock(&self.logs).get(&table).cloned();
+        let log = match open {
+            Some(log) => log,
+            None => {
+                // Created since: no partitions yet, and nothing of it applied.
+                let log = open_log(&self.disk, &self.root, self.entry(table)?, u64::MAX, 0)?;
+                lock(&self.logs).entry(table).or_insert(log).clone()
+            }
+        };
+        if !self.known.iter().any(|(t, s)| *t == table && s == shape) {
+            if lock(&log.state).entry.shape() != *shape {
+                adopt(&log, &self.entry(table)?)?;
+            }
+            self.known.push((table, shape.clone()));
+        }
+        Ok(log)
+    }
+
+    fn entry(&self, table: i64) -> Result<TableEntry, Error> {
+        lock(&self.catalog)
+            .list(&self.branch)?
+            .into_iter()
+            .find(|entry| entry.id == table)
+            .ok_or_else(|| {
+                Error::Corrupt(format!(
+                    "the log holds a write of table {table}, which the catalog does not"
+                ))
+            })
+    }
+}
+
+/// What commits the store's writes: this replica's Raft, the log it persists, and the writes
+/// it proposed, until their entries commit.
 struct Committer {
+    node: RawNode<LogStore>,
     wal: Wal,
+    replica: Replica,
     clock: Clock,
-    /// The last ingest time stamped: each write's is above it, whatever the clock says, so
-    /// ingest times rise across every table and dates and commit order agree.
+    /// The last ingest time stamped or applied: each write's is above it, whatever the clock
+    /// says, so ingest times rise across every table, and dates and commit order agree,
+    /// whichever replica leads.
     stamped: i64,
+    tables: Tables,
+    /// The last index applied to the partition files.
+    applied: Arc<AtomicU64>,
+    /// Writes proposed, in index order, until their entries commit.
+    proposed: VecDeque<Proposed>,
+    /// Writes taken while earlier ones were uncommitted, proposed once those are applied.
+    waiting: Vec<Submitted>,
+    /// The schema messages of the columns written lately, so each is encoded once.
+    schemas: Vec<(Shape, Vec<u8>)>,
+    /// Messages to other replicas, until whoever carries them takes them.
+    outbox: Vec<Message>,
     /// Why the committer stopped taking writes: a failure to log or apply leaves what is
     /// durable in the log, to replay on the next open, and the partition files no longer
     /// following it.
     broken: Option<String>,
 }
 
+/// Writes proposed at `index` in `term`: written if the entry committed there is theirs.
+struct Proposed {
+    index: u64,
+    term: u64,
+    unit: Unit,
+}
+
 impl Committer {
-    /// Stamps `group`'s writes, merges them (`merge`), logs them under one fsync, applies them
-    /// in log order, and answers each.
-    fn commit(&mut self, group: Vec<Submitted>, applied: &AtomicU64) {
+    /// Takes a group of writes to propose (`propose`); each is answered once its entry is
+    /// applied, or now if this replica cannot take it.
+    fn submit(&mut self, group: Vec<Submitted>) {
         if let Some(why) = &self.broken {
             for submitted in group {
-                submitted.answer.send(Err(Error::Io(format!(
-                    "weir stopped taking writes: {why}; restart it"
-                ))));
+                submitted.answer.send(Err(stopped(why)));
             }
             return;
         }
-        let units = merge(group, &mut self.stamped, (self.clock)());
-        let appends: Vec<Append> = units
-            .iter()
-            .map(|unit| Append {
-                table: unit.table,
-                shape: &unit.shape,
-                source: &unit.source,
-                seq: unit.seq,
-                epoch: unit.epoch,
-                change: unit.change,
-                ingest_ns: unit.ingest_ns,
-                batch: &unit.batch,
-            })
-            .collect();
-        let lsns = match self.wal.append(&appends) {
-            Ok(lsns) => lsns,
-            Err(e) => {
-                self.broken = Some(e.to_string());
-                for unit in units {
-                    Answer::send_all(unit.answers, Err(Error::Io(e.to_string())));
+        if !self.is_leader() {
+            for submitted in group {
+                submitted.answer.send(Err(self.not_leader()));
+            }
+            return;
+        }
+        // Mostly nothing waits (a shard of one, always): then the group is taken as it is.
+        if self.waiting.is_empty() {
+            self.waiting = group;
+        } else {
+            self.waiting.extend(group);
+        }
+        self.drive();
+    }
+
+    fn is_leader(&self) -> bool {
+        self.node.raft.state == StateRole::Leader
+    }
+
+    fn tick(&mut self) {
+        if self.broken.is_none() {
+            self.node.tick();
+            self.drive();
+        }
+    }
+
+    fn receive(&mut self, message: Message) {
+        if self.broken.is_none() {
+            // One Raft cannot use (from a replica not of the shard) is dropped, as Raft says.
+            let _ = self.node.step(message);
+            self.drive();
+        }
+    }
+
+    /// Does what Raft asks until it asks nothing more (`handle_ready`), then proposes the
+    /// writes waiting if it can, and again.
+    fn drive(&mut self) {
+        loop {
+            while self.broken.is_none() && self.node.has_ready() {
+                self.handle_ready();
+            }
+            if self.broken.is_some() || !self.propose() {
+                break;
+            }
+        }
+        if self.replica.is_alone() {
+            let applied = self.applied.load(Ordering::Acquire);
+            self.node.mut_store().compact(applied);
+        }
+    }
+
+    /// Proposes the writes waiting, stamped and merged (`merge`) as one group, if this replica
+    /// leads and has applied every entry before them: `merge` tells a resend by the last seq
+    /// the tables hold, which entries not yet applied have not set. Whether it proposed.
+    fn propose(&mut self) -> bool {
+        let last = self.node.raft.raft_log.last_index();
+        if self.waiting.is_empty()
+            || !self.is_leader()
+            || self.applied.load(Ordering::Acquire) != last
+        {
+            return false;
+        }
+        let units = merge(
+            std::mem::take(&mut self.waiting),
+            &mut self.stamped,
+            (self.clock)(),
+        );
+        for unit in units {
+            let data = self.schema(&unit.shape).and_then(|schema| {
+                wal::encode(&Append {
+                    table: unit.table,
+                    schema,
+                    source: &unit.source,
+                    seq: unit.seq,
+                    epoch: unit.epoch,
+                    change: unit.change,
+                    ingest_ns: unit.ingest_ns,
+                    batch: &unit.batch,
+                })
+            });
+            let proposed = data.and_then(|data| {
+                self.node
+                    .propose(Bytes::new(), data)
+                    .map_err(|_| self.not_leader())
+            });
+            match proposed {
+                Ok(()) => self.proposed.push_back(Proposed {
+                    index: self.node.raft.raft_log.last_index(),
+                    term: self.node.raft.term,
+                    unit,
+                }),
+                Err(e) => Answer::send_all(unit.answers, Err(e)),
+            }
+        }
+        true
+    }
+
+    /// The schema message of `shape`'s columns with their IDs.
+    fn schema(&mut self, shape: &Shape) -> Result<&[u8], Error> {
+        let at = match self.schemas.iter().position(|(known, _)| known == shape) {
+            Some(at) => at,
+            None => {
+                // A table's columns change rarely: a few are enough to keep.
+                if self.schemas.len() == 64 {
+                    self.schemas.clear();
                 }
-                return;
+                let message = schema_header(&shape.segment_schema())?;
+                self.schemas.push((shape.clone(), message));
+                self.schemas.len() - 1
             }
         };
-        drop(appends);
-        for (unit, lsn) in units.into_iter().zip(lsns) {
-            let Unit {
-                log,
-                table,
-                shape,
-                source,
-                seq,
-                epoch,
-                change,
-                ingest_ns,
-                batch,
-                answers,
-            } = unit;
-            let outcome = match &self.broken {
-                Some(why) => Err(Error::Io(format!(
-                    "weir stopped taking writes: {why}; restart it"
-                ))),
-                None => {
+        Ok(&self.schemas[at].1)
+    }
+
+    /// Persists the entries and state Raft has for the log under one fsync, sends its messages
+    /// (a follower's only once persisted), and applies the entries committed.
+    fn handle_ready(&mut self) {
+        let mut ready = self.node.ready();
+        if ready
+            .ss()
+            .is_some_and(|soft| soft.raft_state != StateRole::Leader)
+        {
+            self.step_down();
+        }
+        if !ready.snapshot().is_empty() {
+            // A leader sends one only for entries it no longer has, and every replica keeps
+            // them (`LogStore::snapshot`).
+            self.stop("Raft sent a snapshot, which this version cannot take".into());
+            return;
+        }
+        self.outbox.extend(ready.take_messages());
+        let entries = ready.take_entries();
+        // Raft's state goes with entries, at no cost, and alone only when its term or vote
+        // changed. A commit index alone is not written: Raft learns it again, and whatever was
+        // applied was committed (`LogStore::new`), while writing it would cost every group a
+        // second write after its fsync.
+        if !entries.is_empty() || ready.must_sync() {
+            if let Err(e) = self.wal.append(&entries, ready.hs()) {
+                self.stop(e.to_string());
+                return;
+            }
+            self.node.mut_store().append(&entries);
+        }
+        self.outbox.extend(ready.take_persisted_messages());
+        self.apply(ready.take_committed_entries());
+        let mut light = self.node.advance(ready);
+        self.outbox.extend(light.take_messages());
+        self.apply(light.take_committed_entries());
+        self.node.advance_apply();
+    }
+
+    /// Applies committed entries in order, and answers the writes this replica proposed in
+    /// them: written, a resend, or lost to another leader's entry at their index.
+    fn apply(&mut self, entries: Vec<Entry>) {
+        for entry in entries {
+            if self.broken.is_some() {
+                return;
+            }
+            let index = entry.index;
+            while self.proposed.front().is_some_and(|mine| mine.index < index) {
+                let lost = self.proposed.pop_front().expect("seen");
+                Answer::send_all(lost.unit.answers, Err(self.lost()));
+            }
+            let mine = match self.proposed.front() {
+                Some(mine) if mine.index == index => {
+                    let mine = self.proposed.pop_front().expect("seen");
+                    if mine.term == entry.term {
+                        Some(mine.unit)
+                    } else {
+                        Answer::send_all(mine.unit.answers, Err(self.lost()));
+                        None
+                    }
+                }
+                _ => None,
+            };
+            let (outcome, answers) = match mine {
+                Some(unit) => {
+                    let Unit {
+                        log,
+                        table,
+                        shape,
+                        source,
+                        seq,
+                        epoch,
+                        change,
+                        ingest_ns,
+                        batch,
+                        answers,
+                    } = unit;
                     let logged = Logged {
-                        lsn,
+                        lsn: index,
                         table,
                         shape,
                         source,
@@ -1337,17 +1719,74 @@ impl Committer {
                         ingest_ns,
                         batch,
                     };
-                    let outcome = apply(&log, logged);
-                    match &outcome {
-                        Ok(_) => applied.store(lsn, Ordering::Release),
-                        Err(e) => self.broken = Some(e.to_string()),
-                    }
-                    outcome
+                    (apply(&log, logged), answers)
                 }
+                // A leader's first entry of its term.
+                None if entry.data.is_empty() => (Ok(false), Vec::new()),
+                None => (self.tables.apply(&entry, &mut self.stamped), Vec::new()),
             };
+            match &outcome {
+                Ok(_) => self.applied.store(index, Ordering::Release),
+                Err(e) => self.stop(e.to_string()),
+            }
             Answer::send_all(answers, outcome);
         }
     }
+
+    /// No longer the leader: the writes it proposed may commit or be overwritten, which it may
+    /// never learn, and those waiting are for the leader.
+    fn step_down(&mut self) {
+        for mine in std::mem::take(&mut self.proposed) {
+            Answer::send_all(mine.unit.answers, Err(self.lost()));
+        }
+        for submitted in std::mem::take(&mut self.waiting) {
+            submitted.answer.send(Err(self.not_leader()));
+        }
+    }
+
+    /// Stops taking writes, for `why`, failing those taken.
+    fn stop(&mut self, why: String) {
+        for mine in std::mem::take(&mut self.proposed) {
+            Answer::send_all(mine.unit.answers, Err(stopped(&why)));
+        }
+        for submitted in std::mem::take(&mut self.waiting) {
+            submitted.answer.send(Err(stopped(&why)));
+        }
+        self.broken = Some(why);
+    }
+
+    /// Forgets the log's segments wholly below `flushed`: their files. Only a shard of one's,
+    /// for now: a replica keeps its whole log for the others, until one can catch up from a
+    /// peer's partition files instead (`LogStore::snapshot`).
+    fn trim(&mut self, flushed: u64) -> Vec<PathBuf> {
+        if self.replica.is_alone() {
+            self.wal.trim(flushed)
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn not_leader(&self) -> Error {
+        let id = self.replica.id;
+        Error::Busy(match self.node.raft.leader_id {
+            raft::INVALID_ID => {
+                format!("weir replica {id} does not lead its shard, and knows of no leader yet")
+            }
+            leader => format!("weir replica {id} does not lead its shard: replica {leader} does"),
+        })
+    }
+
+    fn lost(&self) -> Error {
+        Error::Busy(format!(
+            "weir replica {} stopped leading its shard before the write committed, so it may or \
+             may not be written: send it again, as a resend",
+            self.replica.id
+        ))
+    }
+}
+
+fn stopped(why: &str) -> Error {
+    Error::Io(format!("weir stopped taking writes: {why}; restart it"))
 }
 
 /// The committer thread: takes every write waiting (up to `GROUP_BYTES`) and commits them as
@@ -1356,7 +1795,7 @@ impl Committer {
 /// Writers answered together come back together, a few microseconds apart: a group waits up to
 /// `GATHER` for as many writes as the last one held, so they share the next fsync instead of
 /// alternating between groups of one and the rest. A lone writer never waits.
-fn commit_every(mut committer: Committer, applied: &AtomicU64, requests: &Receiver<Request>) {
+fn commit_every(mut committer: Committer, requests: &Receiver<Request>) {
     let mut stop = false;
     let mut last_group = 1;
     while !stop {
@@ -1374,7 +1813,7 @@ fn commit_every(mut committer: Committer, applied: &AtomicU64, requests: &Receiv
                     group.push(submitted);
                 }
                 Request::Trim(flushed, reply) => {
-                    let _ = reply.send(committer.wal.trim(flushed));
+                    let _ = reply.send(committer.trim(flushed));
                 }
                 Request::Stop => stop = true,
             }
@@ -1389,7 +1828,7 @@ fn commit_every(mut committer: Committer, applied: &AtomicU64, requests: &Receiv
         }
         if !group.is_empty() {
             last_group = group.len();
-            committer.commit(group, applied);
+            committer.submit(group);
         }
     }
 }
