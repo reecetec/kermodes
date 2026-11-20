@@ -85,8 +85,9 @@ class SortMouseHandler extends GridMouseHandler {
 }
 
 /**
- * Cmd/Ctrl-click on a cell copies that cell, instead of adding it to the selection. While the
- * key is down over a cell, the cursor says so.
+ * Option-click (Alt-click off a Mac) on a cell copies that cell, instead of adding it to the
+ * selection; Cmd/Ctrl-click stays the selection's, as in a spreadsheet. While the key is down
+ * over a cell, the cursor says so.
  */
 class CopyCellMouseHandler extends GridMouseHandler {
   // Whether the pointer was last over a cell, for the cursor when only the key changes
@@ -106,7 +107,7 @@ class CopyCellMouseHandler extends GridMouseHandler {
     event: GridMouseEvent
   ): EventHandlerResult {
     this.isOverCell = gridPoint.column != null && gridPoint.row != null;
-    this.cursor = this.cursorFor(GridUtils.isModifierKeyDown(event));
+    this.cursor = this.cursorFor(event.altKey);
     return this.cursor == null ? false : { stopPropagation: false, preventDefault: false };
   }
 
@@ -121,7 +122,7 @@ class CopyCellMouseHandler extends GridMouseHandler {
     event: GridMouseEvent
   ): EventHandlerResult {
     const { column, row } = gridPoint;
-    if (!GridUtils.isModifierKeyDown(event) || column == null || row == null) {
+    if (!event.altKey || column == null || row == null) {
       return false;
     }
     this.onCopyCell(column, row);
@@ -629,17 +630,17 @@ export function TableViewer({
 
   const copyCellHandler = useMemo(() => new CopyCellMouseHandler(copyCell), [copyCell]);
 
-  // Whether Cmd/Ctrl is held: the cell under the pointer is then what a click copies
+  // Whether Option/Alt is held: the cell under the pointer is then what a click copies
   const [isCopyKeyDown, setIsCopyKeyDown] = useState(false);
   // The copy cursor and target follow the modifier key while the pointer stays still. Capture,
   // since the viewer's own key handler stops propagation (for notebook shortcuts) before a
   // bubbling window listener would hear the key while the grid has focus.
   useEffect(() => {
     const update = (event: KeyboardEvent): void => {
-      if (event.key !== 'Meta' && event.key !== 'Control') {
+      if (event.key !== 'Alt') {
         return;
       }
-      const isDown = GridUtils.isModifierKeyDown(event);
+      const isDown = event.altKey;
       setIsCopyKeyDown(isDown);
       if (copyCellHandler.isOverCell) {
         gridRef.current?.setCursor(copyCellHandler.cursorFor(isDown));

@@ -1726,9 +1726,10 @@ proven parts.
   gzipped) is built by `bun run build` into `python/kermodes/static/`, which the wheel ships; it
   is not checked in.
 - From day one: virtual scrolling over rows and columns; column resize and reorder; sort by
-  clicking a header (shift-click adds a key); per-column quick filters; row and range
-  selection, the clicked cell's row tinted; copy rows (Cmd/Ctrl-C, as tab-separated text) and
-  copy one cell (Cmd/Ctrl-click, with a copy cursor while the key is down); a right-click menu
+  clicking a header (shift-click adds a key); per-column quick filters; selection by whole rows
+  (a click selects its row, shift-click or a drag a run of rows, Cmd/Ctrl-click adds one); copy
+  the selected rows (Cmd/Ctrl-C, as tab-separated text) and one cell (Option/Alt-click, with a
+  copy cursor while the key is down); a right-click menu
   on headers and cells (sort, filter by the clicked value, show the value, copy); a cell whose
   value is cut off or holds JSON shows an expand button at its right edge while hovered, which
   opens the whole value under it, JSON pretty-printed, with Copy; ticking rows briefly

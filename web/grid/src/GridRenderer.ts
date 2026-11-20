@@ -1803,7 +1803,9 @@ export class GridRenderer {
       return;
     }
 
+    // Selecting whole rows, the row is what is active: no cell of it is marked apart.
     const isCursorVisible =
+      !theme.autoSelectRow &&
       column != null &&
       row != null &&
       allColumnXs.has(column) &&

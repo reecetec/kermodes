@@ -151,7 +151,9 @@ export function gridTheme(token: TokenReader): GridTheme {
   return {
     allowColumnResize: true,
     allowRowResize: false,
-    autoSelectRow: false,
+    // A click selects the whole row, as Deephaven's tables do: Cmd/Ctrl-C copies rows, and
+    // Option/Alt-click copies a single cell (TableViewer).
+    autoSelectRow: true,
     autoSelectColumn: false,
     autoSizeColumns: true,
     autoSizeRows: true,
