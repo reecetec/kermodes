@@ -306,6 +306,15 @@ impl Catalog {
         }
     }
 
+    /// The next incarnation of slot `slot` of `branch`'s shard, from 1: a replica whose disk was
+    /// lost or replaced joins as it, a new member (`replica_started`).
+    pub(crate) fn next_incarnation(&mut self, branch: &str, slot: u64) -> Result<u64, Error> {
+        match self {
+            Self::Sqlite(c) => c.next_incarnation(branch, slot),
+            Self::Postgres(c) => c.next_incarnation(branch, slot),
+        }
+    }
+
     /// Every date of a table's history, by date then file.
     pub(crate) fn history(&mut self, table_id: i64) -> Result<Vec<HistoryDate>, Error> {
         match self {
@@ -419,6 +428,11 @@ fn location(branch: &str, name: &TableName, id: i64) -> String {
 /// (`replica_started`).
 fn started_key(branch: &str, replica: u64) -> String {
     format!("replica started: {branch} {replica}")
+}
+
+/// The key in the catalog's metadata counting a slot's incarnations (`next_incarnation`).
+fn incarnation_key(branch: &str, slot: u64) -> String {
+    format!("replica incarnation: {branch} {slot}")
 }
 
 /// Refuses a definition whose key or sort is not the table's: those are fixed when it is

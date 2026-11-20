@@ -11,14 +11,17 @@ use arrow_flight::flight_service_client::FlightServiceClient;
 use tokio::sync::mpsc;
 use tonic::transport::{Channel, Endpoint};
 
+use kermodes_weir::slot;
+
 use crate::{frame_messages, http_url};
 
 /// The most one call carries: whatever waits beyond goes in the next.
 const BATCH_BYTES: usize = 16 << 20;
 
-/// Carries `outgoing` (each message with the ID of the replica it is for) to `peers`, each
-/// replica's ID and URL, until the store stops sending (it closed), on a thread of its own. A
-/// message for a replica not among them is dropped.
+/// Carries `outgoing` (each message with the Raft ID of the replica it is for) to `peers`, each
+/// replica's slot and URL, until the store stops sending (it closed), on a thread of its own:
+/// a message goes to whichever incarnation of its replica's slot serves there now, which drops
+/// one for another (`Store::receive`). One for a slot not among them is dropped.
 pub(crate) fn carry(
     outgoing: Receiver<(u64, Vec<u8>)>,
     peers: &[(u64, String)],
@@ -48,7 +51,7 @@ pub(crate) fn carry(
         .name("kermodes-carrier".into())
         .spawn(move || {
             for (to, message) in outgoing {
-                if let Some(queue) = queues.get(&to) {
+                if let Some(queue) = queues.get(&slot(to)) {
                     let _ = queue.send(message);
                 }
             }

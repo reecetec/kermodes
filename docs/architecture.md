@@ -738,21 +738,28 @@ writers ─► leader ── append + fsync ────────────
   of `weir/` durable before the marker goes, since one that finishes another's moves may have
   nothing left to move. Its own files go only once the copy is whole and durable. It then
   reopens and takes entries from that position.
-- **A lost disk.** Each replica's first log is recorded in the catalog once it is durable and
-  before Raft starts. A replica that starts with no log though the catalog records it had one
-  lost its disk, or was given a new one: its log is no measure of what it held, and it may have
-  voted in terms it no longer knows, so its vote could elect a leader without entries it helped
-  commit. It refuses to open. A replica the catalog does not know has never voted, and joins
-  however late (a StatefulSet starts its pods one at a time). Watching the leader cannot tell
-  it when it is safe to vote again, since a delayed or duplicated message carries a commit
-  index from before the loss. It is to rejoin as Redpanda, Kafka's KRaft (KIP-853), and etcd
-  rejoin a replaced disk: as a new incarnation of the replica, a learner that takes the log or
-  a snapshot and votes only once a membership change, committed after it caught up, makes it
-  a voter. That needs changing a shard's members (step 5 below).
+- **A lost disk** (built). A replica's Raft ID is its slot (the address it serves at, from 1)
+  and the incarnation of that slot: `slot + incarnation << 16`, recorded on its disk before
+  Raft first runs. Each slot's first log is recorded in the catalog once it is durable. A
+  replica that starts with no log though the catalog records its slot had one lost its disk,
+  or was given a new one: its log is no measure of what it held, and it may have voted in
+  terms it no longer knows, so its vote could elect a leader without entries it helped commit.
+  Watching the leader cannot tell it when it is safe to vote again, since a delayed or
+  duplicated message carries a commit index from before the loss. So it rejoins as Redpanda,
+  Kafka's KRaft (KIP-853), and etcd rejoin a replaced disk: as the slot's next incarnation
+  (counted in the catalog), a new member. It asks the leader to take it in (the `join` action,
+  every second until it is a member); the leader adds it as a learner, which takes the log or
+  a snapshot, and once the leader replicates to it at the commit index, one joint-consensus
+  change makes it a voter and removes the incarnation it replaced. Messages for the old
+  incarnation reach its slot's address and are dropped there. The shard's members are in the
+  log (`CONF` records, as each change applied left them, and at each segment's start), and a
+  snapshot's files come with the donor's members as of them. A slot never seen before starts as
+  its first incarnation however late it joins (a StatefulSet starts its pods one at a time).
 - **Planned restarts** (built). A rollout or drain restarts one replica at a time, under a
   PodDisruptionBudget, each only once the previous one has caught up: a replica is ready
-  (gRPC health on its Flight port) once it knows a leader and has applied as far as it knows
-  the log committed. Stopped while it leads, a replica first hands its lead to the voter
+  (gRPC health on its Flight port) once it votes, knows a leader, and has applied as far as
+  it knows the log committed: a new incarnation still a learner is not ready, so a rollout
+  waits for its promotion. Stopped while it leads, a replica first hands its lead to the voter
   heard from lately that holds the most of the log (Raft's leadership transfer: the leader
   sends what it lacks and tells it to stand at once), asking again for another every half
   second, for up to 2 s. Writers are refused meanwhile, move to the new leader, and resend
@@ -789,7 +796,8 @@ writers ─► leader ── append + fsync ────────────
   dates. Its logs roll every 4 KiB, keeping nothing or 64 KiB past what the files hold, so
   followers catch up from the leader's segments and by snapshots, half of which a crash cuts
   short at any step, the swap's included; past dates are merged and dropped through the log,
-  and merged again when a late write grows them. A replica that lost its disk must not open.
+  and merged again when a late write grows them. Disks are lost too, one at a time while every
+  replica votes: the replica rejoins as a new incarnation, and must be made a voter again.
 - **Raft itself.** raft-rs, vendored (§4.1, `crates/kermodes-raft`): etcd's raft as TiKV runs
   it, a pure state machine (ticks, messages, and a `Ready` of what to persist and send) with no
   I/O, clock, or network of its own, so the simulator drives every replica. Its messages are
@@ -801,8 +809,8 @@ writers ─► leader ── append + fsync ────────────
   2. The simulator; then replication over 3 replicas with fixed membership, under it, with
      catch-up from a peer's partition files, replicas over Flight, and the Helm chart running
      three (built).
-  3. Leadership transfer for rollouts, readiness once caught up, and leases as log entries
-     (built); a replica that lost its disk rejoining as a new member; reads from followers.
+  3. Leadership transfer for rollouts, readiness once caught up, leases as log entries, and a
+     replica that lost its disk rejoining as a new member (built); reads from followers.
   4. Local disks, one replica per node (built).
   5. Later: more shards, and changing a shard's members otherwise.
 

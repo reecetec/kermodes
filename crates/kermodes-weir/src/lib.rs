@@ -26,9 +26,9 @@ pub use catalog::{Garbage, HistoryCommit, HistoryDate, HistoryFile, TableEntry};
 pub use names::{Date, SourceId, TableName};
 pub use partition::Stamp;
 pub use pending::{Answer, IN_FLIGHT_BYTES, InFlight, Pending};
-pub use replica::{LogLimits, Replica};
+pub use replica::{LogLimits, Replica, replica_id, replica_name, slot};
 pub use shape::{ColumnId, Shape, column, spec, widens};
-pub use snapshot::{SnapshotSource, SnapshotWanted};
+pub use snapshot::{SnapshotFiles, SnapshotSource, SnapshotWanted};
 pub use store::{
     BRANCH, Clock, Failed, Pace, PendingWriter, Store, Subscriber, Writer, conform, keys_only,
     machine_disk, system_clock,

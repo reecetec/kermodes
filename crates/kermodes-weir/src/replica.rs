@@ -11,15 +11,35 @@ use raft::{GetEntriesContext, RaftState, Storage, StorageError};
 use crate::Error;
 use crate::wal::{self, Recovered, Wal};
 
-/// A replica of the shard: its Raft ID among `voters`, the IDs of every replica (fixed:
-/// changing them is not yet supported), the seed of its election timeouts, and how much log
-/// it keeps.
+/// A replica of the shard: its Raft ID (`replica_id`; opening a store gives a replica its
+/// incarnation, so the caller gives its slot), the voters a shard that never changed its
+/// members starts with, the seed of its election timeouts, and how much log it keeps.
 #[derive(Clone, Debug)]
 pub struct Replica {
     pub id: u64,
     pub voters: Vec<u64>,
     pub seed: Option<u64>,
     pub limits: LogLimits,
+}
+
+/// A replica's Raft ID: its slot in the shard (from 1: the address it serves at) and the
+/// incarnation of that slot (from 0). A disk that replaced a lost one is a new incarnation, a new
+/// member, which never votes as the one it replaced (architecture.md §7.6).
+pub fn replica_id(slot: u64, incarnation: u64) -> u64 {
+    slot | incarnation << 16
+}
+
+/// The slot of the replica with Raft ID `id` (`replica_id`).
+pub fn slot(id: u64) -> u64 {
+    id & 0xffff
+}
+
+/// How a replica is called in what weir says: its slot, and its incarnation past the first.
+pub fn replica_name(id: u64) -> String {
+    match id >> 16 {
+        0 => format!("replica {}", slot(id)),
+        incarnation => format!("replica {} (incarnation {incarnation})", slot(id)),
+    }
 }
 
 impl Replica {
@@ -73,7 +93,10 @@ pub(crate) struct LogStore {
     state: HardState,
     /// This replica's ID, which a snapshot it gives names (`snapshot`).
     id: u64,
-    voters: Vec<u64>,
+    /// The shard's members as the last change the log keeps left them, and the index of its
+    /// entry (`wal::CONF`); before any, those it was opened with.
+    changed: Option<(u64, ConfState)>,
+    opened_with: ConfState,
 }
 
 impl LogStore {
@@ -95,8 +118,31 @@ impl LogStore {
             last,
             state,
             id: replica.id,
-            voters: replica.voters.clone(),
+            changed: recovered.confs.into_iter().last(),
+            opened_with: ConfState {
+                voters: replica.voters.clone(),
+                ..ConfState::default()
+            },
         }
+    }
+
+    /// The shard's members as the latest change applied left them.
+    pub(crate) fn conf(&self) -> &ConfState {
+        self.changed
+            .as_ref()
+            .map_or(&self.opened_with, |(_, conf)| conf)
+    }
+
+    /// The index of the last change of the shard's members applied; 0 before any.
+    pub(crate) fn conf_index(&self) -> u64 {
+        self.changed.as_ref().map_or(0, |(index, _)| *index)
+    }
+
+    /// Records the shard's members as the change at `index`, applied, left them, durably.
+    pub(crate) fn persist_conf(&mut self, index: u64, conf: ConfState) -> Result<(), Error> {
+        self.wal.append_conf(index, &conf)?;
+        self.changed = Some((index, conf));
+        Ok(())
     }
 
     /// Appends `entries` to the log (replacing any at or after the first one's index) with
@@ -168,13 +214,7 @@ fn unavailable(e: Error) -> raft::Error {
 
 impl Storage for LogStore {
     fn initial_state(&self) -> raft::Result<RaftState> {
-        Ok(RaftState::new(
-            self.state.clone(),
-            ConfState {
-                voters: self.voters.clone(),
-                ..ConfState::default()
-            },
-        ))
+        Ok(RaftState::new(self.state.clone(), self.conf().clone()))
     }
 
     fn entries(
@@ -234,7 +274,10 @@ impl Storage for LogStore {
 
     /// A follower needs entries from before the log's start: it is handed the start, and this
     /// replica's ID, to copy its partition files from (`snapshot`), which hold everything up
-    /// to there. Raft asking for one past the start (a follower that asked itself) waits.
+    /// to there. Raft asking for one past the start (a follower that asked itself) waits. Its
+    /// members are the latest, which name the follower (Raft refuses a snapshot that does not):
+    /// the follower restores none of it, but copies the files and takes up the members they
+    /// come with (`SnapshotFiles`).
     fn snapshot(&self, request_index: u64, _: u64) -> raft::Result<Snapshot> {
         if request_index > self.start.0 {
             return Err(raft::Error::Store(
@@ -248,7 +291,7 @@ impl Storage for LogStore {
         let meta = snapshot.mut_metadata();
         meta.index = self.start.0;
         meta.term = self.start.1;
-        meta.mut_conf_state().voters = self.voters.clone();
+        *meta.mut_conf_state() = self.conf().clone();
         Ok(snapshot)
     }
 }
@@ -264,13 +307,45 @@ pub(crate) fn transferee(me: u64, voters: impl IntoIterator<Item = (u64, u64)>) 
         .map(|(id, _)| id)
 }
 
+/// A learner the leader makes a voter (`Promotion`).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Promotion {
+    pub learner: u64,
+    /// Voters of earlier incarnations of its slot: the replica it replaced, which goes in the
+    /// same change.
+    pub replaced: Vec<u64>,
+}
+
+/// Of the `learners` (ID, whether the leader is replicating entries to it rather than
+/// probing it or sending it a snapshot, the last index its log is known to match), the one the
+/// leader `me` promotes: the lowest ID among those caught up to `committed`, so that a voter
+/// that fails next leaves a majority that commits without waiting for it.
+pub(crate) fn promotion(
+    me: u64,
+    voters: &[u64],
+    learners: impl IntoIterator<Item = (u64, bool, u64)>,
+    committed: u64,
+) -> Option<Promotion> {
+    let learner = learners
+        .into_iter()
+        .filter(|&(_, replicating, matched)| replicating && matched >= committed)
+        .map(|(id, _, _)| id)
+        .min()?;
+    let replaced = voters
+        .iter()
+        .copied()
+        .filter(|&voter| slot(voter) == slot(learner) && voter != learner && voter != me)
+        .collect();
+    Some(Promotion { learner, replaced })
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
     use raft::Storage;
     use raft::eraftpb::Entry;
 
-    use super::{LogStore, Replica, transferee};
+    use super::{LogStore, Promotion, Replica, promotion, replica_id, transferee};
     use crate::Error;
     use crate::disk::real;
     use crate::wal::{Logged, Wal};
@@ -330,5 +405,38 @@ mod tests {
         for (voters, chosen) in cases {
             assert_eq!(transferee(1, voters.iter().copied()), chosen, "{voters:?}");
         }
+    }
+
+    #[test]
+    fn a_learner_caught_up_replaces_the_incarnation_of_its_slot() {
+        let new3 = replica_id(3, 1);
+        let other = replica_id(2, 1);
+        let promote = |learner, replaced| Some(Promotion { learner, replaced });
+        let cases = [
+            // Caught up, replicating: promoted, its slot's old incarnation removed.
+            (vec![(new3, true, 100)], 100, promote(new3, vec![3])),
+            // Behind the commit, or still probed or sent a snapshot: not yet.
+            (vec![(new3, true, 99)], 100, None),
+            (vec![(new3, false, 100)], 100, None),
+            // Of two caught up, the lowest ID; the other's turn comes after.
+            (
+                vec![(new3, true, 100), (other, true, 100)],
+                100,
+                promote(other, vec![2]),
+            ),
+            (vec![], 100, None),
+        ];
+        for (learners, committed, chosen) in cases {
+            assert_eq!(
+                promotion(1, &[1, 2, 3], learners.iter().copied(), committed),
+                chosen,
+                "{learners:?}"
+            );
+        }
+        // A slot's new incarnation never removes the leader, whatever its slot.
+        assert_eq!(
+            promotion(3, &[1, 2, 3], [(new3, true, 5)], 5),
+            promote(new3, vec![])
+        );
     }
 }

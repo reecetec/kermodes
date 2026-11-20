@@ -24,7 +24,7 @@ use arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Int64Type, Schema};
 use kermodes_weir::{
     Change, Clock, Date, HistoryCommit, HistoryDate, HistoryFile, LogLimits, Pending,
-    PendingWriter, Replica, SourceId, Store, TableName, Writer, sim,
+    PendingWriter, Replica, SourceId, Store, TableName, Writer, replica_id, sim, slot,
 };
 
 const SOURCES: usize = 3;
@@ -661,7 +661,7 @@ impl Shard {
         if self.cut.is_some_and(|cut| cut == from || cut == to) {
             return;
         }
-        let i = to as usize - 1;
+        let i = slot(to) as usize - 1;
         if let Some(store) = &self.stores[i] {
             store.receive(&message).unwrap();
             self.collect(i);
@@ -699,7 +699,7 @@ impl Shard {
             };
             self.stop(i);
             let root = self.dir.join(format!("r{}", i + 1));
-            if let Some(from) = &self.stores[wanted.from as usize - 1] {
+            if let Some(from) = &self.stores[slot(wanted.from) as usize - 1] {
                 // Every other copy has its process die partway, at any of its operations
                 // that change the disk, the swap's included (one with fewer runs whole).
                 self.installs += 1;
@@ -723,8 +723,9 @@ impl Shard {
         }
     }
 
-    /// Every replica up and connected until they agree: one leader, every replica applied as
-    /// far as it, for rounds on end, and every write sent answered. The leader.
+    /// Every replica up and connected until they agree: one leader, every replica a voter (a new
+    /// incarnation taken in by the leader, then promoted) and applied as far as it, for rounds
+    /// on end, and every write sent answered. The leader.
     fn agree(&mut self, sent: &[Sent]) -> usize {
         for i in 0..REPLICAS {
             if self.stores[i].is_none() {
@@ -747,9 +748,18 @@ impl Shard {
             }
             let stores: Vec<&Store> = self.stores.iter().map(|s| s.as_ref().unwrap()).collect();
             let leaders: Vec<usize> = (0..REPLICAS).filter(|&i| stores[i].is_leader()).collect();
+            // A replica whose disk was lost asks the leader to take it in, as its process does.
+            if let [leader] = leaders[..] {
+                for store in &stores {
+                    if !store.is_member() {
+                        let _ = stores[leader].join(store.replica_id());
+                    }
+                }
+            }
             let applied: Vec<u64> = stores.iter().map(|store| store.applied()).collect();
             let now = (leaders.clone(), applied.clone());
             let agreed = leaders.len() == 1
+                && stores.iter().all(|store| store.is_voter())
                 && applied.iter().all(|&a| a == applied[0])
                 && sent.iter().all(|s| s.pending.is_answered());
             same = if agreed && last.as_ref() == Some(&now) {
@@ -762,7 +772,25 @@ impl Shard {
             }
             last = Some(now);
         }
-        panic!("seed {}: the replicas never came to agree", self.seed);
+        let state: Vec<String> = self
+            .stores
+            .iter()
+            .map(|s| {
+                let s = s.as_ref().unwrap();
+                format!(
+                    "id {} leader {} member {} voter {} applied {}",
+                    s.replica_id(),
+                    s.is_leader(),
+                    s.is_member(),
+                    s.is_voter(),
+                    s.applied()
+                )
+            })
+            .collect();
+        panic!(
+            "seed {}: the replicas never came to agree: {state:?}",
+            self.seed
+        );
     }
 
     /// Once the replicas agree (`agree`): of the writes whose fate was open, those that
@@ -963,6 +991,7 @@ fn simulate_shard(seed: u64, actions: usize) -> (Vec<u64>, Vec<u64>) {
     let mut value = 0_i64;
     let mut shard = Shard::new(&dir.0, seed, clock, REPLICAS);
     shard.resolve(Vec::new(), &mut sent, &mut model, &mut trace);
+    let mut lost = 0;
     for _ in 0..actions {
         now.fetch_add(1_000_000 * (1 + rng.below(500)) as i64, Ordering::Relaxed);
         let before: Vec<u64> = shard.disks.iter().map(sim::Disk::crashes).collect();
@@ -1036,6 +1065,20 @@ fn simulate_shard(seed: u64, actions: usize) -> (Vec<u64>, Vec<u64>) {
             96 => shard.disks[victim].power_loss(),
             // Past dates merged, and weir's copy dropped.
             97 => shard.merge(&mut model),
+            // A replica's disk is lost, and it starts on a new one: a new member of its shard.
+            // Only while every replica votes: with two of three lost before the first is
+            // replaced, what only they held is gone, which no shard of three survives.
+            98 if shard
+                .stores
+                .iter()
+                .all(|store| store.as_ref().is_some_and(Store::is_voter)) =>
+            {
+                lost += 1;
+                shard.stop(victim);
+                let root = dir.0.join(format!("r{}", victim + 1));
+                shard.disks[victim] =
+                    sim::Disk::new(seed * 8 + victim as u64 + 64 * lost, 0, &root);
+            }
             // The replicas that are down start again.
             _ => {
                 for i in 0..REPLICAS {
@@ -1060,18 +1103,26 @@ fn simulate_shard(seed: u64, actions: usize) -> (Vec<u64>, Vec<u64>) {
     (fingerprints, trace)
 }
 
-/// A replica whose disk was lost or replaced, in a shard a leader has committed in, does not
-/// open: its vote could elect a leader without entries it helped commit.
+/// A replica whose disk was lost or replaced comes back as its slot's next incarnation, a new
+/// member: the leader takes it in as a learner, then makes it a voter in place of the
+/// incarnation it replaced once it has caught up. A second disk lost after leaves a majority of
+/// voters only because the first replacement was made one.
 #[test]
-fn a_replica_that_lost_its_disk_does_not_open() {
+fn a_replica_that_lost_its_disk_rejoins_as_a_new_member() {
     let dir = TempDir::new();
     let clock: Clock = Arc::new(|| 1_767_225_540_000_000_000);
     let mut shard = Shard::new(&dir.0, 1, clock, REPLICAS);
     let (mut sent, mut model, mut trace) = (Vec::new(), Model::default(), Vec::new());
     shard.resolve(Vec::new(), &mut sent, &mut model, &mut trace);
-    shard.stop(1);
-    shard.disks[1] = sim::Disk::new(99, 0, &dir.0.join("r2"));
-    assert!(matches!(shard.open(1), Err(kermodes_weir::Error::Io(_))));
+    for lost in [1, 2] {
+        shard.stop(lost);
+        let root = dir.0.join(format!("r{}", lost + 1));
+        shard.disks[lost] = sim::Disk::new(99 + lost as u64, 0, &root);
+        shard.resolve(Vec::new(), &mut sent, &mut model, &mut trace);
+        let store = shard.stores[lost].as_ref().unwrap();
+        assert_eq!(store.replica_id(), replica_id(lost as u64 + 1, 1));
+        assert!(store.is_voter());
+    }
 }
 
 /// A leader hands its lead to another replica without an election: no tick passes, so none

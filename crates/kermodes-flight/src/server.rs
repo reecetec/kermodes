@@ -652,12 +652,27 @@ impl FlightService for Service {
                 json!({})
             }
             "snapshot_files" => {
-                let ((index, term), files) = blocking(move || store.files()).await?;
-                let files: Vec<Value> = files
+                let listed = blocking(move || store.files()).await?;
+                let files: Vec<Value> = listed
+                    .files
                     .iter()
                     .map(|(path, bytes)| json!([path.to_string_lossy(), bytes]))
                     .collect();
-                json!({"index": index, "term": term, "files": files})
+                let (index, term) = listed.at;
+                json!({
+                    "index": index,
+                    "term": term,
+                    "members": listed.members,
+                    "files": files,
+                })
+            }
+            "join" => {
+                let command = command(&action.body)?;
+                let replica = command["replica"]
+                    .as_u64()
+                    .ok_or_else(|| Status::invalid_argument("missing `replica`"))?;
+                store.join(replica).map_err(status)?;
+                json!({})
             }
             "snapshot_read" => {
                 let command = command(&action.body)?;
@@ -729,6 +744,10 @@ impl FlightService for Service {
                 "{table_id, location, file}: forget a deleted file",
             ),
             ("raft", "Raft messages from another replica of the shard"),
+            (
+                "join",
+                "{replica}: as leader, take a new incarnation of a replica into the shard",
+            ),
             (
                 "snapshot_files",
                 "the partition files, as of the last entry applied",

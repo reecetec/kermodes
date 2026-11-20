@@ -22,7 +22,8 @@ use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use raft::eraftpb::HardState;
+use raft::eraftpb::{ConfState, HardState};
+use raft::protocompat::PbMessage;
 
 use crate::disk::{self, DiskRef};
 use crate::store::lock;
@@ -46,14 +47,22 @@ const COPY_MOVING: u8 = 2;
 /// A peer whose partition files a replica copies: the peer's store itself, in a simulation, or
 /// its server.
 pub trait SnapshotSource {
-    /// The last entry the peer applied, its index and term, and every file of its tables as
-    /// of it: each one's path under the peer's `weir` directory, and its length (files only
-    /// grow, so that much of each is there to copy). The peer changes none of them otherwise
-    /// until it is done listing; a date it drops after makes reading that date's files fail.
-    #[allow(clippy::type_complexity)]
-    fn files(&self) -> Result<((u64, u64), Vec<(PathBuf, u64)>), Error>;
+    /// What the peer has applied, as of its last entry applied (`SnapshotFiles`). The peer
+    /// changes none of its files otherwise until it is done listing; a date it drops after
+    /// makes reading that date's files fail.
+    fn files(&self) -> Result<SnapshotFiles, Error>;
     /// Up to `len` bytes of the file at `path`, from `offset`.
     fn read(&self, path: &Path, offset: u64, len: u64) -> Result<Vec<u8>, Error>;
+}
+
+/// A peer's files to copy, as of the last entry it applied (`at`, its index and term): each
+/// one's path under the peer's `weir` directory and its length (files only grow, so that much
+/// of each is there to copy), and the shard's members as of that entry (Raft's `ConfState`,
+/// protobuf), which the copy's log starts with.
+pub struct SnapshotFiles {
+    pub at: (u64, u64),
+    pub members: Vec<u8>,
+    pub files: Vec<(PathBuf, u64)>,
 }
 
 /// The snapshot a replica wants (`Store::snapshot_wanted`): the replica to copy from, the index
@@ -80,13 +89,16 @@ pub(crate) fn install(
     let mut dirs = BTreeSet::new();
     // The files as of the peer's last entry applied: a drop after it would have changed them
     // under a replica that replays from the snapshot's index instead.
-    let (at, files) = from.files()?;
+    let SnapshotFiles { at, members, files } = from.files()?;
     if at.0 < wanted.index {
         return Err(Error::Io(format!(
             "replica {} has applied up to index {}, short of the {} to copy",
             wanted.from, at.0, wanted.index
         )));
     }
+    let mut conf = ConfState::default();
+    conf.merge_from_bytes(&members)
+        .map_err(|e| Error::Io(format!("replica {}'s members: {e}", wanted.from)))?;
     for (path, len) in files {
         let to = staging.join(&path);
         let parent = to.parent().unwrap_or(&staging).to_owned();
@@ -115,7 +127,15 @@ pub(crate) fn install(
         vote: wanted.vote,
         commit: at.0,
     };
-    wal::reset(disk, root, &staging.join(LOG), segment_bytes, at, &state)?;
+    wal::reset(
+        disk,
+        root,
+        &staging.join(LOG),
+        segment_bytes,
+        at,
+        &state,
+        &conf,
+    )?;
     mark(disk, root, OLD_GOING)?;
     finish(disk, root)
 }
@@ -300,9 +320,15 @@ fn read(disk: &DiskRef, root: &Path, path: &Path, offset: u64, len: u64) -> Resu
 
 /// A peer's store in this process: a simulation's.
 impl SnapshotSource for crate::Store {
-    fn files(&self) -> Result<((u64, u64), Vec<(PathBuf, u64)>), Error> {
+    fn files(&self) -> Result<SnapshotFiles, Error> {
         let position = lock(self.position());
-        Ok((*position, files(self.disk(), self.root())?))
+        let mut members = Vec::new();
+        self.members().encode(&mut members);
+        Ok(SnapshotFiles {
+            at: *position,
+            members,
+            files: files(self.disk(), self.root())?,
+        })
     }
 
     fn read(&self, path: &Path, offset: u64, len: u64) -> Result<Vec<u8>, Error> {

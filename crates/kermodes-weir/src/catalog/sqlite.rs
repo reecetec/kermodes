@@ -5,8 +5,8 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::{
-    FORMAT, Found, Garbage, HistoryCommit, HistoryDate, HistoryFile, Row, check_commit, location,
-    started_key,
+    FORMAT, Found, Garbage, HistoryCommit, HistoryDate, HistoryFile, Row, check_commit,
+    incarnation_key, location, started_key,
 };
 use crate::{Date, Error, TableName};
 
@@ -221,6 +221,18 @@ impl Sqlite {
                 [started_key(branch, replica)],
             )
             .map(drop)
+            .map_err(sql)
+    }
+
+    pub(crate) fn next_incarnation(&mut self, branch: &str, slot: u64) -> Result<u64, Error> {
+        self.conn
+            .query_row(
+                "INSERT INTO meta VALUES (?1, 1) ON CONFLICT (key)
+                 DO UPDATE SET value = value + 1 RETURNING value",
+                [incarnation_key(branch, slot)],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|next| next as u64)
             .map_err(sql)
     }
 

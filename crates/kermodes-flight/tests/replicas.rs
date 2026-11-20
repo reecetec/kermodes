@@ -1,7 +1,7 @@
 //! Three replicas of a shard on localhost, sharing a catalog in Postgres, as three processes run
-//! them (architecture.md §7.6): writes go through whichever leads, every replica holds them, and
-//! a replica stopping, the leader too, loses none that were acknowledged. Postgres runs when
-//! `KERMODES_TEST_POSTGRES` names a server.
+//! them (architecture.md §7.6): writes go through whichever leads, every replica holds them, a
+//! replica stopping, the leader too, loses none that were acknowledged, and one whose disk was
+//! lost rejoins as a new member. Postgres runs when `KERMODES_TEST_POSTGRES` names a server.
 
 use std::fs;
 use std::net::{SocketAddr, TcpListener};
@@ -15,6 +15,9 @@ use arrow::array::{AsArray, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Int64Type, Schema};
 use kermodes_flight::{Client, serve_replica};
 use kermodes_weir::{Error, LogLimits, Replica, SourceId, TableName};
+use tonic_health::pb::HealthCheckRequest;
+use tonic_health::pb::health_check_response::ServingStatus;
+use tonic_health::pb::health_client::HealthClient;
 
 const REPLICAS: usize = 3;
 
@@ -161,6 +164,89 @@ fn eventually<T>(seconds: u64, mut done: impl FnMut() -> Result<T, Error>) -> T 
             }
             Err(e) => panic!("never: {e}"),
         }
+    }
+}
+
+/// Whether the replica at `addr` says it is ready (gRPC health), as Kubernetes asks it.
+fn ready(addr: SocketAddr) -> bool {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let Ok(channel) = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+        else {
+            return false;
+        };
+        HealthClient::new(channel)
+            .check(HealthCheckRequest::default())
+            .await
+            .is_ok_and(|answer| answer.into_inner().status == ServingStatus::Serving as i32)
+    })
+}
+
+/// Two disks lost in turn, while a writer writes: each replica comes back on an empty disk as
+/// a new member, catches up from the others' files, and is made a voter, which its readiness
+/// says. After the second, only the first replacement voting keeps a majority, so writes going
+/// on and every replica holding them all prove it was.
+#[test]
+fn replicas_whose_disks_were_lost_rejoin_as_new_members() {
+    let Some(catalog) = postgres() else {
+        return;
+    };
+    let mut shard = Shard::new(catalog);
+    let client = eventually(10, || Client::connect(&shard.url()));
+    eventually(10, || client.create_table(&ticks(), &schema()));
+    let source = SourceId::parse("feed").unwrap();
+    let writer = eventually(10, || client.writer(&ticks(), &source, true));
+    let mut written = 0;
+    let mut write_some = |writer: &kermodes_flight::RemoteWriter| {
+        for _ in 0..20 {
+            assert!(writer.write(&batch(written..written + 10), None).unwrap());
+            written += 10;
+        }
+    };
+    write_some(&writer);
+    for lost in [0, 2] {
+        shard.stop(lost);
+        fs::remove_dir_all(shard.dir.join(format!("r{}", lost + 1))).unwrap();
+        write_some(&writer);
+        shard.start(lost);
+        let addr = shard.addrs[lost];
+        eventually(30, || {
+            if ready(addr) {
+                Ok(())
+            } else {
+                Err(Error::Io(format!("replica {} is not ready yet", lost + 1)))
+            }
+        });
+        write_some(&writer);
+    }
+    let total = written as u64;
+    for (i, addr) in shard.addrs.iter().enumerate() {
+        let replica = eventually(10, || Client::connect(&format!("grpc://{addr}")));
+        let values = eventually(20, || {
+            let (held, rows) = replica.rows_at(&ticks(), 0, total, None)?;
+            if held != total {
+                return Err(Error::Io(format!(
+                    "replica {} holds {held} of {total}",
+                    i + 1
+                )));
+            }
+            Ok(rows
+                .iter()
+                .flat_map(|rows| rows.column(0).as_primitive::<Int64Type>().values().to_vec())
+                .collect::<Vec<i64>>())
+        });
+        assert_eq!(
+            values,
+            (0..written).collect::<Vec<_>>(),
+            "replica {}",
+            i + 1
+        );
     }
 }
 

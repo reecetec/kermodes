@@ -15,6 +15,9 @@
 //!   segment's first, which is where the segment takes up the log.
 //! - STATE: Raft's term, vote, and commit index (u64 each). The last one read is Raft's; each
 //!   segment starts with the latest, so deleting older segments loses none.
+//! - CONF: the shard's members (Raft's `ConfState`, protobuf) as a change at an index (u64)
+//!   left them: written when the change is applied, and at each segment's start the latest, so
+//!   deleting older segments loses none. A log without one has the members it was opened with.
 //! - ENTRY: index (u64), term (u64), Raft entry type (u8), data. An index at or below the last
 //!   one read replaces that entry and every one after it: a new leader overwrote entries that
 //!   were never committed.
@@ -59,7 +62,8 @@ use arrow::ipc::writer::{
 };
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use raft::eraftpb::{Entry, EntryType, HardState};
+use raft::eraftpb::{ConfState, Entry, EntryType, HardState};
+use raft::protocompat::PbMessage;
 
 use crate::disk::{self, DiskFile, DiskRef};
 use crate::shape::Shape;
@@ -80,6 +84,7 @@ const STATE: u8 = 2;
 const ENTRY: u8 = 3;
 const SHAPE: u8 = 4;
 const SHAPED: u8 = 5;
+const CONF: u8 = 6;
 
 /// An entry's data: a write of a table's rows, a past date of a table dropped, or a lease on
 /// one of its sources taken.
@@ -168,6 +173,9 @@ pub(crate) struct Recovered {
     /// The entries after `keep_after`, in index order.
     pub entries: Vec<Entry>,
     pub state: HardState,
+    /// The shard's members as each change kept in the log left them: the index of its entry,
+    /// in order (`CONF`); empty for a log whose members never changed.
+    pub confs: Vec<(u64, ConfState)>,
 }
 
 /// The term of the entry at `index`, from the first index of each term (`Recovered::terms`).
@@ -231,6 +239,9 @@ pub(crate) struct Wal {
     last: (u64, u64),
     /// Raft's state as last appended: a new segment starts with it.
     state: HardState,
+    /// The shard's members as last changed, and the index of that change: a new segment
+    /// starts with them.
+    conf: Option<(u64, ConfState)>,
     /// Set once a write failed: what is on disk past the last good frame is unknown, so nothing
     /// more is appended until the store is opened again.
     broken: Option<String>,
@@ -269,6 +280,7 @@ impl Wal {
             entries: Vec::new(),
             last: None,
             state: HardState::default(),
+            confs: Vec::new(),
         };
         let mut segments: Vec<Segment> = Vec::with_capacity(names.len() + 1);
         for &name in &names {
@@ -297,8 +309,15 @@ impl Wal {
             )));
         }
         let name = (last.0 + 1).max(segments.last().map_or(0, |newest| newest.name + 1));
-        let (file, first_entry) =
-            start_segment(disk, dir, name, segment_bytes, last, &reading.state)?;
+        let (file, first_entry) = start_segment(
+            disk,
+            dir,
+            name,
+            segment_bytes,
+            last,
+            &reading.state,
+            reading.confs.last(),
+        )?;
         segments.push(Segment {
             name,
             start: last,
@@ -315,6 +334,7 @@ impl Wal {
             terms: reading.terms,
             entries: reading.entries,
             state: reading.state.clone(),
+            confs: reading.confs.clone(),
         };
         let wal = Self {
             disk: disk.clone(),
@@ -325,6 +345,7 @@ impl Wal {
             segments,
             last,
             state: reading.state,
+            conf: reading.confs.pop(),
             broken: None,
         };
         Ok((wal, recovered))
@@ -520,6 +541,29 @@ impl Wal {
         self.last.0
     }
 
+    /// Records the shard's members as the change at `index` left them, durably (`CONF`).
+    pub(crate) fn append_conf(&mut self, index: u64, conf: &ConfState) -> Result<(), Error> {
+        if let Some(why) = &self.broken {
+            return Err(Error::Io(format!("the log cannot be written: {why}")));
+        }
+        let mut buffer = Vec::new();
+        frame(&mut buffer, CONF, &[&conf_body(index, conf)]);
+        let open = self.segments.len() - 1;
+        let written = self
+            .file
+            .write_all(&buffer)
+            .and_then(|()| self.file.sync_data());
+        if let Err(e) = written {
+            let path = segment_path(&self.dir, self.segments[open].name);
+            let why = format!("{}: {e}", path.display());
+            self.broken = Some(why.clone());
+            return Err(Error::Io(why));
+        }
+        self.segments[open].end += buffer.len() as u64;
+        self.conf = Some((index, conf.clone()));
+        Ok(())
+    }
+
     fn roll(&mut self) -> Result<(), Error> {
         let newest = self.segments[self.segments.len() - 1].name;
         let name = (self.last.0 + 1).max(newest + 1);
@@ -530,6 +574,7 @@ impl Wal {
             self.segment_bytes,
             self.last,
             &self.state,
+            self.conf.as_ref(),
         )?;
         self.file = file;
         self.first_entry = first_entry;
@@ -549,8 +594,8 @@ fn segment_path(dir: &Path, name: u64) -> PathBuf {
 }
 
 /// A new segment, taking up the log after `last`: preallocated (so an fsync need not also
-/// commit the file's growth), its header, start, and `state` durable, and its directory entry.
-/// Where its first entry goes.
+/// commit the file's growth), its header, start, `state`, and members (`conf`, if they ever
+/// changed) durable, and its directory entry. Where its first entry goes.
 fn start_segment(
     disk: &DiskRef,
     dir: &Path,
@@ -558,6 +603,7 @@ fn start_segment(
     segment_bytes: u64,
     last: (u64, u64),
     state: &HardState,
+    conf: Option<&(u64, ConfState)>,
 ) -> Result<(Box<dyn DiskFile>, u64), Error> {
     let path = segment_path(dir, name);
     let mut file = disk.create(&path, true).map_err(|e| Error::io(&path, e))?;
@@ -570,6 +616,9 @@ fn start_segment(
         &[&last.0.to_le_bytes(), &last.1.to_le_bytes()],
     );
     frame(&mut head, STATE, &[&state_body(state)]);
+    if let Some((index, conf)) = conf {
+        frame(&mut head, CONF, &[&conf_body(*index, conf)]);
+    }
     file.write_all(&head)
         .and_then(|()| file.sync_all())
         .map_err(|e| Error::io(&path, e))?;
@@ -578,7 +627,8 @@ fn start_segment(
 }
 
 /// Starts a log afresh in `dir` (under the store's directory `root`), after the entry `at`
-/// with Raft's `state`: the partition files hold everything up to `at`.
+/// with Raft's `state` and the shard's members as of it (`conf`): the partition files hold
+/// everything up to `at`.
 pub(crate) fn reset(
     disk: &DiskRef,
     root: &Path,
@@ -586,11 +636,13 @@ pub(crate) fn reset(
     segment_bytes: u64,
     at: (u64, u64),
     state: &HardState,
+    conf: &ConfState,
 ) -> Result<(), Error> {
     for parent in disk::create_dirs(&**disk, root, dir).map_err(|e| Error::io(dir, e))? {
         disk.sync_dir(&parent).map_err(|e| Error::io(&parent, e))?;
     }
-    start_segment(disk, dir, at.0 + 1, segment_bytes, at, state)?;
+    let conf = (at.0, conf.clone());
+    start_segment(disk, dir, at.0 + 1, segment_bytes, at, state, Some(&conf))?;
     write_applied(disk, dir, at.0)
 }
 
@@ -669,6 +721,12 @@ fn word(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"))
 }
 
+fn conf_body(index: u64, conf: &ConfState) -> Vec<u8> {
+    let mut body = index.to_le_bytes().to_vec();
+    conf.encode(&mut body);
+    body
+}
+
 /// What reading the segments in order has found so far.
 struct Reading {
     keep_after: u64,
@@ -680,6 +738,8 @@ struct Reading {
     /// The index and term of the last entry read; `None` before the first segment.
     last: Option<(u64, u64)>,
     state: HardState,
+    /// Every CONF read, once each (a segment starts with the one before it).
+    confs: Vec<(u64, ConfState)>,
 }
 
 impl Reading {
@@ -809,6 +869,15 @@ fn read_segment(
                     vote: word(&body, 8),
                     commit: word(&body, 16),
                 };
+            }
+            CONF if body.len() >= 8 => {
+                let index = word(&body, 0);
+                let mut conf = ConfState::default();
+                conf.merge_from_bytes(&body[8..])
+                    .map_err(|e| corrupt(&format!("the shard's members: {e}")))?;
+                if reading.confs.last().is_none_or(|(last, _)| *last < index) {
+                    reading.confs.push((index, conf));
+                }
             }
             SHAPE if body.len() >= 4 => {
                 let number = u32::from_le_bytes(body[..4].try_into().expect("4 bytes"));
@@ -1154,29 +1223,39 @@ fn decode_v1(
 
 /// The index the partition files hold every entry up to: 0 for a store before the log.
 pub(crate) fn read_applied(disk: &DiskRef, dir: &Path) -> Result<u64, Error> {
-    let path = dir.join("applied");
-    match disk.read(&path) {
-        Ok(bytes) => {
-            let bytes: [u8; 12] = bytes
-                .try_into()
-                .map_err(|_| Error::Corrupt(format!("{}: unreadable", path.display())))?;
-            let (lsn, crc) = bytes.split_at(8);
-            if crc32fast::hash(lsn).to_le_bytes() != crc {
-                return Err(Error::Corrupt(format!("{}: unreadable", path.display())));
-            }
-            Ok(u64::from_le_bytes(lsn.try_into().expect("8 bytes")))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
-        Err(e) => Err(Error::io(&path, e)),
-    }
+    Ok(read_word(disk, &dir.join("applied"))?.unwrap_or(0))
 }
 
 /// Records that the partition files hold every entry up to `lsn`, atomically and durably.
 pub(crate) fn write_applied(disk: &DiskRef, dir: &Path, lsn: u64) -> Result<(), Error> {
-    let path = dir.join("applied");
-    let staged = dir.join("applied.new");
-    let mut bytes = lsn.to_le_bytes().to_vec();
-    bytes.extend_from_slice(&crc32fast::hash(&lsn.to_le_bytes()).to_le_bytes());
+    write_word(disk, dir, "applied", lsn)
+}
+
+/// The number in the file at `path` (`write_word`); `None` if there is no file.
+pub(crate) fn read_word(disk: &DiskRef, path: &Path) -> Result<Option<u64>, Error> {
+    match disk.read(path) {
+        Ok(bytes) => {
+            let bytes: [u8; 12] = bytes
+                .try_into()
+                .map_err(|_| Error::Corrupt(format!("{}: unreadable", path.display())))?;
+            let (word, crc) = bytes.split_at(8);
+            if crc32fast::hash(word).to_le_bytes() != crc {
+                return Err(Error::Corrupt(format!("{}: unreadable", path.display())));
+            }
+            Ok(Some(u64::from_le_bytes(word.try_into().expect("8 bytes"))))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::io(path, e)),
+    }
+}
+
+/// Records `word` in the file `name` in `dir`, atomically and durably: its 8 bytes and their
+/// CRC-32, little-endian.
+pub(crate) fn write_word(disk: &DiskRef, dir: &Path, name: &str, word: u64) -> Result<(), Error> {
+    let path = dir.join(name);
+    let staged = dir.join(format!("{name}.new"));
+    let mut bytes = word.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&crc32fast::hash(&word.to_le_bytes()).to_le_bytes());
     let mut file = disk
         .create(&staged, false)
         .map_err(|e| Error::io(&staged, e))?;

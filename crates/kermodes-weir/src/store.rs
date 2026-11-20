@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -32,9 +32,12 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use kermodes_core::type_name;
-use raft::eraftpb::{Entry, EntryType, Message, MessageType, Snapshot};
+use raft::eraftpb::{
+    ConfChangeSingle, ConfChangeType, ConfChangeV2, ConfState, Entry, EntryType, Message,
+    MessageType, Snapshot,
+};
 use raft::protocompat::PbMessage;
-use raft::{RawNode, SnapshotStatus, StateRole, Storage};
+use raft::{ProgressState, RawNode, SnapshotStatus, StateRole, Storage};
 use serde_json::json;
 
 use crate::catalog::{Catalog, Garbage, HistoryCommit, HistoryDate, HistoryFile, TableEntry};
@@ -42,7 +45,9 @@ use crate::disk::{self, DiskRef};
 use crate::keyed::Fold;
 use crate::partition::{Partition, Stamp, ToSync, Written, in_order, schema_header};
 use crate::pending::{Answer, InFlight, Pending};
-use crate::replica::{LogLimits, LogStore, Replica, transferee};
+use crate::replica::{
+    LogLimits, LogStore, Promotion, Replica, promotion, replica_id, replica_name, slot, transferee,
+};
 use crate::shape::Shape;
 use crate::snapshot::{self, SnapshotSource, SnapshotWanted};
 use crate::wal::{self, Append, Command, Logged, Wal};
@@ -205,10 +210,18 @@ type Stop = (Mutex<bool>, Condvar);
 struct Shard {
     /// The leader's Raft ID, as this replica knows it: 0 while it knows of none.
     leader: AtomicU64,
+    /// Whether this replica is among the shard's members, a voter or a learner: one that joins
+    /// asks the leader until it is (`Store::join`).
+    member: AtomicBool,
+    /// Whether this replica votes: a member made a learner first is made a voter once it has
+    /// caught up (`promotion`).
+    voter: AtomicBool,
     /// The shard log's commit index, as this replica knows it (`Store::caught_up`).
     committed: AtomicU64,
     /// The snapshot this replica must install (`Store::snapshot_wanted`).
     wanted: Mutex<Option<SnapshotWanted>>,
+    /// The shard's members as of the last entry applied, read with it (`Store::members`).
+    members: Mutex<ConfState>,
 }
 
 /// A table's log, and the signal that one of its source leases was released.
@@ -272,6 +285,8 @@ enum Request {
     Tick,
     /// Hand the lead to another replica (`Store::hand_over`).
     HandOver,
+    /// Take a replica into the shard (`Store::join`).
+    Join(u64),
 }
 
 /// A past date of a table to drop, its history holding it whole, and where the outcome goes.
@@ -474,7 +489,7 @@ impl Store {
         branch: &str,
         disk: DiskRef,
         clock: Clock,
-        replica: Replica,
+        mut replica: Replica,
         stepped: bool,
     ) -> Result<Self, Error> {
         let untrusted = disk.untrusted().map_err(|e| {
@@ -494,24 +509,9 @@ impl Store {
         snapshot::recover(&disk, root)?;
         let weir = root.join("weir");
         let log_dir = weir.join("log");
-        // No log, for a replica the catalog says had one: it lost its disk (or it was replaced).
-        // Its vote, and what it acknowledged, went with it, so its vote could elect a leader
-        // without entries it helped commit. It rejoins as a new member, caught up before it
-        // votes, which needs changing the shard's members. A replica the catalog does not know
-        // has never voted nor acknowledged: it starts with no log however late it joins (a
-        // shard's pods start one at a time). A shard of one has no one else to have voted.
-        // Checked before anything here makes the log, so a refused replica stays refused.
-        if !replica.is_alone()
-            && !disk.exists(&log_dir)
-            && catalog.replica_started(branch, replica.id)?
-        {
-            return Err(Error::Io(format!(
-                "{}: replica {} has no log, though it had one: its disk was lost or replaced, \
-                 and it cannot rejoin until weir can change a shard's members; restore its \
-                 volume",
-                root.display(),
-                replica.id
-            )));
+        // Which replica this is, recorded before anything here makes the log (`identify`).
+        if !replica.is_alone() {
+            replica = identify(&disk, root, &log_dir, &mut catalog, branch, replica)?;
         }
         let flushed = wal::read_applied(&disk, &log_dir)?;
         let mut logs = HashMap::new();
@@ -559,14 +559,18 @@ impl Store {
         // Recorded once its log is durable (`Wal::open` makes it so), before Raft starts: it
         // has not voted or acknowledged anything before the catalog knows it has a log to lose.
         if !replica.is_alone() {
-            self::lock(&tables.catalog).start_replica(branch, replica.id)?;
+            self::lock(&tables.catalog).start_replica(branch, slot(replica.id))?;
         }
         // The committed entries the partition files do not hold yet, before Raft starts.
         let from = flushed.max(recovered.start.0);
         let mut applied = from;
+        // Changes of the shard's members are Raft's own: applied to it once it runs.
+        let mut changes = Vec::new();
         for entry in &recovered.entries {
             if entry.index > from && entry.index <= recovered.state.commit {
-                if !entry.data.is_empty() {
+                if entry.get_entry_type() == EntryType::EntryConfChangeV2 {
+                    changes.push(entry.clone());
+                } else if !entry.data.is_empty() {
                     tables.apply(entry, &mut stamped, &flusher)?;
                 }
                 applied = entry.index;
@@ -595,11 +599,23 @@ impl Store {
             random_seed: replica.seed,
             ..raft::Config::default()
         };
-        let node = RawNode::new(&config, store, &raft::default_logger()).map_err(|e| {
+        let mut node = RawNode::new(&config, store, &raft::default_logger()).map_err(|e| {
             Error::Corrupt(format!("{}: cannot start Raft: {e}", log_dir.display()))
         })?;
+        // Those the log committed past the last it recorded applied.
+        let recorded = node.store().conf_index();
+        for entry in changes.iter().filter(|entry| entry.index > recorded) {
+            change_members(&mut node, entry)?;
+        }
         let logs = tables.logs.clone();
-        let shard = Arc::new(Shard::default());
+        let members = node.store().conf().clone();
+        let id = replica.id;
+        let shard = Arc::new(Shard {
+            member: AtomicBool::new(members.voters.contains(&id) || members.learners.contains(&id)),
+            voter: AtomicBool::new(members.voters.contains(&id)),
+            members: Mutex::new(members),
+            ..Shard::default()
+        });
         let (outgoing, outgoing_from) = mpsc::channel();
         let catalog = tables.catalog.clone();
         applied_at.store(applied, Ordering::Release);
@@ -711,6 +727,7 @@ impl Store {
                 | Request::Receive(_)
                 | Request::Tick
                 | Request::HandOver
+                | Request::Join(_)
                 | Request::Lease(_) => {}
             }
         }
@@ -741,6 +758,50 @@ impl Store {
             // Gone with the committer: the store is closing, and there is nothing to hand.
             Driver::Threads { .. } => drop(self.requests.send(Request::HandOver)),
         }
+    }
+
+    /// As leader, takes replica `id` into the shard: a new incarnation of a slot whose disk was
+    /// lost (§7.6), made a learner now and a voter, in place of the one it replaced, once it
+    /// has caught up. Asked until it is a member (`is_member`); refused unless this replica
+    /// leads.
+    pub fn join(&self, id: u64) -> Result<(), Error> {
+        if !self.is_leader() {
+            return Err(self.not_leading());
+        }
+        match &self.driver {
+            Driver::Stepped { committer, .. } => lock(committer).join(id),
+            Driver::Threads { .. } => drop(self.requests.send(Request::Join(id))),
+        }
+        Ok(())
+    }
+
+    /// Whether this replica is among its shard's members, a voter or a learner.
+    pub fn is_member(&self) -> bool {
+        self.shard.member.load(Ordering::Acquire)
+    }
+
+    /// Whether this replica votes in its shard's elections and commits.
+    pub fn is_voter(&self) -> bool {
+        self.shard.voter.load(Ordering::Acquire)
+    }
+
+    /// This replica's Raft ID (`replica_id`): its slot and incarnation.
+    pub fn replica_id(&self) -> u64 {
+        self.replica_id
+    }
+
+    fn not_leading(&self) -> Error {
+        Error::NotLeader(match self.shard.leader.load(Ordering::Acquire) {
+            0 => format!(
+                "weir {} does not lead its shard, and knows of no leader yet",
+                replica_name(self.replica_id)
+            ),
+            leader => format!(
+                "weir {} does not lead its shard: {} does",
+                replica_name(self.replica_id),
+                replica_name(leader)
+            ),
+        })
     }
 
     /// Takes a message another replica of the shard sent this one (`take_messages`).
@@ -776,11 +837,13 @@ impl Store {
         self.shard.leader.load(Ordering::Acquire) == self.replica_id
     }
 
-    /// Whether this replica is ready to serve as its shard's: it knows a leader and has applied
-    /// the log as far as it knows it committed. A rollout takes the next replica down only
-    /// once this one is.
+    /// Whether this replica is ready to serve as its shard's: it votes (a new incarnation, once
+    /// promoted), knows a leader, and has applied the log as far as it knows it committed. A
+    /// rollout takes the next replica down only once this one is: one still a learner leaves
+    /// the replica it replaced among the voters, so another going would stall writes.
     pub fn caught_up(&self) -> bool {
-        self.shard.leader.load(Ordering::Acquire) != 0
+        self.is_voter()
+            && self.shard.leader.load(Ordering::Acquire) != 0
             && self.applied() >= self.shard.committed.load(Ordering::Acquire)
     }
 
@@ -913,6 +976,12 @@ impl Store {
         logs.iter()
             .map(|log| lock(&log.state).entry.clone())
             .collect()
+    }
+
+    /// The shard's members as of the last entry this replica applied: read under `position`,
+    /// they go with the files a peer copies (`SnapshotFiles`).
+    pub(crate) fn members(&self) -> ConfState {
+        lock(&self.shard.members).clone()
     }
 
     /// The store's directory.
@@ -1060,18 +1129,7 @@ impl Store {
     ) -> Result<PendingWriter, Error> {
         // Its writes would be refused one by one: the writer goes to the leader instead.
         if !self.is_leader() {
-            return Err(Error::NotLeader(
-                match self.shard.leader.load(Ordering::Acquire) {
-                    0 => format!(
-                        "weir replica {} does not lead its shard, and knows of no leader yet",
-                        self.replica_id
-                    ),
-                    leader => format!(
-                        "weir replica {} does not lead its shard: replica {leader} does",
-                        self.replica_id
-                    ),
-                },
-            ));
+            return Err(self.not_leading());
         }
         let log = self.log(name)?;
         let mut state = lock(&log.state);
@@ -1942,16 +2000,80 @@ impl Committer {
     }
 
     fn receive(&mut self, message: Message) {
-        if self.broken.is_none() {
+        // A message for another incarnation of this replica's slot (the one it replaced) is
+        // not this one's to take.
+        if self.broken.is_none() && message.to == self.replica.id {
             // One Raft cannot use (from a replica not of the shard) is dropped, as Raft says.
             let _ = self.node.step(message);
             self.drive();
         }
     }
 
+    /// As leader, makes replica `id` a learner, unless it is a member already or another change
+    /// of members is under way (`Store::join`).
+    fn join(&mut self, id: u64) {
+        let conf = self.node.store().conf();
+        if self.broken.is_some()
+            || !self.is_leader()
+            || self.node.raft.has_pending_conf()
+            || conf.voters.contains(&id)
+            || conf.learners.contains(&id)
+        {
+            return;
+        }
+        let change = ConfChangeV2 {
+            changes: vec![change_of(id, ConfChangeType::AddLearnerNode)],
+            ..ConfChangeV2::default()
+        };
+        let _ = self.node.propose_conf_change(Vec::new(), change);
+        self.drive();
+    }
+
+    /// As leader, makes a learner that has caught up a voter, removing the incarnation of its
+    /// slot it replaced in the same change (`promotion`): one change of members at a time.
+    fn promote(&mut self) {
+        let conf = self.node.store().conf();
+        let raft = &self.node.raft;
+        if self.broken.is_some()
+            || !self.is_leader()
+            || raft.has_pending_conf()
+            || !conf.voters_outgoing.is_empty()
+        {
+            return;
+        }
+        let learners = conf.learners.iter().filter_map(|&id| {
+            let progress = raft.prs().get(id)?;
+            Some((
+                id,
+                progress.state == ProgressState::Replicate,
+                progress.matched,
+            ))
+        });
+        let Some(Promotion { learner, replaced }) = promotion(
+            self.replica.id,
+            &conf.voters,
+            learners,
+            raft.raft_log.committed,
+        ) else {
+            return;
+        };
+        let mut changes = vec![change_of(learner, ConfChangeType::AddNode)];
+        changes.extend(
+            replaced
+                .into_iter()
+                .map(|id| change_of(id, ConfChangeType::RemoveNode)),
+        );
+        let change = ConfChangeV2 {
+            changes,
+            ..ConfChangeV2::default()
+        };
+        let _ = self.node.propose_conf_change(Vec::new(), change);
+    }
+
     /// Does what Raft asks until it asks nothing more (`handle_ready`), then proposes the
     /// writes waiting if it can, and again.
     fn drive(&mut self) {
+        self.promote();
         loop {
             while self.broken.is_none() && self.node.has_ready() {
                 self.handle_ready();
@@ -1974,6 +2096,15 @@ impl Committer {
         self.shard
             .leader
             .store(self.node.raft.leader_id, Ordering::Release);
+        let conf = self.node.store().conf();
+        let id = self.replica.id;
+        self.shard.member.store(
+            conf.voters.contains(&id) || conf.learners.contains(&id),
+            Ordering::Release,
+        );
+        self.shard
+            .voter
+            .store(conf.voters.contains(&id), Ordering::Release);
     }
 
     /// As leader of others, the last index every follower holds.
@@ -2162,9 +2293,11 @@ impl Committer {
             vote: self.node.raft.vote,
         });
         self.stop(format!(
-            "replica {} is too far behind replica {from} to catch up from the log: it copies \
-             that replica's partition files, from index {}",
-            self.replica.id, meta.index
+            "{} is too far behind {} to catch up from the log: it copies that replica's \
+             partition files, from index {}",
+            replica_name(self.replica.id),
+            replica_name(from),
+            meta.index
         ));
     }
 
@@ -2195,6 +2328,14 @@ impl Committer {
             let held = self.position.clone();
             let mut position = lock(&held);
             let (outcome, answers) = match mine {
+                // A change of the shard's members, Raft's own.
+                None if entry.get_entry_type() == EntryType::EntryConfChangeV2 => (
+                    change_members(&mut self.node, &entry).map(|members| {
+                        *lock(&self.shard.members) = members;
+                        false
+                    }),
+                    Vec::new(),
+                ),
                 Some(Proposal::Write(unit)) => {
                     let Unit {
                         log,
@@ -2317,26 +2458,109 @@ impl Committer {
 
     fn not_leader(&self) -> Error {
         let id = self.replica.id;
+        let me = replica_name(id);
         let raft = &self.node.raft;
         Error::NotLeader(match (raft.leader_id, raft.lead_transferee) {
             (raft::INVALID_ID, _) => {
-                format!("weir replica {id} does not lead its shard, and knows of no leader yet")
+                format!("weir {me} does not lead its shard, and knows of no leader yet")
             }
             (leader, Some(to)) if leader == id => {
-                format!("weir replica {id} is handing the lead of its shard to replica {to}")
+                format!(
+                    "weir {me} is handing the lead of its shard to {}",
+                    replica_name(to)
+                )
             }
             (leader, _) => {
-                format!("weir replica {id} does not lead its shard: replica {leader} does")
+                format!(
+                    "weir {me} does not lead its shard: {} does",
+                    replica_name(leader)
+                )
             }
         })
     }
 
     fn lost(&self) -> Error {
         Error::NotLeader(format!(
-            "weir replica {} stopped leading its shard before the write committed, so it may or \
-             may not be written: send it again, as a resend",
-            self.replica.id
+            "weir {} stopped leading its shard before the write committed, so it may or may not \
+             be written: send it again, as a resend",
+            replica_name(self.replica.id)
         ))
+    }
+}
+
+/// The file in a replica's directory holding its Raft ID (`identify`).
+const IDENTITY: &str = "replica-id";
+
+/// Which replica `replica` is, given its slot as its ID: the incarnation its disk records, or,
+/// on a disk that records none, its slot's first incarnation, unless the catalog says the slot
+/// had a log (`replica_started`) and this disk has none: its disk was lost or replaced. The
+/// replica it replaced may have voted, and acknowledged entries, with what was lost, so it
+/// takes the slot's next incarnation (`Catalog::next_incarnation`), a new member: it takes up
+/// the members as the shard began them (catching up from the log's start replays every change
+/// since; a snapshot brings them as of its copy) and votes only once the shard makes it a
+/// voter (§7.6). The ID is on the disk before Raft first runs; a log from before IDs were
+/// recorded is the first incarnation's.
+fn identify(
+    disk: &DiskRef,
+    root: &Path,
+    log_dir: &Path,
+    catalog: &mut Catalog,
+    branch: &str,
+    mut replica: Replica,
+) -> Result<Replica, Error> {
+    let at = slot(replica.id);
+    let id = match wal::read_word(disk, &root.join(IDENTITY))? {
+        Some(id) => id,
+        None => {
+            let lost = !disk.exists(log_dir) && catalog.replica_started(branch, at)?;
+            let incarnation = if lost {
+                catalog.next_incarnation(branch, at)?
+            } else {
+                0
+            };
+            let id = replica_id(at, incarnation);
+            wal::write_word(disk, root, IDENTITY, id)?;
+            id
+        }
+    };
+    if slot(id) != at {
+        return Err(Error::Corrupt(format!(
+            "{}: the disk of {} serves as replica {at}",
+            root.display(),
+            replica_name(id)
+        )));
+    }
+    replica.id = id;
+    Ok(replica)
+}
+
+/// Applies the change of the shard's members `entry` holds to Raft and records what it left,
+/// durably, before the entry counts as applied.
+fn change_members(node: &mut RawNode<LogStore>, entry: &Entry) -> Result<ConfState, Error> {
+    let mut change = ConfChangeV2::default();
+    change.merge_from_bytes(&entry.data).map_err(|e| {
+        Error::Corrupt(format!(
+            "the shard log's change of members at {}: {e}",
+            entry.index
+        ))
+    })?;
+    let members = node.apply_conf_change(&change).map_err(|e| {
+        Error::Corrupt(format!(
+            "the shard log's change of members at {}: {e}",
+            entry.index
+        ))
+    })?;
+    node.mut_store()
+        .persist_conf(entry.index, members.clone())?;
+    Ok(members)
+}
+
+/// One change of a change of the shard's members: `node_id` added as a voter or a learner, or
+/// removed.
+fn change_of(node_id: u64, change_type: ConfChangeType) -> ConfChangeSingle {
+    ConfChangeSingle {
+        change_type,
+        node_id,
     }
 }
 
@@ -2377,6 +2601,7 @@ fn commit_every(mut committer: Committer, requests: &Receiver<Request>) {
                 Request::Receive(message) => committer.receive(message),
                 Request::Tick => committer.tick(),
                 Request::HandOver => committer.hand_over(),
+                Request::Join(id) => committer.join(id),
             }
             if !stop && bytes < GROUP_BYTES {
                 next = requests.try_recv().ok().or_else(|| {

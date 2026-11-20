@@ -17,8 +17,8 @@ use arrow_flight::{Action, FlightData, FlightDescriptor, PutResult, Ticket};
 use futures::{StreamExt, TryStreamExt};
 use kermodes_weir::{
     Answer, Change, ColumnId, Date, Error, Garbage, HistoryCommit, HistoryDate, HistoryFile,
-    InFlight, Pace, Pending, SnapshotSource, SourceId, Stamp, Subscriber, TableEntry, TableName,
-    conform, keys_only,
+    InFlight, Pace, Pending, SnapshotFiles, SnapshotSource, SourceId, Stamp, Subscriber,
+    TableEntry, TableName, conform, keys_only,
 };
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
@@ -615,15 +615,28 @@ impl Client {
         });
         Ok(schema)
     }
+
+    /// Asks the shard's leader to take replica `id` into the shard (`Store::join`): a new
+    /// incarnation of a replica whose disk was lost.
+    pub fn join(&self, id: u64) -> Result<(), Error> {
+        self.action("join", json!({ "replica": id })).map(drop)
+    }
 }
 
 /// A peer's partition files, from its server: what a replica copies when too far behind.
 impl SnapshotSource for Client {
-    fn files(&self) -> Result<((u64, u64), Vec<(PathBuf, u64)>), Error> {
+    fn files(&self) -> Result<SnapshotFiles, Error> {
         let listed = self.action("snapshot_files", json!({}))?;
         let unreadable = || Error::Io(format!("an unreadable list of a peer's files: {listed}"));
         let index = listed["index"].as_u64().ok_or_else(unreadable)?;
         let term = listed["term"].as_u64().ok_or_else(unreadable)?;
+        let members = listed["members"]
+            .as_array()
+            .ok_or_else(unreadable)?
+            .iter()
+            .map(|byte| byte.as_u64().and_then(|b| u8::try_from(b).ok()))
+            .collect::<Option<Vec<u8>>>()
+            .ok_or_else(unreadable)?;
         let files = listed["files"]
             .as_array()
             .ok_or_else(unreadable)?
@@ -634,7 +647,11 @@ impl SnapshotSource for Client {
                 Ok((PathBuf::from(path), bytes))
             })
             .collect::<Result<_, Error>>()?;
-        Ok(((index, term), files))
+        Ok(SnapshotFiles {
+            at: (index, term),
+            members,
+            files,
+        })
     }
 
     fn read(&self, path: &Path, offset: u64, len: u64) -> Result<Vec<u8>, Error> {

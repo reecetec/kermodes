@@ -5,8 +5,8 @@
 use postgres::{Client, GenericClient, NoTls};
 
 use super::{
-    FORMAT, Found, Garbage, HistoryCommit, HistoryDate, HistoryFile, Row, check_commit, location,
-    started_key,
+    FORMAT, Found, Garbage, HistoryCommit, HistoryDate, HistoryFile, Row, check_commit,
+    incarnation_key, location, started_key,
 };
 use crate::{Date, Error, TableName};
 
@@ -212,6 +212,19 @@ impl Postgres {
             )
             .map(drop)
             .map_err(sql)
+    }
+
+    pub(crate) fn next_incarnation(&mut self, branch: &str, slot: u64) -> Result<u64, Error> {
+        let next: i64 = self
+            .client()?
+            .query_one(
+                "INSERT INTO kermodes_meta VALUES ($1, 1) ON CONFLICT (key)
+                 DO UPDATE SET value = kermodes_meta.value + 1 RETURNING value",
+                &[&incarnation_key(branch, slot)],
+            )
+            .map_err(sql)?
+            .get(0);
+        Ok(next as u64)
     }
 
     pub(crate) fn history(&mut self, table_id: i64) -> Result<Vec<HistoryDate>, Error> {
