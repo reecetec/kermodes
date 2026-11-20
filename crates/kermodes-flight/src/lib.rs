@@ -26,10 +26,18 @@
 //!   `{"table", "written", "replaced", "files", "dates"}`; `drop_date` `{"table", "date"}`;
 //!   `history_garbage` `{"grace_secs"}` → garbage; `forget_garbage` garbage. Each mirrors the
 //!   `Store` method of its name.
+//! - Between the replicas of a shard (§7.6): `raft`, a batch of Raft messages for this replica
+//!   (`frame_messages`), answered `{}`; `snapshot_files` → `{"index", "term", "files": [[path,
+//!   bytes]]}`, the partition files as of the last entry applied; `snapshot_read` `{"path",
+//!   "offset", "len"}` → those bytes of one, raw. A replica that does not lead refuses writes
+//!   and their leases with `Unavailable` and the metadata `kermodes-not-leader`: the client
+//!   tries the next replica it knows.
 
 #![forbid(unsafe_code)]
 
+mod carrier;
 mod client;
+mod replica;
 mod server;
 
 use std::sync::Arc;
@@ -42,7 +50,14 @@ use serde_json::{Value, json};
 use tonic::{Code, Status};
 
 pub use client::{Client, RemoteWriter};
+pub use replica::serve_replica;
 pub use server::{Server, serve};
+
+/// A server's URL as tonic dials it: `grpc://` is plain HTTP/2.
+fn http_url(url: &str) -> String {
+    url.strip_prefix("grpc://")
+        .map_or_else(|| url.to_owned(), |rest| format!("http://{rest}"))
+}
 
 /// The most one write's batch may take over Flight, encoded. A write is one atomic batch (one
 /// sequence number), so it is never split; at weir's segment size, one fits under a live
@@ -246,6 +261,9 @@ fn garbage_from_json(value: &Value) -> Result<Garbage, Error> {
     })
 }
 
+/// The metadata on a status that says the replica does not lead its shard (`Error::NotLeader`).
+const NOT_LEADER: &str = "kermodes-not-leader";
+
 /// A store error as a gRPC status; `error_from_status` reverses it.
 fn status(error: Error) -> Status {
     let code = match &error {
@@ -255,9 +273,18 @@ fn status(error: Error) -> Status {
         Error::Corrupt(_) => Code::DataLoss,
         Error::TooLarge(_) => Code::OutOfRange,
         Error::Gone(_) => Code::Aborted,
+        // As a server that is gone would be: try another replica.
+        Error::NotLeader(_) => Code::Unavailable,
         Error::Io(_) | Error::Arrow(_) | Error::Catalog(_) => Code::Internal,
     };
-    Status::new(code, error.to_string())
+    let not_leader = matches!(error, Error::NotLeader(_));
+    let mut status = Status::new(code, error.to_string());
+    if not_leader {
+        status
+            .metadata_mut()
+            .insert(NOT_LEADER, tonic::metadata::MetadataValue::from_static("1"));
+    }
+    status
 }
 
 fn error_from_status(status: &Status) -> Error {
@@ -270,6 +297,36 @@ fn error_from_status(status: &Status) -> Error {
         // Also how tonic refuses a message over the server's limit.
         Code::OutOfRange => Error::TooLarge(message),
         Code::Aborted => Error::Gone(message),
+        Code::Unavailable if status.metadata().contains_key(NOT_LEADER) => {
+            Error::NotLeader(message)
+        }
         _ => Error::Io(format!("kermodes server: {message}")),
     }
+}
+
+/// Raft messages for one replica, as the `raft` action's body: each its length (u32,
+/// little-endian), then its bytes.
+fn frame_messages(messages: &[Vec<u8>]) -> Vec<u8> {
+    let size = messages.iter().map(|m| 4 + m.len()).sum();
+    let mut body = Vec::with_capacity(size);
+    for message in messages {
+        body.extend_from_slice(&(message.len() as u32).to_le_bytes());
+        body.extend_from_slice(message);
+    }
+    body
+}
+
+/// The messages of a `raft` action's body (`frame_messages`).
+fn unframe_messages(mut body: &[u8]) -> Result<Vec<&[u8]>, Error> {
+    let mut messages = Vec::new();
+    while !body.is_empty() {
+        let length = body
+            .get(..4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("4 bytes")) as usize)
+            .filter(|&length| body.len() >= 4 + length)
+            .ok_or_else(|| Error::Corrupt("a batch of Raft messages cut short".into()))?;
+        messages.push(&body[4..4 + length]);
+        body = &body[4 + length..];
+    }
+    Ok(messages)
 }

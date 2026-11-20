@@ -120,6 +120,15 @@ class Ticker:
     def stop(self) -> None: ...
 
 def control(config: str) -> None: ...
+def serve_replica(
+    data_dir: PathLike[str] | str,
+    catalog: str,
+    branch: str,
+    replica: int,
+    peers: list[str],
+    host: str,
+    port: int,
+) -> None: ...
 def ticker(
     port: int = 0, rate: int = 1_000, symbols: int = 100, host: str = "127.0.0.1"
 ) -> Ticker: ...

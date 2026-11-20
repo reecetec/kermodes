@@ -63,6 +63,16 @@ def main(argv: list[str] | None = None) -> None:
     weir.add_argument(
         "--branch", default="prod", help="the catalog branch it serves (with --catalog)"
     )
+    weir.add_argument(
+        "--replica",
+        type=int,
+        help="this replica's number in its shard, from 1 (with --peers and --catalog)",
+    )
+    weir.add_argument(
+        "--peers",
+        help="every replica's URL in the shard, in order, comma-separated: replica n serves "
+        "at the nth (with --replica)",
+    )
 
     ui = commands.add_parser(
         "ui",
@@ -258,7 +268,18 @@ def main(argv: list[str] | None = None) -> None:
             project,
         )
     elif args.command == "weir":
-        run_weir(args.data_dir, args.host, args.port, args.catalog, args.branch)
+        if args.replica is not None or args.peers:
+            run_replica(
+                args.data_dir,
+                args.host,
+                args.port,
+                args.catalog,
+                args.branch,
+                args.replica,
+                args.peers,
+            )
+        else:
+            run_weir(args.data_dir, args.host, args.port, args.catalog, args.branch)
     elif args.command == "ui":
         run_ui(args.server, args.host, args.port, args.control)
     elif args.command == "ingest":
@@ -423,6 +444,32 @@ def run_dev(
     finally:
         if supervisor:
             supervisor.stop()
+
+
+def run_replica(
+    data_dir: Path,
+    host: str,
+    port: int,
+    catalog: str | None,
+    branch: str,
+    replica: int | None,
+    peers: str | None,
+) -> None:
+    if replica is None or not peers or not catalog:
+        raise SystemExit(
+            "kermodes weir: a replica needs --replica, --peers, and --catalog: every replica "
+            "of a shard shares one catalog"
+        )
+    urls = [url.strip() for url in peers.split(",") if url.strip()]
+    print(
+        f"kermodes weir: {data_dir.resolve()}, replica {replica} of {len(urls)}, catalog "
+        f"branch {branch} in Postgres",
+        flush=True,
+    )
+    try:
+        _native.serve_replica(data_dir, catalog, branch, replica, urls, host, port)
+    except KeyboardInterrupt:
+        pass
 
 
 def run_weir(

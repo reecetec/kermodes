@@ -52,7 +52,8 @@ def connect(
 
     - A server's URL (`grpc://host:port`, from `kermodes dev`, `kermodes weir`, or
       `Session.serve_store`): its tables. Many processes can connect to one server; it is the
-      one writer of the store's files, and they are its clients.
+      one writer of the store's files, and they are its clients. For a replicated weir, every
+      replica (`grpc://a:8731,b:8731,c:8731`): writes go to whichever leads.
     - A directory: the store there, opened in this process (created if needed), like
       `duckdb.connect("x.duckdb")`: tables and the rows their writers write survive the
       process. One process opens a directory at a time.

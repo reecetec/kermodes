@@ -618,13 +618,14 @@ outlive what Kubernetes believes.
 ### 7.6 Replication
 
 Built: the shard log as Raft's log, which every weir runs (a shard of one leads at once), and
-replication over 3 replicas with fixed membership, proven under the simulator: catch-up from a
-follower's log or a peer's partition files, trimming each replica's log, and dropping a merged
-date as an entry. Not built yet: replicas talking over the network, followers serving reads, a
-replica rejoining after its disk is lost, and the other commands as entries; the direction,
-decided before it is written. weir replicates itself so that losing a node loses no
-acknowledged write, a planned restart (a rollout, a drain) costs writers a pause of
-milliseconds and readers nothing, and producing and consuming depend on nothing outside weir.
+replication over 3 replicas with fixed membership, proven under the simulator and running as
+processes over Flight: catch-up from a follower's log or a peer's partition files, trimming
+each replica's log, dropping a merged date as an entry, and clients that find the leader. Not
+built yet: followers serving reads as a feature (they can), a replica rejoining after its disk
+is lost, and the other commands as entries; the direction, decided before it is written. weir
+replicates itself so that losing a node loses no acknowledged write, a planned restart (a
+rollout, a drain) costs writers a pause of milliseconds and readers nothing, and producing and
+consuming depend on nothing outside weir.
 
 The model is the one databases use: one replicated write-ahead log per shard, the only durable
 copy, and everything else derived from it.
@@ -682,6 +683,19 @@ writers ─► leader ── append + fsync ────────────
   add no load to the leader and a change of leader does not touch them. Live delivery is from
   memory as entries commit; catching up and reads by position (§7.2) read the partition files
   and, past them, the log.
+- **Transport.** A replica is a process, `kermodes weir --replica N --peers URL,URL,URL
+  --catalog POSTGRES`: its store, its Flight server, and a carrier that sends its Raft messages
+  to the others as the `raft` action, one call per peer at a time with whatever waited for it
+  (a call that fails loses its messages, which Raft sends again). Raft's clock ticks every
+  100 ms on the store's own thread: a heartbeat a tick, an election after 10 to 20 without
+  the leader. A replica too far behind closes its store, copies its leader's partition files
+  over the same server (`snapshot_files`, `snapshot_read`), and opens again.
+- **Clients** are given every replica (`grpc://a:8731,b:8731,c:8731`). A replica that does not
+  lead refuses writes and their leases as unavailable, saying so; a write lost to a change of
+  leader is refused the same way. The client moves to the next replica at once, and pauses
+  200 ms after each round of them, while they elect a leader: a writer reopens its stream
+  there and resends what was not acknowledged, recognised if it was written; an action tries
+  for up to 10 s. Each reconnect is reported, never silent.
 - **Latency and throughput, per table.** A firm's trading signal and its full-depth market feed
   want opposite trade-offs, and both are first-class. A table declares them; defaults are safe
   and fast (majority fsynced, no producer batching, apps cycling on input).
@@ -735,15 +749,19 @@ writers ─► leader ── append + fsync ────────────
   restarts it hands leadership to an up-to-date follower; writers are redirected, and the batch
   in flight is resent with its `seq`, so nothing is lost or written twice. Readers on the
   restarting replica reconnect and resume by position, each reconnect recorded.
-- **Unplanned failure.** Losing the leader stalls writes for an election timeout (about a
-  second), losing no acknowledged write. Losing a follower changes nothing for writers. With two
-  of three replicas gone, writes stop until one returns, and the committed log is still served.
+- **Unplanned failure.** Losing the leader stalls writes for an election (1 to 2 s without
+  hearing from it, then a vote), losing no acknowledged write. Losing a follower changes
+  nothing for writers. With two of three replicas gone, writes stop until one returns, and the
+  committed log is still served.
 - **`kermodes dev`** runs the same code as a shard of one replica.
 - **Testing.** Replication is proven by deterministic simulation before it serves anything: every
   replica in one process over a simulated network and disk, faults injected from a seed (lost,
   delayed, and reordered messages, crashes mid-fsync, torn writes, partitions), and invariants
   checked over millions of runs: no committed entry lost, none applied twice, every replica's log
-  a prefix of the same log. Then real processes: `kill -9` on the leader under load, and node
+  a prefix of the same log. Then real processes: three replicas on localhost
+  (`crates/kermodes-flight/tests/replicas.rs`), each stopped in turn while a writer writes and
+  started once the others trimmed their logs past it, so it catches up by copying files; then
+  `kill -9` on each of three `kermodes weir` processes under load. Later, node
   drains. Built for one replica: the store runs stepped (§7.1) on a simulated disk that keeps
   what a running process sees apart from what is durable. From a seed the process is killed (the
   page cache staying) or the power goes, between operations or in the middle of one (keeping a
@@ -772,7 +790,7 @@ writers ─► leader ── append + fsync ────────────
      resumed by LSN, and existing segments still read. Its latency, produce to subscriber, is
      measured (p50, p99, p999).
   2. The simulator; then replication over 3 replicas with fixed membership, under it, with
-     catch-up from a peer's partition files (built). Next: replicas over Flight, and the Helm
+     catch-up from a peer's partition files, and replicas over Flight (built). Next: the Helm
      chart running three.
   3. Leadership transfer for rollouts, reads from followers, leases as log entries.
   4. Local disks, one replica per node.

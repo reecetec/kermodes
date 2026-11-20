@@ -1186,6 +1186,56 @@ fn control(py: Python<'_>, config: &str) -> PyResult<()> {
     py.detach(|| kermodes_control::run_blocking(config).map_err(KermodesError::new_err))
 }
 
+/// Runs replica `replica` of the shard whose replicas serve at `peers` (replica `n` at
+/// `peers[n - 1]`), its store in `data_dir` and the catalog every replica shares in Postgres at
+/// `catalog`, serving on `host:port` until interrupted (`kermodes weir --replica`).
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn serve_replica(
+    py: Python<'_>,
+    data_dir: PathBuf,
+    catalog: String,
+    branch: String,
+    replica: u64,
+    peers: Vec<String>,
+    host: &str,
+    port: u16,
+) -> PyResult<()> {
+    let addr: SocketAddr = format!("{host}:{port}")
+        .parse()
+        .map_err(|e| PyValueError::new_err(format!("cannot listen on {host}:{port}: {e}")))?;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let running = {
+        let stop = stop.clone();
+        std::thread::Builder::new()
+            .name("kermodes-replica".into())
+            .spawn(move || {
+                let shard = kermodes_weir::Replica {
+                    id: replica,
+                    voters: (1..=peers.len() as u64).collect(),
+                    seed: None,
+                    limits: kermodes_weir::LogLimits::default(),
+                };
+                kermodes_flight::serve_replica(
+                    &data_dir, &catalog, &branch, shard, &peers, addr, &stop,
+                )
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("cannot start the replica: {e}")))?
+    };
+    // The interpreter takes Ctrl-C between waits: the replica then stops, closing its store.
+    while !running.is_finished() {
+        py.detach(|| std::thread::sleep(Duration::from_millis(200)));
+        if let Err(interrupted) = py.check_signals() {
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            let _ = py.detach(|| running.join());
+            return Err(interrupted);
+        }
+    }
+    py.detach(|| running.join())
+        .map_err(|_| PyRuntimeError::new_err("the replica's thread panicked"))?
+        .map_err(store_error)
+}
+
 /// Serves a synthetic feed on `host:port` (port 0 picks a free one): about `rate` ticks a second
 /// over `symbols` symbols, as JSON arrays of `{sym, price, size, ts}` every 10 ms.
 #[pyfunction]
@@ -1831,8 +1881,8 @@ mod _native {
     #[pymodule_export]
     use super::{
         HistoricalTable, Ingest, IngestStats, Pending, Server, Session, StoreServer, Table, Ticker,
-        Viewer, Writer, control, merge, publish::Publication, replay::Replay, stored::StoredTable,
-        ticker,
+        Viewer, Writer, control, merge, publish::Publication, replay::Replay, serve_replica,
+        stored::StoredTable, ticker,
     };
 
     use pyo3::prelude::*;

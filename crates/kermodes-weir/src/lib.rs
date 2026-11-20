@@ -30,7 +30,8 @@ pub use replica::{LogLimits, Replica};
 pub use shape::{ColumnId, Shape, column, spec, widens};
 pub use snapshot::{SnapshotSource, SnapshotWanted};
 pub use store::{
-    BRANCH, Clock, Failed, Pace, Store, Subscriber, Writer, conform, keys_only, system_clock,
+    BRANCH, Clock, Failed, Pace, Store, Subscriber, Writer, conform, keys_only, machine_disk,
+    system_clock,
 };
 
 /// What a batch is (§7.1): an append table's rows, or a keyed table's upserts, deletes, or the
@@ -84,6 +85,9 @@ pub enum Error {
     TooLarge(String),
     /// A subscription asked to resume after rows no longer all held: it must start again.
     Gone(String),
+    /// This replica does not lead its shard, or stopped leading before a write committed (so
+    /// it may or may not be written): another replica takes it, and a resend is recognised.
+    NotLeader(String),
 }
 
 impl Error {
@@ -104,7 +108,8 @@ impl fmt::Display for Error {
             | Error::Arrow(m)
             | Error::Catalog(m)
             | Error::TooLarge(m)
-            | Error::Gone(m) => f.write_str(m),
+            | Error::Gone(m)
+            | Error::NotLeader(m) => f.write_str(m),
         }
     }
 }

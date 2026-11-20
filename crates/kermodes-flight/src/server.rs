@@ -1,6 +1,7 @@
 //! The Flight service over a store.
 
 use std::net::{SocketAddr, TcpListener};
+use std::path::{Component, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,7 +17,9 @@ use arrow_flight::{
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
 use futures::stream::{self, StreamExt, TryStreamExt};
-use kermodes_weir::{Change, Date, Error, Pace, Pending, SourceId, Stamp, Store, TableName};
+use kermodes_weir::{
+    Change, Date, Error, Pace, Pending, SnapshotSource, SourceId, Stamp, Store, TableName,
+};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -26,7 +29,7 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::{
     CAUGHT_UP, MARKS_CAUGHT_UP, columns_json, commit_from_json, garbage_from_json, garbage_json,
     history_date_json, history_file_json, names_from_json, schema_from_json, stamp_metadata,
-    status,
+    status, unframe_messages,
 };
 
 /// Bytes queued for one reader while it catches up: the replay waits for the reader past this,
@@ -601,6 +604,39 @@ impl FlightService for Service {
                 blocking(move || store.forget_garbage(&garbage)).await?;
                 json!({})
             }
+            "raft" => {
+                // Each is only handed to the committer: no blocking work here.
+                for message in unframe_messages(&action.body).map_err(status)? {
+                    store.receive(message).map_err(status)?;
+                }
+                json!({})
+            }
+            "snapshot_files" => {
+                let ((index, term), files) = blocking(move || store.files()).await?;
+                let files: Vec<Value> = files
+                    .iter()
+                    .map(|(path, bytes)| json!([path.to_string_lossy(), bytes]))
+                    .collect();
+                json!({"index": index, "term": term, "files": files})
+            }
+            "snapshot_read" => {
+                let command = command(&action.body)?;
+                let path = PathBuf::from(command["path"].as_str().unwrap_or_default());
+                // Only a file among the store's own, as `snapshot_files` names them.
+                if path.as_os_str().is_empty()
+                    || !path.components().all(|c| matches!(c, Component::Normal(_)))
+                {
+                    return Err(Status::invalid_argument(format!(
+                        "not a store file: {}",
+                        path.display()
+                    )));
+                }
+                let offset = command["offset"].as_u64().unwrap_or(0);
+                let len = command["len"].as_u64().unwrap_or(0);
+                let bytes = blocking(move || store.read(&path, offset, len)).await?;
+                let result = arrow_flight::Result { body: bytes.into() };
+                return Ok(Response::new(stream::iter([Ok(result)]).boxed()));
+            }
             other => return Err(Status::invalid_argument(format!("no action `{other}`"))),
         };
         let result = arrow_flight::Result {
@@ -651,6 +687,15 @@ impl FlightService for Service {
             (
                 "forget_garbage",
                 "{table_id, location, file}: forget a deleted file",
+            ),
+            ("raft", "Raft messages from another replica of the shard"),
+            (
+                "snapshot_files",
+                "the partition files, as of the last entry applied",
+            ),
+            (
+                "snapshot_read",
+                "{path, offset, len}: bytes of a partition file",
             ),
         ];
         let actions = actions.map(|(kind, description)| {

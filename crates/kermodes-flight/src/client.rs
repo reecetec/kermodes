@@ -1,6 +1,8 @@
 //! A process's handle on a served store: the store's operations, over Flight.
 
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,31 +17,68 @@ use arrow_flight::{Action, FlightData, FlightDescriptor, PutResult, Ticket};
 use futures::{StreamExt, TryStreamExt};
 use kermodes_weir::{
     Answer, Change, ColumnId, Date, Error, Garbage, HistoryCommit, HistoryDate, HistoryFile,
-    InFlight, Pace, Pending, SourceId, Stamp, Subscriber, TableEntry, TableName, conform,
-    keys_only,
+    InFlight, Pace, Pending, SnapshotSource, SourceId, Stamp, Subscriber, TableEntry, TableName,
+    conform, keys_only,
 };
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tonic::transport::Channel;
-use tonic::{Code, Streaming};
+use tonic::{Code, Status, Streaming};
 
 use crate::{
     CAUGHT_UP, MARKS_CAUGHT_UP, MAX_WRITE_BYTES, columns_json, commit_json, date_from_json,
     error_from_status, garbage_from_json, garbage_json, history_date_from_json,
-    history_file_from_json, list_from_json, names_from_json, schema_from_json, stamp_of,
+    history_file_from_json, http_url, list_from_json, names_from_json, schema_from_json, stamp_of,
 };
 
-/// Connected to a store's Flight server. Calls block until the server answers. Clones share the
-/// connection.
+/// How long an action goes from replica to replica while each is gone or does not lead: long
+/// enough for an election.
+const FAILOVER: Duration = Duration::from_secs(10);
+
+/// The servers a client knows: one, or the replicas of a store's shard. Calls go to the
+/// current one; one that answers `Unavailable` (gone, or not leading) makes the next current.
+struct Servers {
+    flights: Vec<FlightServiceClient<Channel>>,
+    current: AtomicUsize,
+}
+
+impl Servers {
+    fn current(&self) -> (usize, FlightServiceClient<Channel>) {
+        let index = self.current.load(Ordering::Acquire);
+        (index, self.flights[index].clone())
+    }
+
+    /// Server `index` is gone or does not lead: the next is tried, unless another call moved
+    /// on already.
+    fn unavailable(&self, index: usize) {
+        let next = (index + 1) % self.flights.len();
+        let _ = self
+            .current
+            .compare_exchange(index, next, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    /// `status` from server `index`, as an error, noting a server that is unavailable.
+    fn failed(&self, index: usize, status: &Status) -> Error {
+        if status.code() == Code::Unavailable {
+            self.unavailable(index);
+        }
+        error_from_status(status)
+    }
+}
+
+/// Connected to a store's Flight server, or to the replicas of its shard. Calls block until a
+/// server answers. Clones share the connections.
 #[derive(Clone)]
 pub struct Client {
     runtime: Arc<Runtime>,
-    flight: FlightServiceClient<Channel>,
+    servers: Arc<Servers>,
 }
 
 impl Client {
-    /// Connects to `url` (`grpc://host:port` or `http://host:port`).
+    /// Connects to `url`: one server (`grpc://host:port` or `http://host:port`), or the
+    /// replicas of a shard (`grpc://host:port,host:port,...`), any of which may be down or not
+    /// lead. Fails if none can be reached.
     pub fn connect(url: &str) -> Result<Self, Error> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -47,32 +86,58 @@ impl Client {
             .enable_all()
             .build()
             .map_err(|e| Error::Io(format!("cannot start the client: {e}")))?;
-        let endpoint = url
-            .strip_prefix("grpc://")
-            .map_or_else(|| url.to_owned(), |rest| format!("http://{rest}"));
-        // Pings on the HTTP/2 connection, idle or not, find one that died silently (a lost peer,
-        // a dropped route) within about 15 s, so no subscription waits on a dead one.
-        let channel = runtime
-            .block_on(async {
-                Channel::from_shared(endpoint.clone())
-                    .map_err(|e| e.to_string())?
-                    .connect_timeout(Duration::from_secs(5))
-                    .http2_keep_alive_interval(Duration::from_secs(5))
-                    .keep_alive_timeout(Duration::from_secs(10))
-                    .keep_alive_while_idle(true)
-                    .connect()
-                    .await
-                    .map_err(|e| chain(&e))
-            })
-            .map_err(|e| Error::Io(format!("cannot connect to {url}: {e}")))?;
+        let (scheme, hosts) = url.split_once("://").unwrap_or(("grpc", url));
+        let mut flights = Vec::new();
+        let mut current = None;
+        let mut failures = Vec::new();
+        for host in hosts.split(',').map(str::trim).filter(|h| !h.is_empty()) {
+            // Pings on the HTTP/2 connection, idle or not, find one that died silently (a lost
+            // peer, a dropped route) within about 15 s, so no subscription waits on a dead one.
+            let endpoint = Channel::from_shared(http_url(&format!("{scheme}://{host}")))
+                .map_err(|e| Error::Io(format!("{host} in {url}: {e}")))?
+                .connect_timeout(Duration::from_secs(5))
+                .http2_keep_alive_interval(Duration::from_secs(5))
+                .keep_alive_timeout(Duration::from_secs(10))
+                .keep_alive_while_idle(true);
+            // Each server is connected to as it is needed, but one is now: a client that can
+            // reach none fails at once.
+            let connected = match current {
+                Some(_) => None,
+                None => match runtime.block_on(endpoint.connect()) {
+                    Ok(channel) => Some(channel),
+                    Err(e) => {
+                        failures.push(format!("{host}: {}", chain(&e)));
+                        None
+                    }
+                },
+            };
+            if connected.is_some() {
+                current = Some(flights.len());
+            }
+            let channel = connected.unwrap_or_else(|| {
+                let _inside = runtime.enter();
+                endpoint.connect_lazy()
+            });
+            // A write's batch, or a snapshot's chunk, is one message.
+            flights.push(
+                FlightServiceClient::new(channel)
+                    .max_decoding_message_size(MAX_WRITE_BYTES + (64 << 10)),
+            );
+        }
+        let current = current.ok_or_else(|| {
+            Error::Io(format!("cannot connect to {url}: {}", failures.join("; ")))
+        })?;
         Ok(Self {
             runtime: Arc::new(runtime),
-            flight: FlightServiceClient::new(channel),
+            servers: Arc::new(Servers {
+                flights,
+                current: AtomicUsize::new(current),
+            }),
         })
     }
 
     fn action(&self, kind: &str, body: Value) -> Result<Value, Error> {
-        self.runtime.block_on(call(self.flight.clone(), kind, body))
+        self.runtime.block_on(call(&self.servers, kind, body))
     }
 
     /// Creates `name`, or checks it exists with the same columns; its schema.
@@ -215,7 +280,7 @@ impl Client {
         date: Date,
         each: &mut dyn FnMut(RecordBatch, Stamp) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        let mut flight = self.flight.clone();
+        let (index, mut flight) = self.servers.current();
         let ticket = Ticket {
             ticket: json!({"table": name.to_string(), "date": date.to_string()})
                 .to_string()
@@ -225,7 +290,7 @@ impl Client {
             let data = flight
                 .do_get(ticket)
                 .await
-                .map_err(|s| error_from_status(&s))?
+                .map_err(|s| self.servers.failed(index, &s))?
                 .into_inner()
                 .map_err(FlightError::from);
             Ok::<_, Error>(FlightDataDecoder::new(data))
@@ -254,7 +319,7 @@ impl Client {
         count: u64,
         columns: Option<&[String]>,
     ) -> Result<(u64, Vec<RecordBatch>), Error> {
-        let mut flight = self.flight.clone();
+        let (index, mut flight) = self.servers.current();
         let mut ticket = json!({"table": name.to_string(), "rows": [start, count]});
         if let Some(columns) = columns {
             ticket["columns"] = json!(columns);
@@ -266,7 +331,7 @@ impl Client {
             let data = flight
                 .do_get(ticket)
                 .await
-                .map_err(|s| error_from_status(&s))?
+                .map_err(|s| self.servers.failed(index, &s))?
                 .into_inner()
                 .map_err(FlightError::from);
             let mut decoded = FlightDataDecoder::new(data);
@@ -371,13 +436,35 @@ impl Client {
     ) -> Result<RemoteWriter, Error> {
         let TableEntry { schema, key, .. } = self.entry(name)?;
         let target = WriteTarget {
-            flight: self.flight.clone(),
+            servers: self.servers.clone(),
             name: name.clone(),
             source: source.clone(),
             schema: schema.clone(),
         };
-        // Returns once the server holds the lease for us.
-        let opened = self.runtime.block_on(target.open(wait))?;
+        // Returns once a server holds the lease for us: with the replicas of a shard, the one
+        // that leads, found as an action finds it.
+        let opened = self.runtime.block_on(async {
+            let until = Instant::now() + FAILOVER;
+            let count = self.servers.flights.len();
+            let mut tries = 0;
+            loop {
+                let (before, _) = self.servers.current();
+                match target.open(wait).await {
+                    // The server was gone or did not lead: the next is current now.
+                    Err(_)
+                        if count > 1
+                            && self.servers.current().0 != before
+                            && Instant::now() < until =>
+                    {
+                        tries += 1;
+                        if tries % count == 0 {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        }
+                    }
+                    opened => return opened,
+                }
+            }
+        })?;
         let stream = Arc::new(Mutex::new(Stream {
             sender: Some(opened.sender),
             unacked: VecDeque::new(),
@@ -389,6 +476,7 @@ impl Client {
         let epoch = Arc::new(Mutex::new(opened.epoch));
         self.runtime.spawn(keep_writing(
             target,
+            opened.index,
             opened.acks,
             stream.clone(),
             acked.clone(),
@@ -430,12 +518,12 @@ impl Client {
     ) -> Result<SchemaRef, Error> {
         let (schema, marks, decoded) =
             self.runtime
-                .block_on(open_subscription(self.flight.clone(), name, None))?;
+                .block_on(open_subscription(&self.servers, name, None))?;
         let mut caught_up = Some(caught_up);
         if !marks && let Some(ready) = caught_up.take() {
             ready();
         }
-        let (flight, name) = (self.flight.clone(), name.clone());
+        let (servers, name) = (self.servers.clone(), name.clone());
         self.runtime.spawn(async move {
             let mut decoded = decoded;
             // The position of the last batch given: what a resumed stream starts after.
@@ -505,7 +593,7 @@ impl Client {
                 decoded = loop {
                     tries += 1;
                     let after = (last > 0).then_some(last);
-                    match open_subscription(flight.clone(), &name, after).await {
+                    match open_subscription(&servers, &name, after).await {
                         Ok((_, _, decoded)) => break decoded,
                         Err(Error::Gone(why)) if rebuilds => {
                             eprintln!("kermodes: {name}: {why}; reading it again from its start");
@@ -526,6 +614,33 @@ impl Client {
             }
         });
         Ok(schema)
+    }
+}
+
+/// A peer's partition files, from its server: what a replica copies when too far behind.
+impl SnapshotSource for Client {
+    fn files(&self) -> Result<((u64, u64), Vec<(PathBuf, u64)>), Error> {
+        let listed = self.action("snapshot_files", json!({}))?;
+        let unreadable = || Error::Io(format!("an unreadable list of a peer's files: {listed}"));
+        let index = listed["index"].as_u64().ok_or_else(unreadable)?;
+        let term = listed["term"].as_u64().ok_or_else(unreadable)?;
+        let files = listed["files"]
+            .as_array()
+            .ok_or_else(unreadable)?
+            .iter()
+            .map(|file| {
+                let path = file[0].as_str().ok_or_else(unreadable)?;
+                let bytes = file[1].as_u64().ok_or_else(unreadable)?;
+                Ok((PathBuf::from(path), bytes))
+            })
+            .collect::<Result<_, Error>>()?;
+        Ok(((index, term), files))
+    }
+
+    fn read(&self, path: &Path, offset: u64, len: u64) -> Result<Vec<u8>, Error> {
+        let body = json!({"path": path.to_string_lossy(), "offset": offset, "len": len});
+        self.runtime
+            .block_on(call_raw(&self.servers, "snapshot_read", body))
     }
 }
 
@@ -560,7 +675,7 @@ impl From<FlightError> for Ended {
 /// Opens a subscription to `name`, after the position `after` if given: its schema, whether the
 /// server marks the end of its replay, and the rest of the stream.
 async fn open_subscription(
-    mut flight: FlightServiceClient<Channel>,
+    servers: &Servers,
     name: &TableName,
     after: Option<u64>,
 ) -> Result<(SchemaRef, bool, FlightDataDecoder), Error> {
@@ -568,12 +683,13 @@ async fn open_subscription(
     if let Some(after) = after {
         ticket["after"] = json!(after);
     }
+    let (index, mut flight) = servers.current();
     let data = flight
         .do_get(Ticket {
             ticket: ticket.to_string().into(),
         })
         .await
-        .map_err(|s| error_from_status(&s))?
+        .map_err(|s| servers.failed(index, &s))?
         .into_inner()
         .map_err(FlightError::from);
     let mut decoded = FlightDataDecoder::new(data);
@@ -586,7 +702,7 @@ async fn open_subscription(
                     return Ok((schema, marks, decoded));
                 }
             }
-            Some(Err(FlightError::Tonic(status))) => return Err(error_from_status(&status)),
+            Some(Err(FlightError::Tonic(status))) => return Err(servers.failed(index, &status)),
             Some(Err(e)) => return Err(Error::Io(e.to_string())),
             None => return Err(Error::Io("the server closed the stream".into())),
         }
@@ -595,7 +711,7 @@ async fn open_subscription(
 
 /// What a remote writer writes to: enough to open its stream again after a break.
 struct WriteTarget {
-    flight: FlightServiceClient<Channel>,
+    servers: Arc<Servers>,
     name: TableName,
     source: SourceId,
     schema: SchemaRef,
@@ -603,6 +719,8 @@ struct WriteTarget {
 
 /// A write stream just opened, the source's lease held.
 struct Opened {
+    /// The server holding the stream.
+    index: usize,
     sender: mpsc::UnboundedSender<FlightData>,
     acks: Streaming<PutResult>,
     /// The source's last seq and lease epoch once the lease is ours.
@@ -630,21 +748,25 @@ impl WriteTarget {
         let outgoing = futures::stream::unfold(outgoing, |mut outgoing| async move {
             outgoing.recv().await.map(|data| (data, outgoing))
         });
-        let acks = self
-            .flight
-            .clone()
+        let (index, mut flight) = self.servers.current();
+        let acks = flight
             .do_put(outgoing)
             .await
-            .map_err(|s| error_from_status(&s))?
+            .map_err(|s| self.servers.failed(index, &s))?
             .into_inner();
-        // Only now: a writer before us may have written until it let go.
-        let state = call(
-            self.flight.clone(),
+        // Only now, and of the server holding the lease: a writer before us may have written
+        // until it let go.
+        let state = ask(
+            flight,
             "last_seq",
             json!({"table": self.name.to_string(), "source": self.source.as_str()}),
         )
-        .await?;
+        .await
+        .map_err(|s| self.servers.failed(index, &s))?;
+        let state: Value = serde_json::from_slice(&state)
+            .map_err(|e| Error::Io(format!("unreadable answer to `last_seq`: {e}")))?;
         Ok(Opened {
+            index,
             sender,
             acks,
             last_seq: state["last_seq"].as_u64(),
@@ -682,6 +804,7 @@ enum Stopped {
 /// refusal, fails the refused write and every one after it.
 async fn keep_writing(
     target: WriteTarget,
+    mut index: usize,
     mut acks: Streaming<PutResult>,
     stream: Arc<Mutex<Stream>>,
     acked: Arc<Mutex<Option<u64>>>,
@@ -709,6 +832,10 @@ async fn keep_writing(
                 }
                 Ok(None) => break Stopped::Broke("the server closed the stream".into()),
                 Err(status) => {
+                    // Gone, or no longer leading: the stream opens again on the next replica.
+                    if status.code() == Code::Unavailable {
+                        target.servers.unavailable(index);
+                    }
                     break match status.code() {
                         Code::InvalidArgument
                         | Code::NotFound
@@ -746,8 +873,12 @@ async fn keep_writing(
         }
         let mut backoff = Duration::from_millis(250);
         let mut tries = 0;
+        // Replicas passed over in a row: each gone or not leading.
+        let mut passed = 0;
+        let count = target.servers.flights.len();
         let opened = loop {
             tries += 1;
+            let (before, _) = target.servers.current();
             // Waiting for the lease: after a connection drops, the server holds the old
             // stream's lease until it notices, up to its pings' timeout.
             match target.open(true).await {
@@ -755,6 +886,18 @@ async fn keep_writing(
                 Err(error @ (Error::Schema(_) | Error::NotFound(_) | Error::Corrupt(_))) => {
                     eprintln!("kermodes: the write stream of {who} cannot reconnect: {error}");
                     return refuse(&stream, error);
+                }
+                // Gone, or not leading: the next replica at once, and a short pause once all
+                // were tried, while they elect a leader.
+                Err(error) if count > 1 && target.servers.current().0 != before => {
+                    passed += 1;
+                    if passed % count == 0 {
+                        eprintln!(
+                            "kermodes: {who}: no replica takes it yet ({error}); trying them \
+                             again in 200ms"
+                        );
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
                 }
                 Err(error) => {
                     eprintln!(
@@ -794,6 +937,7 @@ async fn keep_writing(
         }
         drop(stream);
         acks = opened.acks;
+        index = opened.index;
     }
 }
 
@@ -815,28 +959,54 @@ fn refuse(stream: &Mutex<Stream>, error: Error) {
     }
 }
 
-/// Runs the action `kind` with `body`: the server's answer.
-async fn call(
+/// Runs the action `kind` with `body`: the server's answer, as JSON.
+async fn call(servers: &Servers, kind: &str, body: Value) -> Result<Value, Error> {
+    let answer = call_raw(servers, kind, body).await?;
+    serde_json::from_slice(&answer)
+        .map_err(|e| Error::Io(format!("unreadable answer to `{kind}`: {e}")))
+}
+
+/// Runs the action `kind` with `body`: the bytes of the server's answer. With the replicas of a
+/// shard, one that is gone or does not lead passes it to the next, for up to `FAILOVER`; a pause
+/// after each round of them waits out an election.
+async fn call_raw(servers: &Servers, kind: &str, body: Value) -> Result<Vec<u8>, Error> {
+    let until = Instant::now() + FAILOVER;
+    let count = servers.flights.len();
+    let mut tries = 0;
+    loop {
+        let (index, flight) = servers.current();
+        match ask(flight, kind, body.clone()).await {
+            Ok(answer) => return Ok(answer),
+            Err(status)
+                if status.code() == Code::Unavailable && count > 1 && Instant::now() < until =>
+            {
+                servers.unavailable(index);
+                tries += 1;
+                if tries % count == 0 {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+            Err(status) => return Err(servers.failed(index, &status)),
+        }
+    }
+}
+
+/// Runs the action `kind` with `body` on one server: the bytes of its answer.
+async fn ask(
     mut flight: FlightServiceClient<Channel>,
     kind: &str,
     body: Value,
-) -> Result<Value, Error> {
+) -> Result<Vec<u8>, Status> {
     let action = Action {
         r#type: kind.into(),
         body: body.to_string().into(),
     };
-    let mut results = flight
-        .do_action(action)
-        .await
-        .map_err(|s| error_from_status(&s))?
-        .into_inner();
+    let mut results = flight.do_action(action).await?.into_inner();
     let result = results
         .message()
-        .await
-        .map_err(|s| error_from_status(&s))?
-        .ok_or_else(|| Error::Io(format!("no answer to `{kind}`")))?;
-    serde_json::from_slice(&result.body)
-        .map_err(|e| Error::Io(format!("unreadable answer to `{kind}`: {e}")))
+        .await?
+        .ok_or_else(|| Status::internal(format!("no answer to `{kind}`")))?;
+    Ok(Vec::from(result.body))
 }
 
 /// Writes one source's rows of a served table (`Client::writer`), many in flight at once.

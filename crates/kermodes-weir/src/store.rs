@@ -59,6 +59,10 @@ const FSYNC_FAILED: &str = "weir/fsync-failed";
 /// in the log when acknowledged, so this bounds only how much log a restart replays.
 const FLUSH_EVERY: Duration = Duration::from_secs(1);
 
+/// Raft's clock on a replica with its own threads: a leader's heartbeat every tick, and an
+/// election once a follower hears from no leader for 10 to 20 ticks, 1 to 2 s.
+const TICK: Duration = Duration::from_millis(100);
+
 /// The most the committer gathers into one fsync: whatever is waiting, up to this.
 const GROUP_BYTES: usize = 64 << 20;
 
@@ -146,8 +150,18 @@ pub struct Store {
     /// The last entry applied, its index and term (`Committer::position`).
     position: Arc<Mutex<(u64, u64)>>,
     clock: Clock,
+    /// This replica's Raft ID, and what its committer says of the shard.
+    replica_id: u64,
+    shard: Arc<Shard>,
+    /// The committer's messages to other replicas, until whoever carries them takes them
+    /// (`take_messages`, `take_outgoing`).
+    outgoing: Mutex<Option<Outgoing>>,
     driver: Driver,
 }
+
+/// A replica's messages for the other replicas of its shard: each one encoded, with the ID of the
+/// replica it is for.
+pub type Outgoing = Receiver<(u64, Vec<u8>)>;
 
 /// Reads the time, in nanoseconds since the Unix epoch: the system's, or a simulation's.
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
@@ -161,12 +175,19 @@ pub fn system_clock() -> Clock {
     })
 }
 
+/// The machine's disk, as the store in `root` uses it: where a replica installs a snapshot.
+pub fn machine_disk(root: &Path) -> DiskRef {
+    disk::real(&root.join(FSYNC_FAILED))
+}
+
 /// What commits a store's writes and flushes its files.
 enum Driver {
-    /// Its own threads: the committer, which gathers each group of writes, and the flusher.
+    /// Its own threads: the committer, which gathers each group of writes, the flusher, and on
+    /// a replica of others, Raft's clock.
     Threads {
         committer: Option<JoinHandle<()>>,
         flusher: Option<(Arc<Stop>, JoinHandle<()>)>,
+        ticker: Option<JoinHandle<()>>,
     },
     /// Whoever steps it (`Store::step`, `Store::flush_now`), and nothing else: a simulation,
     /// which must choose the order of everything that happens.
@@ -176,8 +197,17 @@ enum Driver {
     },
 }
 
-/// Tells the flusher to stop: set, then notified.
+/// Tells the flusher and the ticker to stop: set, then notified.
 type Stop = (Mutex<bool>, Condvar);
+
+/// What the committer says of its shard, for the store's callers.
+#[derive(Default)]
+struct Shard {
+    /// The leader's Raft ID, as this replica knows it: 0 while it knows of none.
+    leader: AtomicU64,
+    /// The snapshot this replica must install (`Store::snapshot_wanted`).
+    wanted: Mutex<Option<SnapshotWanted>>,
+}
 
 /// A table's log, and the signal that one of its source leases was released.
 struct Log {
@@ -231,6 +261,10 @@ enum Request {
     /// The partition files hold the log up to this LSN: the segments wholly below it, to delete.
     Trim(u64, SyncSender<Vec<PathBuf>>),
     Stop,
+    /// A message from another replica of the shard (`Store::receive`).
+    Receive(Message),
+    /// One tick of Raft's clock (`TICK`).
+    Tick,
 }
 
 /// A past date of a table to drop, its history holding it whole, and where the outcome goes.
@@ -324,7 +358,7 @@ impl Store {
             lock,
             catalog,
             BRANCH,
-            disk::real(&root.join(FSYNC_FAILED)),
+            machine_disk(root),
             system_clock(),
             Replica::alone(),
             false,
@@ -342,9 +376,34 @@ impl Store {
             lock,
             catalog,
             branch,
-            disk::real(&root.join(FSYNC_FAILED)),
+            machine_disk(root),
             system_clock(),
             Replica::alone(),
+            false,
+        )
+    }
+
+    /// As `open_with_catalog`, as `replica` of its shard: every replica shares the catalog,
+    /// which is how a follower finds the tables the leader's writes name. Its threads commit,
+    /// flush, and keep Raft's clock; its messages to other replicas are for the carrier beside
+    /// it (`take_outgoing`, `receive`). Only the leader takes writes; one too far behind its
+    /// shard's log stops and says what to copy (`snapshot_wanted`).
+    pub fn open_shard(
+        root: &Path,
+        url: &str,
+        branch: &str,
+        replica: Replica,
+    ) -> Result<Self, Error> {
+        let lock = lock_dir(root)?;
+        let catalog = Catalog::postgres(url)?;
+        Self::new(
+            root,
+            lock,
+            catalog,
+            branch,
+            machine_disk(root),
+            system_clock(),
+            replica,
             false,
         )
     }
@@ -516,6 +575,8 @@ impl Store {
             Error::Corrupt(format!("{}: cannot start Raft: {e}", log_dir.display()))
         })?;
         let logs = tables.logs.clone();
+        let shard = Arc::new(Shard::default());
+        let (outgoing, outgoing_from) = mpsc::channel();
         let catalog = tables.catalog.clone();
         applied_at.store(applied, Ordering::Release);
         let applied = applied_at;
@@ -532,8 +593,8 @@ impl Store {
             waiting: Vec::new(),
             drops: Vec::new(),
             schemas: Vec::new(),
-            outbox: Vec::new(),
-            wanted: None,
+            outgoing,
+            shard: shard.clone(),
             started,
             broken: None,
         };
@@ -550,6 +611,8 @@ impl Store {
         // The replay's writes reach the disk now, so another crash need not replay them.
         flusher.flush()?;
         let (requests, received) = mpsc::channel();
+        let replica_id = committer.replica.id;
+        let alone = committer.replica.is_alone();
         let driver = if stepped {
             Driver::Stepped {
                 committer: Box::new(Mutex::new(committer)),
@@ -568,9 +631,20 @@ impl Store {
                     .spawn(move || flush_every(&flusher, &requests, &stop))
                     .map_err(|e| Error::Io(format!("cannot start weir's flusher: {e}")))?
             };
+            // A shard of one leads from its open, and has no one to hear from.
+            let ticker = (!alone)
+                .then(|| {
+                    let (requests, stop) = (requests.clone(), stop.clone());
+                    std::thread::Builder::new()
+                        .name("kermodes-weir-tick".into())
+                        .spawn(move || tick_every(&requests, &stop))
+                        .map_err(|e| Error::Io(format!("cannot start weir's Raft clock: {e}")))
+                })
+                .transpose()?;
             Driver::Threads {
                 committer: Some(committer),
                 flusher: Some((stop, flusher)),
+                ticker,
             }
         };
         Ok(Self {
@@ -584,6 +658,9 @@ impl Store {
             flusher,
             position,
             clock,
+            replica_id,
+            shard,
+            outgoing: Mutex::new(Some(outgoing_from)),
             driver,
         })
     }
@@ -605,7 +682,7 @@ impl Store {
                 Request::Write(submitted) => group.push(submitted),
                 Request::Drop(dropping) => drops.push(dropping),
                 // Asked only of a committer thread.
-                Request::Trim(..) | Request::Stop => {}
+                Request::Trim(..) | Request::Stop | Request::Receive(_) | Request::Tick => {}
             }
         }
         let count = group.len() + drops.len();
@@ -617,6 +694,7 @@ impl Store {
 
     /// A stepped replica's (`open_replica`) Raft clock: one tick. A leader sends heartbeats
     /// every tick; a replica that hears from no leader for 10 to 20 ticks starts an election.
+    /// A store with threads keeps its own (`TICK`).
     pub fn tick(&self) {
         if let Driver::Stepped { committer, .. } = &self.driver {
             lock(committer).tick();
@@ -629,46 +707,38 @@ impl Store {
         decoded
             .merge_from_bytes(message)
             .map_err(|e| Error::Corrupt(format!("a message from another replica: {e}")))?;
-        if let Driver::Stepped { committer, .. } = &self.driver {
-            lock(committer).receive(decoded);
+        match &self.driver {
+            Driver::Stepped { committer, .. } => lock(committer).receive(decoded),
+            // Gone with the committer: the store is closing, and Raft tolerates a lost message.
+            Driver::Threads { .. } => drop(self.requests.send(Request::Receive(decoded))),
         }
         Ok(())
     }
 
     /// The messages for other replicas since the last call, each with the replica's ID, for
-    /// whoever carries them. A shard of one sends none.
+    /// whoever carries them: a stepped replica's carrier. A shard of one sends none.
     pub fn take_messages(&self) -> Vec<(u64, Vec<u8>)> {
-        let Driver::Stepped { committer, .. } = &self.driver else {
-            return Vec::new();
-        };
-        let messages = std::mem::take(&mut lock(committer).outbox);
-        messages
-            .into_iter()
-            .map(|message| {
-                let mut bytes = Vec::with_capacity(message.encoded_len());
-                message.encode(&mut bytes);
-                (message.to, bytes)
-            })
-            .collect()
+        lock(&self.outgoing)
+            .as_ref()
+            .map_or_else(Vec::new, |outgoing| outgoing.try_iter().collect())
+    }
+
+    /// Every message for other replicas from now on, each with the replica's ID, for the
+    /// carrier that runs beside a replica with threads; `None` once taken.
+    pub fn take_outgoing(&self) -> Option<Outgoing> {
+        lock(&self.outgoing).take()
     }
 
     /// Whether this replica leads its shard: only the leader takes writes.
     pub fn is_leader(&self) -> bool {
-        match &self.driver {
-            Driver::Stepped { committer, .. } => lock(committer).is_leader(),
-            // A shard of one, which leads from its open.
-            Driver::Threads { .. } => true,
-        }
+        self.shard.leader.load(Ordering::Acquire) == self.replica_id
     }
 
     /// The snapshot this replica must install before it can go on, when it is too far behind
     /// its shard's log: close the store, `install_snapshot` it from the replica it names, and
     /// open the store again.
     pub fn snapshot_wanted(&self) -> Option<SnapshotWanted> {
-        match &self.driver {
-            Driver::Stepped { committer, .. } => lock(committer).wanted,
-            Driver::Threads { .. } => None,
-        }
+        *lock(&self.shard.wanted)
     }
 
     /// Installs, in the closed store in `root` on `disk`, the snapshot it wanted
@@ -901,6 +971,21 @@ impl Store {
     /// dropped. One writer per source at a time: with `wait`, this waits for the current writer
     /// to go; without, it fails at once. Each lease has a new epoch, recorded with every batch.
     pub fn writer(&self, name: &TableName, source: &SourceId, wait: bool) -> Result<Writer, Error> {
+        // Its writes would be refused one by one: the writer goes to the leader instead.
+        if !self.is_leader() {
+            return Err(Error::NotLeader(
+                match self.shard.leader.load(Ordering::Acquire) {
+                    0 => format!(
+                        "weir replica {} does not lead its shard, and knows of no leader yet",
+                        self.replica_id
+                    ),
+                    leader => format!(
+                        "weir replica {} does not lead its shard: replica {leader} does",
+                        self.replica_id
+                    ),
+                },
+            ));
+        }
         let log = self.log(name)?;
         let mut state = lock(&log.state);
         while state.writing.contains(source) {
@@ -1293,12 +1378,19 @@ impl Drop for Store {
     /// later ones refused), then flushes what was applied, so reopening replays nothing.
     fn drop(&mut self) {
         match &mut self.driver {
-            Driver::Threads { committer, flusher } => {
+            Driver::Threads {
+                committer,
+                flusher,
+                ticker,
+            } => {
                 if let Some((stop, flusher)) = flusher.take() {
                     let (stopped, wake) = &*stop;
                     *lock(stopped) = true;
                     wake.notify_all();
                     let _ = flusher.join();
+                }
+                if let Some(ticker) = ticker.take() {
+                    let _ = ticker.join();
                 }
                 let _ = self.requests.send(Request::Stop);
                 if let Some(committer) = committer.take() {
@@ -1648,11 +1740,10 @@ struct Committer {
     drops: Vec<Dropping>,
     /// The schema messages of the columns written lately, so each is encoded once.
     schemas: Vec<(Shape, Vec<u8>)>,
-    /// Messages to other replicas, until whoever carries them takes them.
-    outbox: Vec<Message>,
-    /// The snapshot this replica must install (`snapshot`), once Raft has handed it one; it
-    /// then takes nothing more until reopened.
-    wanted: Option<SnapshotWanted>,
+    /// Messages to other replicas, for whoever carries them (`Store::take_messages`).
+    outgoing: Sender<(u64, Vec<u8>)>,
+    /// What the store's callers read: the leader, and the snapshot to install.
+    shard: Arc<Shard>,
     /// Whether the catalog says the shard has started (`Catalog::shard_started`); a replica
     /// records it once it applies a committed entry, so a disk lost later is known as lost.
     started: bool,
@@ -1746,6 +1837,9 @@ impl Committer {
             _ => applied,
         };
         self.node.mut_store().compact_cache(keep);
+        self.shard
+            .leader
+            .store(self.node.raft.leader_id, Ordering::Release);
     }
 
     /// As leader of others, the last index every follower holds.
@@ -1862,7 +1956,7 @@ impl Committer {
             .filter(|m| m.get_msg_type() == MessageType::MsgSnapshot)
             .map(|m| m.to)
             .collect();
-        self.outbox.extend(messages);
+        self.send(messages);
         let entries = ready.take_entries();
         // Raft's state goes with entries, at no cost, and alone only when its term or vote
         // changed. A commit index alone is not written: Raft learns it again, and whatever was
@@ -1874,10 +1968,10 @@ impl Committer {
             self.stop(e.to_string());
             return;
         }
-        self.outbox.extend(ready.take_persisted_messages());
+        self.send(ready.take_persisted_messages());
         self.apply(ready.take_committed_entries());
         let mut light = self.node.advance(ready);
-        self.outbox.extend(light.take_messages());
+        self.send(light.take_messages());
         self.apply(light.take_committed_entries());
         self.node.advance_apply();
         for to in snapshots {
@@ -1897,7 +1991,7 @@ impl Committer {
             self.stop("a snapshot that names no replica to copy from".into());
             return;
         };
-        self.wanted = Some(SnapshotWanted {
+        *lock(&self.shard.wanted) = Some(SnapshotWanted {
             from,
             index: meta.index,
             raft_term: self.node.raft.term,
@@ -2041,9 +2135,19 @@ impl Committer {
         self.node.mut_store().trim(flushed, needed, retain)
     }
 
+    /// Hands `messages` to whoever carries them, encoded. One nobody takes is dropped, as a
+    /// network would.
+    fn send(&self, messages: Vec<Message>) {
+        for message in messages {
+            let mut bytes = Vec::with_capacity(message.encoded_len());
+            message.encode(&mut bytes);
+            let _ = self.outgoing.send((message.to, bytes));
+        }
+    }
+
     fn not_leader(&self) -> Error {
         let id = self.replica.id;
-        Error::Busy(match self.node.raft.leader_id {
+        Error::NotLeader(match self.node.raft.leader_id {
             raft::INVALID_ID => {
                 format!("weir replica {id} does not lead its shard, and knows of no leader yet")
             }
@@ -2052,7 +2156,7 @@ impl Committer {
     }
 
     fn lost(&self) -> Error {
-        Error::Busy(format!(
+        Error::NotLeader(format!(
             "weir replica {} stopped leading its shard before the write committed, so it may or \
              may not be written: send it again, as a resend",
             self.replica.id
@@ -2093,6 +2197,8 @@ fn commit_every(mut committer: Committer, requests: &Receiver<Request>) {
                     let _ = reply.send(committer.trim(flushed));
                 }
                 Request::Stop => stop = true,
+                Request::Receive(message) => committer.receive(message),
+                Request::Tick => committer.tick(),
             }
             if !stop && bytes < GROUP_BYTES {
                 next = requests.try_recv().ok().or_else(|| {
@@ -2318,6 +2424,22 @@ impl Flusher {
         }
         wal::write_applied(&self.disk, &self.log_dir, through)?;
         Ok(through)
+    }
+}
+
+/// A replica's Raft clock: a tick every `TICK`, until stopped.
+fn tick_every(requests: &Sender<Request>, stop: &Stop) {
+    let (stopped, wake) = stop;
+    let mut guard = lock(stopped);
+    loop {
+        guard = wake
+            .wait_timeout_while(guard, TICK, |stopped| !*stopped)
+            .expect("kermodes store poisoned by an earlier panic")
+            .0;
+        // Stopped, or the committer is gone.
+        if *guard || requests.send(Request::Tick).is_err() {
+            return;
+        }
     }
 }
 
