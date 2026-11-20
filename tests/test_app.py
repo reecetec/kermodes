@@ -75,7 +75,7 @@ def test_an_app_serves_its_frontend_and_tables_under_its_path(tmp_path):
     built.mkdir()
     (built / "index.html").write_text("<!doctype html>market")
     store = tmp_path / "store"
-    km.local(store).create_table(
+    km.connect(store).create_table(
         "md.ticks", {"sym": km.string(), "price": km.float64()}
     )
 

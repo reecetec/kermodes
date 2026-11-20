@@ -70,7 +70,7 @@ def operations(engine: str, ticks, quotes, refs):
     if engine == "kermodes":
         import kermodes as km
 
-        s = km.local(manual=True)
+        s = km.connect(":memory:", manual=True)
         t, q, r = s.static_table(ticks), s.static_table(quotes), s.static_table(refs)
         return {
             "where + update": lambda: t.where("price > 100").update(

@@ -10,7 +10,7 @@ def test_rerunning_a_cell_replaces_the_table_it_built():
     shell = InteractiveShell.instance()
     shell.run_cell(
         "import kermodes as km\n"
-        "s = km.local(manual=True)\n"
+        "s = km.connect(':memory:', manual=True)\n"
         "src = s.input_table({'sym': km.string(), 'size': km.int64()})"
     )
     for _ in range(3):
@@ -48,7 +48,7 @@ class _Recorded(TableView):
 
 
 def test_the_widget_carries_frames_and_shows_the_viewers_state():
-    s = km.local(manual=True)
+    s = km.connect(":memory:", manual=True)
     src = s.input_table({"sym": km.string(), "price": km.float64()}, key="sym")
     src.upsert(
         pa.table({"sym": ["aa", "AB", "b", "ca"], "price": [3.0, 1.0, 4.0, 2.0]})

@@ -19,7 +19,7 @@ def ticks(sym: list[str], price: list[float], size: list[int | None]) -> pa.Tabl
 
 
 def test_derived_tables_tick_with_their_input():
-    s = km.local(manual=True)
+    s = km.connect(":memory:", manual=True)
     src = s.input_table(COLUMNS)
     live = src.where("price > 0").update("notional = price * size")
 
@@ -42,7 +42,7 @@ def test_derived_tables_tick_with_their_input():
 
 
 def test_static_tables_compute_without_cycles():
-    s = km.local(manual=True)
+    s = km.connect(":memory:", manual=True)
     data = s.static_table(ticks(["a", "b"], [1.0, 2.0], [1, 2]))
     doubled = data.update("size = size * 2")
     assert not doubled.is_refreshing
@@ -50,7 +50,7 @@ def test_static_tables_compute_without_cycles():
 
 
 def test_select_keeps_and_computes_columns_in_order():
-    s = km.local(manual=True)
+    s = km.connect(":memory:", manual=True)
     src = s.input_table(COLUMNS)
     picked = src.select("size", "notional = price * size", "sym")
     src.append(ticks(["a"], [2.0], [3]))
@@ -61,18 +61,18 @@ def test_select_keeps_and_computes_columns_in_order():
 
 
 def test_expression_errors_point_at_the_problem():
-    src = km.local(manual=True).input_table(COLUMNS)
+    src = km.connect(":memory:", manual=True).input_table(COLUMNS)
     with pytest.raises(km.KermodesError, match="did you mean `price`"):
         src.where("prise > 0")
 
 
 def test_the_clock_runs_by_default_starts_once_and_stops_quietly():
-    auto = km.local()
+    auto = km.connect(":memory:")
     assert auto.is_running
     auto.stop()
     assert not auto.is_running
 
-    s = km.local(manual=True)
+    s = km.connect(":memory:", manual=True)
     assert not s.is_running
     with pytest.raises(ValueError, match="period"):
         s.start("fast")
@@ -88,7 +88,7 @@ def test_the_clock_runs_by_default_starts_once_and_stops_quietly():
 
 
 def test_a_failed_table_raises_but_the_session_keeps_running():
-    s = km.local(manual=True)
+    s = km.connect(":memory:", manual=True)
     src = s.input_table(COLUMNS)
     risky = src.update("big = size * 4611686018427387904")
     fine = src.where("size > 0")
@@ -100,14 +100,14 @@ def test_a_failed_table_raises_but_the_session_keeps_running():
 
 
 def test_appends_must_match_the_table():
-    src = km.local(manual=True).input_table(COLUMNS)
+    src = km.connect(":memory:", manual=True).input_table(COLUMNS)
     wrong = pa.table({"sym": ["a"], "price": [1], "size": [1]})
     with pytest.raises(km.KermodesError, match="column `price` is int64"):
         src.append(wrong)
 
 
 def test_keyed_tables_follow_upserts_and_deletes():
-    s = km.local(manual=True)
+    s = km.connect(":memory:", manual=True)
     book = s.input_table(COLUMNS, key="sym")
     rich = book.where("price > 10")
     book.upsert(ticks(["a", "b"], [5.0, 20.0], [1, 2]))
@@ -123,7 +123,7 @@ def test_keyed_tables_follow_upserts_and_deletes():
 
 
 def test_last_by_and_agg_by_match_a_plain_python_recomputation():
-    s = km.local(manual=True)
+    s = km.connect(":memory:", manual=True)
     src = s.input_table(COLUMNS)
     latest = src.last_by("sym")
     stats = src.agg_by(
@@ -156,7 +156,7 @@ def test_last_by_and_agg_by_match_a_plain_python_recomputation():
 
 
 def test_trades_pick_up_the_prevailing_quote_and_reference_data():
-    s = km.local(manual=True)
+    s = km.connect(":memory:", manual=True)
     stamp = km.timestamp()
     trades = s.input_table({"sym": km.string(), "ts": stamp, "qty": km.int64()})
     quotes = s.input_table({"sym": km.string(), "ts": stamp, "bid": km.float64()})
@@ -204,7 +204,7 @@ def test_trades_pick_up_the_prevailing_quote_and_reference_data():
 
 
 def test_merge_follows_its_tables_in_order_and_needs_matching_columns():
-    s = km.local(manual=True)
+    s = km.connect(":memory:", manual=True)
     east, west = s.input_table(COLUMNS), s.input_table(COLUMNS)
     both = km.merge(east, west)
     east.append(ticks(["a"], [1.0], [1]))
@@ -222,7 +222,7 @@ def test_merge_follows_its_tables_in_order_and_needs_matching_columns():
 
 
 def test_head_and_tail_follow_the_ends_of_a_ticking_table():
-    s = km.local(manual=True)
+    s = km.connect(":memory:", manual=True)
     src = s.input_table(COLUMNS)
     first, last = src.head(2), src.tail(2)
     src.append(ticks(["a", "b", "c"], [1.0, 2.0, 3.0], [1, 2, 3]))
@@ -234,7 +234,7 @@ def test_head_and_tail_follow_the_ends_of_a_ticking_table():
 
 
 def test_sort_orders_rows_with_nulls_last_and_ticking_sorts_order_reads():
-    s = km.local(manual=True)
+    s = km.connect(":memory:", manual=True)
     fixed = s.static_table(
         ticks(["b", "a", "b", "a"], [1.0, 2.0, 3.0, 4.0], [1, None, 2, 3])
     )
@@ -253,7 +253,7 @@ def test_sort_orders_rows_with_nulls_last_and_ticking_sorts_order_reads():
 
 
 def test_rolling_follows_row_and_time_windows():
-    s = km.local(manual=True)
+    s = km.connect(":memory:", manual=True)
     src = s.input_table(
         {"sym": km.string(), "price": km.float64(), "ts": km.timestamp()}
     )
@@ -278,7 +278,7 @@ import array, random, threading, time
 import pyarrow as pa
 import kermodes as km
 
-s = km.local()
+s = km.connect(":memory:")
 book = s.input_table({"id": km.int64(), "price": km.float64()}, key="id")
 rng = random.Random(1)
 stop = time.monotonic() + 3

@@ -48,7 +48,7 @@ def test_history_weir_and_today_read_under_the_new_columns(tmp_path):
 
 
 def test_changes_that_are_not_compatible_are_refused_by_name(tmp_path):
-    s = km.local(tmp_path, manual=True)
+    s = km.connect(tmp_path, manual=True)
     s.create_table("md.ticks", {"sym": km.string(), "q": km.int32()})
     with pytest.raises(
         km.KermodesError, match="column `q` the columns given leave out"

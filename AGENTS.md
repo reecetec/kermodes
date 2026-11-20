@@ -75,7 +75,7 @@ Tests passing is not evidence the change works. Run the changed path the way its
 
 | Change | Verify by |
 | --- | --- |
-| An operator or expression | Build it from Python on `km.local()`, tick it, and compare the result with a pandas recomputation of the same input. |
+| An operator or expression | Build it from Python on `km.connect(":memory:")`, tick it, and compare the result with a pandas recomputation of the same input. |
 | Ingest or weir | Run `kermodes dev`, push data, kill the process with `-9`, restart, and check the table has no gaps or duplicates. |
 | History, merge, or the catalog | Merge a day, read it back as `db.historical_table`, and check row counts and pruning in `EXPLAIN`. |
 | SQL | Run the query once over merged dates (static) and once over today (ticking). |

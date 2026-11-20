@@ -87,7 +87,7 @@ def test_dates_before_today_are_static_and_read_only_their_files(tmp_path):
 
 
 def test_joins_read_passed_tables_and_today_ticking(tmp_path):
-    s = km.local(tmp_path, manual=True)
+    s = km.connect(tmp_path, manual=True)
     s.create_table("md.ticks", {"sym": km.string(), "px": km.float64()})
     w = s.writer("md.ticks", source="feed")
     w.write(pa.table({"sym": ["a", "b", "z"], "px": [1.0, 2.0, 3.0]}))

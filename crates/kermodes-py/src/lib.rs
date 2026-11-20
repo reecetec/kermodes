@@ -726,7 +726,7 @@ impl Session {
     fn serve_store(&self, py: Python<'_>, port: u16, host: &str) -> PyResult<StoreServer> {
         let Some(Tables::Local(store)) = &self.tables else {
             return Err(KermodesError::new_err(
-                "only a session that opened a store directory (km.local(path)) can serve it",
+                "only a session that opened a store directory (km.connect(path)) can serve it",
             ));
         };
         let addr: SocketAddr = format!("{host}:{port}")
@@ -776,7 +776,7 @@ impl Session {
     fn stored(&self) -> PyResult<&Tables> {
         self.tables.as_ref().ok_or_else(|| {
             KermodesError::new_err(
-                "this session keeps no tables: open a store with km.local(path), or connect to \
+                "this session keeps no tables: open a store with km.connect(path), or connect to \
                  one with km.connect(url)",
             )
         })

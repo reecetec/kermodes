@@ -9,7 +9,7 @@ cluster through a build-once, promote-everywhere pipeline.
 import pyarrow as pa
 import kermodes as km
 
-s = km.local(manual=True)  # cycles run on step(); km.local() runs them on input
+s = km.connect(":memory:", manual=True)  # no store; cycles run on step(), else on input
 ticks = s.input_table({"sym": km.string(), "price": km.float64(), "size": km.int64()})
 live = ticks.where("price > 0").update("notional = price * size")
 

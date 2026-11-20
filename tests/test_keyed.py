@@ -23,7 +23,7 @@ def as_dict(table) -> dict:
 
 
 def test_keyed_tables_hold_each_keys_latest_row(tmp_path):
-    s = km.local(tmp_path, manual=True)
+    s = km.connect(tmp_path, manual=True)
     s.create_table("md.quotes", QUOTES, key="sym")
     w = s.writer("md.quotes", source="feed")
     assert w.upsert(quotes([("a", 1.0), ("b", 2.0)]))
@@ -37,7 +37,7 @@ def test_keyed_tables_hold_each_keys_latest_row(tmp_path):
         w.write(quotes([("d", 4.0)]))
 
     del s, w, live
-    s = km.local(tmp_path, manual=True)
+    s = km.connect(tmp_path, manual=True)
     reopened = s.live_table("md.quotes")
     s.step()
     assert as_dict(reopened) == {"a": 10.0, "c": 3.0}
@@ -55,7 +55,7 @@ def until_equal(s, reader, table) -> None:
 
 
 def test_a_published_table_follows_its_table_and_replaces_on_restart(tmp_path):
-    s = km.local(tmp_path, manual=True)
+    s = km.connect(tmp_path, manual=True)
     s.create_table("md.ticks", {"sym": km.string(), "px": km.float64()})
     w = s.writer("md.ticks", source="feed")
     ticks = s.live_table("md.ticks")
@@ -86,7 +86,7 @@ def test_a_published_table_follows_its_table_and_replaces_on_restart(tmp_path):
 
 
 def test_changes_are_a_keyed_tables_log(tmp_path):
-    s = km.local(tmp_path, manual=True)
+    s = km.connect(tmp_path, manual=True)
     s.create_table("md.quotes", QUOTES, key="sym")
     w = s.writer("md.quotes")
     changes = s.changes("md.quotes")
@@ -108,7 +108,7 @@ def test_changes_are_a_keyed_tables_log(tmp_path):
 
 
 def test_a_keyed_stored_table_is_its_latest_state(tmp_path):
-    s = km.local(tmp_path, manual=True)
+    s = km.connect(tmp_path, manual=True)
     s.create_table("md.quotes", QUOTES, key="sym")
     w = s.writer("md.quotes")
     w.upsert(quotes([("a", 1.0), ("b", 20.0), ("c", 30.0)]))

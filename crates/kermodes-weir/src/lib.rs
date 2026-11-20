@@ -1,7 +1,7 @@
 //! weir (architecture.md §7): the ingest log. Each table's rows are kept per internal partition
 //! `(date, source)` as Arrow IPC segments, durably and in order; readers get every committed
 //! batch, then each new one. This crate is the storage, embedded in a process by
-//! `km.local(path)` through `Store`; the Flight server that shares it between processes wraps the
+//! `km.connect(path)` through `Store`; the Flight server that shares it between processes wraps the
 //! same store.
 
 #![forbid(unsafe_code)]

@@ -218,7 +218,7 @@ def test_kermodes_run_runs_a_deployment_on_a_servers_tables(tmp_path):
             writer.write(pa.table({"n": pa.array([1, 2, 3], pa.int64())}))
         """,
     )
-    owner = km.local(tmp_path / "store", manual=True)
+    owner = km.connect(tmp_path / "store", manual=True)
     # The run starts first, as after a restart while weir is away: it waits for its store.
     flight = free_port()
     run = subprocess.Popen(

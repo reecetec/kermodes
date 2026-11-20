@@ -1,4 +1,4 @@
-"""The engine.md startup target: `import kermodes; km.local()` in a fresh interpreter, < 100 ms.
+"""The engine.md startup target: `import kermodes; km.connect(":memory:")` in a fresh interpreter, < 100 ms.
 
     uv run --no-sync python bench/import_time.py
 
@@ -10,7 +10,7 @@ import subprocess
 import sys
 
 PROBE = (
-    "import time; start = time.perf_counter(); import kermodes as km; s = km.local(); "
+    "import time; start = time.perf_counter(); import kermodes as km; s = km.connect(':memory:'); "
     "print((time.perf_counter() - start) * 1000)"
 )
 
@@ -20,7 +20,7 @@ def main() -> None:
         float(subprocess.check_output([sys.executable, "-c", PROBE])) for _ in range(7)
     )
     print(
-        f"import kermodes + km.local(): median {statistics.median(runs):.1f} ms "
+        f"import kermodes + km.connect(':memory:'): median {statistics.median(runs):.1f} ms "
         f"(runs: {', '.join(f'{r:.1f}' for r in runs)}); target < 100 ms"
     )
 

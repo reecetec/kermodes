@@ -115,7 +115,7 @@ def test_a_writer_rides_out_a_killed_kermodes_dev_and_loses_nothing(tmp_path):
 
 
 def test_a_live_table_fails_when_its_store_goes(tmp_path):
-    owner = km.local(tmp_path, manual=True)
+    owner = km.connect(tmp_path, manual=True)
     owner.create_table("md.ticks", {"n": km.int64()})
     server = owner.serve_store()
     reader = km.connect(server.url, manual=True)
@@ -139,7 +139,7 @@ def test_a_live_table_fails_when_its_store_goes(tmp_path):
 
 
 def test_kermodes_ui_serves_on_while_its_store_is_away(tmp_path):
-    store = km.local(tmp_path / "store")
+    store = km.connect(tmp_path / "store")
     store.create_table("md.t", {"n": km.int64()})
     flight, port = free_port(), free_port()
     server = store.serve_store(port=flight)

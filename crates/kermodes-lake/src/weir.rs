@@ -1,4 +1,4 @@
-//! What history needs of weir: the store in this process (`km.local`, `kermodes dev`), or the
+//! What history needs of weir: the store in this process (`km.connect(path)`, `kermodes dev`), or the
 //! cluster's over Flight (a merge Job, a worker reading history).
 
 use std::time::Duration;

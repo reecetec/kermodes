@@ -1,6 +1,6 @@
 # Kermodes engine (M0)
 
-Direction for the first milestone: the engine as a library, driven from Python on `km.local()`,
+Direction for the first milestone: the engine as a library, driven from Python on `km.connect(":memory:")`,
 with ticking tables in Jupyter. Like `architecture.md`, this is the current best guess; the code
 corrects it.
 
@@ -127,12 +127,12 @@ Delta { added: [(keys, rows)], removed: [(keys, last rows)], modified: [(keys, p
 - One `RwLock` guards graph state: a cycle holds the write lock; snapshot readers hold the read
   lock between cycles. Readers copy what they need and release it.
 - Clocks:
-  - on input (the default for `km.local()`): a background thread runs a cycle as soon as writes
+  - on input (the default for `km.connect(":memory:")`): a background thread runs a cycle as soon as writes
     arrive; writes that arrive during a cycle fold into the next, so batches grow with load and
     latency stays near zero when idle. `start(min_period)` optionally spaces cycles at least that
     far apart; `stop()` ends it. The thread holds the session weakly, so dropping the session
     ends it.
-  - manual (`km.local(manual=True)`): `step()` runs one cycle (tests, replay).
+  - manual (`km.connect(":memory:", manual=True)`): `step()` runs one cycle (tests, replay).
 - Each table records the cycle that last changed its rows (or failed it); viewers poll that to
   re-render only what changed.
 - Cycles run tables one after another. Within a table, a large delta (64k+ rows) spreads over every
@@ -213,7 +213,7 @@ Grouping keys:
 ```python
 import kermodes as km
 
-s = km.local()  # in-process engine; cycles run as soon as writes arrive
+s = km.connect(":memory:")  # in-process engine; cycles run as soon as writes arrive
 
 ticks = s.input_table(
     {
@@ -237,7 +237,7 @@ vwap = stats.update("vwap = notional / size")
 pa.table(latest)  # snapshot through the Arrow PyCapsule interface
 latest  # in a notebook: a live view (§8)
 
-m = km.local(manual=True)  # only m.step() runs cycles; m.start() / m.stop()
+m = km.connect(":memory:", manual=True)  # m.step() runs cycles; m.start() / m.stop()
 
 enriched = live.natural_join(refs, on="sym")  # `joins=` picks and renames right columns
 priced = ticks.as_of_join(quotes, on="sym", at="ts")
@@ -280,7 +280,7 @@ vol = ticks.rolling("sym", rows=100, std_price="std(price)")  # or time="5m", at
   compares exactly. A failure prints the seed and the cycle that diverged.
 - **Expressions:** decision tables per kernel family (null semantics, overflow, casts), and the
   same expressions checked against pandas in Python tests.
-- **Python:** pytest over the public API on `km.local(manual=True)`, stepping manually.
+- **Python:** pytest over the public API on `km.connect(":memory:", manual=True)`, stepping manually.
 - **Determinism:** no test depends on wall-clock time or thread scheduling.
 
 ## 10. Benchmarks
@@ -320,7 +320,7 @@ Targets (release build, on the development laptop):
 | Same workload in Deephaven Community on the same machine | Kermodes sustained throughput ≥ Deephaven's |
 | Keyed order book (`kermodes-bench book`): 1M orders over 100 symbols, 100k upserts and deletes per cycle, through `agg_by(sym)` (`count`, `sum`, `mean`, `std`); the same in Deephaven (`bench/deephaven_book.py`) | Cycle time ≤ Deephaven's |
 | Static `agg_by` over 100M rows, 10k `int64` groups, `sum`/`mean`/`std` of a `float64` | Within 2× of Polars `group_by` on the same data |
-| `import kermodes; km.local()` | < 100 ms |
+| `import kermodes; km.connect(":memory:")` | < 100 ms |
 
 ## 11. Code layout for M0
 

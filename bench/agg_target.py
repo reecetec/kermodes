@@ -30,7 +30,7 @@ def worker(engine: str, rows: int) -> dict:
     if engine == "kermodes":
         import kermodes as km
 
-        source = km.local(manual=True).static_table(table)
+        source = km.connect(":memory:", manual=True).static_table(table)
 
         def run():
             return source.agg_by(

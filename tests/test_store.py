@@ -16,7 +16,7 @@ def rows(values: list[int]) -> pa.Table:
 
 
 def test_stored_tables_tick_and_survive_the_process(tmp_path):
-    s = km.local(tmp_path, manual=True)
+    s = km.connect(tmp_path, manual=True)
     s.create_table("md.ticks", COLUMNS)
     w = s.writer("md.ticks", source="feed")
     assert w.write(rows([1, 2])) and w.last_seq == 1
@@ -32,7 +32,7 @@ def test_stored_tables_tick_and_survive_the_process(tmp_path):
 
     del s, w, live
     gc.collect()
-    s = km.local(tmp_path, manual=True)
+    s = km.connect(tmp_path, manual=True)
     reopened = s.live_table("md.ticks")
     s.step()
     assert pa.table(reopened)["n"].to_pylist() == [1, 2, 3]
@@ -41,7 +41,7 @@ def test_stored_tables_tick_and_survive_the_process(tmp_path):
 
 
 def test_writes_sent_without_waiting_land_in_order_locally_and_remotely(tmp_path):
-    owner = km.local(tmp_path / "store", manual=True)
+    owner = km.connect(tmp_path / "store", manual=True)
     owner.create_table("md.ticks", COLUMNS)
     server = owner.serve_store()
     for session, source, values in [
@@ -61,7 +61,7 @@ def test_writes_sent_without_waiting_land_in_order_locally_and_remotely(tmp_path
 
 
 def test_a_remote_writer_rides_out_a_server_restart(tmp_path):
-    owner = km.local(tmp_path / "store", manual=True)
+    owner = km.connect(tmp_path / "store", manual=True)
     owner.create_table("md.ticks", COLUMNS)
     server = owner.serve_store()
     port = int(server.url.rsplit(":", 1)[1])
@@ -79,9 +79,9 @@ def test_a_remote_writer_rides_out_a_server_restart(tmp_path):
 
 
 def test_a_store_has_one_owner_and_clear_errors(tmp_path):
-    s = km.local(tmp_path, manual=True)
+    s = km.connect(tmp_path, manual=True)
     with pytest.raises(km.KermodesError, match="open in another process"):
-        km.local(tmp_path)
+        km.connect(tmp_path)
     with pytest.raises(km.KermodesError, match="not a table name"):
         s.create_table("ticks", COLUMNS)
     with pytest.raises(km.KermodesError, match="no table md.nope"):
@@ -95,7 +95,7 @@ def test_a_store_has_one_owner_and_clear_errors(tmp_path):
     del first
     s.writer("md.ticks")
     with pytest.raises(km.KermodesError, match="keeps no tables"):
-        km.local(manual=True).live_table("md.ticks")
+        km.connect(":memory:", manual=True).live_table("md.ticks")
 
 
 _WRITE_UNTIL_KILLED = """
@@ -103,7 +103,7 @@ import sys
 import pyarrow as pa
 import kermodes as km
 
-s = km.local(sys.argv[1], manual=True)
+s = km.connect(sys.argv[1], manual=True)
 s.create_table("md.ticks", {"n": km.int64()})
 w = s.writer("md.ticks", source="feed")
 seq = (w.last_seq or 0) + 1
@@ -127,7 +127,7 @@ def test_a_killed_writer_loses_nothing_it_acknowledged(tmp_path):
             acknowledged = int(child.stdout.readline())
         child.kill()  # SIGKILL: no clean shutdown, possibly mid-write
         child.wait()
-        s = km.local(tmp_path, manual=True)
+        s = km.connect(tmp_path, manual=True)
         table = s.live_table("md.ticks")
         s.step()
         n = pa.table(table)["n"].to_pylist()

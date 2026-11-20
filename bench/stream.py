@@ -44,7 +44,7 @@ def main() -> None:
     gc.collect()
     before = resident()
 
-    s = km.local(manual=True)
+    s = km.connect(":memory:", manual=True)
     ticks = s.input_table(
         {
             "sym": km.string(),

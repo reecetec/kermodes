@@ -43,7 +43,7 @@ def main() -> None:
             }
         )
 
-    s = km.local(manual=True)
+    s = km.connect(":memory:", manual=True)
     book = s.input_table(
         {
             "id": km.int64(),

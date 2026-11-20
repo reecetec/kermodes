@@ -50,7 +50,7 @@ def worker(op: str, cycles: int, batch: int) -> dict:
     gc.collect()
     before = resident()
 
-    s = km.local(manual=True)
+    s = km.connect(":memory:", manual=True)
     stamp = km.timestamp()
     ticks = s.input_table(
         {"sym": km.string(), "price": km.float64(), "size": km.int64(), "ts": stamp}

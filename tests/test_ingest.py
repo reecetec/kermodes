@@ -13,7 +13,7 @@ TICKS = {
 
 def test_a_websocket_feed_ticks_into_a_stored_table(tmp_path):
     feed = km.demo.ticker(rate=2_000, symbols=20)
-    s = km.local(tmp_path, manual=True)
+    s = km.connect(tmp_path, manual=True)
     s.create_table("md.ticks", TICKS)
     live = s.live_table("md.ticks")
     ingest = s.ingest_websocket(feed.url, "md.ticks", flush="20ms")

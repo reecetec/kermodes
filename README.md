@@ -13,7 +13,7 @@ agents: [llms.txt](https://reecetec.github.io/kermodes/llms.txt)), from [docs/](
 import pyarrow as pa
 import kermodes as km
 
-s = km.local(manual=True)  # cycles run on step(); km.local() runs them on input
+s = km.connect(":memory:", manual=True)  # no store; cycles run on step(), else on input
 ticks = s.input_table({"sym": km.string(), "price": km.float64(), "size": km.int64()})
 live = ticks.where("price > 0").update("notional = price * size")
 
@@ -22,7 +22,7 @@ s.step()
 pa.table(live)  # sym, price, size, notional for rows with price > 0
 ```
 
-By default `km.local()` runs a cycle as soon as writes arrive, and a ticking table displayed in a
+By default a session runs a cycle as soon as writes arrive, and a ticking table displayed in a
 notebook updates in place; [examples/live.ipynb](examples/live.ipynb) streams a random-walk ticker.
 
 ## Development

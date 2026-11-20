@@ -38,7 +38,7 @@ def store_with_past_days(path):
     renamed to the date it stands for. The first is merged into history."""
     today = datetime.now(UTC).date().isoformat()
     for day, rows in DAYS.items():
-        s = km.local(path, manual=True)
+        s = km.connect(path, manual=True)
         s.create_table("md.ticks", COLUMNS)
         ts, sym, px = zip(*rows)
         s.writer("md.ticks", source="feed").write(
@@ -50,7 +50,7 @@ def store_with_past_days(path):
         gc.collect()
         partition = next((path / "weir").glob(f"**/{today}"))
         partition.rename(partition.with_name(day))
-    s = km.local(path, manual=True)
+    s = km.connect(path, manual=True)
     s.merge_history("md.ticks", "2026-11-01")
     return s
 

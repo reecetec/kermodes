@@ -307,7 +307,7 @@ def main(argv: list[str] | None = None) -> None:
         print(f"built {args.into}", flush=True)
     elif args.command == "merge":
         session = (
-            km.local(args.data_dir)
+            km.connect(args.data_dir)
             if args.data_dir
             else connect_when_up(args.server, "kermodes merge")
         )
@@ -357,7 +357,7 @@ def run_resource(
     resource = found.resource(name)
     # A run started while its store is away (weir restarting) waits for it rather than exiting,
     # so a restart does not become a crash loop; it is not ready until then.
-    db = km.local(data_dir) if data_dir else connect_when_up(server, "kermodes run")
+    db = km.connect(data_dir) if data_dir else connect_when_up(server, "kermodes run")
     print(f"running {name}; Ctrl-C to stop", flush=True)
     serving = dataclasses.replace(serving, path=found.app_path(name))
     try:
@@ -379,7 +379,7 @@ def run_backtest(
     ran and what its tables ended with."""
     first, _, last = dates.partition("..")
     resource = projects.discover(project).resource(name)
-    db = km.local(data_dir) if data_dir else connect_when_up(server, "kermodes run")
+    db = km.connect(data_dir) if data_dir else connect_when_up(server, "kermodes run")
     replay = db.replay(first, last or first, step=step)
     print(
         f"replaying {name} over {first} to {last or first}; Ctrl-C to stop", flush=True
@@ -401,7 +401,7 @@ def run_backtest(
 def run_dev(
     data_dir: Path, host: str, port: int, flight_port: int, project: Path | None
 ) -> None:
-    session = km.local(data_dir)
+    session = km.connect(data_dir)
     flight = session.serve_store(port=flight_port, host=host)
     ui = session.serve(port=port, host=host)
     print(
@@ -433,7 +433,7 @@ def run_weir(
         session.start()
         where = f"{data_dir.resolve()}, catalog branch {branch} in Postgres"
     else:
-        session = km.local(data_dir)
+        session = km.connect(data_dir)
         where = str(data_dir.resolve())
     flight = session.serve_store(port=port, host=host)
     print(f"kermodes weir: {where}\n  serving  {flight.url}", flush=True)

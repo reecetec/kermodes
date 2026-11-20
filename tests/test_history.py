@@ -19,14 +19,14 @@ def store_with_past_days(path):
     day's partition renamed to the date it stands for."""
     today = datetime.now(UTC).date().isoformat()
     for day, columns in DAYS.items():
-        s = km.local(path, manual=True)
+        s = km.connect(path, manual=True)
         s.create_table("md.ticks", COLUMNS)
         s.writer("md.ticks", source="feed").write(pa.table(columns))
         del s
         gc.collect()
         partition = next((path / "weir").glob(f"**/{today}"))
         partition.rename(partition.with_name(day))
-    return km.local(path, manual=True)
+    return km.connect(path, manual=True)
 
 
 def rows(table: pa.Table) -> list[tuple]:
@@ -75,7 +75,7 @@ def test_past_days_merge_into_history_and_read_back_like_pyarrow(tmp_path):
 
 
 def test_today_is_not_history_yet(tmp_path):
-    s = km.local(tmp_path, manual=True)
+    s = km.connect(tmp_path, manual=True)
     s.create_table("md.ticks", COLUMNS)
     today = datetime.now(UTC).date().isoformat()
     with pytest.raises(km.KermodesError, match="still being written"):

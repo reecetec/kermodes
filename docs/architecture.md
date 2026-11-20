@@ -142,7 +142,7 @@ rewrite expressions, dropping table qualifiers, without matching every expressio
 crate to the build.
 
 `rusqlite` (with SQLite bundled) holds the local catalog: a synchronous, in-process database is
-what an embedded store (`km.local(path)`) and `kermodes dev` need, with no runtime to start. The
+what an embedded store (`km.connect(path)`) and `kermodes dev` need, with no runtime to start. The
 cluster's catalog is Postgres, shared by every weir, through the rust-postgres family: weir's
 catalog calls are synchronous (made under the store's locks), which its `postgres` client is, and
 the async control plane uses `tokio-postgres` from the same family; `sqlx` would be async-only and
@@ -216,11 +216,11 @@ as written and never mutates a row, so a keyed table's history is its log of cha
 ### 5.3 Access API
 
 ```python
-db = km.connect().db
+db = km.connect()  # $KERMODES_URL, else kermodes dev; or a directory, or ":memory:"
 
-odds = db.live_table("sports", "odds")  # unmerged intraday partitions, ticking
-hist = db.historical_table("sports", "odds")  # merged dates, static
-full = db.table("sports", "odds")  # historical ∪ live, disjoint by Date
+odds = db.live_table("sports.odds")  # unmerged intraday partitions, ticking
+hist = db.historical_table("sports.odds")  # merged dates, static
+full = db.table("sports.odds")  # historical ∪ live, disjoint by Date
 ```
 
 `db.live_table` contains every intraday partition not yet merged; callers usually filter
@@ -906,7 +906,7 @@ files keep their first path; the catalog (`kermodes data locate ns.table`) gives
   use the static path for static subtrees.
 - One worker pod per deployment, ingester, or session (§16.3). No worker process is shared
   between users.
-- The engine is a library first (Rust crate, PyO3 module for `km.local()`) and a server second
+- The engine is a library first (Rust crate, PyO3 module for `km.connect(":memory:")`) and a server second
   (same crate plus Flight).
 
 ### 9.2 Operators (initial set)
@@ -1234,7 +1234,7 @@ strategy/
   apps/market/        an app (§15.2), served at /apps/<project>/market/
     app.py            @km.app() def market(db): its Python, which returns the tables its page shows
     App.tsx           its page: the default export, any React and TypeScript
-  tests/              pytest: unit tests on km.local(), replay tests on pinned history
+  tests/              pytest: unit tests on km.connect(":memory:"), replay tests on pinned history
 ```
 
 ```toml
@@ -1295,7 +1295,7 @@ flowchart LR
 - Outputs always stay on the machine: tables a local run produces are written to its local store,
   on the `local` branch (§10.1), and shadow prod's for that run only. Nothing a local run does can
   write to the cluster.
-- `kermodes test` runs the same tests the pipeline runs: pytest on `km.local()`, plus replay tests over
+- `kermodes test` runs the same tests the pipeline runs: pytest on `km.connect(":memory:")`, plus replay tests over
   the dates in `kermodes.toml` with the replay clock (§9.4).
 - `kermodes plan` diffs the working tree against what is deployed on prod: resources added, changed,
   and removed, schema change classes, downstream impact, and how each change will roll out (§11.4).
@@ -1538,8 +1538,10 @@ namespaces).
 
 ### 15.1 Python SDK and notebooks
 
-- `km.connect()` — remote cluster or a running `kermodes dev`; `km.local()` — in-process engine from
-  the same Rust crate. `db.sql(...)` and the table API build the same plans (§9.3, §9.8).
+- `km.connect(target)`: a server's URL (the cluster's weir, or a running `kermodes dev`), a store
+  directory opened in this process, or `":memory:"` for no store; the engine runs in this process
+  either way, from the same Rust crate. `db.sql(...)` and the table API build the same plans
+  (§9.3, §9.8).
 - Tables convert to pyarrow, pandas, and polars without copying where possible (Arrow PyCapsule
   interface).
 - Tables render in Jupyter through the table viewer (§15.3), an anywidget subscribed to a
@@ -1899,8 +1901,8 @@ No JVM, Docker, or Kubernetes.
 
 | Entry point | What runs | Use |
 |---|---|---|
-| `km.local()` | Engine inside the Python process (PyO3), in memory | Notebooks, tests, experiments |
-| `km.local("./.kermodes")` | The same, plus weir, the lake, and the catalog in-process on that directory: tables survive restarts | One notebook or script working with its own data, like `duckdb.connect("x.duckdb")` |
+| `km.connect(":memory:")` | Engine inside the Python process (PyO3), in memory | Notebooks, tests, experiments |
+| `km.connect("./.kermodes")` | The same, plus weir, the lake, and the catalog in-process on that directory: tables survive restarts | One notebook or script working with its own data, like `duckdb.connect("x.duckdb")` |
 | `kermodes dev` | One supervisor process: control plane, gateway + UI, weir, workers as child processes; hot reload of the current project | Development |
 | Kubernetes | Same package, one role per pod | Cluster |
 
@@ -1908,7 +1910,7 @@ No JVM, Docker, or Kubernetes.
   every server role, and the `kermodes` command (§19.1).
 - `kermodes dev` keeps state in `./.kermodes/` (or `--data-dir`): weir segments on local disk; the lake as
   local Parquet; catalog and control-plane state in SQLite; a single implicit user, OIDC optional.
-  It is the same directory layout `km.local(path)` opens, and the bucket's layout in the cluster.
+  It is the same directory layout `km.connect(path)` opens, and the bucket's layout in the cluster.
 - One process owns a directory at a time (a lock file): a second process opening it would write
   the same files behind the first one's back. To share data between processes, run `kermodes dev`
   and connect with `km.connect()`; weir is then the one writer and every process is its client.
@@ -1924,7 +1926,7 @@ No JVM, Docker, or Kubernetes.
   from any process that opened it. `kermodes dev` is the two cluster roles in one process:
   `kermodes weir` (the store over Flight) and `kermodes ui` (an engine that follows every table of
   a store and serves the web UI).
-- Startup targets: `km.local()` under 100 ms; `kermodes dev` ready under 1 s.
+- Startup targets: `km.connect(":memory:")` under 100 ms; `kermodes dev` ready under 1 s.
 
 ### 16.7 Monitoring
 

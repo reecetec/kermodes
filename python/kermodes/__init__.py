@@ -38,7 +38,6 @@ __all__ = [
     "ingester",
     "int32",
     "int64",
-    "local",
     "merge",
     "string",
     "timestamp",
@@ -46,33 +45,34 @@ __all__ = [
 ]
 
 
-def local(path: str | PathLike[str] | None = None, *, manual: bool = False) -> Session:
-    """Start an engine inside this Python process.
+def connect(
+    target: str | PathLike[str] | None = None, *, manual: bool = False
+) -> Session:
+    """Start an engine inside this Python process, on the tables `target` names.
 
-    With `path`, the session also opens the store in that directory (creating it if needed),
-    like `duckdb.connect("x.duckdb")`: tables made with `create_table` and the rows their writers
-    write survive the process. One process opens a directory at a time.
+    - A server's URL (`grpc://host:port`, from `kermodes dev`, `kermodes weir`, or
+      `Session.serve_store`): its tables. Many processes can connect to one server; it is the
+      one writer of the store's files, and they are its clients.
+    - A directory: the store there, opened in this process (created if needed), like
+      `duckdb.connect("x.duckdb")`: tables and the rows their writers write survive the
+      process. One process opens a directory at a time.
+    - `":memory:"`: no store; tables are this process's own.
+    - Nothing: `$KERMODES_URL`, else the local `kermodes dev`.
 
     Cycles run on their own as soon as writes arrive. With `manual=True`, nothing runs until
     `step()` (tests, replay); `start()` and `stop()` switch between the two.
     """
-    session = Session(path)
-    if not manual:
-        session.start()
-    return session
+    if target is None:
+        from kermodes.cli import DEV_PORT
 
-
-def connect(url: str | None = None, *, manual: bool = False) -> Session:
-    """Start an engine inside this Python process that uses a server's tables.
-
-    `url` is a store server's (`kermodes dev`, or `Session.serve_store`); by default
-    `$KERMODES_URL`, else the local `kermodes dev`. Many processes can connect to one server:
-    it is the one writer of the store's files, and they are its clients.
-    """
-    from kermodes.cli import DEV_PORT
-
-    url = url or os.environ.get("KERMODES_URL") or f"grpc://127.0.0.1:{DEV_PORT + 1}"
-    session = Session(url=url)
+        target = os.environ.get("KERMODES_URL") or f"grpc://127.0.0.1:{DEV_PORT + 1}"
+    target = os.fspath(target)
+    if target == ":memory:":
+        session = Session()
+    elif "://" in target:
+        session = Session(url=target)
+    else:
+        session = Session(target)
     if not manual:
         session.start()
     return session
