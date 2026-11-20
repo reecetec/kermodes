@@ -111,7 +111,7 @@ impl Graph {
             )));
         }
         for parent in state.source.parents() {
-            self.tables[parent].dependents += 1;
+            self.tables[parent].life.add_dependent();
         }
         self.tables.push(state);
         Ok(self.tables.len() - 1)
@@ -127,17 +127,17 @@ impl Graph {
                 .expect("kermodes release queue poisoned by an earlier panic"),
         );
         for id in &ids {
-            self.tables[*id].held = false;
+            self.tables[*id].life.unhold();
         }
         while let Some(id) = ids.pop() {
             let table = &mut self.tables[id];
-            if table.held || table.dependents > 0 || table.released {
+            if !table.life.can_release() {
                 continue;
             }
             let parents: Vec<usize> = table.source.parents().collect();
             table.release();
             for parent in parents {
-                self.tables[parent].dependents -= 1;
+                self.tables[parent].life.remove_dependent();
                 ids.push(parent);
             }
         }
@@ -181,6 +181,57 @@ enum Growth {
     AppendOnly,
 }
 
+/// Whether anything still refers to a table. Only a live table with neither a handle nor a
+/// dependent may be released, and a released one never comes back.
+#[derive(Clone, Copy)]
+enum Life {
+    Live {
+        /// Whether a `Table` handle still refers to the table.
+        held: bool,
+        /// Live tables computed from this one (static ones have their own rows and don't count).
+        dependents: usize,
+    },
+    /// An empty placeholder that no handle or table refers to.
+    Released,
+}
+
+impl Life {
+    fn is_released(self) -> bool {
+        matches!(self, Life::Released)
+    }
+
+    fn can_release(self) -> bool {
+        matches!(
+            self,
+            Life::Live {
+                held: false,
+                dependents: 0
+            }
+        )
+    }
+
+    /// The table's last handle dropped.
+    fn unhold(&mut self) {
+        if let Life::Live { held, .. } = self {
+            *held = false;
+        }
+    }
+
+    fn add_dependent(&mut self) {
+        match self {
+            Life::Live { dependents, .. } => *dependents += 1,
+            Life::Released => unreachable!("a table was built on a released table"),
+        }
+    }
+
+    fn remove_dependent(&mut self) {
+        match self {
+            Life::Live { dependents, .. } => *dependents -= 1,
+            Life::Released => unreachable!("a released table had a dependent"),
+        }
+    }
+}
+
 struct TableState {
     description: String,
     schema: SchemaRef,
@@ -194,12 +245,7 @@ struct TableState {
     /// The cycle that last changed this table's rows or failed it; 0 if none has.
     changed: u64,
     source: Source,
-    /// Whether a `Table` handle still refers to this table.
-    held: bool,
-    /// Live tables computed from this one (static ones have their own rows and don't count).
-    dependents: usize,
-    /// Released: an empty placeholder that no handle or table refers to.
-    released: bool,
+    life: Life,
     /// Told each cycle's changes (`Table::on_changes`).
     listeners: Vec<Listener>,
     /// A fed table not yet given what its store held when it subscribed (`Feed::ready`): its
@@ -678,7 +724,7 @@ impl Feed {
         let (released, loading) = {
             let graph = session.read();
             let table = &graph.tables[self.id];
-            (table.released, table.loading)
+            (table.life.is_released(), table.loading)
         };
         (!released).then(|| Target {
             session,
@@ -1133,7 +1179,11 @@ impl Session {
     /// How many tables the session holds: those with a handle, and those live tables are
     /// computed from. Dropping a table's last handle releases it unless others need it.
     pub fn table_count(&self) -> usize {
-        self.read().tables.iter().filter(|t| !t.released).count()
+        self.read()
+            .tables
+            .iter()
+            .filter(|t| !t.life.is_released())
+            .count()
     }
 
     fn read(&self) -> RwLockReadGuard<'_, Graph> {
@@ -1225,9 +1275,10 @@ impl TableState {
             delta: None,
             changed: 0,
             source,
-            held: true,
-            dependents: 0,
-            released: false,
+            life: Life::Live {
+                held: true,
+                dependents: 0,
+            },
             listeners: Vec::new(),
             loading: false,
         }
@@ -1235,7 +1286,7 @@ impl TableState {
 
     /// Frees everything but the description: no handle or live table refers to this one.
     fn release(&mut self) {
-        self.released = true;
+        self.life = Life::Released;
         self.storage = None;
         self.source = Source::Static;
         self.delta = None;
