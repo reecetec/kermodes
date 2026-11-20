@@ -735,10 +735,12 @@ writers ─► leader ── append + fsync ────────────
   of `weir/` durable before the marker goes, since one that finishes another's moves may have
   nothing left to move. Its own files go only once the copy is whole and durable. It then
   reopens and takes entries from that position.
-- **A lost disk.** A replica that starts with no log in a shard the catalog records as started
-  (a leader committed in it) lost its disk, or was given a new one: its log is no measure of
-  what it held, and it may have voted in terms it no longer knows, so its vote could elect a
-  leader without entries it helped commit. It refuses to open. Watching the leader cannot tell
+- **A lost disk.** Each replica's first log is recorded in the catalog once it is durable and
+  before Raft starts. A replica that starts with no log though the catalog records it had one
+  lost its disk, or was given a new one: its log is no measure of what it held, and it may have
+  voted in terms it no longer knows, so its vote could elect a leader without entries it helped
+  commit. It refuses to open. A replica the catalog does not know has never voted, and joins
+  however late (a StatefulSet starts its pods one at a time). Watching the leader cannot tell
   it when it is safe to vote again, since a delayed or duplicated message carries a commit
   index from before the loss. It is to rejoin as Redpanda, Kafka's KRaft (KIP-853), and etcd
   rejoin a replaced disk: as a new incarnation of the replica, a learner that takes the log or

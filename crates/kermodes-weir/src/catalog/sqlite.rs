@@ -222,22 +222,22 @@ impl Sqlite {
             .map_err(sql)
     }
 
-    pub(crate) fn shard_started(&mut self, branch: &str) -> Result<bool, Error> {
+    pub(crate) fn replica_started(&mut self, branch: &str, replica: u64) -> Result<bool, Error> {
         self.conn
             .query_row(
                 "SELECT count(*) FROM meta WHERE key = ?1",
-                [started_key(branch)],
+                [started_key(branch, replica)],
                 |row| row.get::<_, i64>(0),
             )
             .map(|n| n > 0)
             .map_err(sql)
     }
 
-    pub(crate) fn start_shard(&mut self, branch: &str) -> Result<(), Error> {
+    pub(crate) fn start_replica(&mut self, branch: &str, replica: u64) -> Result<(), Error> {
         self.conn
             .execute(
                 "INSERT INTO meta VALUES (?1, 1) ON CONFLICT (key) DO NOTHING",
-                [started_key(branch)],
+                [started_key(branch, replica)],
             )
             .map(drop)
             .map_err(sql)

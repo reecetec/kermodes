@@ -226,22 +226,22 @@ impl Postgres {
             .map(|row| row.get::<_, i64>(0) as u64))
     }
 
-    pub(crate) fn shard_started(&mut self, branch: &str) -> Result<bool, Error> {
+    pub(crate) fn replica_started(&mut self, branch: &str, replica: u64) -> Result<bool, Error> {
         Ok(self
             .client()?
             .query_opt(
                 "SELECT 1 FROM kermodes_meta WHERE key = $1",
-                &[&started_key(branch)],
+                &[&started_key(branch, replica)],
             )
             .map_err(sql)?
             .is_some())
     }
 
-    pub(crate) fn start_shard(&mut self, branch: &str) -> Result<(), Error> {
+    pub(crate) fn start_replica(&mut self, branch: &str, replica: u64) -> Result<(), Error> {
         self.client()?
             .execute(
                 "INSERT INTO kermodes_meta VALUES ($1, 1) ON CONFLICT (key) DO NOTHING",
-                &[&started_key(branch)],
+                &[&started_key(branch, replica)],
             )
             .map(drop)
             .map_err(sql)

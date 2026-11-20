@@ -478,6 +478,25 @@ impl Store {
         snapshot::recover(&disk, root)?;
         let weir = root.join("weir");
         let log_dir = weir.join("log");
+        // No log, for a replica the catalog says had one: it lost its disk (or it was replaced).
+        // Its vote, and what it acknowledged, went with it, so its vote could elect a leader
+        // without entries it helped commit. It rejoins as a new member, caught up before it
+        // votes, which needs changing the shard's members. A replica the catalog does not know
+        // has never voted nor acknowledged: it starts with no log however late it joins (a
+        // shard's pods start one at a time). A shard of one has no one else to have voted.
+        // Checked before anything here makes the log, so a refused replica stays refused.
+        if !replica.is_alone()
+            && !disk.exists(&log_dir)
+            && catalog.replica_started(branch, replica.id)?
+        {
+            return Err(Error::Io(format!(
+                "{}: replica {} has no log, though it had one: its disk was lost or replaced, \
+                 and it cannot rejoin until weir can change a shard's members; restore its \
+                 volume",
+                root.display(),
+                replica.id
+            )));
+        }
         let flushed = wal::read_applied(&disk, &log_dir)?;
         let mut logs = HashMap::new();
         let mut stamped = 0;
@@ -521,6 +540,11 @@ impl Store {
                 apply(&log, logged).map(drop)
             },
         )?;
+        // Recorded once its log is durable (`Wal::open` makes it so), before Raft starts: it
+        // has not voted or acknowledged anything before the catalog knows it has a log to lose.
+        if !replica.is_alone() {
+            self::lock(&tables.catalog).start_replica(branch, replica.id)?;
+        }
         // The committed entries the partition files do not hold yet, before Raft starts.
         let from = flushed.max(recovered.start.0);
         let mut applied = from;
@@ -531,22 +555,6 @@ impl Store {
                 }
                 applied = entry.index;
             }
-        }
-        // No log at all, in a shard a leader has committed in: this replica lost its disk (or
-        // it was replaced). Its log is no measure of what it held, nor its vote of whom it voted
-        // for, so its vote could elect a leader without entries it helped commit. It rejoins as
-        // a new member, caught up before it votes, which needs changing the shard's members. A
-        // shard of one has no one else to have voted, and nothing else to lose.
-        let started = replica.is_alone() || self::lock(&tables.catalog).shard_started(branch)?;
-        // The entries the partition files hold are not in `recovered`: the log's end says.
-        if !replica.is_alone() && started && wal.last_index() == 0 {
-            return Err(Error::Io(format!(
-                "{}: replica {} has no log, in a shard that has started: its disk was lost or \
-                 replaced, and it cannot rejoin until weir can change a shard's members; \
-                 restore its volume",
-                root.display(),
-                replica.id
-            )));
         }
         let mut store = LogStore::new(wal, recovered, applied, &replica);
         store.compact_cache(applied);
@@ -595,7 +603,6 @@ impl Store {
             schemas: Vec::new(),
             outgoing,
             shard: shard.clone(),
-            started,
             broken: None,
         };
         if committer.replica.is_alone() {
@@ -1744,9 +1751,6 @@ struct Committer {
     outgoing: Sender<(u64, Vec<u8>)>,
     /// What the store's callers read: the leader, and the snapshot to install.
     shard: Arc<Shard>,
-    /// Whether the catalog says the shard has started (`Catalog::shard_started`); a replica
-    /// records it once it applies a committed entry, so a disk lost later is known as lost.
-    started: bool,
     /// Why the committer stopped taking writes: a failure to log or apply leaves what is
     /// durable in the log, to replay on the next open, and the partition files no longer
     /// following it.
@@ -2084,12 +2088,6 @@ impl Committer {
             }
             drop(position);
             Answer::send_all(answers, outcome);
-        }
-        if !self.started && self.applied.load(Ordering::Acquire) > 0 {
-            // Not recorded (the catalog unreachable) is tried again on the next apply: until
-            // it is, a replica that loses its disk is not known to have, as before any commit.
-            let branch = &self.tables.branch;
-            self.started = lock(&self.tables.catalog).start_shard(branch).is_ok();
         }
     }
 

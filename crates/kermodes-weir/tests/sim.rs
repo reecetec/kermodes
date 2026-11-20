@@ -567,9 +567,9 @@ struct Shard {
 }
 
 impl Shard {
-    /// Starts every replica, then creates the tables: a follower finds them when the first
-    /// writes reach it.
-    fn new(dir: &Path, seed: u64, clock: Clock) -> Self {
+    /// Starts the first `started` replicas (the others start when the shard next agrees), then
+    /// creates the tables: a follower finds them when the first writes reach it.
+    fn new(dir: &Path, seed: u64, clock: Clock, started: usize) -> Self {
         let disks = (0..REPLICAS)
             .map(|i| {
                 let root = dir.join(format!("r{}", i + 1));
@@ -588,7 +588,7 @@ impl Shard {
             writers: None,
             installs: 0,
         };
-        for i in 0..REPLICAS {
+        for i in 0..started {
             shard.start(i);
         }
         let store = shard.stores[0].as_ref().unwrap();
@@ -916,7 +916,7 @@ fn simulate_shard(seed: u64, actions: usize) -> (Vec<u64>, Vec<u64>) {
     let mut trace = Vec::new();
     let mut sent: Vec<Sent> = Vec::new();
     let mut value = 0_i64;
-    let mut shard = Shard::new(&dir.0, seed, clock);
+    let mut shard = Shard::new(&dir.0, seed, clock, REPLICAS);
     shard.resolve(Vec::new(), &mut sent, &mut model, &mut trace);
     for _ in 0..actions {
         now.fetch_add(1_000_000 * (1 + rng.below(500)) as i64, Ordering::Relaxed);
@@ -1014,12 +1014,44 @@ fn simulate_shard(seed: u64, actions: usize) -> (Vec<u64>, Vec<u64>) {
 fn a_replica_that_lost_its_disk_does_not_open() {
     let dir = TempDir::new();
     let clock: Clock = Arc::new(|| 1_767_225_540_000_000_000);
-    let mut shard = Shard::new(&dir.0, 1, clock);
+    let mut shard = Shard::new(&dir.0, 1, clock, REPLICAS);
     let (mut sent, mut model, mut trace) = (Vec::new(), Model::default(), Vec::new());
     shard.resolve(Vec::new(), &mut sent, &mut model, &mut trace);
     shard.stop(1);
     shard.disks[1] = sim::Disk::new(99, 0, &dir.0.join("r2"));
     assert!(matches!(shard.open(1), Err(kermodes_weir::Error::Io(_))));
+}
+
+/// A replica that never had a log joins its shard however late, the others having elected a
+/// leader and committed without it (a StatefulSet starts its pods one at a time), and catches
+/// up: it has never voted, so it has no vote to have lost.
+#[test]
+fn a_replica_that_starts_late_joins_its_shard() {
+    let dir = TempDir::new();
+    let clock: Clock = Arc::new(|| 1_767_225_540_000_000_000);
+    let mut shard = Shard::new(&dir.0, 1, clock, 2);
+    for _ in 0..200 {
+        for i in 0..2 {
+            shard.stores[i].as_ref().unwrap().step();
+            shard.collect(i);
+        }
+        shard.tick();
+        while !shard.wire.is_empty() {
+            let message = shard.wire.remove(0);
+            shard.deliver(message);
+        }
+    }
+    let first = shard.stores[0].as_ref().unwrap();
+    assert!(first.applied() > 0, "two of three replicas commit");
+    // Replica 3 starts as the shard agrees, which checks every replica holds the same.
+    let (mut sent, mut model, mut trace) = (Vec::new(), Model::default(), Vec::new());
+    shard.resolve(Vec::new(), &mut sent, &mut model, &mut trace);
+    let applied: Vec<u64> = shard
+        .stores
+        .iter()
+        .map(|store| store.as_ref().unwrap().applied())
+        .collect();
+    assert!(applied.iter().all(|&a| a == applied[0]), "{applied:?}");
 }
 
 /// The seeds each test runs (module docs).

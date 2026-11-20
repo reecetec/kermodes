@@ -305,20 +305,20 @@ impl Catalog {
         }
     }
 
-    /// Whether a leader of `branch`'s shard has committed (`start_shard`): from then on, a
-    /// replica that finds its log empty has lost it, and whom it voted for with it.
-    pub(crate) fn shard_started(&mut self, branch: &str) -> Result<bool, Error> {
+    /// Whether replica `replica` of `branch`'s shard has had a log (`start_replica`): from then
+    /// on, finding none, it has lost it, and whom it voted for and what it acknowledged with it.
+    pub(crate) fn replica_started(&mut self, branch: &str, replica: u64) -> Result<bool, Error> {
         match self {
-            Self::Sqlite(c) => c.shard_started(branch),
-            Self::Postgres(c) => c.shard_started(branch),
+            Self::Sqlite(c) => c.replica_started(branch, replica),
+            Self::Postgres(c) => c.replica_started(branch, replica),
         }
     }
 
-    /// Records that a leader of `branch`'s shard has committed (`shard_started`).
-    pub(crate) fn start_shard(&mut self, branch: &str) -> Result<(), Error> {
+    /// Records that replica `replica` of `branch`'s shard has a log (`replica_started`).
+    pub(crate) fn start_replica(&mut self, branch: &str, replica: u64) -> Result<(), Error> {
         match self {
-            Self::Sqlite(c) => c.start_shard(branch),
-            Self::Postgres(c) => c.start_shard(branch),
+            Self::Sqlite(c) => c.start_replica(branch, replica),
+            Self::Postgres(c) => c.start_replica(branch, replica),
         }
     }
 
@@ -431,9 +431,10 @@ fn location(branch: &str, name: &TableName, id: i64) -> String {
     format!("{branch}/{}/{}.{id}", name.namespace(), name.table())
 }
 
-/// The key in the catalog's metadata that says `branch`'s shard has started (`shard_started`).
-fn started_key(branch: &str) -> String {
-    format!("shard started: {branch}")
+/// The key in the catalog's metadata that says a replica of `branch`'s shard has had a log
+/// (`replica_started`).
+fn started_key(branch: &str, replica: u64) -> String {
+    format!("replica started: {branch} {replica}")
 }
 
 /// Refuses a definition whose key or sort is not the table's: those are fixed when it is
