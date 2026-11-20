@@ -1710,6 +1710,9 @@ impl Tables {
                 let log = self.open(table)?;
                 apply_drop(&log, date, rows, now_ns, entry.index, flusher).map(|()| false)
             }
+            // Understood here before any replica proposes one, so that during a rollout old and
+            // new replicas apply the same log (a Parallel Change, §7.6). The table must exist.
+            Command::Lease { table, .. } => self.open(table).map(|_| false),
         }
     }
 

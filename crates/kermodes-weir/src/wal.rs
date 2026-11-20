@@ -40,7 +40,9 @@
 //! their IDs as an Arrow IPC schema message (u32 length, then bytes), then the rows as an Arrow
 //! IPC record batch message. A drop of a past date its history holds: kind (u8, `DROP`), table
 //! ID (i64), the date (i32, days since 1970-01-01), the rows history holds of it (u64), and the
-//! leader's clock (i64, ns). A leader's first entry of its term has no data.
+//! leader's clock (i64, ns). A lease taken on a source (§7.4): kind (u8, `LEASE`), table ID
+//! (i64), source (u16 length, then bytes); its index is the lease's epoch. A leader's first
+//! entry of its term has no data.
 //!
 //! Format 1 (header version 1), weir's log before Raft, is still read: its segments hold the
 //! writes (and shapes) of a single writer, numbered from 1, all committed. They are replayed as
@@ -79,9 +81,11 @@ const ENTRY: u8 = 3;
 const SHAPE: u8 = 4;
 const SHAPED: u8 = 5;
 
-/// An entry's data: a write of a table's rows, or a past date of a table dropped.
+/// An entry's data: a write of a table's rows, a past date of a table dropped, or a lease on
+/// one of its sources taken.
 const WRITE: u8 = 1;
 const DROP: u8 = 2;
+const LEASE: u8 = 3;
 
 /// What an entry's data says to do (`decode`).
 pub(crate) enum Command {
@@ -947,10 +951,22 @@ pub(crate) fn decode(index: u64, data: &Bytes) -> Result<Command, String> {
             rows: u64::from_le_bytes(data[13..21].try_into().expect("8")),
             now_ns: i64::from_le_bytes(data[21..29].try_into().expect("8")),
         }),
+        Some(&LEASE) => decode_lease(index, data),
         _ => Err(format!(
             "the entry at index {index} is of a kind this version cannot read"
         )),
     }
+}
+
+/// The lease an entry at `index` takes.
+fn decode_lease(index: u64, data: &Bytes) -> Result<Command, String> {
+    let short = || format!("the entry at index {index} is too short to read");
+    let table = i64::from_le_bytes(data.get(1..9).ok_or_else(short)?.try_into().expect("8"));
+    let len = u16::from_le_bytes(data.get(9..11).ok_or_else(short)?.try_into().expect("2"));
+    let source = data.get(11..11 + len as usize).ok_or_else(short)?;
+    let source = std::str::from_utf8(source).map_err(|e| e.to_string())?;
+    SourceId::parse(source).map_err(|e| e.to_string())?;
+    Ok(Command::Lease { table })
 }
 
 /// The write an entry at `index` holds (`encode`).
@@ -1167,8 +1183,8 @@ mod tests {
     use raft::eraftpb::{Entry, HardState};
 
     use super::{
-        Append, HEADER_V1, Logged, Recovered, SEGMENT_BYTES, Wal, encode, read_applied,
-        write_applied, write_rows,
+        Append, Command, HEADER_V1, LEASE, Logged, Recovered, SEGMENT_BYTES, Wal, decode, encode,
+        read_applied, write_applied, write_rows,
     };
     use crate::disk::{DiskRef, real};
     use crate::partition::schema_header;
@@ -1419,6 +1435,22 @@ mod tests {
             "the columns, once in each segment that took writes"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lease entry, as a newer version writes it, reads back as the table it took a source
+    /// of, and one cut short is refused rather than read as another.
+    #[test]
+    fn a_lease_reads_back_as_its_table() {
+        let mut data = vec![LEASE];
+        data.extend_from_slice(&7_i64.to_le_bytes());
+        data.extend_from_slice(&4_u16.to_le_bytes());
+        data.extend_from_slice(b"feed");
+        let Ok(Command::Lease { table }) = decode(12, &Bytes::from(data.clone())) else {
+            panic!("a lease");
+        };
+        assert_eq!(table, 7);
+        data.pop();
+        assert!(decode(12, &Bytes::from(data)).is_err());
     }
 
     /// A format 1 frame: LSN, kind, and body, under length and CRC.
