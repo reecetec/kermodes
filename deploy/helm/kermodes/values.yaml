@@ -62,9 +62,13 @@ builds:
 imagePullSecrets: []
 
 weir:
+  # The shard's replicas (architecture.md §7.6): 1 holds it alone; 3 replicate it, losing a node
+  # loses no acknowledged write, and need `catalog` (they share it in Postgres) and a node each.
+  replicas: 1
   storage:
     size: 20Gi
-    # Empty: the cluster's default StorageClass.
+    # Empty: the cluster's default StorageClass. With replicas, a disk local to the node is
+    # enough: the replicas keep the copies.
     storageClassName: ""
   resources:
     requests:

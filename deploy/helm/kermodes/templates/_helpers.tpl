@@ -24,8 +24,25 @@ app.kubernetes.io/component: {{ .component }}
 {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
 {{- end -}}
 
+{{- /* Each weir replica's address: pod n at <pod>.<headless service>. */ -}}
+{{- define "kermodes.weirHosts" -}}
+{{- $name := printf "%s-weir" (include "kermodes.fullname" .) -}}
+{{- range $i := until (int .Values.weir.replicas) -}}
+{{- if $i }},{{ end -}}
+{{ $name }}-{{ $i }}.{{ $name }}.{{ $.Release.Namespace }}.svc:8731
+{{- end -}}
+{{- end -}}
+
+{{- /* weir for its clients: every replica, so a client finds whichever leads. */ -}}
 {{- define "kermodes.weirUrl" -}}
-grpc://{{ include "kermodes.fullname" . }}-weir:8731
+grpc://{{ include "kermodes.weirHosts" . }}
+{{- end -}}
+
+{{- /* weir for its replicas: each replica's own URL, in order. */ -}}
+{{- define "kermodes.weirPeers" -}}
+{{- range $i, $host := splitList "," (include "kermodes.weirHosts" .) -}}
+{{- if $i }},{{ end }}grpc://{{ $host }}
+{{- end -}}
 {{- end -}}
 
 {{- define "kermodes.podSecurityContext" -}}

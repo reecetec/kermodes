@@ -596,13 +596,13 @@ outlive what Kubernetes believes.
 
 ### 7.5 Durability
 
-- Initial: one weir, its log fsynced per group before any writer is acknowledged, on a
-  replicated PVC (block storage such as Longhorn). weir is a StatefulSet with one replica;
-  draining its node is a brief outage (§17.1), which readers resume across by position.
-- With replication (§7.6), its volumes become local and unreplicated (a single-replica storage
-  class, or local disks): the storage's replicas under weir's own would add network round-trips
-  to every acknowledged write and triple the storage. The switch lands with replication, never
-  before, and measured acknowledgement latency on both storage classes decides it.
+- One replica: its log fsynced per group before any writer is acknowledged, on a replicated PVC
+  (block storage such as Longhorn); draining its node is a brief outage (§17.1), which readers
+  resume across by position. The chart's default (`weir.replicas: 1`).
+- Three replicas (§7.6, `weir.replicas: 3`): a write is acknowledged once a majority fsynced it,
+  so their volumes are local and unreplicated (a single-replica storage class, or local disks):
+  the storage's replicas under weir's own would add network round-trips to every acknowledged
+  write and triple the storage.
 - Retention: intraday partitions are deleted N days after their merge validates.
 - A failed fsync stops weir, and weir will not open again on that boot. After an fsync fails,
   Linux marks the pages it held clean: they may never reach the disk, while every process still
@@ -1826,11 +1826,12 @@ host it: Kubernetes (§16.1–16.5) and local (§16.6).
   npm packages, and chart are relabelled `X.Y.Z` (`ci/relabel.py`, which fails if anything but
   version metadata would change) and published to PyPI, npm under `latest`, and GHCR. The tag
   chooses the number; a candidate's label only orders it.
-- The chart installs weir (a StatefulSet on a PVC, reachable only from its namespace until Flight
-  has authentication), `kermodes ui` (a Deployment, with an optional Gateway API route), and,
-  with `control.enabled`, `kermodes control` with its ServiceAccount and namespaced Role. It
-  grows to `kermodes-gateway` and config. It does not contain workers, ingesters, or jobs; the
-  controller creates those at runtime.
+- The chart installs weir (a StatefulSet of one replica or a shard of three, each on its PVC,
+  behind a headless Service, reachable only from its namespace until Flight has
+  authentication), `kermodes ui` (a Deployment, with an optional Gateway API route), and, with
+  `control.enabled`, `kermodes control` with its ServiceAccount and namespaced Role. It grows to
+  `kermodes-gateway` and config. It does not contain workers, ingesters, or jobs; the controller
+  creates those at runtime.
 - External dependencies are values: Postgres (a Secret with its connection URI, such as a
   CloudNativePG cluster's `<cluster>-app` Secret), an S3-compatible endpoint and bucket, OCI
   registry for environment images, git hosts, OIDC issuer.
@@ -1905,7 +1906,7 @@ host it: Kubernetes (§16.1–16.5) and local (§16.6).
 
 | Workload | Kind | Storage / dependency |
 |---|---|---|
-| weir | StatefulSet (chart) | Longhorn PVC |
+| weir | StatefulSet, 1 or 3 replicas (chart) | A PVC each: Longhorn for one, a local disk each for three |
 | kermodes-control | Deployment, 2+ replicas (chart) | Postgres (CNPG) |
 | kermodes-gateway | Deployment (chart) | — |
 | Workers | Deployment per resource (controller) | Optional PVC cache |
@@ -1965,8 +1966,8 @@ is fixed:
 
 ## 17. Scaling and high availability
 
-Not built initially: one weir, restart-based recovery. These invariants are built from M1 so that
-sharding and HA are additive later instead of a redesign. weir's replication is designed in §7.6.
+weir runs as one replica or a shard of three (§7.6); more shards are not built. These invariants
+are built from M1 so that sharding is additive later instead of a redesign.
 
 | Invariant | Enables |
 |---|---|
@@ -1985,7 +1986,7 @@ failure; `plan` warns when a non-replayable source has no replicated ack.
 
 | Component | Initial behaviour on failure | Later |
 |---|---|---|
-| weir | Single StatefulSet on a Longhorn-replicated volume; pod reschedules and volume reattaches (minutes); writers buffer and resume from `last_seq` | A shard of 3 replicas on local disks (§7.6): losing a node loses no acknowledged write, a leader's loss stalls writes for about a second; more shards via the placement map in Postgres |
+| weir | One replica: a StatefulSet on a Longhorn-replicated volume; pod reschedules and volume reattaches (minutes); writers buffer and resume from `last_seq`. A shard of 3 on local disks (§7.6): losing a node loses no acknowledged write, and the leader's loss stalls writes for an election | More shards via the placement map in Postgres |
 | Ingesters | Restart; replayable sources lose nothing; non-replayable sources lose the outage window | Replicated ack; standby ingester |
 | Engine deployments | Rollouts and drains replace runs without downtime (§11.4, §17.1); a crash restarts and rebuilds from weir and history, so recovery time = rebuild time | State checkpoints; hot standby (`replicas=2`) with input-driven (deterministic) cycles |
 | Sessions | Lost with the pod | — |
@@ -2015,7 +2016,7 @@ down until its replacement has rebuilt. Kermodes moves runs before they are evic
 | Gateway, `kermodes ui` | No downtime: stateless, 2+ replicas and a PodDisruptionBudget |
 | Control plane | No downtime for the API; the loops hand over to the other replica within a second (a PodDisruptionBudget keeps one up) |
 | Postgres (CNPG) | No downtime: CNPG switches the primary over before eviction |
-| weir | A brief outage until it is replicated: the pod reschedules and its volume reattaches. Writers and readers reconnect by themselves, writers resending what was not acknowledged and readers resuming by log position, each reconnect reported. Replicated (§7.6): no downtime: one replica at a time, the leader handing over first |
+| weir | One replica: a brief outage: the pod reschedules and its volume reattaches. Writers and readers reconnect by themselves, writers resending what was not acknowledged and readers resuming by log position, each reconnect reported. Three: one replica at a time (a PodDisruptionBudget); writes go on, stalled for an election when the leader goes, until leaders hand over first |
 
 ## 18. Technology choices
 

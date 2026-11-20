@@ -217,7 +217,7 @@ impl Kube {
     /// The platform's components as their pods show them, in `system::COMPONENTS` order; one
     /// without pods is left out. Usage is zero while metrics-server is not answering, and an
     /// instance whose disks cannot be read in time shows none.
-    pub async fn components(&self, weir: &str) -> Result<Vec<system::Component>, String> {
+    pub async fn components(&self) -> Result<Vec<system::Component>, String> {
         let selector = ListParams::default().labels(COMPONENTS_SELECTOR);
         let pods = self
             .pods
@@ -278,8 +278,26 @@ impl Kube {
         if let Some(postgres) = instances.get_mut("database") {
             self.postgres_disks(postgres, &addresses).await;
         }
-        if let Some(store) = instances.get_mut("weir").and_then(|pods| pods.first_mut()) {
-            store.disks = weir_disks(weir).await;
+        // Each weir replica's own volume, asked at its own address, all at once.
+        if let Some(replicas) = instances.get_mut("weir") {
+            let asks: Vec<_> = replicas
+                .iter()
+                .map(|replica| {
+                    let url = pods
+                        .iter()
+                        .find(|pod| pod.metadata.name.as_deref() == Some(replica.pod.as_str()))
+                        .and_then(|pod| flight_url(pod, addresses.get(&replica.pod)?));
+                    tokio::spawn(async move {
+                        match url {
+                            Some(url) => weir_disks(url).await,
+                            None => Vec::new(),
+                        }
+                    })
+                })
+                .collect();
+            for (replica, ask) in replicas.iter_mut().zip(asks) {
+                replica.disks = ask.await.unwrap_or_default();
+            }
         }
         let mut warnings: BTreeMap<String, (String, i64)> = BTreeMap::new();
         for event in self
@@ -859,9 +877,21 @@ impl Kube {
     }
 }
 
-/// weir's store volume, from its `stats` action; none if weir does not answer in time.
-async fn weir_disks(weir: &str) -> Vec<system::Disk> {
-    let url = weir.to_owned();
+/// A weir pod's Flight address: its IP, at its container's `flight` port.
+fn flight_url(pod: &Pod, ip: &str) -> Option<String> {
+    let port = pod
+        .spec
+        .as_ref()?
+        .containers
+        .iter()
+        .flat_map(|c| c.ports.iter().flatten())
+        .find(|p| p.name.as_deref() == Some("flight"))?
+        .container_port;
+    Some(format!("grpc://{ip}:{port}"))
+}
+
+/// A weir replica's store volume, from its `stats` action; none if it does not answer in time.
+async fn weir_disks(url: String) -> Vec<system::Disk> {
     let stats = tokio::task::spawn_blocking(move || {
         kermodes_flight::Client::connect(&url).and_then(|client| client.stats())
     });

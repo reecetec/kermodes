@@ -162,7 +162,7 @@ async fn logs(
 /// The platform's own components: weir, Postgres, the controller, the web UI, and, with history
 /// configured, the lake, and with an artifacts store, it.
 async fn components(State(controller): State<Arc<Controller>>) -> Response {
-    match controller.kube.components(&controller.config.weir).await {
+    match controller.kube.components().await {
         Ok(mut components) => {
             components.extend(controller.lake().await);
             components.extend(controller.artifacts_component().await);

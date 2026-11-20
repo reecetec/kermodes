@@ -1,5 +1,11 @@
 {{- $name := printf "%s-weir" (include "kermodes.fullname" .) -}}
 {{- $selector := dict "root" . "component" "weir" -}}
+{{- $replicas := int .Values.weir.replicas -}}
+{{- if and (gt $replicas 1) (not .Values.catalog.secretName) -}}
+{{- fail "weir.replicas above 1 needs catalog.secretName: a shard's replicas share their catalog in Postgres" -}}
+{{- end -}}
+# Headless: each replica answers at its own name, <pod>.<this service>, which clients and the other
+# replicas use; a load-balanced address would hide which replica leads.
 apiVersion: v1
 kind: Service
 metadata:
@@ -8,6 +14,9 @@ metadata:
     {{- include "kermodes.labels" . | nindent 4 }}
     app.kubernetes.io/component: weir
 spec:
+  clusterIP: None
+  # Replicas reach each other before they are ready.
+  publishNotReadyAddresses: true
   selector:
     {{- include "kermodes.selectorLabels" $selector | nindent 4 }}
   ports:
@@ -15,9 +24,25 @@ spec:
       port: 8731
       targetPort: flight
       appProtocol: kubernetes.io/h2c
+{{- if gt $replicas 1 }}
 ---
-# One replica: a store has one writer (it holds the store's lock), and its PVC is ReadWriteOnce.
-# A restart recovers to the last committed index record; writers resume from their last_seq.
+# A drain takes one replica at a time: the others still make a majority, and writes go on.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "kermodes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: weir
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "kermodes.selectorLabels" $selector | nindent 6 }}
+{{- end }}
+---
+# The shard's replicas (architecture.md §7.6), each with its own volume: one replica holds the
+# shard alone; more replicate its log by Raft, so losing one loses no acknowledged write.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -27,7 +52,7 @@ metadata:
     app.kubernetes.io/component: weir
 spec:
   serviceName: {{ $name }}
-  replicas: 1
+  replicas: {{ $replicas }}
   selector:
     matchLabels:
       {{- include "kermodes.selectorLabels" $selector | nindent 6 }}
@@ -43,11 +68,30 @@ spec:
       {{- end }}
       securityContext:
         {{- include "kermodes.podSecurityContext" . | nindent 8 }}
+      {{- if gt $replicas 1 }}
+      # A node lost takes one replica at most.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  {{- include "kermodes.selectorLabels" $selector | nindent 18 }}
+      {{- end }}
       containers:
         - name: weir
           image: {{ include "kermodes.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if gt $replicas 1 }}
+          # Pod n is replica n + 1: its ordinal ends its hostname.
+          command: [sh, -c]
+          args:
+            - >-
+              exec kermodes weir --data-dir /var/lib/kermodes --host 0.0.0.0 --port 8731
+              --replica $(( ${HOSTNAME##*-} + 1 )) --peers {{ include "kermodes.weirPeers" . }}
+          {{- else }}
           args: [weir, --data-dir, /var/lib/kermodes, --host, 0.0.0.0, --port, "8731"]
+          {{- end }}
           {{- with .Values.catalog.secretName }}
           # The catalog in Postgres, shared by every weir (§8.2); without it, SQLite on the PVC.
           env:

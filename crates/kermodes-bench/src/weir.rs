@@ -4,17 +4,19 @@
 //! `--count` times, on the disk holding `--dir`: the floor under every durable write there.
 //!
 //! `kermodes-bench weir [--dir PATH] [--writers 1] [--rate 1000] [--rows 1] [--window 1]
-//! [--seconds 10] [--flight]`: `--writers` writers, each writing `--rows`-row batches `--rate`
-//! times a second (0: as fast as it can) with up to `--window` writes in flight, to a store in
-//! `--dir`, with one subscriber; over Flight on localhost with `--flight`, in-process without.
-//! Each batch carries the time it was due, so a writer that falls behind counts its wait (no
-//! coordinated omission). Reports, after a second of warm-up: the time from due to durable (the
-//! write's acknowledgement), and from due to the subscriber having it; and the process's CPU
-//! time per row written, the bench's own writers and subscriber included, so comparable between
-//! builds and machines rather than a cost of weir alone.
+//! [--seconds 10] [--flight] [--url URL]`: `--writers` writers, each writing `--rows`-row batches
+//! `--rate` times a second (0: as fast as it can) with up to `--window` writes in flight, to a
+//! store in `--dir`, with one subscriber; over Flight on localhost with `--flight`, in-process
+//! without. With `--url`, to a running weir instead (a shard's replicas: every one's address),
+//! its table `bench.ticks` kept between runs. Each batch carries the time it was due, so a
+//! writer that falls behind counts its wait (no coordinated omission). Reports, after a second of
+//! warm-up: the time from due to durable (the write's acknowledgement), and from due to the
+//! subscriber having it; and the process's CPU time per row written, the bench's own writers and
+//! subscriber included, so comparable between builds and machines rather than a cost of weir
+//! alone.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -32,6 +34,7 @@ struct Args {
     window: usize,
     seconds: u64,
     flight: bool,
+    url: Option<String>,
 }
 
 impl Args {
@@ -45,6 +48,7 @@ impl Args {
             window: 1,
             seconds: 10,
             flight: false,
+            url: None,
         };
         let mut words = words.peekable();
         while let Some(flag) = words.next() {
@@ -68,9 +72,10 @@ impl Args {
                 "--rows" => args.rows = number() as usize,
                 "--window" => args.window = (number() as usize).max(1),
                 "--seconds" => args.seconds = number(),
+                "--url" => args.url = Some(value),
                 other => panic!(
                     "unknown flag {other}; expected --dir, --count, --writers, --rate, --rows, \
-                     --window, --seconds, --flight"
+                     --window, --seconds, --flight, --url"
                 ),
             }
         }
@@ -137,31 +142,41 @@ fn weir(args: &Args) {
     let dir = args
         .dir
         .join(format!("kermodes-weir-bench-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let store = Arc::new(Store::open(&dir).expect("a store in --dir"));
     let name = TableName::parse("bench.ticks").expect("a table name");
     let schema = Schema::new(vec![
         Field::new("due", DataType::Int64, true),
         Field::new("n", DataType::Int64, true),
     ]);
-    store.create_table(&name, &schema).expect("created");
-    let server = args.flight.then(|| {
+    // A store of its own in --dir, unless given a running weir.
+    let store = args.url.is_none().then(|| {
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::open(&dir).expect("a store in --dir"));
+        store.create_table(&name, &schema).expect("created");
+        store
+    });
+    if let Some(url) = &args.url {
+        let client = Client::connect(url).expect("connected");
+        client.create_table(&name, &schema).expect("created");
+    }
+    let server = store.as_ref().filter(|_| args.flight).map(|store| {
         kermodes_flight::serve(store.clone(), "127.0.0.1:0".parse().expect("an address"))
             .expect("serving")
     });
-    let url = server.as_ref().map(|s| format!("grpc://{}", s.addr()));
+    let url = args
+        .url
+        .clone()
+        .or_else(|| server.as_ref().map(|s| format!("grpc://{}", s.addr())));
 
-    // A second's warm-up: batches due before it are not counted.
-    let start_ns = now_ns();
-    let start_cpu = cpu_seconds();
-    let warm_ns = start_ns + 1_000_000_000;
+    // Batches due before the warm-up's end are not counted, nor those a running weir held from
+    // earlier runs, replayed before the clock starts.
+    let warm = Arc::new(AtomicI64::new(i64::MAX));
     let delivered = Arc::new(Mutex::new(Vec::new()));
     let subscriber: kermodes_weir::Subscriber = {
-        let delivered = delivered.clone();
+        let (delivered, warm) = (delivered.clone(), warm.clone());
         Box::new(move |batch, _, _| {
             if batch.num_rows() > 0 {
                 let due = batch.column(0).as_primitive::<Int64Type>().value(0);
-                if due >= warm_ns {
+                if due >= warm.load(Ordering::Relaxed) {
                     let waited = (now_ns() - due).max(0) as u64;
                     delivered.lock().unwrap().push(Duration::from_nanos(waited));
                 }
@@ -172,25 +187,34 @@ fn weir(args: &Args) {
     let reader = url
         .as_ref()
         .map(|url| Client::connect(url).expect("connected"));
-    match &reader {
-        Some(client) => {
+    match (&reader, &store) {
+        (Some(client), _) => {
+            let (caught_up, replayed) = std::sync::mpsc::channel();
             client
                 .subscribe(
                     &name,
                     subscriber,
-                    Box::new(|| {}),
+                    Box::new(move || {
+                        let _ = caught_up.send(());
+                    }),
                     Box::new(|why| panic!("the bench's subscription ended: {why}")),
                     false,
                 )
                 .expect("subscribed");
+            replayed.recv().expect("caught up");
         }
-        None => {
+        (None, Some(store)) => {
             store
                 .subscribe(&name, subscriber, Box::new(|why| panic!("{why}")))
                 .expect("subscribed");
         }
+        (None, None) => unreachable!("a store of its own, or a URL"),
     }
 
+    let start_ns = now_ns();
+    let start_cpu = cpu_seconds();
+    let warm_ns = start_ns + 1_000_000_000;
+    warm.store(warm_ns, Ordering::Relaxed);
     let stop = Arc::new(AtomicBool::new(false));
     let acked = Arc::new(Mutex::new(Vec::new()));
     let written = Arc::new(Mutex::new(0_u64));
@@ -204,6 +228,7 @@ fn weir(args: &Args) {
                     Box::new(move |batch| writer.send(Change::Rows, batch, None))
                 }
                 None => {
+                    let store = store.as_ref().expect("a store of its own");
                     let writer = store.writer(&name, &source, false).expect("a writer");
                     Box::new(move |batch| writer.send(Change::Rows, batch, None))
                 }
@@ -279,10 +304,17 @@ fn weir(args: &Args) {
     let elapsed = (now_ns() - start_ns) as f64 / 1e9;
     let cpu = cpu_seconds() - start_cpu;
     let rows = *written.lock().unwrap();
+    let place = match &args.url {
+        // Only the bench's own CPU: the replicas' is on their machines.
+        Some(url) => format!("at {url}"),
+        None => format!("on {}", args.dir.display()),
+    };
     println!(
         "weir {}: {} writer(s) x {} x {}-row batches, {} in flight, {:.0} rows/s over {:.1} s, \
-         {:.2} us CPU per row ({:.1} cores), on {}",
-        if args.flight {
+         {:.2} us CPU per row ({:.1} cores), {place}",
+        if args.url.is_some() {
+            "remote"
+        } else if args.flight {
             "over Flight"
         } else {
             "in-process"
@@ -299,7 +331,6 @@ fn weir(args: &Args) {
         elapsed,
         cpu * 1e6 / rows.max(1) as f64,
         cpu / elapsed,
-        args.dir.display()
     );
     print_latency("due to durable", std::mem::take(&mut acked.lock().unwrap()));
     print_latency(
@@ -308,8 +339,10 @@ fn weir(args: &Args) {
     );
     drop(reader);
     drop(server);
-    drop(store);
-    let _ = std::fs::remove_dir_all(&dir);
+    if store.is_some() {
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 fn print_latency(what: &str, mut times: Vec<Duration>) {
