@@ -691,7 +691,9 @@ impl Shard {
     /// Every running replica too far behind the log to catch up from it copies the partition
     /// files of the replica its leader named, if that one is running, and starts again. One
     /// whose copy is cut short, or with no one to copy from, starts again as it was, and its
-    /// leader hands it a snapshot again.
+    /// leader hands it a snapshot again. As over Flight, the copy is from whoever serves at the
+    /// named replica's address: a new incarnation there since (its disk lost) may not have
+    /// applied as far, and refuses.
     fn catch_up(&mut self) {
         for i in 0..REPLICAS {
             let Some(wanted) = self.stores[i].as_ref().and_then(Store::snapshot_wanted) else {
@@ -711,7 +713,9 @@ impl Shard {
                 let installed =
                     Store::install_snapshot(&root, disk, limits(self.seed), &wanted, from);
                 assert!(
-                    installed.is_ok() || self.disks[i].crashes() > crashes,
+                    installed.is_ok()
+                        || self.disks[i].crashes() > crashes
+                        || from.replica_id() != wanted.from,
                     "seed {}: replica {} installing from {}: {installed:?}",
                     self.seed,
                     i + 1,
@@ -1242,6 +1246,17 @@ fn the_same_seed_does_the_same() {
 #[test]
 fn a_shard_of_three_loses_no_acknowledged_write_to_crashes_or_the_network() {
     for seed in seeds() {
+        simulate_shard(seed, 600);
+    }
+}
+
+/// Seeds past the default range that found bugs, run always: a restarted replica applying again
+/// a change of members it had recorded, making a voter a learner and the shard lose its quorum
+/// (788); a replica told to copy from one whose disk was lost since (1488). A change to the
+/// simulator may send them elsewhere, so they guard only as long as it leaves them be.
+#[test]
+fn a_shard_of_three_passes_the_seeds_that_found_bugs() {
+    for seed in [788, 1488] {
         simulate_shard(seed, 600);
     }
 }

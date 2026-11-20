@@ -603,8 +603,7 @@ impl Store {
             Error::Corrupt(format!("{}: cannot start Raft: {e}", log_dir.display()))
         })?;
         // Those the log committed past the last it recorded applied.
-        let recorded = node.store().conf_index();
-        for entry in changes.iter().filter(|entry| entry.index > recorded) {
+        for entry in &changes {
             change_members(&mut node, entry)?;
         }
         let logs = tables.logs.clone();
@@ -2331,7 +2330,9 @@ impl Committer {
                 // A change of the shard's members, Raft's own.
                 None if entry.get_entry_type() == EntryType::EntryConfChangeV2 => (
                     change_members(&mut self.node, &entry).map(|members| {
-                        *lock(&self.shard.members) = members;
+                        if let Some(members) = members {
+                            *lock(&self.shard.members) = members;
+                        }
                         false
                     }),
                     Vec::new(),
@@ -2535,8 +2536,14 @@ fn identify(
 }
 
 /// Applies the change of the shard's members `entry` holds to Raft and records what it left,
-/// durably, before the entry counts as applied.
-fn change_members(node: &mut RawNode<LogStore>, entry: &Entry) -> Result<ConfState, Error> {
+/// durably, before the entry counts as applied; `None` for one recorded before. Raft hands a
+/// restarted replica again the entries past those its partition files hold, and the changes
+/// among them it applied before the restart are already in what it recorded: applied again, an
+/// old change would undo the later ones (a learner since made a voter, made a learner again).
+fn change_members(node: &mut RawNode<LogStore>, entry: &Entry) -> Result<Option<ConfState>, Error> {
+    if entry.index <= node.store().conf_index() {
+        return Ok(None);
+    }
     let mut change = ConfChangeV2::default();
     change.merge_from_bytes(&entry.data).map_err(|e| {
         Error::Corrupt(format!(
@@ -2552,7 +2559,7 @@ fn change_members(node: &mut RawNode<LogStore>, entry: &Entry) -> Result<ConfSta
     })?;
     node.mut_store()
         .persist_conf(entry.index, members.clone())?;
-    Ok(members)
+    Ok(Some(members))
 }
 
 /// One change of a change of the shard's members: `node_id` added as a voter or a learner, or
