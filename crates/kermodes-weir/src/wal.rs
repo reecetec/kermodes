@@ -34,18 +34,20 @@
 //! so the segments read in name order, and the one after a segment is named at most one past
 //! that segment's last entry.
 //!
-//! An entry's data is a write, whole in itself so that any replica reads it alone: kind (u8,
-//! `WRITE`), table ID (i64), ingest time (i64, ns), seq (u64), epoch (u64), change kind (u8),
-//! source (u16 length, then bytes), the columns with their IDs as an Arrow IPC schema message
-//! (u32 length, then bytes), then the rows as an Arrow IPC record batch message. A leader's
-//! first entry of its term has no data.
+//! An entry's data is a command every replica carries out alike, whole in itself so that any
+//! replica reads it alone. A write: kind (u8, `WRITE`), table ID (i64), ingest time (i64, ns),
+//! seq (u64), epoch (u64), change kind (u8), source (u16 length, then bytes), the columns with
+//! their IDs as an Arrow IPC schema message (u32 length, then bytes), then the rows as an Arrow
+//! IPC record batch message. A drop of a past date its history holds: kind (u8, `DROP`), table
+//! ID (i64), the date (i32, days since 1970-01-01), the rows history holds of it (u64), and the
+//! leader's clock (i64, ns). A leader's first entry of its term has no data.
 //!
 //! Format 1 (header version 1), weir's log before Raft, is still read: its segments hold the
 //! writes (and shapes) of a single writer, numbered from 1, all committed. They are replayed as
 //! entries of term 0 and deleted, like any segment, once the partition files hold them.
 
 use std::collections::HashMap;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use arrow::buffer::Buffer;
@@ -59,13 +61,15 @@ use raft::eraftpb::{Entry, EntryType, HardState};
 
 use crate::disk::{self, DiskFile, DiskRef};
 use crate::shape::Shape;
-use crate::{Change, Error, SourceId};
+use crate::{Change, Date, Error, SourceId};
 
 const HEADER: &[u8; 8] = b"KMLOG\x00\x00\x02";
 const HEADER_V1: &[u8; 8] = b"KMLOG\x00\x00\x01";
-/// A segment takes entries until it reaches this size; entries larger than what is left go to
-/// a new segment, which grows past it if they alone are larger.
-const SEGMENT_BYTES: u64 = 256 << 20;
+/// What a segment takes entries until, by default: entries larger than what is left go to a
+/// new segment, which grows past it if they alone are larger.
+pub(crate) const SEGMENT_BYTES: u64 = 256 << 20;
+/// No frame is larger: a length past it is not one weir wrote.
+const MAX_FRAME: usize = 1 << 30;
 /// Length and CRC.
 const FRAME: usize = 8;
 
@@ -75,8 +79,34 @@ const ENTRY: u8 = 3;
 const SHAPE: u8 = 4;
 const SHAPED: u8 = 5;
 
-/// An entry's data: a write of a table's rows.
+/// An entry's data: a write of a table's rows, or a past date of a table dropped.
 const WRITE: u8 = 1;
+const DROP: u8 = 2;
+
+/// What an entry's data says to do (`decode`).
+pub(crate) enum Command {
+    Write(Logged),
+    /// Drop `table`'s partitions of `date`, if they hold the `rows` its history does; `now_ns`
+    /// is the leader's clock as it proposed it, which says what today is, whose keyed
+    /// checkpoint the date's state goes into first.
+    Drop {
+        table: i64,
+        date: Date,
+        rows: u64,
+        now_ns: i64,
+    },
+}
+
+/// Encodes a drop of `table`'s past `date` as an entry's data (`Command::Drop`).
+pub(crate) fn encode_drop(table: i64, date: Date, rows: u64, now_ns: i64) -> Bytes {
+    let mut data = Vec::with_capacity(29);
+    data.push(DROP);
+    data.extend_from_slice(&table.to_le_bytes());
+    data.extend_from_slice(&date.days().to_le_bytes());
+    data.extend_from_slice(&rows.to_le_bytes());
+    data.extend_from_slice(&now_ns.to_le_bytes());
+    Bytes::from(data)
+}
 
 /// Format 1's entries.
 const V1_SHAPE: u8 = 1;
@@ -109,45 +139,93 @@ pub(crate) struct Logged {
     pub batch: RecordBatch,
 }
 
-/// The log as opened: Raft's state and the entries kept.
+/// The log as opened: Raft's state, where the log starts, and the entries kept in memory.
 pub(crate) struct Recovered {
-    /// The index and term of the entry before `entries`: Raft's log starts after it.
+    /// The index and term of the entry before the log's first: where it starts.
     pub start: (u64, u64),
-    /// In index order, every one after `start`.
+    /// The first index of each term in the log, in order (`terms`).
+    pub terms: Vec<(u64, u64)>,
+    /// The entries after `keep_after`, in index order.
     pub entries: Vec<Entry>,
     pub state: HardState,
 }
+
+/// The term of the entry at `index`, from the first index of each term (`Recovered::terms`).
+pub(crate) fn term_at(terms: &[(u64, u64)], index: u64) -> Option<u64> {
+    let after = terms.partition_point(|&(first, _)| first <= index);
+    after.checked_sub(1).map(|at| terms[at].1)
+}
+
+/// Notes `index`'s term, an entry that replaces any at or after it.
+pub(crate) fn note_term(terms: &mut Vec<(u64, u64)>, index: u64, term: u64) {
+    let keep = terms.partition_point(|&(first, _)| first < index);
+    terms.truncate(keep);
+    if terms.last().is_none_or(|&(_, last)| last != term) {
+        terms.push((index, term));
+    }
+}
+
+/// A segment of the log, as far as reading entries back from it needs.
+struct Segment {
+    name: u64,
+    /// The index and term of the entry before its first.
+    start: (u64, u64),
+    /// Where reading may begin: the index and offset of an entry, in file order, at least every
+    /// `MARK_BYTES` and wherever an entry replaced others. Between a mark and the next, an
+    /// entry at or past the next's index was replaced: reading never needs to look ahead.
+    marks: Vec<(u64, u64)>,
+    /// Its SHAPEs, by number.
+    shapes: Vec<Bytes>,
+    /// Where its frames end.
+    end: u64,
+}
+
+impl Segment {
+    /// Notes an entry at `offset`: a mark if it replaces others (`replaces`), starts the
+    /// segment, or is `MARK_BYTES` past the last mark.
+    fn mark(&mut self, index: u64, offset: u64, replaces: bool) {
+        let far = self
+            .marks
+            .last()
+            .is_none_or(|&(_, at)| offset >= at + MARK_BYTES);
+        if replaces || far {
+            self.marks.push((index, offset));
+        }
+    }
+}
+
+/// How far apart reading may begin in a segment: what reading an entry at most re-reads.
+const MARK_BYTES: u64 = 1 << 20;
 
 /// The log, open for appending.
 pub(crate) struct Wal {
     disk: DiskRef,
     dir: PathBuf,
-    /// The segment taking entries, where the next frame goes in it, and where its first entry
-    /// went (after its START and STATE).
+    segment_bytes: u64,
+    /// The segment taking entries, and where its first entry went (after its START and STATE).
     file: Box<dyn DiskFile>,
-    offset: u64,
     first_entry: u64,
-    /// Each segment's name, the one taking entries last.
-    segments: Vec<u64>,
+    /// Every segment, the one taking entries last.
+    segments: Vec<Segment>,
     /// The index and term of the last entry appended.
     last: (u64, u64),
     /// Raft's state as last appended: a new segment starts with it.
     state: HardState,
-    /// The schema messages the open segment has as SHAPEs, by number.
-    shapes: Vec<Bytes>,
     /// Set once a write failed: what is on disk past the last good frame is unknown, so nothing
     /// more is appended until the store is opened again.
     broken: Option<String>,
 }
 
 impl Wal {
-    /// Opens the log in `dir` (creating it, under the store's directory `root`). Hands each
-    /// format 1 write after `after` (what the partition files hold) to `each`, in order; returns
-    /// Raft's state and the entries after `keep_after`. Appending continues in a new segment.
+    /// Opens the log in `dir` (creating it, under the store's directory `root`), whose segments
+    /// take entries until they hold `segment_bytes`. Hands each format 1 write after `after`
+    /// (what the partition files hold) to `each`, in order; returns Raft's state, where the log
+    /// starts, and the entries after `keep_after`. Appending continues in a new segment.
     pub(crate) fn open(
         disk: &DiskRef,
         root: &Path,
         dir: &Path,
+        segment_bytes: u64,
         after: u64,
         keep_after: u64,
         each: &mut dyn FnMut(Logged) -> Result<(), Error>,
@@ -167,25 +245,27 @@ impl Wal {
         let mut reading = Reading {
             keep_after,
             start: (after, 0),
+            terms: Vec::new(),
             entries: Vec::new(),
             last: None,
             state: HardState::default(),
         };
-        let mut kept = Vec::with_capacity(names.len() + 1);
+        let mut segments: Vec<Segment> = Vec::with_capacity(names.len() + 1);
         for &name in &names {
             let path = segment_path(dir, name);
-            if read_segment(disk, &path, name, after, &mut reading, each)? {
-                // What is replayed must be durable before anything is built on it: a process
-                // that was killed leaves its last entries in the page cache, read here, and lost
-                // to a later power loss unless fsynced now.
-                disk.open(&path, false)
-                    .and_then(|file| file.sync_data())
-                    .map_err(|e| Error::io(&path, e))?;
-                kept.push(name);
-            } else {
+            match read_segment(disk, &path, name, after, &mut reading, &mut segments, each)? {
+                Some(segment) => {
+                    // What is replayed must be durable before anything is built on it: a
+                    // process that was killed leaves its last entries in the page cache, read
+                    // here, and lost to a later power loss unless fsynced now.
+                    disk.open(&path, false)
+                        .and_then(|file| file.sync_data())
+                        .map_err(|e| Error::io(&path, e))?;
+                    segments.push(segment);
+                }
                 // Created, then the process died before its start was durable: it holds
                 // nothing, and its name may be the next segment's.
-                disk.remove_file(&path).map_err(|e| Error::io(&path, e))?;
+                None => disk.remove_file(&path).map_err(|e| Error::io(&path, e))?,
             }
         }
         let last = reading.last.unwrap_or((after, 0));
@@ -196,24 +276,35 @@ impl Wal {
                 last.0
             )));
         }
-        let name = (last.0 + 1).max(kept.last().map_or(0, |newest| newest + 1));
-        let (file, first_entry) = start_segment(disk, dir, name, last, &reading.state)?;
-        kept.push(name);
+        let name = (last.0 + 1).max(segments.last().map_or(0, |newest| newest.name + 1));
+        let (file, first_entry) =
+            start_segment(disk, dir, name, segment_bytes, last, &reading.state)?;
+        segments.push(Segment {
+            name,
+            start: last,
+            marks: Vec::new(),
+            shapes: Vec::new(),
+            end: first_entry,
+        });
+        // A segment records the entry before its first as it was when the segment began; a new
+        // leader may have replaced that entry since, in the segment itself, before it committed.
+        let at = reading.start.0;
+        let start = (at, term_at(&reading.terms, at).unwrap_or(reading.start.1));
         let recovered = Recovered {
-            start: reading.start,
+            start,
+            terms: reading.terms,
             entries: reading.entries,
             state: reading.state.clone(),
         };
         let wal = Self {
             disk: disk.clone(),
             dir: dir.to_owned(),
+            segment_bytes,
             file,
-            offset: first_entry,
             first_entry,
-            segments: kept,
+            segments,
             last,
             state: reading.state,
-            shapes: Vec::new(),
             broken: None,
         };
         Ok((wal, recovered))
@@ -234,21 +325,27 @@ impl Wal {
             .map(|entry| entry.data.len() as u64 + 32)
             .sum::<u64>()
             + 64;
-        if self.offset > self.first_entry && self.offset + needed > SEGMENT_BYTES {
+        let open = self.segments.len() - 1;
+        if self.segments[open].end > self.first_entry
+            && self.segments[open].end + needed > self.segment_bytes
+        {
             self.roll()?;
         }
+        let open = self.segments.len() - 1;
+        let segment = &mut self.segments[open];
         let mut buffer = Vec::with_capacity(needed as usize);
+        let mut shapes = segment.shapes.len();
         for entry in entries {
             let Some((head, schema, rows)) = split(&entry.data) else {
                 entry_frame(&mut buffer, ENTRY, entry, &[&entry.data]);
                 continue;
             };
-            let number = match self.shapes.iter().position(|known| *known == schema) {
+            let number = match segment.shapes.iter().position(|known| *known == schema) {
                 Some(at) => at as u32,
                 None => {
-                    let number = self.shapes.len() as u32;
+                    let number = segment.shapes.len() as u32;
                     frame(&mut buffer, SHAPE, &[&number.to_le_bytes(), &schema]);
-                    self.shapes.push(schema);
+                    segment.shapes.push(schema);
                     number
                 }
             };
@@ -267,12 +364,26 @@ impl Wal {
             .write_all(&buffer)
             .and_then(|()| self.file.sync_data());
         if let Err(e) = written {
-            let path = segment_path(&self.dir, self.segments[self.segments.len() - 1]);
+            let path = segment_path(&self.dir, segment.name);
             let why = format!("{}: {e}", path.display());
             self.broken = Some(why.clone());
+            // What it may not have written is not the segment's to read back.
+            shapes = shapes.min(segment.shapes.len());
+            segment.shapes.truncate(shapes);
             return Err(Error::Io(why));
         }
-        self.offset += buffer.len() as u64;
+        if let Some(first) = entries.first() {
+            let replaces = first.index <= self.last.0;
+            if replaces {
+                for older in &mut self.segments {
+                    older.marks.retain(|&(index, _)| index < first.index);
+                }
+            }
+            let segment = &mut self.segments[open];
+            segment.mark(first.index, segment.end, replaces);
+        }
+        let segment = &mut self.segments[open];
+        segment.end += buffer.len() as u64;
         if let Some(entry) = entries.last() {
             self.last = (entry.index, entry.term);
         }
@@ -282,26 +393,133 @@ impl Wal {
         Ok(())
     }
 
-    /// Forgets the segments whose every entry is at or below `applied` (the partition files hold
-    /// them now), never the one taking entries; their files, for the caller to delete outside
-    /// whatever lock it holds. A segment's entries are at most one below the next's name.
-    pub(crate) fn trim(&mut self, applied: u64) -> Vec<PathBuf> {
-        let mut gone = Vec::new();
-        while self.segments.len() > 1 && self.segments[1] <= applied + 1 {
-            gone.push(segment_path(&self.dir, self.segments.remove(0)));
+    /// The entries from `low` to before `high`, read from the segments, stopping once they
+    /// hold more than `max_size` bytes (at least one). Only entries no later one can replace:
+    /// committed ones.
+    pub(crate) fn read(&self, low: u64, high: u64, max_size: u64) -> Result<Vec<Entry>, Error> {
+        let marks: Vec<(usize, u64, u64)> = self
+            .segments
+            .iter()
+            .enumerate()
+            .flat_map(|(at, segment)| segment.marks.iter().map(move |&(i, o)| (at, i, o)))
+            .collect();
+        let first = marks.partition_point(|&(_, index, _)| index <= low);
+        let mut out: Vec<Entry> = Vec::new();
+        let mut size = 0;
+        let mut next = low;
+        for (k, &(at, _, offset)) in marks.iter().enumerate().skip(first.saturating_sub(1)) {
+            let segment = &self.segments[at];
+            // Entries here up to the next mark's index; past it, replaced.
+            let (limit, end) = match marks.get(k + 1) {
+                Some(&(other, index, off)) if other == at => (index, off),
+                Some(&(_, index, _)) => (index, segment.end),
+                None => (u64::MAX, segment.end),
+            };
+            let path = segment_path(&self.dir, segment.name);
+            let corrupt = |what: &str| Error::Corrupt(format!("{}: {what}", path.display()));
+            let mut file = self
+                .disk
+                .open(&path, false)
+                .map_err(|e| Error::io(&path, e))?;
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|e| Error::io(&path, e))?;
+            let mut reader = BufReader::with_capacity(1 << 16, file.take(end - offset));
+            let mut frames = Frames {
+                reader: &mut reader,
+                at: offset,
+            };
+            while let Some((kind, body)) = frames.next() {
+                let Some(entry) =
+                    parse_entry(kind, &body, &segment.shapes).map_err(|e| corrupt(&e))?
+                else {
+                    continue;
+                };
+                let (index, _) = entry.head();
+                if index < next {
+                    continue;
+                }
+                if index >= limit || index >= high {
+                    break;
+                }
+                if index != next {
+                    return Err(corrupt(&format!("entry {index} where {next} should be")));
+                }
+                let entry = entry.build();
+                size += entry.data.len() as u64;
+                out.push(entry);
+                next += 1;
+                if next == high || size > max_size {
+                    return Ok(out);
+                }
+            }
+            if next == high {
+                break;
+            }
         }
-        gone
+        if next != high {
+            return Err(Error::Corrupt(format!(
+                "{}: the log does not hold entries {next} to {}",
+                self.dir.display(),
+                high - 1
+            )));
+        }
+        Ok(out)
+    }
+
+    /// Forgets the oldest segments, never the one taking entries, whose every entry the
+    /// partition files hold (at or below `flushed`) and which no replica needs (at or below
+    /// `needed`), or which, past `retain` bytes of segments the files hold, are too far behind
+    /// to keep. Their files, for the caller to delete outside whatever lock it holds, and where
+    /// the log now starts.
+    pub(crate) fn trim(
+        &mut self,
+        flushed: u64,
+        needed: u64,
+        retain: u64,
+    ) -> (Vec<PathBuf>, (u64, u64)) {
+        let mut gone = Vec::new();
+        while self.segments.len() > 1 && self.segments[1].start.0 <= flushed {
+            // Bytes of the segments the files hold, this one first.
+            let held: u64 = self
+                .segments
+                .windows(2)
+                .take_while(|pair| pair[1].start.0 <= flushed)
+                .map(|pair| pair[0].end)
+                .sum();
+            if self.segments[1].start.0 > needed && held <= retain {
+                break;
+            }
+            let segment = self.segments.remove(0);
+            gone.push(segment_path(&self.dir, segment.name));
+        }
+        (gone, self.segments[0].start)
+    }
+
+    /// The index of the last entry appended.
+    pub(crate) fn last_index(&self) -> u64 {
+        self.last.0
     }
 
     fn roll(&mut self) -> Result<(), Error> {
-        let name = (self.last.0 + 1).max(self.segments[self.segments.len() - 1] + 1);
-        let (file, first_entry) =
-            start_segment(&self.disk, &self.dir, name, self.last, &self.state)?;
+        let newest = self.segments[self.segments.len() - 1].name;
+        let name = (self.last.0 + 1).max(newest + 1);
+        let (file, first_entry) = start_segment(
+            &self.disk,
+            &self.dir,
+            name,
+            self.segment_bytes,
+            self.last,
+            &self.state,
+        )?;
         self.file = file;
-        self.offset = first_entry;
         self.first_entry = first_entry;
-        self.segments.push(name);
-        self.shapes.clear();
+        self.segments.push(Segment {
+            name,
+            start: self.last,
+            marks: Vec::new(),
+            shapes: Vec::new(),
+            end: first_entry,
+        });
         Ok(())
     }
 }
@@ -317,12 +535,13 @@ fn start_segment(
     disk: &DiskRef,
     dir: &Path,
     name: u64,
+    segment_bytes: u64,
     last: (u64, u64),
     state: &HardState,
 ) -> Result<(Box<dyn DiskFile>, u64), Error> {
     let path = segment_path(dir, name);
     let mut file = disk.create(&path, true).map_err(|e| Error::io(&path, e))?;
-    file.allocate(SEGMENT_BYTES)
+    file.allocate(segment_bytes)
         .map_err(|e| Error::Io(format!("{}: cannot preallocate: {e}", path.display())))?;
     let mut head = HEADER.to_vec();
     frame(
@@ -336,6 +555,23 @@ fn start_segment(
         .map_err(|e| Error::io(&path, e))?;
     disk.sync_dir(dir).map_err(|e| Error::io(dir, e))?;
     Ok((file, head.len() as u64))
+}
+
+/// Starts a log afresh in `dir` (under the store's directory `root`), after the entry `at`
+/// with Raft's `state`: the partition files hold everything up to `at`.
+pub(crate) fn reset(
+    disk: &DiskRef,
+    root: &Path,
+    dir: &Path,
+    segment_bytes: u64,
+    at: (u64, u64),
+    state: &HardState,
+) -> Result<(), Error> {
+    for parent in disk::create_dirs(&**disk, root, dir).map_err(|e| Error::io(dir, e))? {
+        disk.sync_dir(&parent).map_err(|e| Error::io(&parent, e))?;
+    }
+    start_segment(disk, dir, at.0 + 1, segment_bytes, at, state)?;
+    write_applied(disk, dir, at.0)
 }
 
 /// A frame of `kind` whose body is `parts`, each copied once, into `buffer`.
@@ -416,7 +652,10 @@ fn word(bytes: &[u8], at: usize) -> u64 {
 /// What reading the segments in order has found so far.
 struct Reading {
     keep_after: u64,
+    /// Where the log starts: before the first segment's entries.
     start: (u64, u64),
+    terms: Vec<(u64, u64)>,
+    /// Those after `keep_after`.
     entries: Vec<Entry>,
     /// The index and term of the last entry read; `None` before the first segment.
     last: Option<(u64, u64)>,
@@ -433,11 +672,10 @@ impl Reading {
         }
         let keep = self.entries.partition_point(|kept| kept.index < index);
         self.entries.truncate(keep);
+        note_term(&mut self.terms, index, term);
         self.last = Some((index, term));
         if index > self.keep_after {
             self.entries.push(entry());
-        } else if index == self.keep_after {
-            self.start = (index, term);
         }
         true
     }
@@ -454,9 +692,7 @@ impl Reading {
             ))),
             None => {
                 self.last = Some(at);
-                if at.0 >= self.keep_after {
-                    self.start = at;
-                }
+                self.start = at;
                 Ok(())
             }
             Some(last) if last == at => Ok(()),
@@ -472,16 +708,18 @@ impl Reading {
     }
 }
 
-/// Reads the segment at `path`, named `name`, into `reading`; format 1 writes after `after`
-/// go to `each`. Whether it holds anything: `false` for one whose start never became durable.
+/// Reads the segment at `path`, named `name`, into `reading` (`earlier`, the segments read
+/// before it, lose the marks of entries it replaces); format 1 writes after `after` go to
+/// `each`. The segment, or `None` for one whose start never became durable.
 fn read_segment(
     disk: &DiskRef,
     path: &Path,
     name: u64,
     after: u64,
     reading: &mut Reading,
+    earlier: &mut [Segment],
     each: &mut dyn FnMut(Logged) -> Result<(), Error>,
-) -> Result<bool, Error> {
+) -> Result<Option<Segment>, Error> {
     let file = disk.open(path, false).map_err(|e| Error::io(path, e))?;
     let mut reader = BufReader::with_capacity(1 << 20, file);
     let mut header = Vec::with_capacity(HEADER.len());
@@ -491,11 +729,20 @@ fn read_segment(
         .map_err(|e| Error::io(path, e))?;
     if header == HEADER_V1 {
         reading.start_at(path, after, (name - 1, 0))?;
-        return read_v1(&mut reader, path, name, after, reading, each);
+        // Never read back: Raft's log starts after its writes.
+        let segment = Segment {
+            name,
+            start: (name - 1, 0),
+            marks: Vec::new(),
+            shapes: Vec::new(),
+            end: 0,
+        };
+        return Ok(read_v1(&mut reader, path, name, after, reading, each)?.then_some(segment));
     }
     let corrupt = |what: &str| Error::Corrupt(format!("{}: {what}", path.display()));
     let mut frames = Frames {
         reader: &mut reader,
+        at: HEADER.len() as u64,
     };
     let start = if header == HEADER {
         frames.next()
@@ -511,7 +758,7 @@ fn read_segment(
             .read_to_end(&mut rest)
             .map_err(|e| Error::io(path, e))?;
         if rest.iter().all(|&b| b == 0) {
-            return Ok(false);
+            return Ok(None);
         }
         return Err(corrupt("not a log segment this version can read"));
     };
@@ -519,11 +766,22 @@ fn read_segment(
     // segment was never used.
     let Some((START, start)) = start.filter(|(kind, body)| *kind == START && body.len() == 16)
     else {
-        return Ok(false);
+        return Ok(None);
     };
-    reading.start_at(path, after, (word(&start, 0), word(&start, 8)))?;
-    let mut shapes: Vec<Bytes> = Vec::new();
-    while let Some((kind, body)) = frames.next() {
+    let start = (word(&start, 0), word(&start, 8));
+    reading.start_at(path, after, start)?;
+    let mut segment = Segment {
+        name,
+        start,
+        marks: Vec::new(),
+        shapes: Vec::new(),
+        end: frames.at,
+    };
+    loop {
+        let offset = frames.at;
+        let Some((kind, body)) = frames.next() else {
+            break;
+        };
         match kind {
             STATE if body.len() == 24 => {
                 reading.state = HardState {
@@ -534,61 +792,44 @@ fn read_segment(
             }
             SHAPE if body.len() >= 4 => {
                 let number = u32::from_le_bytes(body[..4].try_into().expect("4 bytes"));
-                if number as usize != shapes.len() {
+                if number as usize != segment.shapes.len() {
                     return Err(corrupt(&format!("shape {number} out of order")));
                 }
-                shapes.push(body.slice(4..));
-            }
-            ENTRY | SHAPED if body.len() >= 17 => {
-                let entry_type = EntryType::from_i32(i32::from(body[16]))
-                    .ok_or_else(|| corrupt(&format!("an entry of type {}", body[16])))?;
-                // A write's head, its columns, and its rows, for SHAPED; checked here, joined
-                // only if the entry is kept.
-                let shaped = if kind == SHAPED {
-                    let number = body
-                        .get(17..21)
-                        .map(|n| u32::from_le_bytes(n.try_into().expect("4 bytes")));
-                    let schema = number.and_then(|n| shapes.get(n as usize));
-                    let head = head_length(&body[21.min(body.len())..]);
-                    match (schema, head) {
-                        (Some(schema), Some(head)) => Some((schema.clone(), 21 + head)),
-                        _ => return Err(corrupt("a write whose shape or head is not there")),
-                    }
-                } else {
-                    None
-                };
-                let (index, term) = (word(&body, 0), word(&body, 8));
-                let taken = reading.entry(index, term, || {
-                    let mut entry = Entry {
-                        index,
-                        term,
-                        data: match &shaped {
-                            Some((schema, rows)) => join(&body[21..*rows], schema, &body[*rows..]),
-                            None => body.slice(17..),
-                        },
-                        ..Entry::default()
-                    };
-                    entry.set_entry_type(entry_type);
-                    entry
-                });
-                if !taken {
-                    break;
-                }
+                segment.shapes.push(body.slice(4..));
             }
             kind => {
-                return Err(corrupt(&format!(
-                    "a frame of kind {kind}, or of a length its kind cannot have, which this \
-                     version cannot read"
-                )));
+                let Some(entry) =
+                    parse_entry(kind, &body, &segment.shapes).map_err(|e| corrupt(&e))?
+                else {
+                    return Err(corrupt(&format!(
+                        "a frame of kind {kind}, or of a length its kind cannot have, which \
+                         this version cannot read"
+                    )));
+                };
+                let (index, term) = entry.head();
+                let replaces = reading.last.is_some_and(|(last, _)| index <= last);
+                if !reading.entry(index, term, || entry.build()) {
+                    break;
+                }
+                if replaces {
+                    for older in earlier.iter_mut() {
+                        older.marks.retain(|&(marked, _)| marked < index);
+                    }
+                    segment.marks.retain(|&(marked, _)| marked < index);
+                }
+                segment.mark(index, offset, replaces);
             }
         }
+        segment.end = frames.at;
     }
-    Ok(true)
+    Ok(Some(segment))
 }
 
-/// A segment's frames after its header, each kind and body, to the first that is not one.
+/// A segment's frames from `at`, each kind and body, to the first that is not one.
 struct Frames<'a, R> {
     reader: &'a mut R,
+    /// Where the next frame starts in the segment.
+    at: u64,
 }
 
 impl<R: Read> Frames<'_, R> {
@@ -597,16 +838,82 @@ impl<R: Read> Frames<'_, R> {
         self.reader.read_exact(&mut frame).ok()?;
         let length = u32::from_le_bytes(frame[..4].try_into().expect("4 bytes")) as usize;
         let crc = u32::from_le_bytes(frame[4..].try_into().expect("4 bytes"));
-        if length == 0 || length > SEGMENT_BYTES as usize * 2 {
+        if length == 0 || length > MAX_FRAME {
             return None;
         }
         let mut body = vec![0; length];
         if self.reader.read_exact(&mut body).is_err() || crc32fast::hash(&body) != crc {
             return None;
         }
+        self.at += (FRAME + length) as u64;
         let body = Bytes::from(body);
         Some((body[0], body.slice(1..)))
     }
+}
+
+/// The entry an ENTRY or SHAPED frame holds, checked; built only if it is wanted.
+struct Framed<'a> {
+    body: &'a Bytes,
+    entry_type: EntryType,
+    /// A SHAPED frame's columns, and where its rows begin in the body.
+    shaped: Option<(Bytes, usize)>,
+}
+
+impl Framed<'_> {
+    fn head(&self) -> (u64, u64) {
+        (word(self.body, 0), word(self.body, 8))
+    }
+
+    fn build(&self) -> Entry {
+        let (index, term) = self.head();
+        let data = match &self.shaped {
+            Some((schema, rows)) => join(&self.body[21..*rows], schema, &self.body[*rows..]),
+            None => self.body.slice(17..),
+        };
+        let mut entry = Entry {
+            index,
+            term,
+            data,
+            ..Entry::default()
+        };
+        entry.set_entry_type(self.entry_type);
+        entry
+    }
+}
+
+/// What a frame of `kind` holds if it is an ENTRY or SHAPED, against its segment's `shapes`;
+/// `None` for a frame of another kind.
+fn parse_entry<'a>(
+    kind: u8,
+    body: &'a Bytes,
+    shapes: &[Bytes],
+) -> Result<Option<Framed<'a>>, String> {
+    if !matches!(kind, ENTRY | SHAPED) {
+        return Ok(None);
+    }
+    if body.len() < 17 {
+        return Err("an entry frame too short to read".into());
+    }
+    let entry_type =
+        EntryType::from_i32(i32::from(body[16])).ok_or(format!("an entry of type {}", body[16]))?;
+    let shaped = if kind == SHAPED {
+        let number = body
+            .get(17..21)
+            .map(|n| u32::from_le_bytes(n.try_into().expect("4 bytes")));
+        let schema = number.and_then(|n| shapes.get(n as usize));
+        let head = head_length(&body[21.min(body.len())..]);
+        match (schema, head) {
+            (Some(schema), Some(head)) => Some((schema.clone(), 21 + head)),
+            _ => return Err("a write whose shape or head is not there".into()),
+        }
+    } else {
+        None
+    };
+    Ok(Some(Framed {
+        body,
+        entry_type,
+        shaped,
+    }))
 }
 
 /// Encodes a write as an entry's data.
@@ -630,15 +937,26 @@ pub(crate) fn encode(append: &Append) -> Result<Bytes, Error> {
     Ok(Bytes::from(data))
 }
 
-/// Reads the write an entry at `index` holds (`encode`).
-pub(crate) fn decode(index: u64, data: &Bytes) -> Result<Logged, String> {
+/// What the entry at `index` says to do.
+pub(crate) fn decode(index: u64, data: &Bytes) -> Result<Command, String> {
+    match data.first() {
+        Some(&WRITE) => decode_write(index, data).map(Command::Write),
+        Some(&DROP) if data.len() == 29 => Ok(Command::Drop {
+            table: i64::from_le_bytes(data[1..9].try_into().expect("8")),
+            date: Date::from_days(i32::from_le_bytes(data[9..13].try_into().expect("4"))),
+            rows: u64::from_le_bytes(data[13..21].try_into().expect("8")),
+            now_ns: i64::from_le_bytes(data[21..29].try_into().expect("8")),
+        }),
+        _ => Err(format!(
+            "the entry at index {index} is of a kind this version cannot read"
+        )),
+    }
+}
+
+/// The write an entry at `index` holds (`encode`).
+fn decode_write(index: u64, data: &Bytes) -> Result<Logged, String> {
     let short = || format!("the entry at index {index} is too short to read");
     let get = |at: usize, len: usize| data.get(at..at + len).ok_or_else(short);
-    if data.first() != Some(&WRITE) {
-        return Err(format!(
-            "the entry at index {index} is of a kind this version cannot read"
-        ));
-    }
     let table = i64::from_le_bytes(get(1, 8)?.try_into().expect("8"));
     let ingest_ns = i64::from_le_bytes(get(9, 8)?.try_into().expect("8"));
     let seq = u64::from_le_bytes(get(17, 8)?.try_into().expect("8"));
@@ -717,7 +1035,10 @@ fn read_v1(
     let corrupt = |what: &str| Error::Corrupt(format!("{}: {what}", path.display()));
     // Each shape's table and schema message, by number.
     let mut shapes: HashMap<u32, (i64, Bytes)> = HashMap::new();
-    let mut frames = Frames { reader };
+    let mut frames = Frames {
+        reader,
+        at: HEADER_V1.len() as u64,
+    };
     let mut next = first;
     // A format 1 entry: LSN (u64), kind (u8), body; its frame's kind byte is the LSN's first.
     while let Some((byte, rest)) = frames.next() {
@@ -733,6 +1054,7 @@ fn read_v1(
         }
         // Not Raft's: format 1's writes are applied here, and Raft's log starts after them.
         reading.entries.clear();
+        reading.terms.clear();
         reading.start = (lsn, 0);
         next += 1;
         let body = rest.slice(8..);
@@ -845,7 +1167,8 @@ mod tests {
     use raft::eraftpb::{Entry, HardState};
 
     use super::{
-        Append, HEADER_V1, Logged, Recovered, Wal, encode, read_applied, write_applied, write_rows,
+        Append, HEADER_V1, Logged, Recovered, SEGMENT_BYTES, Wal, encode, read_applied,
+        write_applied, write_rows,
     };
     use crate::disk::{DiskRef, real};
     use crate::partition::schema_header;
@@ -868,9 +1191,15 @@ mod tests {
     }
 
     fn open(disk: &DiskRef, dir: &Path, after: u64, keep_after: u64) -> (Wal, Recovered) {
-        Wal::open(disk, dir, dir, after, keep_after, &mut |_| {
-            unreachable!("no format 1 segments")
-        })
+        Wal::open(
+            disk,
+            dir,
+            dir,
+            SEGMENT_BYTES,
+            after,
+            keep_after,
+            &mut |_| unreachable!("no format 1 segments"),
+        )
         .unwrap()
     }
 
@@ -924,11 +1253,11 @@ mod tests {
         let (recovered, entries) = read(&disk, &dir, 0);
         assert_eq!(entries, owned(&[(1, 1, "1@1"), (2, 2, "2@2")]));
         assert_eq!((recovered.start, recovered.state), ((0, 0), later));
-        // Kept after what the partition files hold: the start is the entry there.
+        // Kept in memory after what the partition files hold; the log still starts at 0.
         let (recovered, entries) = read(&disk, &dir, 1);
         assert_eq!(
             (recovered.start, entries),
-            ((1, 1), owned(&[(2, 2, "2@2")]))
+            ((0, 0), owned(&[(2, 2, "2@2")]))
         );
 
         // Each open started a segment, named past the entries before it.
@@ -958,7 +1287,7 @@ mod tests {
         // Segments wholly at or below what the partition files hold go; the log still opens
         // from there.
         let (mut wal, _) = open(&disk, &dir, 0, 0);
-        for path in wal.trim(4) {
+        for path in wal.trim(4, 4, 0).0 {
             std::fs::remove_file(path).unwrap();
         }
         drop(wal);
@@ -968,6 +1297,61 @@ mod tests {
         assert_eq!(read_applied(&disk, &dir).unwrap(), 0);
         write_applied(&disk, &dir, 3).unwrap();
         assert_eq!(read_applied(&disk, &dir).unwrap(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An entry `size` bytes long, of index and term.
+    fn sized(index: u64, term: u64, size: usize) -> Entry {
+        let mut data = format!("{index}@{term}").into_bytes();
+        data.resize(size, b'.');
+        Entry {
+            index,
+            term,
+            data: Bytes::from(data),
+            ..Entry::default()
+        }
+    }
+
+    /// Entries read back from the segments are the log's, wherever reading starts: across
+    /// segments, past entries a later append replaced, and as far as `max_size` lets them.
+    #[test]
+    fn entries_read_back_from_the_segments_are_the_logs() {
+        let dir = dir("read");
+        let disk = real(&dir.join("fsync-failed"));
+        let none = &mut |_: Logged| -> Result<(), Error> { unreachable!() };
+        // Small segments: about twenty entries each.
+        let (mut wal, _) = Wal::open(&disk, &dir, &dir, 4096, 0, 0, none).unwrap();
+        let mut log: Vec<Entry> = Vec::new();
+        for first in (1..=200).step_by(10) {
+            let batch: Vec<Entry> = (first..first + 10).map(|i| sized(i, 1, 180)).collect();
+            wal.append(&batch, None).unwrap();
+            log.extend(batch);
+        }
+        // A new leader replaces 150 on, in two appends; then more.
+        for (from, to) in [(150, 160), (161, 250)] {
+            let batch: Vec<Entry> = (from..=to).map(|i| sized(i, 2, 180)).collect();
+            wal.append(&batch, None).unwrap();
+            log.truncate(from as usize - 1);
+            log.extend(batch);
+        }
+        let check = |wal: &Wal| {
+            for low in [1, 7, 21, 149, 150, 151, 160, 161, 199, 249] {
+                for high in [low + 1, (low + 13).min(251), 251] {
+                    let read = wal.read(low, high, u64::MAX).unwrap();
+                    let want = &log[low as usize - 1..high as usize - 1];
+                    assert_eq!(read, want, "{low}..{high}");
+                }
+            }
+            // Stopped once past the size: three entries of 180 bytes pass 500.
+            assert_eq!(wal.read(5, 251, 500).unwrap(), log[4..7]);
+        };
+        check(&wal);
+        drop(wal);
+        // The same, from the segments as reopened.
+        let (wal, recovered) = Wal::open(&disk, &dir, &dir, 4096, 0, 0, none).unwrap();
+        assert!(wal.segments.len() > 10, "{} segments", wal.segments.len());
+        assert_eq!(recovered.entries, log);
+        check(&wal);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1081,15 +1465,23 @@ mod tests {
 
         let replay = |after: u64| -> (Vec<(u64, i64, u64, i64)>, Recovered) {
             let mut seen = Vec::new();
-            let (_, recovered) = Wal::open(&disk, &dir, &dir, after, after, &mut |l: Logged| {
-                let n = l.batch.column(0).as_any().downcast_ref::<Int64Array>();
-                assert_eq!(
-                    (l.table, l.shape.ids.as_ref()),
-                    (7, [ColumnId(1)].as_slice())
-                );
-                seen.push((l.lsn, n.unwrap().value(0), l.seq, l.ingest_ns));
-                Ok::<(), Error>(())
-            })
+            let (_, recovered) = Wal::open(
+                &disk,
+                &dir,
+                &dir,
+                SEGMENT_BYTES,
+                after,
+                after,
+                &mut |l: Logged| {
+                    let n = l.batch.column(0).as_any().downcast_ref::<Int64Array>();
+                    assert_eq!(
+                        (l.table, l.shape.ids.as_ref()),
+                        (7, [ColumnId(1)].as_slice())
+                    );
+                    seen.push((l.lsn, n.unwrap().value(0), l.seq, l.ingest_ns));
+                    Ok::<(), Error>(())
+                },
+            )
             .unwrap();
             (seen, recovered)
         };
@@ -1102,7 +1494,7 @@ mod tests {
         // Raft's entries continue the log after it; once the partition files hold it, it goes.
         let (mut wal, _) = open_after(&disk, &dir, 3);
         wal.append(&[entry(4, 1)], None).unwrap();
-        for path in wal.trim(3) {
+        for path in wal.trim(3, 3, 0).0 {
             std::fs::remove_file(path).unwrap();
         }
         drop(wal);
@@ -1116,6 +1508,6 @@ mod tests {
 
     /// Opens a log whose format 1 writes up to `after` the partition files hold.
     fn open_after(disk: &DiskRef, dir: &Path, after: u64) -> (Wal, Recovered) {
-        Wal::open(disk, dir, dir, after, after, &mut |_| Ok(())).unwrap()
+        Wal::open(disk, dir, dir, SEGMENT_BYTES, after, after, &mut |_| Ok(())).unwrap()
     }
 }

@@ -6,6 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::{
     FORMAT, Found, Garbage, HistoryCommit, HistoryDate, HistoryFile, Row, check_commit, location,
+    started_key,
 };
 use crate::{Date, Error, SourceId, TableName};
 
@@ -218,6 +219,27 @@ impl Sqlite {
                 |row| row.get::<_, i64>(0),
             )
             .map(|epoch| epoch as u64)
+            .map_err(sql)
+    }
+
+    pub(crate) fn shard_started(&mut self, branch: &str) -> Result<bool, Error> {
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM meta WHERE key = ?1",
+                [started_key(branch)],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|n| n > 0)
+            .map_err(sql)
+    }
+
+    pub(crate) fn start_shard(&mut self, branch: &str) -> Result<(), Error> {
+        self.conn
+            .execute(
+                "INSERT INTO meta VALUES (?1, 1) ON CONFLICT (key) DO NOTHING",
+                [started_key(branch)],
+            )
+            .map(drop)
             .map_err(sql)
     }
 

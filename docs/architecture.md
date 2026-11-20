@@ -459,11 +459,11 @@ catalog as live tables.
   (format 1) is still read: its writes are replayed once, as committed, and Raft's log takes up
   after them.
 - Every second the partition files written since are fsynced, `applied` records how far they
-  hold the log, and a shard of one deletes the log's segments wholly below that (replicas keep
-  theirs, §7.6). Opening the store drops index records past `applied` (they may be torn) and
-  replays the committed entries from there; a resend is recognised by `(source, seq)` as it is
-  applied. Index records written before the log (format 1, without an LSN, fsynced one by one)
-  are always kept.
+  hold the log, and the log's segments wholly below that go: a shard of one deletes them at once,
+  and a replica keeps those a follower still needs, up to 4 GiB of them (§7.6). Opening the store
+  drops index records past `applied` (they may be torn) and replays the committed entries from
+  there; a resend is recognised by `(source, seq)` as it is applied. Index records written before
+  the log (format 1, without an LSN, fsynced one by one) are always kept.
 - A resend is recognised whatever its date: a source's seqs rise across its dates, so one at or
   below its last is a resend. Its last outlives the dates it was written on, as Redpanda keeps
   producer state apart from the segments it came from: before a merged date is dropped, each
@@ -558,12 +558,20 @@ never depends on a day weir no longer has. The checkpoint sits in commit order w
 day ends, which is what it holds: it is written after the flush that covers that position, so a
 crash can take it, or leave its index without its stream (recovery drops what is missing, as it
 never does for a source's batches), and the one folded again on reopening is the same
-checkpoint in the same place, before the day's changes. Dropping a merged day waits until a flush covers its last batch
-(the log must not replay part of it back), fsyncs the checkpoint, which could no longer be folded
-once the day is gone, and fsyncs the day's going. A busy day gets checkpoints as it goes: once
-the changes since the last checkpoint pass 64 MiB and that checkpoint's own size, the write that
-crosses it folds a new one, so folding costs in proportion to the bytes written. A publisher's
-first write is a checkpoint too (§5.2). Weir keeps no state per key in memory.
+checkpoint in the same place, before the day's changes. Dropping a merged day is an entry in the
+shard log (§7.6), so every replica drops it at the same position. It carries the rows history
+holds of the day, and a replica drops the day only if it holds as many: a write stamped just
+before midnight can commit after the merge read the day (proposed under a leader that lost the
+lead before it committed), and then the day stays, for the merge to take again. Applying the
+drop fsyncs the checkpoint, which could no longer be folded once the day is gone; marks the day
+as going at the drop's position; waits until a flush covers that position (the log must not
+replay part of the day back); records each source's last seq on the day (§7.1), which earlier
+would have a replay of the day's writes take them for resends; and fsyncs the day's going. A
+process stopped in between finishes on opening if a flush covered the mark, and otherwise
+replays the drop. A busy day gets checkpoints as it goes: once the changes since the last
+checkpoint pass 64 MiB and that checkpoint's own size, the write that crosses it folds a new
+one, so folding costs in proportion to the bytes written. A publisher's first write is a
+checkpoint too (§5.2). Weir keeps no state per key in memory.
 
 ### 7.4 Source leases
 
@@ -610,12 +618,13 @@ outlive what Kubernetes believes.
 ### 7.6 Replication
 
 Built: the shard log as Raft's log, which every weir runs (a shard of one leads at once), and
-replication over 3 replicas with fixed membership, proven under the simulator (step 2). Not built
-yet: replicas talking over the network, a lagging or new replica catching up from a peer's
-partition files, trimming a replica's log, followers serving reads, and commands as entries; the
-direction, decided before it is written. weir replicates itself so that losing a node loses no
-acknowledged write, a planned restart (a rollout, a drain) costs writers a pause of milliseconds
-and readers nothing, and producing and consuming depend on nothing outside weir.
+replication over 3 replicas with fixed membership, proven under the simulator: catch-up from a
+follower's log or a peer's partition files, trimming each replica's log, and dropping a merged
+date as an entry. Not built yet: replicas talking over the network, followers serving reads, a
+replica rejoining after its disk is lost, and the other commands as entries; the direction,
+decided before it is written. weir replicates itself so that losing a node loses no
+acknowledged write, a planned restart (a rollout, a drain) costs writers a pause of
+milliseconds and readers nothing, and producing and consuming depend on nothing outside weir.
 
 The model is the one databases use: one replicated write-ahead log per shard, the only durable
 copy, and everything else derived from it.
@@ -649,11 +658,12 @@ writers ─► leader ── append + fsync ────────────
   kind (§7.1), the ingest time the leader stamps (rising across leaders, since every replica
   keeps the last it applied and a leader stamps above it), and the rows as Arrow IPC (built). A
   leader's first entry of its term is empty. Commands are entries too, so every replica does the
-  same thing at the same position: taking and releasing a source lease (§7.4), changing a
-  table's columns (§5.4), dropping a merged date (§8.3). Until they are, a follower takes up a
-  table created, or columns changed, since it opened from the catalog when the first write in
-  them reaches it. Entries are versioned; a change to their format is a Parallel Change across
-  two releases, so old and new replicas run side by side during a rollout.
+  same thing at the same position: dropping a merged date (§7.3, built), and later taking and
+  releasing a source lease (§7.4) and changing a table's columns (§5.4). Until they are, a
+  follower takes up a table created, or columns changed, since it opened from the catalog when
+  the first write in them reaches it. Entries are versioned; a change to their format is a
+  Parallel Change across two releases, so old and new replicas run side by side during a
+  rollout.
 - **Writes.** The leader assigns each batch the next log position (LSN), appends it, and
   replicates it while it fsyncs; one fsync covers every batch waiting, from every producer, so
   commit is grouped by construction. The writer is acknowledged once the batch is committed:
@@ -696,9 +706,30 @@ writers ─► leader ── append + fsync ────────────
 - **Partition files** keep the layout of §7.1, so dates, merges, reads by position, and dropping
   merged dates are unchanged. Each replica writes them from the log in the background and flushes
   them in bulk; recovery replays the log from the position the files hold. Keyed checkpoints
-  (§7.3) are each replica's own, folded from the log, never replicated. A new or replaced
-  replica copies partition files from a peer, then the log from their position. Writing every
-  byte twice is the price of the clean split, small at our volumes.
+  (§7.3) are each replica's own, folded from the log, never replicated. Writing every byte twice
+  is the price of the clean split, small at our volumes.
+- **Catching up.** A follower behind takes the entries it lacks from its leader: the last 64 MiB
+  past what the leader applied from memory, older ones read back from the log's segments, which
+  keep an offset every MiB. Each replica keeps its segments down to what every follower holds,
+  but no more than 4 GiB of those its partition files hold; a follower further behind gets a
+  snapshot instead. Raft's snapshot is only a position and the replica to copy from, its leader:
+  the follower copies that replica's partition files, keyed checkpoints included, as of the last
+  entry it applied (listed under the lock its committer holds while applying an entry, so the
+  files are of one position), stages them beside `weir/` with a log that takes up at that
+  position, makes them durable, then swaps them in under a marker, so an install cut short
+  either finishes on the next open or never began. Each pass at the swap makes every directory
+  of `weir/` durable before the marker goes, since one that finishes another's moves may have
+  nothing left to move. Its own files go only once the copy is whole and durable. It then
+  reopens and takes entries from that position.
+- **A lost disk.** A replica that starts with no log in a shard the catalog records as started
+  (a leader committed in it) lost its disk, or was given a new one: its log is no measure of
+  what it held, and it may have voted in terms it no longer knows, so its vote could elect a
+  leader without entries it helped commit. It refuses to open. Watching the leader cannot tell
+  it when it is safe to vote again, since a delayed or duplicated message carries a commit
+  index from before the loss. It is to rejoin as Redpanda, Kafka's KRaft (KIP-853), and etcd
+  rejoin a replaced disk: as a new incarnation of the replica, a learner that takes the log or
+  a snapshot and votes only once a membership change, committed after it caught up, makes it
+  a voter. That needs changing a shard's members (step 5 below).
 - **Planned restarts.** A rollout or drain restarts one replica at a time, under a
   PodDisruptionBudget, each only once the previous one has caught up. Before the leader
   restarts it hands leadership to an up-to-date follower; writers are redirected, and the batch
@@ -727,7 +758,11 @@ writers ─► leader ── append + fsync ────────────
   replica's process is killed or its power lost at any point, the leader's included. A write
   refused, lost to a leader change, or cut short by a crash is resolved once the replicas agree
   again (one leader, all applied as far as it): every replica must then hold exactly what was
-  acknowledged and the writes resolved as written, each once and in order.
+  acknowledged and the writes resolved as written, each once and in order, and the same past
+  dates. Its logs roll every 4 KiB, keeping nothing or 64 KiB past what the files hold, so
+  followers catch up from the leader's segments and by snapshots, half of which a crash cuts
+  short at any step, the swap's included; past dates are merged and dropped through the log,
+  and merged again when a late write grows them. A replica that lost its disk must not open.
 - **Raft itself.** raft-rs, vendored (§4.1, `crates/kermodes-raft`): etcd's raft as TiKV runs
   it, a pure state machine (ticks, messages, and a `Ready` of what to persist and send) with no
   I/O, clock, or network of its own, so the simulator drives every replica. Its messages are
@@ -736,9 +771,9 @@ writers ─► leader ── append + fsync ────────────
   1. One replica: the shard log, partition files derived from it, grouped commit, subscriptions
      resumed by LSN, and existing segments still read. Its latency, produce to subscriber, is
      measured (p50, p99, p999).
-  2. The simulator; then replication over 3 replicas with fixed membership, under it (built).
-     Next: replicas over Flight, catch-up from a peer's partition files, and the Helm chart
-     running three.
+  2. The simulator; then replication over 3 replicas with fixed membership, under it, with
+     catch-up from a peer's partition files (built). Next: replicas over Flight, and the Helm
+     chart running three.
   3. Leadership transfer for rollouts, reads from followers, leases as log entries.
   4. Local disks, one replica per node.
   5. Later: more shards, and changing a shard's members.

@@ -7,6 +7,7 @@ use postgres::{Client, GenericClient, NoTls};
 
 use super::{
     FORMAT, Found, Garbage, HistoryCommit, HistoryDate, HistoryFile, Row, check_commit, location,
+    started_key,
 };
 use crate::{Date, Error, SourceId, TableName};
 
@@ -223,6 +224,27 @@ impl Postgres {
             )
             .map_err(sql)?
             .map(|row| row.get::<_, i64>(0) as u64))
+    }
+
+    pub(crate) fn shard_started(&mut self, branch: &str) -> Result<bool, Error> {
+        Ok(self
+            .client()?
+            .query_opt(
+                "SELECT 1 FROM kermodes_meta WHERE key = $1",
+                &[&started_key(branch)],
+            )
+            .map_err(sql)?
+            .is_some())
+    }
+
+    pub(crate) fn start_shard(&mut self, branch: &str) -> Result<(), Error> {
+        self.client()?
+            .execute(
+                "INSERT INTO kermodes_meta VALUES ($1, 1) ON CONFLICT (key) DO NOTHING",
+                &[&started_key(branch)],
+            )
+            .map(drop)
+            .map_err(sql)
     }
 
     pub(crate) fn history(&mut self, table_id: i64) -> Result<Vec<HistoryDate>, Error> {

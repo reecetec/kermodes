@@ -32,9 +32,9 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use kermodes_core::type_name;
-use raft::eraftpb::{Entry, EntryType, Message};
+use raft::eraftpb::{Entry, EntryType, Message, MessageType, Snapshot};
 use raft::protocompat::PbMessage;
-use raft::{RawNode, StateRole};
+use raft::{RawNode, SnapshotStatus, StateRole, Storage};
 use serde_json::json;
 
 use crate::catalog::{Catalog, Garbage, HistoryCommit, HistoryDate, HistoryFile, TableEntry};
@@ -42,9 +42,10 @@ use crate::disk::{self, DiskRef};
 use crate::keyed::Fold;
 use crate::partition::{Partition, Stamp, ToSync, Written, in_order, schema_header};
 use crate::pending::{Answer, InFlight, Pending};
-use crate::replica::{LogStore, Replica};
+use crate::replica::{LogLimits, LogStore, Replica};
 use crate::shape::Shape;
-use crate::wal::{self, Append, Logged, Wal};
+use crate::snapshot::{self, SnapshotSource, SnapshotWanted};
+use crate::wal::{self, Append, Command, Logged, Wal};
 use crate::{Change, Date, Error, SourceId, TableName};
 
 /// The branch a local store's tables live on (architecture.md §10.1).
@@ -63,6 +64,10 @@ const GROUP_BYTES: usize = 64 << 20;
 
 /// The longest a group waits for writers that were in the last one (`commit`).
 const GATHER: Duration = Duration::from_micros(100);
+
+/// The most a leader keeps in memory of entries its followers have yet to take: past it, a
+/// follower behind reads them back from the log.
+const CACHE_BYTES: u64 = 64 << 20;
 
 /// Receives a table's batches in order, each with its stamp (change kind and ingest time): every
 /// batch committed today (UTC) when it subscribes (a keyed table's starting with its
@@ -138,6 +143,8 @@ pub struct Store {
     /// To the committer, which proposes, logs, and applies every write.
     requests: Sender<Request>,
     flusher: Arc<Flusher>,
+    /// The last entry applied, its index and term (`Committer::position`).
+    position: Arc<Mutex<(u64, u64)>>,
     clock: Clock,
     driver: Driver,
 }
@@ -220,9 +227,22 @@ impl TableLog {
 /// What the committer thread is asked.
 enum Request {
     Write(Submitted),
+    Drop(Dropping),
     /// The partition files hold the log up to this LSN: the segments wholly below it, to delete.
     Trim(u64, SyncSender<Vec<PathBuf>>),
     Stop,
+}
+
+/// A past date of a table to drop, its history holding it whole, and where the outcome goes.
+struct Dropping {
+    log: Arc<Log>,
+    table: i64,
+    date: Date,
+    /// The rows its history holds: the date goes only if it still holds as many.
+    rows: u64,
+    /// The clock as it was asked: what today is, whose keyed checkpoint takes the date's state.
+    now_ns: i64,
+    answer: Answer,
 }
 
 /// A write to log and apply, and where its outcome goes: written, or a resend (`false`).
@@ -395,6 +415,8 @@ impl Store {
                 root.display()
             )));
         }
+        // A snapshot whose install was under way is finished; one never copied whole goes.
+        snapshot::recover(&disk, root)?;
         let weir = root.join("weir");
         let log_dir = weir.join("log");
         let flushed = wal::read_applied(&disk, &log_dir)?;
@@ -417,14 +439,23 @@ impl Store {
             root: root.to_owned(),
             known: Vec::new(),
         };
-        // A shard of one keeps no entry once applied: no replica will ask for it.
-        let keep_after = if replica.is_alone() { flushed } else { 0 };
+        // Built before the replay: a drop it replays flushes through itself first.
+        let applied_at = Arc::new(AtomicU64::new(flushed));
+        let flusher = Arc::new(Flusher {
+            disk: disk.clone(),
+            logs: tables.logs.clone(),
+            log_dir: log_dir.clone(),
+            applied: applied_at.clone(),
+            failed: Mutex::new(false),
+        });
+        // Entries the partition files hold stay in the log, not in memory.
         let (wal, recovered) = Wal::open(
             &disk,
             root,
             &log_dir,
+            replica.limits.segment_bytes,
             flushed,
-            keep_after,
+            flushed,
             &mut |logged: Logged| {
                 stamped = stamped.max(logged.ingest_ns);
                 let log = tables.log_for(logged.table, &logged.shape)?;
@@ -437,15 +468,36 @@ impl Store {
         for entry in &recovered.entries {
             if entry.index > from && entry.index <= recovered.state.commit {
                 if !entry.data.is_empty() {
-                    tables.apply(entry, &mut stamped)?;
+                    tables.apply(entry, &mut stamped, &flusher)?;
                 }
                 applied = entry.index;
             }
         }
-        let mut store = LogStore::new(recovered, applied, replica.voters.clone());
-        if replica.is_alone() {
-            store.compact(applied);
+        // No log at all, in a shard a leader has committed in: this replica lost its disk (or
+        // it was replaced). Its log is no measure of what it held, nor its vote of whom it voted
+        // for, so its vote could elect a leader without entries it helped commit. It rejoins as
+        // a new member, caught up before it votes, which needs changing the shard's members. A
+        // shard of one has no one else to have voted, and nothing else to lose.
+        let started = replica.is_alone() || self::lock(&tables.catalog).shard_started(branch)?;
+        // The entries the partition files hold are not in `recovered`: the log's end says.
+        if !replica.is_alone() && started && wal.last_index() == 0 {
+            return Err(Error::Io(format!(
+                "{}: replica {} has no log, in a shard that has started: its disk was lost or \
+                 replaced, and it cannot rejoin until weir can change a shard's members; \
+                 restore its volume",
+                root.display(),
+                replica.id
+            )));
         }
+        let mut store = LogStore::new(wal, recovered, applied, &replica);
+        store.compact_cache(applied);
+        let term = Storage::term(&store, applied).map_err(|e| {
+            Error::Corrupt(format!(
+                "{}: the term of index {applied}: {e}",
+                log_dir.display()
+            ))
+        })?;
+        let position = Arc::new(Mutex::new((applied, term)));
         let config = raft::Config {
             id: replica.id,
             election_tick: 10,
@@ -465,26 +517,24 @@ impl Store {
         })?;
         let logs = tables.logs.clone();
         let catalog = tables.catalog.clone();
-        let applied = Arc::new(AtomicU64::new(applied));
-        let flusher = Arc::new(Flusher {
-            disk: disk.clone(),
-            logs: logs.clone(),
-            log_dir,
-            applied: applied.clone(),
-            failed: Mutex::new(false),
-        });
+        applied_at.store(applied, Ordering::Release);
+        let applied = applied_at;
         let mut committer = Committer {
             node,
-            wal,
             replica,
             clock: clock.clone(),
             stamped,
             tables,
+            flusher: flusher.clone(),
             applied: applied.clone(),
+            position: position.clone(),
             proposed: VecDeque::new(),
             waiting: Vec::new(),
+            drops: Vec::new(),
             schemas: Vec::new(),
             outbox: Vec::new(),
+            wanted: None,
+            started,
             broken: None,
         };
         if committer.replica.is_alone() {
@@ -532,6 +582,7 @@ impl Store {
             logs,
             requests,
             flusher,
+            position,
             clock,
             driver,
         })
@@ -548,17 +599,18 @@ impl Store {
         else {
             return 0;
         };
-        let group: Vec<Submitted> = lock(received)
-            .try_iter()
-            .filter_map(|request| match request {
-                Request::Write(submitted) => Some(submitted),
+        let (mut group, mut drops) = (Vec::new(), Vec::new());
+        for request in lock(received).try_iter() {
+            match request {
+                Request::Write(submitted) => group.push(submitted),
+                Request::Drop(dropping) => drops.push(dropping),
                 // Asked only of a committer thread.
-                Request::Trim(..) | Request::Stop => None,
-            })
-            .collect();
-        let count = group.len();
+                Request::Trim(..) | Request::Stop => {}
+            }
+        }
+        let count = group.len() + drops.len();
         if count > 0 {
-            lock(committer).submit(group);
+            lock(committer).submit(group, drops);
         }
         count
     }
@@ -607,6 +659,30 @@ impl Store {
             // A shard of one, which leads from its open.
             Driver::Threads { .. } => true,
         }
+    }
+
+    /// The snapshot this replica must install before it can go on, when it is too far behind
+    /// its shard's log: close the store, `install_snapshot` it from the replica it names, and
+    /// open the store again.
+    pub fn snapshot_wanted(&self) -> Option<SnapshotWanted> {
+        match &self.driver {
+            Driver::Stepped { committer, .. } => lock(committer).wanted,
+            Driver::Threads { .. } => None,
+        }
+    }
+
+    /// Installs, in the closed store in `root` on `disk`, the snapshot it wanted
+    /// (`snapshot_wanted`), its partition files copied from `from`; opening it then goes on
+    /// from there. Should it fail, or the process stop, the replica stays as it was until
+    /// the copy was whole, and is handed a snapshot again.
+    pub fn install_snapshot(
+        root: &Path,
+        disk: DiskRef,
+        limits: LogLimits,
+        wanted: &SnapshotWanted,
+        from: &dyn SnapshotSource,
+    ) -> Result<(), Error> {
+        snapshot::install(&disk, root, limits.segment_bytes, wanted, from)
     }
 
     /// The last index of the shard log this replica has applied to its tables: how far behind
@@ -706,6 +782,16 @@ impl Store {
     /// The store's directory.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub(crate) fn disk(&self) -> &DiskRef {
+        &self.disk
+    }
+
+    /// The last entry applied, its index and term, held while it is: what a peer copying this
+    /// replica's files may read them as of (`SnapshotSource`).
+    pub(crate) fn position(&self) -> &Mutex<(u64, u64)> {
+        &self.position
     }
 
     /// The table called `name`.
@@ -1131,6 +1217,8 @@ impl Store {
 
     /// Deletes weir's partitions of a past `date` of `name`, once its history holds the date
     /// whole (as many rows as weir has): weir never deletes rows its history does not hold.
+    /// The drop is an entry of the shard log, so every replica drops the date where its log
+    /// says, and a replay brings back none of it. A date weir no longer holds was dropped.
     pub fn drop_date(&self, name: &TableName, date: Date) -> Result<(), Error> {
         self.past(date)?;
         let in_history: u64 = self
@@ -1139,75 +1227,50 @@ impl Store {
             .filter(|held| held.date == date)
             .map(|held| held.rows)
             .sum();
-        // Flushed first (outside the table's lock, which a flush takes): the date's batches must
-        // not be the log's to replay once its partitions are gone, or the replay would bring
-        // part of it back.
-        let flushed = self.flusher.flush()?;
         let log = self.log(name)?;
-        let mut state = lock(&log.state);
-        // A keyed table's state must not depend on the date going: today's checkpoint holds it.
-        let now = self.now_ns();
-        let today = Date::of_ns(now).to_string();
-        ensure_checkpoint(&mut state, &today, now)?;
-        let key = date.to_string();
-        let rows: u64 = state
-            .partitions
-            .iter()
-            .filter(|((day, _), _)| *day == key)
-            .map(|(_, partition)| partition.rows())
-            .sum();
+        let (table, held, rows) = {
+            let state = lock(&log.state);
+            let key = date.to_string();
+            let of_date = || state.partitions.iter().filter(|((day, _), _)| *day == key);
+            let rows: u64 = of_date().map(|(_, partition)| partition.rows()).sum();
+            (state.entry.id, of_date().next().is_some(), rows)
+        };
+        if !held {
+            return Ok(());
+        }
         if rows != in_history {
             return Err(Error::Catalog(format!(
                 "weir holds {rows} rows of {name} on {date} and its history {in_history}: \
                  merge the date before dropping it"
             )));
         }
-        // A reader resuming from before the date's last batch would miss what goes.
-        let gone = state
-            .partitions
-            .iter()
-            .filter(|((day, stream), _)| *day == key && *stream != Stream::Checkpoint)
-            .filter_map(|(_, partition)| partition.last_order())
-            .map(|(lsn, _)| lsn)
-            .max()
-            .unwrap_or(0);
-        if gone > flushed {
-            return Err(Error::Busy(format!(
-                "{name} on {date} has batches not yet flushed: drop it again"
-            )));
-        }
-        state.resumable_from = state.resumable_from.max(gone);
-        // Each source's last seq on the date outlives it, durably first: `source_last` must not
-        // go back, or a resend of the date's writes would be written again.
-        let mut floors = state.floors.clone();
-        for ((day, stream), partition) in &state.partitions {
-            if let (true, Stream::Source(source), Some(last)) =
-                (*day == key, stream, partition.last_seq())
-            {
-                let floor = floors.entry(source.clone()).or_insert(last);
-                *floor = (*floor).max(last);
+        let gone: Arc<str> = Arc::from("weir closed before the drop committed: drop it again");
+        let (pending, answer) = Arc::new(InFlight::default()).send(0, &gone);
+        let dropping = Dropping {
+            log,
+            table,
+            date,
+            rows,
+            now_ns: self.now_ns(),
+            answer,
+        };
+        match &self.driver {
+            Driver::Stepped { committer, .. } => {
+                lock(committer).submit(Vec::new(), vec![dropping]);
+                if !pending.is_answered() {
+                    return Err(Error::Busy(format!(
+                        "the drop of {name} on {date} is proposed, and done once a quorum of \
+                         replicas holds it"
+                    )));
+                }
+            }
+            Driver::Threads { .. } => {
+                self.requests
+                    .send(Request::Drop(dropping))
+                    .map_err(|_| Error::Io(gone.to_string()))?;
             }
         }
-        if floors != state.floors {
-            write_floors(&self.disk, &state.dir, &floors)?;
-            state.floors = floors;
-        }
-        // The checkpoint is durable before the date it may be folded from goes: whichever
-        // process wrote it, it cannot be folded again once the date is gone.
-        if let Some(checkpoint) = state.partitions.get(&(today, Stream::Checkpoint)) {
-            checkpoint.sync_now(&state.root)?;
-        }
-        state.partitions.retain(|(day, _), _| *day != key);
-        let dir = state.dir.join(&key);
-        match self.disk.remove_dir_all(&dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(Error::io(&dir, e)),
-        }
-        // Gone durably: a power loss does not bring the date back.
-        self.disk
-            .sync_dir(&state.dir)
-            .map_err(|e| Error::io(&state.dir, e))
+        pending.wait().map(drop)
     }
 
     /// The table's log: opened when the store was, or (a table created since) on first use.
@@ -1263,13 +1326,17 @@ fn open_log(
     floor: u64,
 ) -> Result<Arc<Log>, Error> {
     let dir = root.join("weir").join(&entry.location);
-    let floors = read_floors(disk, &dir)?;
+    let mut floors = read_floors(disk, &dir)?;
+    let forgotten = settle_drops(disk, &dir, trusted)?;
     let mut partitions = BTreeMap::new();
     for (date, stream) in partition_dirs(disk, &dir)? {
         let path = dir.join(&date).join(stream.dir_name());
         let partition =
             Partition::open(disk, root, &path, entry.shape(), trusted, stream.written())?;
         partitions.insert((date, stream), partition);
+    }
+    for key in forgotten {
+        forget_date(disk, &dir, &mut partitions, &mut floors, &key)?;
     }
     let last_lsn = partitions
         .values()
@@ -1395,6 +1462,67 @@ fn apply(log: &Log, logged: Logged) -> Result<bool, Error> {
     Ok(true)
 }
 
+/// Drops `log`'s partitions of a past `date` (`Store::drop_date`), its history holding them,
+/// as the shard log says at the time `now_ns`: if they still hold the `rows` its history does.
+/// Writes stamped on the date may commit after it was merged (proposed before midnight, under
+/// a leader that lost the lead before they did): then the date stays, and is merged again.
+fn apply_drop(
+    log: &Log,
+    date: Date,
+    rows: u64,
+    now_ns: i64,
+    index: u64,
+    flusher: &Flusher,
+) -> Result<(), Error> {
+    let key = date.to_string();
+    {
+        let mut guard = lock(&log.state);
+        let state = &mut *guard;
+        let held: u64 = state
+            .partitions
+            .iter()
+            .filter(|((day, _), _)| *day == key)
+            .map(|(_, partition)| partition.rows())
+            .sum();
+        if held != rows {
+            return Ok(());
+        }
+        // A keyed table's state must not depend on the date going: today's checkpoint holds it.
+        let today = Date::of_ns(now_ns).to_string();
+        ensure_checkpoint(state, &today, now_ns)?;
+        // A reader resuming from before the date's last batch would miss what goes.
+        let gone = state
+            .partitions
+            .iter()
+            .filter(|((day, stream), _)| *day == key && *stream != Stream::Checkpoint)
+            .filter_map(|(_, partition)| partition.last_order())
+            .map(|(lsn, _)| lsn)
+            .max()
+            .unwrap_or(0);
+        state.resumable_from = state.resumable_from.max(gone);
+        // The checkpoint is durable before the date it may be folded from goes: whichever
+        // process wrote it, it cannot be folded again once the date is gone.
+        if let Some(checkpoint) = state.partitions.get(&(today, Stream::Checkpoint)) {
+            checkpoint.sync_now(&state.root)?;
+        }
+    }
+    // The partition files hold everything up to the drop before the date goes, so no replay
+    // starts before it: one would fold today's keyed state again without the date. The date
+    // says first that it is going, at `index`: a process stopped before it went finishes on
+    // opening (`settle_drops`), the drop being past where its replay starts.
+    mark_drop(&log.state, &key, index)?;
+    flusher.flush_through(index)?;
+    let mut guard = lock(&log.state);
+    let state = &mut *guard;
+    forget_date(
+        &state.disk,
+        &state.dir,
+        &mut state.partitions,
+        &mut state.floors,
+        &key,
+    )
+}
+
 /// Takes up `entry`'s columns in its table's log, if they changed: segments written from now on
 /// hold them, and writers' rows are brought to them. Readers and writers already open keep
 /// their own.
@@ -1423,8 +1551,13 @@ struct Tables {
 }
 
 impl Tables {
-    /// Applies the write an entry holds (`apply`). Whether it was written.
-    fn apply(&mut self, entry: &Entry, stamped: &mut i64) -> Result<bool, Error> {
+    /// Carries out what an entry says (`apply`, `apply_drop`). Whether it wrote.
+    fn apply(
+        &mut self,
+        entry: &Entry,
+        stamped: &mut i64,
+        flusher: &Flusher,
+    ) -> Result<bool, Error> {
         if entry.get_entry_type() != EntryType::EntryNormal {
             return Err(Error::Corrupt(format!(
                 "the shard log holds a {:?} at index {}, which this version cannot apply",
@@ -1432,26 +1565,31 @@ impl Tables {
                 entry.index
             )));
         }
-        let logged = wal::decode(entry.index, &entry.data)
-            .map_err(|e| Error::Corrupt(format!("the shard log: {e}")))?;
-        *stamped = (*stamped).max(logged.ingest_ns);
-        let log = self.log_for(logged.table, &logged.shape)?;
-        apply(&log, logged)
+        match wal::decode(entry.index, &entry.data)
+            .map_err(|e| Error::Corrupt(format!("the shard log: {e}")))?
+        {
+            Command::Write(logged) => {
+                *stamped = (*stamped).max(logged.ingest_ns);
+                let log = self.log_for(logged.table, &logged.shape)?;
+                apply(&log, logged)
+            }
+            Command::Drop {
+                table,
+                date,
+                rows,
+                now_ns,
+            } => {
+                let log = self.open(table)?;
+                apply_drop(&log, date, rows, now_ns, entry.index, flusher).map(|()| false)
+            }
+        }
     }
 
     /// The log of `table`, whose write came in `shape`: opened if the table was created since
     /// this replica opened, its columns taken up if they changed since (§5.4), as the leader
     /// took them up when they did.
     fn log_for(&mut self, table: i64, shape: &Shape) -> Result<Arc<Log>, Error> {
-        let open = lock(&self.logs).get(&table).cloned();
-        let log = match open {
-            Some(log) => log,
-            None => {
-                // Created since: no partitions yet, and nothing of it applied.
-                let log = open_log(&self.disk, &self.root, self.entry(table)?, u64::MAX, 0)?;
-                lock(&self.logs).entry(table).or_insert(log).clone()
-            }
-        };
+        let log = self.open(table)?;
         if !self.known.iter().any(|(t, s)| *t == table && s == shape) {
             if lock(&log.state).entry.shape() != *shape {
                 adopt(&log, &self.entry(table)?)?;
@@ -1459,6 +1597,16 @@ impl Tables {
             self.known.push((table, shape.clone()));
         }
         Ok(log)
+    }
+
+    /// The log of `table`, opened if the table was created since this replica opened.
+    fn open(&mut self, table: i64) -> Result<Arc<Log>, Error> {
+        if let Some(log) = lock(&self.logs).get(&table) {
+            return Ok(log.clone());
+        }
+        // Created since: no partitions yet, and nothing of it applied.
+        let log = open_log(&self.disk, &self.root, self.entry(table)?, u64::MAX, 0)?;
+        Ok(lock(&self.logs).entry(table).or_insert(log).clone())
     }
 
     fn entry(&self, table: i64) -> Result<TableEntry, Error> {
@@ -1478,7 +1626,6 @@ impl Tables {
 /// it proposed, until their entries commit.
 struct Committer {
     node: RawNode<LogStore>,
-    wal: Wal,
     replica: Replica,
     clock: Clock,
     /// The last ingest time stamped or applied: each write's is above it, whatever the clock
@@ -1488,40 +1635,66 @@ struct Committer {
     tables: Tables,
     /// The last index applied to the partition files.
     applied: Arc<AtomicU64>,
+    /// What a drop flushes the partition files with before the date goes (`apply_drop`).
+    flusher: Arc<Flusher>,
+    /// The last entry applied, its index and term, locked while an entry is: a peer copying the
+    /// partition files reads them as of it (`snapshot`), and none changes them meanwhile.
+    position: Arc<Mutex<(u64, u64)>>,
     /// Writes proposed, in index order, until their entries commit.
     proposed: VecDeque<Proposed>,
-    /// Writes taken while earlier ones were uncommitted, proposed once those are applied.
+    /// Writes and drops taken while earlier ones were uncommitted, proposed once those are
+    /// applied.
     waiting: Vec<Submitted>,
+    drops: Vec<Dropping>,
     /// The schema messages of the columns written lately, so each is encoded once.
     schemas: Vec<(Shape, Vec<u8>)>,
     /// Messages to other replicas, until whoever carries them takes them.
     outbox: Vec<Message>,
+    /// The snapshot this replica must install (`snapshot`), once Raft has handed it one; it
+    /// then takes nothing more until reopened.
+    wanted: Option<SnapshotWanted>,
+    /// Whether the catalog says the shard has started (`Catalog::shard_started`); a replica
+    /// records it once it applies a committed entry, so a disk lost later is known as lost.
+    started: bool,
     /// Why the committer stopped taking writes: a failure to log or apply leaves what is
     /// durable in the log, to replay on the next open, and the partition files no longer
     /// following it.
     broken: Option<String>,
 }
 
-/// Writes proposed at `index` in `term`: written if the entry committed there is theirs.
+/// What was proposed at `index` in `term`: done if the entry committed there is it.
 struct Proposed {
     index: u64,
     term: u64,
-    unit: Unit,
+    what: Proposal,
+}
+
+enum Proposal {
+    Write(Unit),
+    Drop(Dropping),
+}
+
+impl Proposal {
+    fn answers(self) -> Vec<Answer> {
+        match self {
+            Proposal::Write(unit) => unit.answers,
+            Proposal::Drop(dropping) => vec![dropping.answer],
+        }
+    }
 }
 
 impl Committer {
-    /// Takes a group of writes to propose (`propose`); each is answered once its entry is
+    /// Takes writes and drops to propose (`propose`); each is answered once its entry is
     /// applied, or now if this replica cannot take it.
-    fn submit(&mut self, group: Vec<Submitted>) {
-        if let Some(why) = &self.broken {
-            for submitted in group {
-                submitted.answer.send(Err(stopped(why)));
-            }
-            return;
-        }
-        if !self.is_leader() {
-            for submitted in group {
-                submitted.answer.send(Err(self.not_leader()));
+    fn submit(&mut self, group: Vec<Submitted>, drops: Vec<Dropping>) {
+        let refused = match &self.broken {
+            Some(why) => Some(stopped(why)),
+            None => (!self.is_leader()).then(|| self.not_leader()),
+        };
+        if let Some(refused) = refused {
+            let answers = group.into_iter().map(|submitted| submitted.answer);
+            for answer in answers.chain(drops.into_iter().map(|dropping| dropping.answer)) {
+                answer.send(Err(Error::Busy(refused.to_string())));
             }
             return;
         }
@@ -1531,6 +1704,7 @@ impl Committer {
         } else {
             self.waiting.extend(group);
         }
+        self.drops.extend(drops);
         self.drive();
     }
 
@@ -1564,10 +1738,29 @@ impl Committer {
                 break;
             }
         }
-        if self.replica.is_alone() {
-            let applied = self.applied.load(Ordering::Acquire);
-            self.node.mut_store().compact(applied);
+        // In memory past what is applied: entries followers are still taking, up to
+        // `CACHE_BYTES`; one further behind reads them back from the log.
+        let applied = self.applied.load(Ordering::Acquire);
+        let keep = match self.followers_matched() {
+            Some(matched) if self.node.store().cache_bytes() <= CACHE_BYTES => applied.min(matched),
+            _ => applied,
+        };
+        self.node.mut_store().compact_cache(keep);
+    }
+
+    /// As leader of others, the last index every follower holds.
+    fn followers_matched(&self) -> Option<u64> {
+        if !self.is_leader() || self.replica.is_alone() {
+            return None;
         }
+        let id = self.replica.id;
+        self.node
+            .raft
+            .prs()
+            .iter()
+            .filter(|(peer, _)| **peer != id)
+            .map(|(_, progress)| progress.matched)
+            .min()
     }
 
     /// Proposes the writes waiting, stamped and merged (`merge`) as one group, if this replica
@@ -1575,7 +1768,7 @@ impl Committer {
     /// the tables hold, which entries not yet applied have not set. Whether it proposed.
     fn propose(&mut self) -> bool {
         let last = self.node.raft.raft_log.last_index();
-        if self.waiting.is_empty()
+        if (self.waiting.is_empty() && self.drops.is_empty())
             || !self.is_leader()
             || self.applied.load(Ordering::Acquire) != last
         {
@@ -1599,21 +1792,35 @@ impl Committer {
                     batch: &unit.batch,
                 })
             });
-            let proposed = data.and_then(|data| {
-                self.node
-                    .propose(Bytes::new(), data)
-                    .map_err(|_| self.not_leader())
-            });
-            match proposed {
-                Ok(()) => self.proposed.push_back(Proposed {
-                    index: self.node.raft.raft_log.last_index(),
-                    term: self.node.raft.term,
-                    unit,
-                }),
-                Err(e) => Answer::send_all(unit.answers, Err(e)),
-            }
+            self.offer(data, Proposal::Write(unit));
+        }
+        for dropping in std::mem::take(&mut self.drops) {
+            let data = wal::encode_drop(
+                dropping.table,
+                dropping.date,
+                dropping.rows,
+                dropping.now_ns,
+            );
+            self.offer(Ok(data), Proposal::Drop(dropping));
         }
         true
+    }
+
+    /// Proposes `data`, encoded for `what`, and keeps `what` until its entry commits.
+    fn offer(&mut self, data: Result<Bytes, Error>, what: Proposal) {
+        let proposed = data.and_then(|data| {
+            self.node
+                .propose(Bytes::new(), data)
+                .map_err(|_| self.not_leader())
+        });
+        match proposed {
+            Ok(()) => self.proposed.push_back(Proposed {
+                index: self.node.raft.raft_log.last_index(),
+                term: self.node.raft.term,
+                what,
+            }),
+            Err(e) => Answer::send_all(what.answers(), Err(e)),
+        }
     }
 
     /// The schema message of `shape`'s columns with their IDs.
@@ -1644,23 +1851,28 @@ impl Committer {
             self.step_down();
         }
         if !ready.snapshot().is_empty() {
-            // A leader sends one only for entries it no longer has, and every replica keeps
-            // them (`LogStore::snapshot`).
-            self.stop("Raft sent a snapshot, which this version cannot take".into());
+            self.want(ready.snapshot());
             return;
         }
-        self.outbox.extend(ready.take_messages());
+        let messages = ready.take_messages();
+        // A snapshot is its index and term: sent, it is done as far as Raft is concerned, and
+        // the follower goes back to taking entries once it has copied the files.
+        let snapshots: Vec<u64> = messages
+            .iter()
+            .filter(|m| m.get_msg_type() == MessageType::MsgSnapshot)
+            .map(|m| m.to)
+            .collect();
+        self.outbox.extend(messages);
         let entries = ready.take_entries();
         // Raft's state goes with entries, at no cost, and alone only when its term or vote
         // changed. A commit index alone is not written: Raft learns it again, and whatever was
         // applied was committed (`LogStore::new`), while writing it would cost every group a
         // second write after its fsync.
-        if !entries.is_empty() || ready.must_sync() {
-            if let Err(e) = self.wal.append(&entries, ready.hs()) {
-                self.stop(e.to_string());
-                return;
-            }
-            self.node.mut_store().append(&entries);
+        if (!entries.is_empty() || ready.must_sync())
+            && let Err(e) = self.node.mut_store().persist(&entries, ready.hs())
+        {
+            self.stop(e.to_string());
+            return;
         }
         self.outbox.extend(ready.take_persisted_messages());
         self.apply(ready.take_committed_entries());
@@ -1668,6 +1880,34 @@ impl Committer {
         self.outbox.extend(light.take_messages());
         self.apply(light.take_committed_entries());
         self.node.advance_apply();
+        for to in snapshots {
+            self.node.report_snapshot(to, SnapshotStatus::Finish);
+        }
+    }
+
+    /// Raft hands this follower a snapshot: it wants the donor's partition files, keeping its
+    /// own term and vote, and takes nothing more until they are installed and it is reopened.
+    fn want(&mut self, given: &Snapshot) {
+        let meta = given.get_metadata();
+        let donor = given
+            .data
+            .get(..8)
+            .map(|id| u64::from_le_bytes(id.try_into().expect("8 bytes")));
+        let Some(from) = donor else {
+            self.stop("a snapshot that names no replica to copy from".into());
+            return;
+        };
+        self.wanted = Some(SnapshotWanted {
+            from,
+            index: meta.index,
+            raft_term: self.node.raft.term,
+            vote: self.node.raft.vote,
+        });
+        self.stop(format!(
+            "replica {} is too far behind replica {from} to catch up from the log: it copies \
+             that replica's partition files, from index {}",
+            self.replica.id, meta.index
+        ));
     }
 
     /// Applies committed entries in order, and answers the writes this replica proposed in
@@ -1680,22 +1920,24 @@ impl Committer {
             let index = entry.index;
             while self.proposed.front().is_some_and(|mine| mine.index < index) {
                 let lost = self.proposed.pop_front().expect("seen");
-                Answer::send_all(lost.unit.answers, Err(self.lost()));
+                Answer::send_all(lost.what.answers(), Err(self.lost()));
             }
             let mine = match self.proposed.front() {
                 Some(mine) if mine.index == index => {
                     let mine = self.proposed.pop_front().expect("seen");
                     if mine.term == entry.term {
-                        Some(mine.unit)
+                        Some(mine.what)
                     } else {
-                        Answer::send_all(mine.unit.answers, Err(self.lost()));
+                        Answer::send_all(mine.what.answers(), Err(self.lost()));
                         None
                     }
                 }
                 _ => None,
             };
+            let held = self.position.clone();
+            let mut position = lock(&held);
             let (outcome, answers) = match mine {
-                Some(unit) => {
+                Some(Proposal::Write(unit)) => {
                     let Unit {
                         log,
                         table,
@@ -1721,15 +1963,39 @@ impl Committer {
                     };
                     (apply(&log, logged), answers)
                 }
+                Some(Proposal::Drop(dropping)) => {
+                    let dropped = apply_drop(
+                        &dropping.log,
+                        dropping.date,
+                        dropping.rows,
+                        dropping.now_ns,
+                        index,
+                        &self.flusher,
+                    );
+                    (dropped.map(|()| true), vec![dropping.answer])
+                }
                 // A leader's first entry of its term.
                 None if entry.data.is_empty() => (Ok(false), Vec::new()),
-                None => (self.tables.apply(&entry, &mut self.stamped), Vec::new()),
+                None => (
+                    self.tables.apply(&entry, &mut self.stamped, &self.flusher),
+                    Vec::new(),
+                ),
             };
             match &outcome {
-                Ok(_) => self.applied.store(index, Ordering::Release),
+                Ok(_) => {
+                    *position = (index, entry.term);
+                    self.applied.store(index, Ordering::Release);
+                }
                 Err(e) => self.stop(e.to_string()),
             }
+            drop(position);
             Answer::send_all(answers, outcome);
+        }
+        if !self.started && self.applied.load(Ordering::Acquire) > 0 {
+            // Not recorded (the catalog unreachable) is tried again on the next apply: until
+            // it is, a replica that loses its disk is not known to have, as before any commit.
+            let branch = &self.tables.branch;
+            self.started = lock(&self.tables.catalog).start_shard(branch).is_ok();
         }
     }
 
@@ -1737,33 +2003,42 @@ impl Committer {
     /// never learn, and those waiting are for the leader.
     fn step_down(&mut self) {
         for mine in std::mem::take(&mut self.proposed) {
-            Answer::send_all(mine.unit.answers, Err(self.lost()));
+            Answer::send_all(mine.what.answers(), Err(self.lost()));
         }
         for submitted in std::mem::take(&mut self.waiting) {
             submitted.answer.send(Err(self.not_leader()));
+        }
+        for dropping in std::mem::take(&mut self.drops) {
+            dropping.answer.send(Err(self.not_leader()));
         }
     }
 
     /// Stops taking writes, for `why`, failing those taken.
     fn stop(&mut self, why: String) {
         for mine in std::mem::take(&mut self.proposed) {
-            Answer::send_all(mine.unit.answers, Err(stopped(&why)));
+            Answer::send_all(mine.what.answers(), Err(stopped(&why)));
         }
         for submitted in std::mem::take(&mut self.waiting) {
             submitted.answer.send(Err(stopped(&why)));
         }
+        for dropping in std::mem::take(&mut self.drops) {
+            dropping.answer.send(Err(stopped(&why)));
+        }
         self.broken = Some(why);
     }
 
-    /// Forgets the log's segments wholly below `flushed`: their files. Only a shard of one's,
-    /// for now: a replica keeps its whole log for the others, until one can catch up from a
-    /// peer's partition files instead (`LogStore::snapshot`).
+    /// Deletes what the log need not keep (`LogStore::trim`), their files: for a shard of one,
+    /// whatever the partition files hold; for a replica, what every follower holds (as their
+    /// leader), and past `LogLimits::retain_bytes` of it what one far behind would need, which
+    /// catches up from a peer's partition files instead.
     fn trim(&mut self, flushed: u64) -> Vec<PathBuf> {
-        if self.replica.is_alone() {
-            self.wal.trim(flushed)
+        let needed = if self.replica.is_alone() {
+            flushed
         } else {
-            Vec::new()
-        }
+            self.followers_matched().unwrap_or(0)
+        };
+        let retain = self.replica.limits.retain_bytes;
+        self.node.mut_store().trim(flushed, needed, retain)
     }
 
     fn not_leader(&self) -> Error {
@@ -1804,6 +2079,7 @@ fn commit_every(mut committer: Committer, requests: &Receiver<Request>) {
         };
         let gather_until = Instant::now() + GATHER;
         let mut group = Vec::new();
+        let mut drops = Vec::new();
         let mut bytes = 0;
         let mut next = Some(first);
         while let Some(request) = next.take() {
@@ -1812,6 +2088,7 @@ fn commit_every(mut committer: Committer, requests: &Receiver<Request>) {
                     bytes += submitted.batch.get_array_memory_size();
                     group.push(submitted);
                 }
+                Request::Drop(dropping) => drops.push(dropping),
                 Request::Trim(flushed, reply) => {
                     let _ = reply.send(committer.trim(flushed));
                 }
@@ -1826,9 +2103,9 @@ fn commit_every(mut committer: Committer, requests: &Receiver<Request>) {
                 });
             }
         }
-        if !group.is_empty() {
-            last_group = group.len();
-            committer.submit(group);
+        if !group.is_empty() || !drops.is_empty() {
+            last_group = group.len().max(1);
+            committer.submit(group, drops);
         }
     }
 }
@@ -2008,6 +2285,12 @@ impl Flusher {
         let flushed = self.sync_and_record();
         *failed = flushed.is_err();
         flushed
+    }
+
+    /// Flushes, recording that the files hold everything up to `index`, which is applied.
+    fn flush_through(&self, index: u64) -> Result<(), Error> {
+        self.applied.store(index, Ordering::Release);
+        self.flush().map(drop)
     }
 
     fn sync_and_record(&self) -> Result<u64, Error> {
@@ -2279,6 +2562,95 @@ fn write_floors(disk: &DiskRef, dir: &Path, floors: &HashMap<SourceId, u64>) -> 
     disk.sync_dir(dir).map_err(|e| Error::io(dir, e))
 }
 
+/// In a date's directory, while it is being dropped: the drop's index (u64, little-endian).
+const DROP_MARK: &str = "@drop";
+const DROP_MARK_NEW: &str = "@drop.new";
+
+/// Says durably that `key`, a date of `log`, is being dropped by the entry at `index`.
+fn mark_drop(log: &Mutex<TableLog>, key: &str, index: u64) -> Result<(), Error> {
+    let state = lock(log);
+    let dir = state.dir.join(key);
+    let staged = dir.join(DROP_MARK_NEW);
+    let mut file = state
+        .disk
+        .create(&staged, false)
+        .map_err(|e| Error::io(&staged, e))?;
+    file.write_all(&index.to_le_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|e| Error::io(&staged, e))?;
+    let path = dir.join(DROP_MARK);
+    state
+        .disk
+        .rename(&staged, &path)
+        .map_err(|e| Error::io(&path, e))?;
+    state.disk.sync_dir(&dir).map_err(|e| Error::io(&dir, e))
+}
+
+/// Settles the drops of a table's dates (`mark_drop`) that a process stopped in: one the
+/// partition files hold the log through (`flushed`) is past where the replay starts, so its
+/// date is to be forgotten (`forget_date`), which it returns; one they do not is replayed,
+/// and its mark goes.
+fn settle_drops(disk: &DiskRef, dir: &Path, flushed: u64) -> Result<Vec<String>, Error> {
+    let mut forgotten = Vec::new();
+    let Ok(dates) = disk.list(dir) else {
+        return Ok(forgotten);
+    };
+    for date in dates {
+        let day = dir.join(&date);
+        let mark = day.join(DROP_MARK);
+        if Date::parse(&date).is_err() || !disk.exists(&mark) {
+            continue;
+        }
+        let bytes = disk.read(&mark).map_err(|e| Error::io(&mark, e))?;
+        let index = <[u8; 8]>::try_from(bytes.as_slice())
+            .map(u64::from_le_bytes)
+            .map_err(|_| Error::Corrupt(format!("{}: not a drop's index", mark.display())))?;
+        if index <= flushed {
+            forgotten.push(date);
+        } else {
+            disk.remove_file(&mark)
+                .and_then(|()| disk.sync_dir(&day))
+                .map_err(|e| Error::io(&mark, e))?;
+        }
+    }
+    Ok(forgotten)
+}
+
+/// Forgets `key`, a dropped date of the table in `dir`. Each source's last seq on it outlives
+/// it, durably first: `source_last` must not go back, or a resend of the date's writes would
+/// be written again. Only then, since a replay of the date's writes takes those at or below
+/// the floors for resends, and so only once no replay can start before the drop.
+fn forget_date(
+    disk: &DiskRef,
+    dir: &Path,
+    partitions: &mut BTreeMap<(String, Stream), Partition>,
+    floors: &mut HashMap<SourceId, u64>,
+    key: &str,
+) -> Result<(), Error> {
+    let mut raised = floors.clone();
+    for ((day, stream), partition) in partitions.iter() {
+        if let (true, Stream::Source(source), Some(last)) =
+            (day == key, stream, partition.last_seq())
+        {
+            let floor = raised.entry(source.clone()).or_insert(last);
+            *floor = (*floor).max(last);
+        }
+    }
+    if raised != *floors {
+        write_floors(disk, dir, &raised)?;
+        *floors = raised;
+    }
+    partitions.retain(|(day, _), _| day != key);
+    let day = dir.join(key);
+    match disk.remove_dir_all(&day) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::io(&day, e)),
+    }
+    // Gone durably: a power loss does not bring the date back.
+    disk.sync_dir(dir).map_err(|e| Error::io(dir, e))
+}
+
 /// Creates `root` if needed and takes its lock: one process owns a store directory.
 fn lock_dir(root: &Path) -> Result<File, Error> {
     fs::create_dir_all(root).map_err(|e| Error::io(root, e))?;
@@ -2352,6 +2724,7 @@ fn partition_dirs(disk: &DiskRef, dir: &Path) -> Result<Vec<(String, Stream)>, E
         for name in disk.list(&path).map_err(|e| Error::io(&path, e))? {
             let stream = match name.as_str() {
                 "@checkpoint" => Stream::Checkpoint,
+                DROP_MARK | DROP_MARK_NEW => continue,
                 name => Stream::Source(SourceId::parse(name)?),
             };
             found.push((date.clone(), stream));
@@ -2550,7 +2923,7 @@ fn names(schema: &Schema) -> String {
         .join(", ")
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .expect("kermodes store poisoned by an earlier panic")

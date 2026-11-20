@@ -15,6 +15,7 @@ mod pending;
 mod replica;
 mod shape;
 pub mod sim;
+mod snapshot;
 mod store;
 mod wal;
 
@@ -25,8 +26,9 @@ pub use catalog::{Garbage, HistoryCommit, HistoryDate, HistoryFile, TableEntry};
 pub use names::{Date, SourceId, TableName};
 pub use partition::Stamp;
 pub use pending::{Answer, IN_FLIGHT_BYTES, InFlight, Pending};
-pub use replica::Replica;
+pub use replica::{LogLimits, Replica};
 pub use shape::{ColumnId, Shape, column, spec, widens};
+pub use snapshot::{SnapshotSource, SnapshotWanted};
 pub use store::{
     BRANCH, Clock, Failed, Pace, Store, Subscriber, Writer, conform, keys_only, system_clock,
 };

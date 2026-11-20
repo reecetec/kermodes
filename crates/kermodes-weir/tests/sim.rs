@@ -11,7 +11,8 @@
 //! Whenever they come to agree, every replica holds exactly the writes acknowledged, each once
 //! and in order.
 //!
-//! Each test runs seeds 1 to 64; `KERMODES_SIM_SEEDS=N` runs 1 to N, for a longer search.
+//! Each test runs seeds 1 to 64; `KERMODES_SIM_SEEDS=N` runs 1 to N, for a longer search, and
+//! `KERMODES_SIM_SEED=N` only seed N, to replay a failure.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -22,8 +23,8 @@ use std::sync::{Arc, Mutex};
 use arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Int64Type, Schema};
 use kermodes_weir::{
-    Change, Clock, Date, HistoryCommit, HistoryDate, HistoryFile, Pending, Replica, SourceId,
-    Store, TableName, Writer, sim,
+    Change, Clock, Date, HistoryCommit, HistoryDate, HistoryFile, LogLimits, Pending, Replica,
+    SourceId, Store, TableName, Writer, sim,
 };
 
 const SOURCES: usize = 3;
@@ -536,6 +537,16 @@ fn send(
 
 const REPLICAS: usize = 3;
 
+/// Small enough that segments roll every few dozen writes. On even seeds a replica keeps no log
+/// its partition files hold, so one behind catches up from a peer's files; on odd seeds it keeps
+/// some, so one a little behind catches up from the log, read back from disk.
+fn limits(seed: u64) -> LogLimits {
+    LogLimits {
+        segment_bytes: 4 << 10,
+        retain_bytes: if seed.is_multiple_of(2) { 0 } else { 64 << 10 },
+    }
+}
+
 /// A shard's replicas, each on its own simulated disk, and the network between them.
 struct Shard {
     dir: PathBuf,
@@ -551,6 +562,8 @@ struct Shard {
     /// The writers, one per source and table, on the replica (its index) that led when they
     /// opened.
     writers: Option<(usize, Vec<[Writer; 2]>)>,
+    /// Snapshots installed so far: every other one is cut short by its process dying.
+    installs: u64,
 }
 
 impl Shard {
@@ -573,6 +586,7 @@ impl Shard {
             wire: Vec::new(),
             cut: None,
             writers: None,
+            installs: 0,
         };
         for i in 0..REPLICAS {
             shard.start(i);
@@ -591,14 +605,7 @@ impl Shard {
         let disk = &self.disks[i];
         let store = loop {
             let crashes = disk.crashes();
-            let replica = Replica {
-                id: i as u64 + 1,
-                voters: (1..=REPLICAS as u64).collect(),
-                seed: Some(self.seed * 8 + i as u64),
-            };
-            let root = self.dir.join(format!("r{}", i + 1));
-            let catalog = self.dir.join("catalog.sqlite");
-            match Store::open_replica(&root, disk.handle(), self.clock.clone(), &catalog, replica) {
+            match self.open(i) {
                 Ok(store) => break store,
                 Err(_) if disk.crashes() > crashes => continue,
                 Err(e) => panic!("seed {}: replica {}: reopening: {e}", self.seed, i + 1),
@@ -606,6 +613,25 @@ impl Shard {
         };
         disk.disarm();
         self.stores[i] = Some(store);
+    }
+
+    /// Opens replica `i`'s store, as its process does when it starts.
+    fn open(&self, i: usize) -> Result<Store, kermodes_weir::Error> {
+        let replica = Replica {
+            id: i as u64 + 1,
+            voters: (1..=REPLICAS as u64).collect(),
+            seed: Some(self.seed * 8 + i as u64),
+            limits: limits(self.seed),
+        };
+        let root = self.dir.join(format!("r{}", i + 1));
+        let catalog = self.dir.join("catalog.sqlite");
+        Store::open_replica(
+            &root,
+            self.disks[i].handle(),
+            self.clock.clone(),
+            &catalog,
+            replica,
+        )
     }
 
     /// Replica `i`'s process is gone: its store first, whose closing answers every write it
@@ -658,6 +684,41 @@ impl Shard {
         }
     }
 
+    /// Every running replica too far behind the log to catch up from it copies the partition
+    /// files of the replica its leader named, if that one is running, and starts again. One
+    /// whose copy is cut short, or with no one to copy from, starts again as it was, and its
+    /// leader hands it a snapshot again.
+    fn catch_up(&mut self) {
+        for i in 0..REPLICAS {
+            let Some(wanted) = self.stores[i].as_ref().and_then(Store::snapshot_wanted) else {
+                continue;
+            };
+            self.stop(i);
+            let root = self.dir.join(format!("r{}", i + 1));
+            if let Some(from) = &self.stores[wanted.from as usize - 1] {
+                // Every other copy has its process die partway, at any of its operations
+                // that change the disk, the swap's included (one with fewer runs whole).
+                self.installs += 1;
+                if self.installs.is_multiple_of(2) {
+                    self.disks[i].kill_after(self.installs * 37 % 256);
+                }
+                let crashes = self.disks[i].crashes();
+                let disk = self.disks[i].handle();
+                let installed =
+                    Store::install_snapshot(&root, disk, limits(self.seed), &wanted, from);
+                assert!(
+                    installed.is_ok() || self.disks[i].crashes() > crashes,
+                    "seed {}: replica {} installing from {}: {installed:?}",
+                    self.seed,
+                    i + 1,
+                    wanted.from
+                );
+            }
+            self.disks[i].disarm();
+            self.start(i);
+        }
+    }
+
     /// Every replica up and connected until they agree: one leader, every replica applied as
     /// far as it, for rounds on end, and every write sent answered. The leader.
     fn agree(&mut self, sent: &[Sent]) -> usize {
@@ -675,6 +736,7 @@ impl Shard {
                 self.collect(i);
             }
             self.tick();
+            self.catch_up();
             while !self.wire.is_empty() {
                 let message = self.wire.remove(0);
                 self.deliver(message);
@@ -733,9 +795,74 @@ impl Shard {
         }
         model.sent = model.acked;
         self.writers = Some((leader, writers));
+        // As the merger would: a date written to after it was merged is merged again.
+        self.merge(model);
+        let held = |store: &Store| {
+            let ticks = store.past_dates(&ticks()).unwrap();
+            (ticks, store.past_dates(&quotes()).unwrap())
+        };
+        let first = held(self.stores[0].as_ref().unwrap());
         for (i, store) in self.stores.iter().enumerate() {
+            let store = store.as_ref().unwrap();
             let when = format!("replica {} once agreed", i + 1);
-            check(store.as_ref().unwrap(), model, self.seed, &when);
+            check(store, model, self.seed, &when);
+            // Every replica dropped the same dates, where its log said to.
+            assert_eq!(held(store), first, "seed {}: {when}: dates held", self.seed);
+        }
+    }
+
+    /// Merges each table's past dates on the writers' replica, as the merger does: a date whose
+    /// rows in weir are not what its history holds (not merged yet, or written to since, by
+    /// writes stamped on it that committed late) is merged, replacing what history held of it
+    /// (the catalog told so; the files are not the point here). Then weir's copy is dropped,
+    /// which every replica does once the drop commits, if the date still holds those rows.
+    fn merge(&self, model: &mut Model) {
+        let (at, _) = self.writers.as_ref().expect("resolved");
+        let Some(store) = &self.stores[*at] else {
+            return;
+        };
+        for (table, name) in [ticks(), quotes()].iter().enumerate() {
+            let history = store.history(name).unwrap();
+            for date in store.past_dates(name).unwrap() {
+                let rows = store.date_rows(name, date).unwrap().0;
+                let held = history.iter().find(|held| held.date == date);
+                if held.map(|held| held.rows) != Some(rows) {
+                    if table == 0 {
+                        let mut values: [Vec<i64>; SOURCES] = Default::default();
+                        store
+                            .read_date(name, date, &mut |batch, _| {
+                                ticks_of(&batch, &mut values);
+                                Ok(())
+                            })
+                            .unwrap();
+                        model.history.insert(date, values);
+                    }
+                    let file = format!("{date}-{rows}.parquet");
+                    let commit = HistoryCommit {
+                        written: vec![date],
+                        replaced: held.map(|held| held.file.clone()).into_iter().collect(),
+                        files: vec![HistoryFile {
+                            name: file.clone(),
+                            first: date,
+                            last: date,
+                            rows,
+                            bytes: 0,
+                        }],
+                        dates: vec![HistoryDate {
+                            date,
+                            file,
+                            rows,
+                            bytes: 0,
+                        }],
+                    };
+                    store.commit_history(name, &commit).unwrap();
+                    model.merged.insert((table, date));
+                }
+                match store.drop_date(name, date) {
+                    Ok(()) | Err(kermodes_weir::Error::Busy(_) | kermodes_weir::Error::Io(_)) => {}
+                    Err(e) => panic!("seed {}: dropping {name} on {date}: {e}", self.seed),
+                }
+            }
         }
     }
 }
@@ -855,6 +982,8 @@ fn simulate_shard(seed: u64, actions: usize) -> (Vec<u64>, Vec<u64>) {
             94..=95 => shard.disks[victim].kill(),
             // The power goes between two operations.
             96 => shard.disks[victim].power_loss(),
+            // Past dates merged, and weir's copy dropped.
+            97 => shard.merge(&mut model),
             // The replicas that are down start again.
             _ => {
                 for i in 0..REPLICAS {
@@ -865,6 +994,7 @@ fn simulate_shard(seed: u64, actions: usize) -> (Vec<u64>, Vec<u64>) {
             }
         }
         shard.reap(&before);
+        shard.catch_up();
         let maybes = answers(&mut sent, &mut model, &mut trace, seed);
         if !maybes.is_empty() || shard.writers.is_none() {
             shard.resolve(maybes, &mut sent, &mut model, &mut trace);
@@ -878,13 +1008,31 @@ fn simulate_shard(seed: u64, actions: usize) -> (Vec<u64>, Vec<u64>) {
     (fingerprints, trace)
 }
 
+/// A replica whose disk was lost or replaced, in a shard a leader has committed in, does not
+/// open: its vote could elect a leader without entries it helped commit.
+#[test]
+fn a_replica_that_lost_its_disk_does_not_open() {
+    let dir = TempDir::new();
+    let clock: Clock = Arc::new(|| 1_767_225_540_000_000_000);
+    let mut shard = Shard::new(&dir.0, 1, clock);
+    let (mut sent, mut model, mut trace) = (Vec::new(), Model::default(), Vec::new());
+    shard.resolve(Vec::new(), &mut sent, &mut model, &mut trace);
+    shard.stop(1);
+    shard.disks[1] = sim::Disk::new(99, 0, &dir.0.join("r2"));
+    assert!(matches!(shard.open(1), Err(kermodes_weir::Error::Io(_))));
+}
+
 /// The seeds each test runs (module docs).
 fn seeds() -> std::ops::RangeInclusive<u64> {
-    let last = std::env::var("KERMODES_SIM_SEEDS")
-        .ok()
-        .map(|n| n.parse().expect("KERMODES_SIM_SEEDS is a number"))
-        .unwrap_or(64);
-    1..=last
+    let number = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|n| n.parse::<u64>().expect("a seed number"))
+    };
+    if let Some(seed) = number("KERMODES_SIM_SEED") {
+        return seed..=seed;
+    }
+    1..=number("KERMODES_SIM_SEEDS").unwrap_or(64)
 }
 
 #[test]

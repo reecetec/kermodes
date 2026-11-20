@@ -305,6 +305,23 @@ impl Catalog {
         }
     }
 
+    /// Whether a leader of `branch`'s shard has committed (`start_shard`): from then on, a
+    /// replica that finds its log empty has lost it, and whom it voted for with it.
+    pub(crate) fn shard_started(&mut self, branch: &str) -> Result<bool, Error> {
+        match self {
+            Self::Sqlite(c) => c.shard_started(branch),
+            Self::Postgres(c) => c.shard_started(branch),
+        }
+    }
+
+    /// Records that a leader of `branch`'s shard has committed (`shard_started`).
+    pub(crate) fn start_shard(&mut self, branch: &str) -> Result<(), Error> {
+        match self {
+            Self::Sqlite(c) => c.start_shard(branch),
+            Self::Postgres(c) => c.start_shard(branch),
+        }
+    }
+
     /// Every date of a table's history, by date then file.
     pub(crate) fn history(&mut self, table_id: i64) -> Result<Vec<HistoryDate>, Error> {
         match self {
@@ -412,6 +429,11 @@ fn check_commit(
 
 fn location(branch: &str, name: &TableName, id: i64) -> String {
     format!("{branch}/{}/{}.{id}", name.namespace(), name.table())
+}
+
+/// The key in the catalog's metadata that says `branch`'s shard has started (`shard_started`).
+fn started_key(branch: &str) -> String {
+    format!("shard started: {branch}")
 }
 
 /// Refuses a definition whose key or sort is not the table's: those are fixed when it is
