@@ -253,13 +253,24 @@ impl Storage for LogStore {
     }
 }
 
+/// The replica a leader `me` hands its lead to (`Store::hand_over`), of the `voters` (ID, the
+/// last index its log is known to match the leader's): the one furthest along, which needs the
+/// least sent before it can stand, the lowest ID among equals. None without another voter.
+pub(crate) fn transferee(me: u64, voters: impl IntoIterator<Item = (u64, u64)>) -> Option<u64> {
+    voters
+        .into_iter()
+        .filter(|&(id, _)| id != me)
+        .max_by_key(|&(id, matched)| (matched, std::cmp::Reverse(id)))
+        .map(|(id, _)| id)
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
     use raft::Storage;
     use raft::eraftpb::Entry;
 
-    use super::{LogStore, Replica};
+    use super::{LogStore, Replica, transferee};
     use crate::Error;
     use crate::disk::real;
     use crate::wal::{Logged, Wal};
@@ -305,5 +316,19 @@ mod tests {
         assert_eq!(store.first_index().unwrap(), 11);
         assert_eq!(store.term(10).unwrap(), 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_lead_goes_to_the_voter_furthest_along() {
+        let cases = [
+            (vec![(1, 90), (2, 80), (3, 85)], Some(3)),
+            (vec![(1, 90), (2, 85), (3, 85)], Some(2)),
+            (vec![(1, 90), (3, 0)], Some(3)),
+            (vec![(1, 90)], None),
+            (vec![], None),
+        ];
+        for (voters, chosen) in cases {
+            assert_eq!(transferee(1, voters.iter().copied()), chosen, "{voters:?}");
+        }
     }
 }

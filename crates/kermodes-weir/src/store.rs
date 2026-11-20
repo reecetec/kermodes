@@ -42,7 +42,7 @@ use crate::disk::{self, DiskRef};
 use crate::keyed::Fold;
 use crate::partition::{Partition, Stamp, ToSync, Written, in_order, schema_header};
 use crate::pending::{Answer, InFlight, Pending};
-use crate::replica::{LogLimits, LogStore, Replica};
+use crate::replica::{LogLimits, LogStore, Replica, transferee};
 use crate::shape::Shape;
 use crate::snapshot::{self, SnapshotSource, SnapshotWanted};
 use crate::wal::{self, Append, Command, Logged, Wal};
@@ -205,6 +205,8 @@ type Stop = (Mutex<bool>, Condvar);
 struct Shard {
     /// The leader's Raft ID, as this replica knows it: 0 while it knows of none.
     leader: AtomicU64,
+    /// The shard log's commit index, as this replica knows it (`Store::caught_up`).
+    committed: AtomicU64,
     /// The snapshot this replica must install (`Store::snapshot_wanted`).
     wanted: Mutex<Option<SnapshotWanted>>,
 }
@@ -265,6 +267,8 @@ enum Request {
     Receive(Message),
     /// One tick of Raft's clock (`TICK`).
     Tick,
+    /// Hand the lead to another replica (`Store::hand_over`).
+    HandOver,
 }
 
 /// A past date of a table to drop, its history holding it whole, and where the outcome goes.
@@ -689,7 +693,11 @@ impl Store {
                 Request::Write(submitted) => group.push(submitted),
                 Request::Drop(dropping) => drops.push(dropping),
                 // Asked only of a committer thread.
-                Request::Trim(..) | Request::Stop | Request::Receive(_) | Request::Tick => {}
+                Request::Trim(..)
+                | Request::Stop
+                | Request::Receive(_)
+                | Request::Tick
+                | Request::HandOver => {}
             }
         }
         let count = group.len() + drops.len();
@@ -705,6 +713,19 @@ impl Store {
     pub fn tick(&self) {
         if let Driver::Stepped { committer, .. } = &self.driver {
             lock(committer).tick();
+        }
+    }
+
+    /// As leader, hands the lead to the replica that holds the most of the log, before this
+    /// one stops: Raft sends it what it lacks and has it stand at once, so writers wait for a
+    /// round trip instead of an election. Writes are refused meanwhile, as by a replica that
+    /// does not lead. Done once this replica no longer leads (`is_leader`); Raft gives up after
+    /// an election timeout.
+    pub fn hand_over(&self) {
+        match &self.driver {
+            Driver::Stepped { committer, .. } => lock(committer).hand_over(),
+            // Gone with the committer: the store is closing, and there is nothing to hand.
+            Driver::Threads { .. } => drop(self.requests.send(Request::HandOver)),
         }
     }
 
@@ -739,6 +760,14 @@ impl Store {
     /// Whether this replica leads its shard: only the leader takes writes.
     pub fn is_leader(&self) -> bool {
         self.shard.leader.load(Ordering::Acquire) == self.replica_id
+    }
+
+    /// Whether this replica is ready to serve as its shard's: it knows a leader and has applied
+    /// the log as far as it knows it committed. A rollout takes the next replica down only
+    /// once this one is.
+    pub fn caught_up(&self) -> bool {
+        self.shard.leader.load(Ordering::Acquire) != 0
+            && self.applied() >= self.shard.committed.load(Ordering::Acquire)
     }
 
     /// The snapshot this replica must install before it can go on, when it is too far behind
@@ -1842,6 +1871,9 @@ impl Committer {
         };
         self.node.mut_store().compact_cache(keep);
         self.shard
+            .committed
+            .store(self.node.raft.raft_log.committed, Ordering::Release);
+        self.shard
             .leader
             .store(self.node.raft.leader_id, Ordering::Release);
     }
@@ -1859,6 +1891,32 @@ impl Committer {
             .filter(|(peer, _)| **peer != id)
             .map(|(_, progress)| progress.matched)
             .min()
+    }
+
+    /// As leader of others, hands the lead to the voter holding the most of the log
+    /// (`Store::hand_over`), of those heard from lately. Asked again while a hand-over is under
+    /// way, it tries another: the one it was handing to may have gone since it last answered.
+    fn hand_over(&mut self) {
+        if self.broken.is_some() || !self.is_leader() {
+            return;
+        }
+        let raft = &self.node.raft;
+        let voters = raft.prs().conf().voters();
+        let to = transferee(
+            self.replica.id,
+            raft.prs()
+                .iter()
+                .filter(|(id, progress)| {
+                    voters.contains(**id)
+                        && progress.recent_active
+                        && raft.lead_transferee != Some(**id)
+                })
+                .map(|(id, progress)| (*id, progress.matched)),
+        );
+        if let Some(to) = to {
+            self.node.transfer_leader(to);
+            self.drive();
+        }
     }
 
     /// Proposes the writes waiting, stamped and merged (`merge`) as one group, if this replica
@@ -2145,11 +2203,17 @@ impl Committer {
 
     fn not_leader(&self) -> Error {
         let id = self.replica.id;
-        Error::NotLeader(match self.node.raft.leader_id {
-            raft::INVALID_ID => {
+        let raft = &self.node.raft;
+        Error::NotLeader(match (raft.leader_id, raft.lead_transferee) {
+            (raft::INVALID_ID, _) => {
                 format!("weir replica {id} does not lead its shard, and knows of no leader yet")
             }
-            leader => format!("weir replica {id} does not lead its shard: replica {leader} does"),
+            (leader, Some(to)) if leader == id => {
+                format!("weir replica {id} is handing the lead of its shard to replica {to}")
+            }
+            (leader, _) => {
+                format!("weir replica {id} does not lead its shard: replica {leader} does")
+            }
         })
     }
 
@@ -2197,6 +2261,7 @@ fn commit_every(mut committer: Committer, requests: &Receiver<Request>) {
                 Request::Stop => stop = true,
                 Request::Receive(message) => committer.receive(message),
                 Request::Tick => committer.tick(),
+                Request::HandOver => committer.hand_over(),
             }
             if !stop && bytes < GROUP_BYTES {
                 next = requests.try_recv().ok().or_else(|| {

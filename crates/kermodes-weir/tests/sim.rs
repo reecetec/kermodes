@@ -858,8 +858,15 @@ impl Shard {
                     store.commit_history(name, &commit).unwrap();
                     model.merged.insert((table, date));
                 }
+                // Refused for now (the lead is being handed over, or lost): the next merge
+                // drops it, as the merger's client tries the next replica.
                 match store.drop_date(name, date) {
-                    Ok(()) | Err(kermodes_weir::Error::Busy(_) | kermodes_weir::Error::Io(_)) => {}
+                    Ok(())
+                    | Err(
+                        kermodes_weir::Error::Busy(_)
+                        | kermodes_weir::Error::Io(_)
+                        | kermodes_weir::Error::NotLeader(_),
+                    ) => {}
                     Err(e) => panic!("seed {}: dropping {name} on {date}: {e}", self.seed),
                 }
             }
@@ -958,7 +965,14 @@ fn simulate_shard(seed: u64, actions: usize) -> (Vec<u64>, Vec<u64>) {
                     }
                 }
             }
-            75..=86 => shard.tick(),
+            75..=85 => shard.tick(),
+            // The leader hands over its lead, as before a planned restart.
+            86 => {
+                if let Some(store) = &shard.stores[victim] {
+                    store.hand_over();
+                    shard.collect(victim);
+                }
+            }
             // A replica is cut off from the others, or the network heals.
             87..=88 => shard.cut = (victim > 0).then_some(victim as u64),
             89..=91 => {
@@ -1020,6 +1034,36 @@ fn a_replica_that_lost_its_disk_does_not_open() {
     shard.stop(1);
     shard.disks[1] = sim::Disk::new(99, 0, &dir.0.join("r2"));
     assert!(matches!(shard.open(1), Err(kermodes_weir::Error::Io(_))));
+}
+
+/// A leader hands its lead to another replica without an election: no tick passes, so none
+/// can time out, and another replica leads once the messages arrive.
+#[test]
+fn a_leader_hands_over_its_lead() {
+    let dir = TempDir::new();
+    let clock: Clock = Arc::new(|| 1_767_225_540_000_000_000);
+    let mut shard = Shard::new(&dir.0, 1, clock, REPLICAS);
+    let (mut sent, mut model, mut trace) = (Vec::new(), Model::default(), Vec::new());
+    shard.resolve(Vec::new(), &mut sent, &mut model, &mut trace);
+    let (was, _) = shard.writers.as_ref().expect("resolved");
+    let was = *was;
+    shard.stores[was].as_ref().unwrap().hand_over();
+    shard.collect(was);
+    for _ in 0..20 {
+        while !shard.wire.is_empty() {
+            let message = shard.wire.remove(0);
+            shard.deliver(message);
+        }
+        for i in 0..REPLICAS {
+            shard.stores[i].as_ref().unwrap().step();
+            shard.collect(i);
+        }
+    }
+    let leaders: Vec<usize> = (0..REPLICAS)
+        .filter(|&i| shard.stores[i].as_ref().unwrap().is_leader())
+        .collect();
+    assert_eq!(leaders.len(), 1, "{leaders:?}");
+    assert_ne!(leaders[0], was);
 }
 
 /// A replica that never had a log joins its shard however late, the others having elected a

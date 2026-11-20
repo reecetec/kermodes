@@ -25,12 +25,48 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status, Streaming};
+use tonic_health::pb::health_server::{Health, HealthServer};
+use tonic_health::pb::{HealthCheckRequest, HealthCheckResponse, health_check_response};
 
 use crate::{
     CAUGHT_UP, MARKS_CAUGHT_UP, columns_json, commit_from_json, garbage_from_json, garbage_json,
     history_date_json, history_file_json, names_from_json, schema_from_json, stamp_metadata,
     status, unframe_messages,
 };
+
+/// The readiness Kubernetes asks of a weir replica (gRPC health's `Check`): serving once it has
+/// caught up with its shard (`Store::caught_up`), so a rollout restarts the next replica only
+/// then.
+struct Ready {
+    store: Arc<Store>,
+}
+
+#[tonic::async_trait]
+impl Health for Ready {
+    async fn check(
+        &self,
+        _: Request<HealthCheckRequest>,
+    ) -> Result<Response<HealthCheckResponse>, Status> {
+        let status = if self.store.caught_up() {
+            health_check_response::ServingStatus::Serving
+        } else {
+            health_check_response::ServingStatus::NotServing
+        };
+        Ok(Response::new(HealthCheckResponse {
+            status: status as i32,
+        }))
+    }
+
+    type WatchStream =
+        Pin<Box<dyn futures::Stream<Item = Result<HealthCheckResponse, Status>> + Send>>;
+
+    async fn watch(
+        &self,
+        _: Request<HealthCheckRequest>,
+    ) -> Result<Response<Self::WatchStream>, Status> {
+        Err(Status::unimplemented("ask with Check"))
+    }
+}
 
 /// Bytes queued for one reader while it catches up: the replay waits for the reader past this,
 /// so a day of any size costs about this much of the server's memory per reader.
@@ -60,6 +96,9 @@ pub fn serve(store: Arc<Store>, addr: SocketAddr) -> std::io::Result<Server> {
     let (shutdown, stopped) = oneshot::channel::<()>();
     // A write's batch is one message; the rest of the message (its descriptor, sequence number,
     // and protobuf framing) takes far less than the headroom.
+    let ready = HealthServer::new(Ready {
+        store: store.clone(),
+    });
     let service = FlightServiceServer::new(Service { store })
         .max_decoding_message_size(crate::MAX_WRITE_BYTES + (64 << 10));
     let thread = thread::Builder::new()
@@ -79,6 +118,7 @@ pub fn serve(store: Arc<Store>, addr: SocketAddr) -> std::io::Result<Server> {
                     .http2_keepalive_interval(Some(Duration::from_secs(10)))
                     .http2_keepalive_timeout(Some(Duration::from_secs(20)))
                     .add_service(service)
+                    .add_service(ready)
                     .serve_with_incoming(incoming);
                 tokio::select! {
                     _ = serving => {}

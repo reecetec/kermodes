@@ -57,6 +57,7 @@ pub fn serve_replica(
         );
         let wanted = loop {
             if stop.load(Ordering::Acquire) {
+                hand_over(&store, id);
                 server.stop();
                 close(store)?;
                 return Ok(());
@@ -90,6 +91,40 @@ pub fn serve_replica(
                 thread::sleep(Duration::from_secs(1));
             }
         }
+    }
+}
+
+/// The longest a stopping leader waits for another replica to take its lead (`Store::hand_over`)
+/// before it stops anyway, leaving the others to elect one.
+const HAND_OVER: Duration = Duration::from_secs(2);
+
+/// Before a leader stops (a rollout, a drain), it hands its lead to the replica furthest along,
+/// so writers wait for that instead of an election. Asked again every half second, it tries
+/// another replica, in case the first went.
+fn hand_over(store: &Store, id: u64) {
+    if !store.is_leader() {
+        return;
+    }
+    let started = Instant::now();
+    let mut asked = Duration::ZERO;
+    while store.is_leader() && started.elapsed() < HAND_OVER {
+        if started.elapsed() >= asked {
+            store.hand_over();
+            asked += Duration::from_millis(500);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    if store.is_leader() {
+        eprintln!(
+            "kermodes weir: replica {id} could not hand over its lead in {} s; stopping, so the \
+             others elect a leader",
+            HAND_OVER.as_secs()
+        );
+    } else {
+        eprintln!(
+            "kermodes weir: replica {id} handed over its lead in {} ms",
+            started.elapsed().as_millis()
+        );
     }
 }
 

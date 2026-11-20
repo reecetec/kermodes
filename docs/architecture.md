@@ -746,11 +746,15 @@ writers ─► leader ── append + fsync ────────────
   rejoin a replaced disk: as a new incarnation of the replica, a learner that takes the log or
   a snapshot and votes only once a membership change, committed after it caught up, makes it
   a voter. That needs changing a shard's members (step 5 below).
-- **Planned restarts.** A rollout or drain restarts one replica at a time, under a
-  PodDisruptionBudget, each only once the previous one has caught up. Before the leader
-  restarts it hands leadership to an up-to-date follower; writers are redirected, and the batch
-  in flight is resent with its `seq`, so nothing is lost or written twice. Readers on the
-  restarting replica reconnect and resume by position, each reconnect recorded.
+- **Planned restarts** (built). A rollout or drain restarts one replica at a time, under a
+  PodDisruptionBudget, each only once the previous one has caught up: a replica is ready
+  (gRPC health on its Flight port) once it knows a leader and has applied as far as it knows
+  the log committed. Stopped while it leads, a replica first hands its lead to the voter
+  heard from lately that holds the most of the log (Raft's leadership transfer: the leader
+  sends what it lacks and tells it to stand at once), asking again for another every half
+  second, for up to 2 s. Writers are refused meanwhile, move to the new leader, and resend
+  what was not acknowledged, recognised if it was written. Readers on the restarting replica
+  reconnect and resume by position, each reconnect recorded.
 - **Unplanned failure.** Losing the leader stalls writes for an election (1 to 2 s without
   hearing from it, then a vote), losing no acknowledged write. Losing a follower changes
   nothing for writers. With two of three replicas gone, writes stop until one returns, and the
@@ -792,11 +796,12 @@ writers ─► leader ── append + fsync ────────────
      resumed by LSN, and existing segments still read. Its latency, produce to subscriber, is
      measured (p50, p99, p999).
   2. The simulator; then replication over 3 replicas with fixed membership, under it, with
-     catch-up from a peer's partition files, and replicas over Flight (built). Next: the Helm
-     chart running three.
-  3. Leadership transfer for rollouts, reads from followers, leases as log entries.
-  4. Local disks, one replica per node.
-  5. Later: more shards, and changing a shard's members.
+     catch-up from a peer's partition files, replicas over Flight, and the Helm chart running
+     three (built).
+  3. Leadership transfer for rollouts, and readiness once caught up (built); leases as log
+     entries; a replica that lost its disk rejoining as a new member; reads from followers.
+  4. Local disks, one replica per node (built).
+  5. Later: more shards, and changing a shard's members otherwise.
 
 ## 8. Lake
 

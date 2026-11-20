@@ -104,10 +104,12 @@ spec:
           ports:
             - name: flight
               containerPort: 8731
+          # Ready once caught up with its shard (gRPC health), so a rollout or drain takes the
+          # next replica down only then; alive while it catches up, however long that takes.
           readinessProbe:
-            tcpSocket:
-              port: flight
-            periodSeconds: 5
+            grpc:
+              port: 8731
+            periodSeconds: 2
           livenessProbe:
             tcpSocket:
               port: flight
