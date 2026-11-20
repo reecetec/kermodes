@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -210,18 +210,47 @@ type Stop = (Mutex<bool>, Condvar);
 struct Shard {
     /// The leader's Raft ID, as this replica knows it: 0 while it knows of none.
     leader: AtomicU64,
-    /// Whether this replica is among the shard's members, a voter or a learner: one that joins
-    /// asks the leader until it is (`Store::join`).
-    member: AtomicBool,
-    /// Whether this replica votes: a member made a learner first is made a voter once it has
-    /// caught up (`promotion`).
-    voter: AtomicBool,
+    /// Where this replica stands among the shard's members (`Standing`, as its `u8`): one
+    /// joining asks the leader until it is a member (`Store::join`), and is ready only once
+    /// it votes (`Store::caught_up`).
+    standing: AtomicU8,
     /// The shard log's commit index, as this replica knows it (`Store::caught_up`).
     committed: AtomicU64,
     /// The snapshot this replica must install (`Store::snapshot_wanted`).
     wanted: Mutex<Option<SnapshotWanted>>,
     /// The shard's members as of the last entry applied, read with it (`Store::members`).
     members: Mutex<ConfState>,
+}
+
+/// Where a replica stands in its shard (§7.6): not among its members yet (a new incarnation
+/// asking to join), a learner taking the log, or a voter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum Standing {
+    Joining = 0,
+    Learner = 1,
+    Voter = 2,
+}
+
+impl Standing {
+    /// Where replica `id` stands among `members`.
+    fn of(id: u64, members: &ConfState) -> Self {
+        if members.voters.contains(&id) {
+            Self::Voter
+        } else if members.learners.contains(&id) {
+            Self::Learner
+        } else {
+            Self::Joining
+        }
+    }
+
+    fn from_u8(standing: u8) -> Self {
+        match standing {
+            2 => Self::Voter,
+            1 => Self::Learner,
+            _ => Self::Joining,
+        }
+    }
 }
 
 /// A table's log, and the signal that one of its source leases was released.
@@ -608,10 +637,8 @@ impl Store {
         }
         let logs = tables.logs.clone();
         let members = node.store().conf().clone();
-        let id = replica.id;
         let shard = Arc::new(Shard {
-            member: AtomicBool::new(members.voters.contains(&id) || members.learners.contains(&id)),
-            voter: AtomicBool::new(members.voters.contains(&id)),
+            standing: AtomicU8::new(Standing::of(replica.id, &members) as u8),
             members: Mutex::new(members),
             ..Shard::default()
         });
@@ -635,7 +662,7 @@ impl Store {
             schemas: Vec::new(),
             outgoing,
             shard: shard.clone(),
-            broken: None,
+            halted: None,
         };
         if committer.replica.is_alone() {
             committer
@@ -643,7 +670,7 @@ impl Store {
                 .campaign()
                 .map_err(|e| Error::Io(format!("weir cannot lead its shard: {e}")))?;
             committer.drive();
-            if let Some(why) = committer.broken {
+            if let Some(Halt::Failed(why) | Halt::Copying(why)) = committer.halted {
                 return Err(Error::Io(why));
             }
         }
@@ -776,12 +803,16 @@ impl Store {
 
     /// Whether this replica is among its shard's members, a voter or a learner.
     pub fn is_member(&self) -> bool {
-        self.shard.member.load(Ordering::Acquire)
+        self.standing() != Standing::Joining
     }
 
     /// Whether this replica votes in its shard's elections and commits.
     pub fn is_voter(&self) -> bool {
-        self.shard.voter.load(Ordering::Acquire)
+        self.standing() == Standing::Voter
+    }
+
+    fn standing(&self) -> Standing {
+        Standing::from_u8(self.shard.standing.load(Ordering::Acquire))
     }
 
     /// This replica's Raft ID (`replica_id`): its slot and incarnation.
@@ -1915,10 +1946,28 @@ struct Committer {
     outgoing: Sender<(u64, Vec<u8>)>,
     /// What the store's callers read: the leader, and the snapshot to install.
     shard: Arc<Shard>,
-    /// Why the committer stopped taking writes: a failure to log or apply leaves what is
-    /// durable in the log, to replay on the next open, and the partition files no longer
-    /// following it.
-    broken: Option<String>,
+    /// Why the committer takes nothing more until the store is reopened.
+    halted: Option<Halt>,
+}
+
+/// Why a committer stopped.
+enum Halt {
+    /// A failure to log or apply: what is durable in the log is replayed on the next open, and
+    /// the partition files no longer follow it. Writes are refused until weir restarts.
+    Failed(String),
+    /// Too far behind to catch up from the log: the replica copies a peer's partition files
+    /// (`Store::snapshot_wanted`) and reopens by itself. Writes go to another replica meanwhile,
+    /// as to any follower's.
+    Copying(String),
+}
+
+impl Halt {
+    fn refusal(&self) -> Error {
+        match self {
+            Halt::Failed(why) => stopped(why),
+            Halt::Copying(why) => Error::NotLeader(why.clone()),
+        }
+    }
 }
 
 /// What was proposed at `index` in `term`: done if the entry committed there is it.
@@ -1948,11 +1997,11 @@ impl Committer {
     /// Takes writes and drops to propose (`propose`); each is answered once its entry is
     /// applied, or now if this replica cannot take it.
     fn submit(&mut self, group: Vec<Submitted>, drops: Vec<Dropping>) {
-        if self.broken.is_some() || !self.is_leader() {
-            // Each refused as what it is: not leading sends a writer to the next replica to
-            // resend there; weir stopped says to restart it.
-            let refused = || match &self.broken {
-                Some(why) => stopped(why),
+        if self.halted.is_some() || !self.is_leader() {
+            // Each refused as what it is: not leading (or copying a peer's files) sends a
+            // writer to the next replica to resend there; weir stopped says to restart it.
+            let refused = || match &self.halted {
+                Some(halt) => halt.refusal(),
                 None => self.not_leader(),
             };
             let answers = group.into_iter().map(|submitted| submitted.answer);
@@ -1974,8 +2023,8 @@ impl Committer {
     /// Takes a lease to propose (`propose`): answered once its entry is applied, or now if
     /// this replica cannot take it.
     fn submit_lease(&mut self, leasing: Leasing) {
-        let refused = match &self.broken {
-            Some(why) => Some(stopped(why)),
+        let refused = match &self.halted {
+            Some(halt) => Some(halt.refusal()),
             None => (!self.is_leader()).then(|| self.not_leader()),
         };
         match refused {
@@ -1992,7 +2041,7 @@ impl Committer {
     }
 
     fn tick(&mut self) {
-        if self.broken.is_none() {
+        if self.halted.is_none() {
             self.node.tick();
             self.drive();
         }
@@ -2001,7 +2050,7 @@ impl Committer {
     fn receive(&mut self, message: Message) {
         // A message for another incarnation of this replica's slot (the one it replaced) is
         // not this one's to take.
-        if self.broken.is_none() && message.to == self.replica.id {
+        if self.halted.is_none() && message.to == self.replica.id {
             // One Raft cannot use (from a replica not of the shard) is dropped, as Raft says.
             let _ = self.node.step(message);
             self.drive();
@@ -2012,7 +2061,7 @@ impl Committer {
     /// of members is under way (`Store::join`).
     fn join(&mut self, id: u64) {
         let conf = self.node.store().conf();
-        if self.broken.is_some()
+        if self.halted.is_some()
             || !self.is_leader()
             || self.node.raft.has_pending_conf()
             || conf.voters.contains(&id)
@@ -2033,7 +2082,7 @@ impl Committer {
     fn promote(&mut self) {
         let conf = self.node.store().conf();
         let raft = &self.node.raft;
-        if self.broken.is_some()
+        if self.halted.is_some()
             || !self.is_leader()
             || raft.has_pending_conf()
             || !conf.voters_outgoing.is_empty()
@@ -2074,10 +2123,10 @@ impl Committer {
     fn drive(&mut self) {
         self.promote();
         loop {
-            while self.broken.is_none() && self.node.has_ready() {
+            while self.halted.is_none() && self.node.has_ready() {
                 self.handle_ready();
             }
-            if self.broken.is_some() || !self.propose() {
+            if self.halted.is_some() || !self.propose() {
                 break;
             }
         }
@@ -2095,15 +2144,8 @@ impl Committer {
         self.shard
             .leader
             .store(self.node.raft.leader_id, Ordering::Release);
-        let conf = self.node.store().conf();
-        let id = self.replica.id;
-        self.shard.member.store(
-            conf.voters.contains(&id) || conf.learners.contains(&id),
-            Ordering::Release,
-        );
-        self.shard
-            .voter
-            .store(conf.voters.contains(&id), Ordering::Release);
+        let standing = Standing::of(self.replica.id, self.node.store().conf());
+        self.shard.standing.store(standing as u8, Ordering::Release);
     }
 
     /// As leader of others, the last index every follower holds.
@@ -2125,7 +2167,7 @@ impl Committer {
     /// (`Store::hand_over`), of those heard from lately. Asked again while a hand-over is under
     /// way, it tries another: the one it was handing to may have gone since it last answered.
     fn hand_over(&mut self) {
-        if self.broken.is_some() || !self.is_leader() {
+        if self.halted.is_some() || !self.is_leader() {
             return;
         }
         let raft = &self.node.raft;
@@ -2259,7 +2301,7 @@ impl Committer {
         if (!entries.is_empty() || ready.must_sync())
             && let Err(e) = self.node.mut_store().persist(&entries, ready.hs())
         {
-            self.stop(e.to_string());
+            self.halt(Halt::Failed(e.to_string()));
             return;
         }
         self.send(ready.take_persisted_messages());
@@ -2282,7 +2324,9 @@ impl Committer {
             .get(..8)
             .map(|id| u64::from_le_bytes(id.try_into().expect("8 bytes")));
         let Some(from) = donor else {
-            self.stop("a snapshot that names no replica to copy from".into());
+            self.halt(Halt::Failed(
+                "a snapshot that names no replica to copy from".into(),
+            ));
             return;
         };
         *lock(&self.shard.wanted) = Some(SnapshotWanted {
@@ -2291,20 +2335,20 @@ impl Committer {
             raft_term: self.node.raft.term,
             vote: self.node.raft.vote,
         });
-        self.stop(format!(
-            "{} is too far behind {} to catch up from the log: it copies that replica's \
+        self.halt(Halt::Copying(format!(
+            "weir {} is too far behind {} to catch up from the log: it copies that replica's \
              partition files, from index {}",
             replica_name(self.replica.id),
             replica_name(from),
             meta.index
-        ));
+        )));
     }
 
     /// Applies committed entries in order, and answers the writes this replica proposed in
     /// them: written, a resend, or lost to another leader's entry at their index.
     fn apply(&mut self, entries: Vec<Entry>) {
         for entry in entries {
-            if self.broken.is_some() {
+            if self.halted.is_some() {
                 return;
             }
             let index = entry.index;
@@ -2392,7 +2436,7 @@ impl Committer {
                     *position = (index, entry.term);
                     self.applied.store(index, Ordering::Release);
                 }
-                Err(e) => self.stop(e.to_string()),
+                Err(e) => self.halt(Halt::Failed(e.to_string())),
             }
             drop(position);
             Answer::send_all(answers, outcome);
@@ -2416,21 +2460,21 @@ impl Committer {
         }
     }
 
-    /// Stops taking writes, for `why`, failing those taken.
-    fn stop(&mut self, why: String) {
+    /// Takes nothing more until reopened, for `halt`, refusing what was taken.
+    fn halt(&mut self, halt: Halt) {
         for mine in std::mem::take(&mut self.proposed) {
-            Answer::send_all(mine.what.answers(), Err(stopped(&why)));
+            Answer::send_all(mine.what.answers(), Err(halt.refusal()));
         }
         for submitted in std::mem::take(&mut self.waiting) {
-            submitted.answer.send(Err(stopped(&why)));
+            submitted.answer.send(Err(halt.refusal()));
         }
         for dropping in std::mem::take(&mut self.drops) {
-            dropping.answer.send(Err(stopped(&why)));
+            dropping.answer.send(Err(halt.refusal()));
         }
         for leasing in std::mem::take(&mut self.leases) {
-            leasing.answer.send(Err(stopped(&why)));
+            leasing.answer.send(Err(halt.refusal()));
         }
-        self.broken = Some(why);
+        self.halted = Some(halt);
     }
 
     /// Deletes what the log need not keep (`LogStore::trim`), their files: for a shard of one,

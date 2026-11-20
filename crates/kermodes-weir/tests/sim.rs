@@ -928,15 +928,12 @@ impl Shard {
                     store.commit_history(name, &commit).unwrap();
                     model.merged.insert((table, date));
                 }
-                // Refused for now (the lead is being handed over, or lost): the next merge
-                // drops it, as the merger's client tries the next replica.
+                // Refused for now (the lead is being handed over, or lost, or the replica is
+                // copying a peer's files): the next merge drops it, as the merger's client
+                // tries the next replica.
                 match store.drop_date(name, date) {
                     Ok(())
-                    | Err(
-                        kermodes_weir::Error::Busy(_)
-                        | kermodes_weir::Error::Io(_)
-                        | kermodes_weir::Error::NotLeader(_),
-                    ) => {}
+                    | Err(kermodes_weir::Error::Busy(_) | kermodes_weir::Error::NotLeader(_)) => {}
                     Err(e) => panic!("seed {}: dropping {name} on {date}: {e}", self.seed),
                 }
             }
@@ -1169,6 +1166,77 @@ fn a_leader_hands_over_its_lead() {
         matches!(refused, Err(kermodes_weir::Error::NotLeader(_))),
         "{refused:?}"
     );
+}
+
+/// A leader cut off while the others write on is made to copy a peer's files once it hears
+/// from them again: their logs no longer hold what it lacks. A write reaching it meanwhile, on
+/// a writer it took while it led, is refused as not leading, which sends a remote writer to the
+/// next replica to resend there, rather than as weir stopped, which would fail it for good.
+#[test]
+fn a_replica_copying_a_peers_files_refuses_writes_as_not_leading() {
+    // An even seed: logs keep nothing for a follower far behind (`limits`).
+    let dir = TempDir::new();
+    let clock: Clock = Arc::new(|| 1_767_225_540_000_000_000);
+    let mut shard = Shard::new(&dir.0, 2, clock, REPLICAS);
+    let (mut sent, mut model, mut trace) = (Vec::new(), Model::default(), Vec::new());
+    shard.resolve(Vec::new(), &mut sent, &mut model, &mut trace);
+    let (was, old) = shard.writers.take().expect("resolved");
+    shard.cut = Some(was as u64 + 1);
+    let leader = (0..200)
+        .find_map(|_| {
+            rounds(&mut shard, 1);
+            (0..REPLICAS).find(|&i| i != was && shard.stores[i].as_ref().unwrap().is_leader())
+        })
+        .expect("the other two elect a leader");
+    let writers = shard.lease(leader).unwrap();
+    for value in 0..200 {
+        let batch = rows(vec![0; 20], (value * 20..value * 20 + 20).collect());
+        drop(writers[0][0].send(Change::Rows, &batch, None).unwrap());
+        rounds(&mut shard, 1);
+    }
+    // Its partition files hold the writes: its log keeps none of them for the one cut off.
+    shard.stores[leader].as_ref().unwrap().flush_now().unwrap();
+    shard.cut = None;
+    for _ in 0..200 {
+        if shard.stores[was]
+            .as_ref()
+            .unwrap()
+            .snapshot_wanted()
+            .is_some()
+        {
+            break;
+        }
+        rounds(&mut shard, 1);
+    }
+    let copying = shard.stores[was].as_ref().unwrap();
+    assert!(copying.snapshot_wanted().is_some(), "made to copy");
+    let pending = old[0][0]
+        .send(Change::Rows, &rows(vec![0], vec![1]), None)
+        .unwrap();
+    copying.step();
+    let refused = pending.wait();
+    assert!(
+        matches!(refused, Err(kermodes_weir::Error::NotLeader(_))),
+        "{refused:?}"
+    );
+}
+
+/// `n` rounds of the shard: a tick of every replica's clock, each stepped, and every message
+/// carried.
+fn rounds(shard: &mut Shard, n: usize) {
+    for _ in 0..n {
+        shard.tick();
+        for i in 0..REPLICAS {
+            if let Some(store) = &shard.stores[i] {
+                store.step();
+            }
+            shard.collect(i);
+        }
+        while !shard.wire.is_empty() {
+            let message = shard.wire.remove(0);
+            shard.deliver(message);
+        }
+    }
 }
 
 /// A replica that never had a log joins its shard however late, the others having elected a
