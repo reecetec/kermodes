@@ -30,8 +30,8 @@ pub use replica::{LogLimits, Replica};
 pub use shape::{ColumnId, Shape, column, spec, widens};
 pub use snapshot::{SnapshotSource, SnapshotWanted};
 pub use store::{
-    BRANCH, Clock, Failed, Pace, Store, Subscriber, Writer, conform, keys_only, machine_disk,
-    system_clock,
+    BRANCH, Clock, Failed, Pace, PendingWriter, Store, Subscriber, Writer, conform, keys_only,
+    machine_disk, system_clock,
 };
 
 /// What a batch is (§7.1): an append table's rows, or a keyed table's upserts, deletes, or the

@@ -1,7 +1,7 @@
 //! The catalog (architecture.md §8.2): which tables exist, their IDs, storage locations, and
-//! columns, each source's lease epoch (§7.4), and which files hold each table's history (§8).
-//! Locally it is SQLite in the store's directory; in the cluster it is Postgres, shared by every
-//! weir (and later the control plane), so weirs agree on tables and epochs rise across them.
+//! columns, and which files hold each table's history (§8). Locally it is SQLite in the store's
+//! directory; in the cluster it is Postgres, shared by every weir (and later the control plane),
+//! so weirs agree on tables.
 //! Both backends hold the same rows and pass the same tests (`tests/catalog.rs`).
 
 mod postgres;
@@ -15,7 +15,7 @@ use kermodes_core::{parse_type, type_name};
 use serde_json::Value;
 
 use crate::shape::{ColumnId, Shape, former, widens};
-use crate::{Date, Error, SourceId, TableName};
+use crate::{Date, Error, TableName};
 
 /// The catalog's format; a newer one is a migration, not a silent reinterpretation.
 const FORMAT: i64 = 1;
@@ -287,22 +287,6 @@ impl Catalog {
                 })
             })
             .collect()
-    }
-
-    /// Takes the next lease on a table's source: its epoch, one above the last ever taken.
-    pub(crate) fn next_epoch(&mut self, table_id: i64, source: &SourceId) -> Result<u64, Error> {
-        match self {
-            Self::Sqlite(c) => c.next_epoch(table_id, source),
-            Self::Postgres(c) => c.next_epoch(table_id, source),
-        }
-    }
-
-    /// The epoch of a table source's latest lease; `None` before its first writer.
-    pub(crate) fn epoch(&mut self, table_id: i64, source: &SourceId) -> Result<Option<u64>, Error> {
-        match self {
-            Self::Sqlite(c) => c.epoch(table_id, source),
-            Self::Postgres(c) => c.epoch(table_id, source),
-        }
     }
 
     /// Whether replica `replica` of `branch`'s shard has had a log (`start_replica`): from then

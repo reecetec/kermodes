@@ -243,6 +243,8 @@ struct TableLog {
     positions: Option<Positions>,
     /// Each source's last seq on the dates weir has dropped (`@sources`): its partitions held it.
     floors: HashMap<SourceId, u64>,
+    /// Each source's latest lease this replica applied: its epoch, the index of its entry.
+    leases: HashMap<SourceId, u64>,
 }
 
 impl TableLog {
@@ -260,6 +262,7 @@ impl TableLog {
 enum Request {
     Write(Submitted),
     Drop(Dropping),
+    Lease(Leasing),
     /// The partition files hold the log up to this LSN: the segments wholly below it, to delete.
     Trim(u64, SyncSender<Vec<PathBuf>>),
     Stop,
@@ -280,6 +283,15 @@ struct Dropping {
     rows: u64,
     /// The clock as it was asked: what today is, whose keyed checkpoint takes the date's state.
     now_ns: i64,
+    answer: Answer,
+}
+
+/// A lease on a table's source to take (§7.4), and where the outcome goes: its entry
+/// committed, its epoch the entry's index (`TableLog::leases`).
+struct Leasing {
+    log: Arc<Log>,
+    table: i64,
+    source: SourceId,
     answer: Answer,
 }
 
@@ -604,6 +616,7 @@ impl Store {
             proposed: VecDeque::new(),
             waiting: Vec::new(),
             drops: Vec::new(),
+            leases: Vec::new(),
             schemas: Vec::new(),
             outgoing,
             shard: shard.clone(),
@@ -692,12 +705,13 @@ impl Store {
             match request {
                 Request::Write(submitted) => group.push(submitted),
                 Request::Drop(dropping) => drops.push(dropping),
-                // Asked only of a committer thread.
+                // Asked only of a committer thread; a lease, of the committer at once.
                 Request::Trim(..)
                 | Request::Stop
                 | Request::Receive(_)
                 | Request::Tick
-                | Request::HandOver => {}
+                | Request::HandOver
+                | Request::Lease(_) => {}
             }
         }
         let count = group.len() + drops.len();
@@ -880,9 +894,25 @@ impl Store {
         adopt(&log, entry)
     }
 
-    /// Every table, by name.
+    /// Every table, by name: as the catalog has them, or, while it cannot be reached, those
+    /// this replica holds (`table`).
     pub fn tables(&self) -> Result<Vec<TableEntry>, Error> {
-        lock(&self.catalog).list(&self.branch)
+        match lock(&self.catalog).list(&self.branch) {
+            Err(Error::Catalog(_)) if !lock(&self.logs).is_empty() => {
+                let mut held = self.held();
+                held.sort_by_key(|entry| entry.name.to_string());
+                Ok(held)
+            }
+            listed => listed,
+        }
+    }
+
+    /// The tables this replica holds, as it last took them up.
+    fn held(&self) -> Vec<TableEntry> {
+        let logs: Vec<Arc<Log>> = lock(&self.logs).values().cloned().collect();
+        logs.iter()
+            .map(|log| lock(&log.state).entry.clone())
+            .collect()
     }
 
     /// The store's directory.
@@ -900,11 +930,20 @@ impl Store {
         &self.position
     }
 
-    /// The table called `name`.
+    /// The table called `name`: as the catalog has it, or, while the catalog cannot be reached
+    /// (a Postgres outage), as this replica holds it, so that writing, reading, and failing over
+    /// go on (§7.6); a table created or changed meanwhile waits for the catalog.
     pub fn table(&self, name: &TableName) -> Result<TableEntry, Error> {
-        lock(&self.catalog)
-            .get(&self.branch, name)?
-            .ok_or_else(|| Error::NotFound(format!("no table {name}; create it first")))
+        match lock(&self.catalog).get(&self.branch, name) {
+            Ok(Some(entry)) => Ok(entry),
+            Ok(None) => Err(Error::NotFound(format!("no table {name}; create it first"))),
+            Err(unreachable @ Error::Catalog(_)) => self
+                .held()
+                .into_iter()
+                .find(|entry| entry.name == *name)
+                .ok_or(unreachable),
+            Err(e) => Err(e),
+        }
     }
 
     /// Every date of `name`'s history (§8), by date then file.
@@ -1005,8 +1044,20 @@ impl Store {
 
     /// A writer for `source`'s rows of `name`, holding the source's lease (§7.4) until it is
     /// dropped. One writer per source at a time: with `wait`, this waits for the current writer
-    /// to go; without, it fails at once. Each lease has a new epoch, recorded with every batch.
+    /// to go; without, it fails at once. Each lease is an entry in the shard log, its epoch
+    /// that entry's index, recorded with every batch: taking one needs no catalog.
     pub fn writer(&self, name: &TableName, source: &SourceId, wait: bool) -> Result<Writer, Error> {
+        self.lease(name, source, wait)?.writer()
+    }
+
+    /// Takes the lease a writer holds (`writer`), its entry proposed: the writer once it
+    /// commits. A stepped replica of others is stepped until it is ready.
+    pub fn lease(
+        &self,
+        name: &TableName,
+        source: &SourceId,
+        wait: bool,
+    ) -> Result<PendingWriter, Error> {
         // Its writes would be refused one by one: the writer goes to the leader instead.
         if !self.is_leader() {
             return Err(Error::NotLeader(
@@ -1038,11 +1089,9 @@ impl Store {
         state.writing.insert(source.clone());
         let entry = state.entry.clone();
         drop(state);
-        // The source is ours from here: the epoch is taken outside the log's lock, so the
-        // catalog's lock is never held inside it.
-        // If taking the epoch fails, dropping this writer releases the source again.
-        let mut writer = Writer {
-            log,
+        // The source is ours from here; if the lease fails, dropping the writer releases it.
+        let writer = Writer {
+            log: log.clone(),
             requests: self.requests.clone(),
             source: source.clone(),
             shape: entry.shape(),
@@ -1053,24 +1102,45 @@ impl Store {
             in_flight: Arc::default(),
             gone: format!("the store holding {} closed", entry.name).into(),
         };
-        writer.epoch = lock(&self.catalog).next_epoch(entry.id, source)?;
-        Ok(writer)
+        let gone: Arc<str> = Arc::from("weir closed before the lease committed: take it again");
+        let (pending, answer) = Arc::new(InFlight::default()).send(0, &gone);
+        let leasing = Leasing {
+            log,
+            table: entry.id,
+            source: source.clone(),
+            answer,
+        };
+        let stepped = match &self.driver {
+            Driver::Stepped { committer, .. } => {
+                lock(committer).submit_lease(leasing);
+                true
+            }
+            Driver::Threads { .. } => {
+                // Gone with the committer: the store is closing, and the answer says so.
+                let _ = self.requests.send(Request::Lease(leasing));
+                false
+            }
+        };
+        Ok(PendingWriter {
+            writer,
+            pending,
+            stepped,
+        })
     }
 
     /// `source`'s last sequence number for `name`, as its writer would resume from, and the
-    /// epoch of its latest lease (`None` before its first writer).
+    /// epoch of its latest lease this replica applied (`None` before one, since it opened).
     pub fn source_state(
         &self,
         name: &TableName,
         source: &SourceId,
     ) -> Result<(Option<u64>, Option<u64>), Error> {
         let log = self.log(name)?;
-        let (table_id, last_seq) = {
-            let state = lock(&log.state);
-            (state.entry.id, source_last(&state, source))
-        };
-        let epoch = lock(&self.catalog).epoch(table_id, source)?;
-        Ok((last_seq, epoch))
+        let state = lock(&log.state);
+        Ok((
+            source_last(&state, source),
+            state.leases.get(source).copied(),
+        ))
     }
 
     /// Feeds `subscriber` every batch of `name` committed today (UTC), then each new one as it
@@ -1504,6 +1574,7 @@ fn open_log(
             checkpoint_bytes: 0,
             positions: None,
             floors,
+            leases: HashMap::new(),
         }),
         released: Condvar::new(),
     }))
@@ -1710,9 +1781,12 @@ impl Tables {
                 let log = self.open(table)?;
                 apply_drop(&log, date, rows, now_ns, entry.index, flusher).map(|()| false)
             }
-            // Understood here before any replica proposes one, so that during a rollout old and
-            // new replicas apply the same log (a Parallel Change, §7.6). The table must exist.
-            Command::Lease { table, .. } => self.open(table).map(|_| false),
+            // Another replica's lease: its epoch is the entry's index.
+            Command::Lease { table, source } => {
+                let log = self.open(table)?;
+                lock(&log.state).leases.insert(source, entry.index);
+                Ok(false)
+            }
         }
     }
 
@@ -1777,6 +1851,7 @@ struct Committer {
     /// applied.
     waiting: Vec<Submitted>,
     drops: Vec<Dropping>,
+    leases: Vec<Leasing>,
     /// The schema messages of the columns written lately, so each is encoded once.
     schemas: Vec<(Shape, Vec<u8>)>,
     /// Messages to other replicas, for whoever carries them (`Store::take_messages`).
@@ -1799,6 +1874,7 @@ struct Proposed {
 enum Proposal {
     Write(Unit),
     Drop(Dropping),
+    Lease(Leasing),
 }
 
 impl Proposal {
@@ -1806,6 +1882,7 @@ impl Proposal {
         match self {
             Proposal::Write(unit) => unit.answers,
             Proposal::Drop(dropping) => vec![dropping.answer],
+            Proposal::Lease(leasing) => vec![leasing.answer],
         }
     }
 }
@@ -1833,6 +1910,22 @@ impl Committer {
         }
         self.drops.extend(drops);
         self.drive();
+    }
+
+    /// Takes a lease to propose (`propose`): answered once its entry is applied, or now if
+    /// this replica cannot take it.
+    fn submit_lease(&mut self, leasing: Leasing) {
+        let refused = match &self.broken {
+            Some(why) => Some(stopped(why)),
+            None => (!self.is_leader()).then(|| self.not_leader()),
+        };
+        match refused {
+            Some(refused) => leasing.answer.send(Err(refused)),
+            None => {
+                self.leases.push(leasing);
+                self.drive();
+            }
+        }
     }
 
     fn is_leader(&self) -> bool {
@@ -1927,7 +2020,7 @@ impl Committer {
     /// the tables hold, which entries not yet applied have not set. Whether it proposed.
     fn propose(&mut self) -> bool {
         let last = self.node.raft.raft_log.last_index();
-        if (self.waiting.is_empty() && self.drops.is_empty())
+        if (self.waiting.is_empty() && self.drops.is_empty() && self.leases.is_empty())
             || !self.is_leader()
             || self.applied.load(Ordering::Acquire) != last
         {
@@ -1961,6 +2054,10 @@ impl Committer {
                 dropping.now_ns,
             );
             self.offer(Ok(data), Proposal::Drop(dropping));
+        }
+        for leasing in std::mem::take(&mut self.leases) {
+            let data = wal::encode_lease(leasing.table, &leasing.source);
+            self.offer(Ok(data), Proposal::Lease(leasing));
         }
         true
     }
@@ -2133,6 +2230,12 @@ impl Committer {
                     );
                     (dropped.map(|()| true), vec![dropping.answer])
                 }
+                Some(Proposal::Lease(leasing)) => {
+                    lock(&leasing.log.state)
+                        .leases
+                        .insert(leasing.source, index);
+                    (Ok(true), vec![leasing.answer])
+                }
                 // A leader's first entry of its term.
                 None if entry.data.is_empty() => (Ok(false), Vec::new()),
                 None => (
@@ -2164,6 +2267,9 @@ impl Committer {
         for dropping in std::mem::take(&mut self.drops) {
             dropping.answer.send(Err(self.not_leader()));
         }
+        for leasing in std::mem::take(&mut self.leases) {
+            leasing.answer.send(Err(self.not_leader()));
+        }
     }
 
     /// Stops taking writes, for `why`, failing those taken.
@@ -2176,6 +2282,9 @@ impl Committer {
         }
         for dropping in std::mem::take(&mut self.drops) {
             dropping.answer.send(Err(stopped(&why)));
+        }
+        for leasing in std::mem::take(&mut self.leases) {
+            leasing.answer.send(Err(stopped(&why)));
         }
         self.broken = Some(why);
     }
@@ -2258,6 +2367,7 @@ fn commit_every(mut committer: Committer, requests: &Receiver<Request>) {
                     group.push(submitted);
                 }
                 Request::Drop(dropping) => drops.push(dropping),
+                Request::Lease(leasing) => committer.submit_lease(leasing),
                 Request::Trim(flushed, reply) => {
                     let _ = reply.send(committer.trim(flushed));
                 }
@@ -2552,6 +2662,44 @@ fn delete_segments(disk: &DiskRef, paths: Vec<PathBuf>) {
         if let Err(e) = disk.remove_file(&path) {
             eprintln!("kermodes weir: cannot delete {}: {e}", path.display());
         }
+    }
+}
+
+/// A writer whose lease is proposed (`Store::lease`): the writer once the lease commits.
+pub struct PendingWriter {
+    writer: Writer,
+    pending: Pending,
+    /// The committer is stepped by its caller: the lease commits only as it steps.
+    stepped: bool,
+}
+
+impl PendingWriter {
+    /// Whether the lease is answered: `writer` then returns at once.
+    pub fn is_ready(&self) -> bool {
+        self.pending.is_answered()
+    }
+
+    /// The writer, holding the lease once its entry commits; waits for it, unless its
+    /// committer is stepped by the caller, who steps it until `is_ready` first.
+    pub fn writer(self) -> Result<Writer, Error> {
+        let PendingWriter {
+            mut writer,
+            pending,
+            stepped,
+        } = self;
+        if stepped && !pending.is_answered() {
+            return Err(Error::Busy(format!(
+                "the lease on {} for source `{}` is proposed: step the replicas until it is ready",
+                writer.name, writer.source
+            )));
+        }
+        pending.wait()?;
+        writer.epoch = lock(&writer.log.state)
+            .leases
+            .get(&writer.source)
+            .copied()
+            .expect("a lease applied records its epoch");
+        Ok(writer)
     }
 }
 

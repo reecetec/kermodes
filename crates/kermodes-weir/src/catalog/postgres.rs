@@ -1,7 +1,6 @@
 //! The cluster's catalog: Postgres, shared by every weir (architecture.md §8.2). Concurrent
 //! clients agree because Postgres decides: a table is created once (`ON CONFLICT DO NOTHING`, the
-//! loser reads the winner's), and an epoch is bumped atomically (`ON CONFLICT DO UPDATE ...
-//! RETURNING`).
+//! loser reads the winner's).
 
 use postgres::{Client, GenericClient, NoTls};
 
@@ -9,7 +8,7 @@ use super::{
     FORMAT, Found, Garbage, HistoryCommit, HistoryDate, HistoryFile, Row, check_commit, location,
     started_key,
 };
-use crate::{Date, Error, SourceId, TableName};
+use crate::{Date, Error, TableName};
 
 /// Held while creating the catalog's tables, so clients starting together do not collide on
 /// `CREATE TABLE IF NOT EXISTS` (which is not atomic in Postgres).
@@ -36,12 +35,6 @@ impl Postgres {
                  location TEXT NOT NULL,
                  columns TEXT NOT NULL,
                  UNIQUE (branch, namespace, name)
-             );
-             CREATE TABLE IF NOT EXISTS kermodes_sources (
-                 table_id BIGINT NOT NULL REFERENCES kermodes_tables (id),
-                 source TEXT NOT NULL,
-                 epoch BIGINT NOT NULL,
-                 PRIMARY KEY (table_id, source)
              );
              CREATE TABLE IF NOT EXISTS kermodes_table_keys (
                  table_id BIGINT PRIMARY KEY REFERENCES kermodes_tables (id),
@@ -198,32 +191,6 @@ impl Postgres {
                 )
             })
             .collect())
-    }
-
-    pub(crate) fn next_epoch(&mut self, table_id: i64, source: &SourceId) -> Result<u64, Error> {
-        let epoch: i64 = self
-            .client()?
-            .query_one(
-                "INSERT INTO kermodes_sources (table_id, source, epoch) VALUES ($1, $2, 1)
-                 ON CONFLICT (table_id, source)
-                 DO UPDATE SET epoch = kermodes_sources.epoch + 1
-                 RETURNING epoch",
-                &[&table_id, &source.as_str()],
-            )
-            .map_err(sql)?
-            .get(0);
-        Ok(epoch as u64)
-    }
-
-    pub(crate) fn epoch(&mut self, table_id: i64, source: &SourceId) -> Result<Option<u64>, Error> {
-        Ok(self
-            .client()?
-            .query_opt(
-                "SELECT epoch FROM kermodes_sources WHERE table_id = $1 AND source = $2",
-                &[&table_id, &source.as_str()],
-            )
-            .map_err(sql)?
-            .map(|row| row.get::<_, i64>(0) as u64))
     }
 
     pub(crate) fn replica_started(&mut self, branch: &str, replica: u64) -> Result<bool, Error> {

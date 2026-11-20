@@ -345,12 +345,16 @@ def test_kermodes_dev_rolls_a_project_onto_each_change(tmp_path):
             time.sleep(0.05)
         time.sleep(0.5)
 
-        # One writer at a time: version 1's rows under its lease, then version 2's under the
-        # next, never interleaved.
+        # One writer at a time: version 1's rows under its lease, then version 2's under a
+        # later one, never interleaved.
         seen = rows()
-        first = seen.index((2, 2))
-        assert set(seen[:first]) == {(1, 1)}
-        assert set(seen[first:]) == {(2, 2)}
+        first = next(i for i, (version, _) in enumerate(seen) if version == 2)
+        before, after = seen[:first], seen[first:]
+        assert {version for version, _ in before} == {1}
+        assert {version for version, _ in after} == {2}
+        (old,) = {epoch for _, epoch in before}
+        (new,) = {epoch for _, epoch in after}
+        assert new > old
     finally:
         dev.terminate()
         # Shown by pytest when the test fails.

@@ -23,8 +23,8 @@ use std::sync::{Arc, Mutex};
 use arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Int64Type, Schema};
 use kermodes_weir::{
-    Change, Clock, Date, HistoryCommit, HistoryDate, HistoryFile, LogLimits, Pending, Replica,
-    SourceId, Store, TableName, Writer, sim,
+    Change, Clock, Date, HistoryCommit, HistoryDate, HistoryFile, LogLimits, Pending,
+    PendingWriter, Replica, SourceId, Store, TableName, Writer, sim,
 };
 
 const SOURCES: usize = 3;
@@ -222,10 +222,29 @@ struct Open {
 /// (`failing`), weir opens only once the machine restarts, which a power loss is.
 fn open(root: &std::path::Path, disk: &sim::Disk, clock: &Clock, seed: u64, failing: bool) -> Open {
     let mut reboots = 0;
-    let store = loop {
+    loop {
         let crashes = disk.crashes();
-        match Store::open_stepped(root, disk.handle(), clock.clone()) {
-            Ok(store) => break store,
+        // Taking a writer's lease writes to the log, as a write does: a failed fsync stops weir
+        // there too, and it is restarted.
+        let opened = Store::open_stepped(root, disk.handle(), clock.clone()).and_then(|store| {
+            store.create_table(&ticks(), &schema())?;
+            store.create_keyed_table(&quotes(), &schema(), &["k".to_owned()])?;
+            let writers = (0..SOURCES)
+                .map(|who| {
+                    let source = SourceId::parse(&format!("s{who}")).unwrap();
+                    Ok([
+                        store.writer(&ticks(), &source, false)?,
+                        store.writer(&quotes(), &source, false)?,
+                    ])
+                })
+                .collect::<Result<Vec<_>, kermodes_weir::Error>>()?;
+            Ok(Open { store, writers })
+        });
+        match opened {
+            Ok(at) => {
+                disk.disarm();
+                return at;
+            }
             Err(_) if disk.crashes() > crashes => continue,
             // Each open fsyncs a few dozen times, one in 30 failing: a hundred restarts in a row
             // that all fail is an error that is not the disk's.
@@ -235,22 +254,7 @@ fn open(root: &std::path::Path, disk: &sim::Disk, clock: &Clock, seed: u64, fail
             }
             Err(e) => panic!("seed {seed}: reopening: {e}"),
         }
-    };
-    disk.disarm();
-    store.create_table(&ticks(), &schema()).unwrap();
-    store
-        .create_keyed_table(&quotes(), &schema(), &["k".to_owned()])
-        .unwrap();
-    let writers = (0..SOURCES)
-        .map(|who| {
-            let source = SourceId::parse(&format!("s{who}")).unwrap();
-            [
-                store.writer(&ticks(), &source, false).unwrap(),
-                store.writer(&quotes(), &source, false).unwrap(),
-            ]
-        })
-        .collect();
-    Open { store, writers }
+    }
 }
 
 /// A write whose answer leaves its fate open (its process stopped while it was committed): its
@@ -773,19 +777,22 @@ impl Shard {
         model: &mut Model,
         trace: &mut Vec<u64>,
     ) {
-        let leader = self.agree(sent);
+        let mut leader = self.agree(sent);
         maybes.extend(answers(sent, model, trace, self.seed));
         self.writers = None;
-        let store = self.stores[leader].as_ref().unwrap();
-        let writers: Vec<[Writer; 2]> = (0..SOURCES)
-            .map(|who| {
-                let source = SourceId::parse(&format!("s{who}")).unwrap();
-                [
-                    store.writer(&ticks(), &source, false).unwrap(),
-                    store.writer(&quotes(), &source, false).unwrap(),
-                ]
-            })
-            .collect();
+        // A lease refused (the leader was handing over its lead, or lost it) is taken again
+        // once the replicas agree again.
+        let mut tries = 0;
+        let writers = loop {
+            match self.lease(leader) {
+                Ok(writers) => break writers,
+                Err(_) if tries < 10 => {
+                    tries += 1;
+                    leader = self.agree(sent);
+                }
+                Err(e) => panic!("seed {}: a lease: {e}", self.seed),
+            }
+        };
         for ((table, who, seq), effect) in maybes {
             let held = writers[who][table].last_seq().unwrap_or(0);
             if let Some(effect) = effect.filter(|_| seq <= held) {
@@ -809,6 +816,37 @@ impl Shard {
             // Every replica dropped the same dates, where its log said to.
             assert_eq!(held(store), first, "seed {}: {when}: dates held", self.seed);
         }
+    }
+
+    /// Every writer's lease, taken on replica `leader` (`Store::lease`): its entries proposed,
+    /// then the messages carried and the replicas stepped until they commit.
+    fn lease(&mut self, leader: usize) -> Result<Vec<[Writer; 2]>, kermodes_weir::Error> {
+        let store = self.stores[leader].as_ref().unwrap();
+        let pending = (0..SOURCES)
+            .map(|who| {
+                let source = SourceId::parse(&format!("s{who}")).unwrap();
+                Ok([
+                    store.lease(&ticks(), &source, false)?,
+                    store.lease(&quotes(), &source, false)?,
+                ])
+            })
+            .collect::<Result<Vec<[PendingWriter; 2]>, kermodes_weir::Error>>()?;
+        for _ in 0..100 {
+            if pending.iter().flatten().all(PendingWriter::is_ready) {
+                break;
+            }
+            for i in 0..REPLICAS {
+                self.collect(i);
+            }
+            while !self.wire.is_empty() {
+                let message = self.wire.remove(0);
+                self.deliver(message);
+            }
+        }
+        pending
+            .into_iter()
+            .map(|[on_ticks, on_quotes]| Ok([on_ticks.writer()?, on_quotes.writer()?]))
+            .collect()
     }
 
     /// Merges each table's past dates on the writers' replica, as the merger does: a date whose

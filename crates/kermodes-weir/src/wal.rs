@@ -99,10 +99,10 @@ pub(crate) enum Command {
         rows: u64,
         now_ns: i64,
     },
-    /// A writer took the lease on one of `table`'s sources (§7.4); the entry's index is its
-    /// epoch.
+    /// A writer took the lease on `table`'s `source` (§7.4); the entry's index is its epoch.
     Lease {
         table: i64,
+        source: SourceId,
     },
 }
 
@@ -114,6 +114,17 @@ pub(crate) fn encode_drop(table: i64, date: Date, rows: u64, now_ns: i64) -> Byt
     data.extend_from_slice(&date.days().to_le_bytes());
     data.extend_from_slice(&rows.to_le_bytes());
     data.extend_from_slice(&now_ns.to_le_bytes());
+    Bytes::from(data)
+}
+
+/// Encodes a lease taken on `table`'s `source` as an entry's data (`Command::Lease`).
+pub(crate) fn encode_lease(table: i64, source: &SourceId) -> Bytes {
+    let source = source.as_str().as_bytes();
+    let mut data = Vec::with_capacity(11 + source.len());
+    data.push(LEASE);
+    data.extend_from_slice(&table.to_le_bytes());
+    data.extend_from_slice(&(source.len() as u16).to_le_bytes());
+    data.extend_from_slice(source);
     Bytes::from(data)
 }
 
@@ -970,8 +981,8 @@ fn decode_lease(index: u64, data: &Bytes) -> Result<Command, String> {
     let len = u16::from_le_bytes(data.get(9..11).ok_or_else(short)?.try_into().expect("2"));
     let source = data.get(11..11 + len as usize).ok_or_else(short)?;
     let source = std::str::from_utf8(source).map_err(|e| e.to_string())?;
-    SourceId::parse(source).map_err(|e| e.to_string())?;
-    Ok(Command::Lease { table })
+    let source = SourceId::parse(source).map_err(|e| e.to_string())?;
+    Ok(Command::Lease { table, source })
 }
 
 /// The write an entry at `index` holds (`encode`).
@@ -1188,8 +1199,8 @@ mod tests {
     use raft::eraftpb::{Entry, HardState};
 
     use super::{
-        Append, Command, HEADER_V1, LEASE, Logged, Recovered, SEGMENT_BYTES, Wal, decode, encode,
-        read_applied, write_applied, write_rows,
+        Append, Command, HEADER_V1, Logged, Recovered, SEGMENT_BYTES, Wal, decode, encode,
+        encode_lease, read_applied, write_applied, write_rows,
     };
     use crate::disk::{DiskRef, real};
     use crate::partition::schema_header;
@@ -1442,20 +1453,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A lease entry, as a newer version writes it, reads back as the table it took a source
-    /// of, and one cut short is refused rather than read as another.
+    /// A lease entry reads back as the table and source it took, and one cut short is refused
+    /// rather than read as another.
     #[test]
-    fn a_lease_reads_back_as_its_table() {
-        let mut data = vec![LEASE];
-        data.extend_from_slice(&7_i64.to_le_bytes());
-        data.extend_from_slice(&4_u16.to_le_bytes());
-        data.extend_from_slice(b"feed");
-        let Ok(Command::Lease { table }) = decode(12, &Bytes::from(data.clone())) else {
+    fn a_lease_reads_back_as_its_table_and_source() {
+        let feed = crate::SourceId::parse("feed").unwrap();
+        let data = encode_lease(7, &feed);
+        let Ok(Command::Lease { table, source }) = decode(12, &data) else {
             panic!("a lease");
         };
-        assert_eq!(table, 7);
-        data.pop();
-        assert!(decode(12, &Bytes::from(data)).is_err());
+        assert_eq!((table, source), (7, feed));
+        assert!(decode(12, &data.slice(..data.len() - 1)).is_err());
     }
 
     /// A format 1 frame: LSN, kind, and body, under length and CRC.

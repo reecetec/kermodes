@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
+use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use kermodes_weir::{
     Date, Error, HistoryCommit, HistoryDate, HistoryFile, SourceId, Store, TableName,
@@ -90,10 +91,9 @@ fn schema() -> Schema {
 }
 
 #[test]
-fn both_catalogs_keep_tables_and_epochs() {
+fn both_catalogs_keep_tables() {
     for backend in backends() {
         let dir = TempDir::new();
-        let feed = SourceId::parse("feed").unwrap();
         let (id, location) = {
             let store = open(&dir, &backend);
             let created = store.create_table(&ticks(), &schema()).unwrap();
@@ -114,19 +114,12 @@ fn both_catalogs_keep_tables_and_epochs() {
                 .map(|t| t.name.to_string())
                 .collect();
             assert_eq!(names, ["md.ticks"]);
-            assert_eq!(store.writer(&ticks(), &feed, false).unwrap().epoch(), 1);
-            assert_eq!(store.writer(&ticks(), &feed, false).unwrap().epoch(), 2);
             (created.id, created.location)
         };
-        // Reopened, the table is the same and epochs go on rising.
+        // Reopened, the table is the same.
         let store = open(&dir, &backend);
         let entry = store.table(&ticks()).unwrap();
         assert_eq!((entry.id, entry.location), (id, location));
-        assert_eq!(store.writer(&ticks(), &feed, false).unwrap().epoch(), 3);
-        assert_eq!(
-            store.source_state(&ticks(), &feed).unwrap(),
-            (None, Some(3))
-        );
     }
 }
 
@@ -199,8 +192,7 @@ fn both_catalogs_keep_a_keyed_tables_key() {
     }
 }
 
-/// Weirs sharing a Postgres catalog: one definition per table, however they race to create it,
-/// and epochs that rise across all of them.
+/// Weirs sharing a Postgres catalog: one definition per table, however they race to create it.
 #[test]
 fn weirs_sharing_a_postgres_catalog_agree() {
     let Some(url) = postgres() else { return };
@@ -224,12 +216,52 @@ fn weirs_sharing_a_postgres_catalog_agree() {
         let ids: Vec<i64> = racers.into_iter().map(|r| r.join().unwrap()).collect();
         assert_eq!(ids[0], ids[1], "md.t{i} was created twice");
     }
+}
 
+/// While the catalog fails (Postgres unreachable, §7.6), a weir goes on writing and reading the
+/// tables it holds, a new writer's lease included; creating a table waits for the catalog.
+#[test]
+fn writing_goes_on_while_the_catalog_fails() {
+    let Some(url) = postgres() else { return };
+    let dir = TempDir::new();
+    let store = Store::open_with_catalog(&dir.0, &url, "prod").unwrap();
+    store.create_table(&ticks(), &schema()).unwrap();
+    let rows = |n: i64| {
+        RecordBatch::try_from_iter([
+            ("n", Arc::new(Int64Array::from(vec![n])) as ArrayRef),
+            ("sym", Arc::new(StringArray::from(vec!["A"])) as ArrayRef),
+        ])
+        .unwrap()
+    };
     let feed = SourceId::parse("feed").unwrap();
-    let name = TableName::parse("md.t0").unwrap();
-    assert_eq!(a.writer(&name, &feed, false).unwrap().epoch(), 1);
-    assert_eq!(b.writer(&name, &feed, false).unwrap().epoch(), 2);
-    assert_eq!(b.source_state(&name, &feed).unwrap().1, Some(2));
+    let writer = store.writer(&ticks(), &feed, false).unwrap();
+    assert!(writer.write(&rows(1), None).unwrap());
+    drop(writer);
+
+    // The catalog's tables gone, as when Postgres cannot be reached: every query of it fails.
+    let schema_name = url.rsplit("search_path%3D").next().unwrap();
+    let admin_url = std::env::var("KERMODES_TEST_POSTGRES").unwrap();
+    let mut admin = postgres::Client::connect(&admin_url, postgres::NoTls).unwrap();
+    admin
+        .batch_execute(&format!("DROP SCHEMA {schema_name} CASCADE"))
+        .unwrap();
+
+    let names: Vec<String> = store
+        .tables()
+        .unwrap()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert_eq!(names, ["md.ticks"]);
+    let other = SourceId::parse("other").unwrap();
+    let writer = store.writer(&ticks(), &other, false).unwrap();
+    assert!(writer.write(&rows(2), None).unwrap());
+    assert_eq!(store.source_state(&ticks(), &other).unwrap().0, Some(1));
+    let quotes = TableName::parse("md.quotes").unwrap();
+    assert!(matches!(
+        store.create_table(&quotes, &schema()),
+        Err(Error::Catalog(_))
+    ));
 }
 
 fn date(text: &str) -> Date {

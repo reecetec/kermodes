@@ -8,7 +8,7 @@ use super::{
     FORMAT, Found, Garbage, HistoryCommit, HistoryDate, HistoryFile, Row, check_commit, location,
     started_key,
 };
-use crate::{Date, Error, SourceId, TableName};
+use crate::{Date, Error, TableName};
 
 pub(crate) struct Sqlite {
     conn: Connection,
@@ -31,25 +31,19 @@ impl Sqlite {
                  columns TEXT NOT NULL,
                  UNIQUE (branch, namespace, name)
              );
-             -- Each source's lease epoch (§7.4). Added after format 1 shipped: a table of its
+             -- A keyed table's key columns (§5.2). Added after format 1 shipped: a table of its
              -- own, so catalogs without it still open, and older versions ignore it.
-             CREATE TABLE IF NOT EXISTS sources (
-                 table_id INTEGER NOT NULL REFERENCES tables (id),
-                 source TEXT NOT NULL,
-                 epoch INTEGER NOT NULL,
-                 PRIMARY KEY (table_id, source)
-             );
-             -- A keyed table's key columns (§5.2), added after format 1 shipped, like `sources`.
              CREATE TABLE IF NOT EXISTS table_keys (
                  table_id INTEGER PRIMARY KEY REFERENCES tables (id),
                  key TEXT NOT NULL
              );
-             -- An append table's sort columns (§8.1), added after format 1 shipped, like `sources`.
+             -- An append table's sort columns (§8.1), added after format 1 shipped, like
+             -- `table_keys`.
              CREATE TABLE IF NOT EXISTS table_sort (
                  table_id INTEGER PRIMARY KEY REFERENCES tables (id),
                  sort TEXT NOT NULL
              );
-             -- History (§8), added after format 1 shipped, like `sources`: which files hold
+             -- History (§8), added after format 1 shipped, like `table_keys`: which files hold
              -- each table's history, which dates each holds, and files replaced but not yet
              -- deleted.
              CREATE TABLE IF NOT EXISTS history_files (
@@ -209,19 +203,6 @@ impl Sqlite {
             .collect()
     }
 
-    pub(crate) fn next_epoch(&mut self, table_id: i64, source: &SourceId) -> Result<u64, Error> {
-        self.conn
-            .query_row(
-                "INSERT INTO sources (table_id, source, epoch) VALUES (?1, ?2, 1)
-                 ON CONFLICT (table_id, source) DO UPDATE SET epoch = epoch + 1
-                 RETURNING epoch",
-                params![table_id, source.as_str()],
-                |row| row.get::<_, i64>(0),
-            )
-            .map(|epoch| epoch as u64)
-            .map_err(sql)
-    }
-
     pub(crate) fn replica_started(&mut self, branch: &str, replica: u64) -> Result<bool, Error> {
         self.conn
             .query_row(
@@ -240,18 +221,6 @@ impl Sqlite {
                 [started_key(branch, replica)],
             )
             .map(drop)
-            .map_err(sql)
-    }
-
-    pub(crate) fn epoch(&mut self, table_id: i64, source: &SourceId) -> Result<Option<u64>, Error> {
-        self.conn
-            .query_row(
-                "SELECT epoch FROM sources WHERE table_id = ?1 AND source = ?2",
-                params![table_id, source.as_str()],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map(|epoch| epoch.map(|e| e as u64))
             .map_err(sql)
     }
 

@@ -581,11 +581,11 @@ outlive what Kubernetes believes.
 
 - A writer holds a lease on `(table, source)`: `session.writer(table, source, wait=True)` waits
   for the current holder to go; without `wait`, a taken source fails at once.
-- Taking a lease increments the source's epoch, kept in the catalog, so epochs rise across
-  restarts. weir accepts writes only on the holder's stream, and each batch's index record carries
-  its epoch, so a replicated weir (§17) can reject a fenced holder's writes as well. With
-  replication (§7.6), taking and releasing a lease are entries in the shard's log, so writing
-  needs no catalog call at all.
+- Taking a lease is an entry in the shard's log (§7.6): the lease's epoch is that entry's index,
+  so epochs rise across restarts and leaders and taking one needs no catalog. weir accepts
+  writes only on the holder's stream, and each batch's index record carries its epoch. A lease
+  is held by the leader that took it: a new leader starts with none held, and a holder whose
+  leader went takes a new lease there when it reconnects.
 - A lease is released when its writer closes or its connection drops. A holder that vanishes
   without closing (a crashed or partitioned node) is found by HTTP/2 keepalive pings within about
   30 s.
@@ -653,16 +653,18 @@ writers ─► leader ── append + fsync ────────────
   ZooKeeper-era Kafka lost acknowledged writes.
 - **What Postgres holds.** What changes rarely: tables and their columns, shards and their
   members, which shard holds which partitions, and history (§8.2). A Postgres outage stops none
-  of producing, consuming, or failing over; it blocks creating tables, changing columns, and
-  moving partitions until it is back.
+  of producing, consuming, or failing over (built: a weir that cannot reach its catalog serves
+  the tables it holds as it holds them, and leases are log entries); it blocks creating tables,
+  changing columns, merging history, and moving partitions until it is back. A replica opening
+  needs the catalog, so one restarted during an outage waits for it.
 - **Log entries.** A batch: its table, its columns with their IDs, source, `seq`, epoch, change
   kind (§7.1), the ingest time the leader stamps (rising across leaders, since every replica
   keeps the last it applied and a leader stamps above it), and the rows as Arrow IPC (built). A
   leader's first entry of its term is empty. Commands are entries too, so every replica does the
-  same thing at the same position: dropping a merged date (§7.3, built), and later taking and
-  releasing a source lease (§7.4) and changing a table's columns (§5.4). Until they are, a
-  follower takes up a table created, or columns changed, since it opened from the catalog when
-  the first write in them reaches it. Entries are versioned; a change to their format is a
+  same thing at the same position: dropping a merged date (§7.3) and taking a source lease (§7.4)
+  (built), and later changing a table's columns (§5.4). Until then, a follower takes up a table
+  created, or columns changed, since it opened from the catalog when the first write in them
+  reaches it. Entries are versioned; a change to their format is a
   Parallel Change across two releases, so old and new replicas run side by side during a
   rollout.
 - **Writes.** The leader assigns each batch the next log position (LSN), appends it, and
@@ -798,8 +800,8 @@ writers ─► leader ── append + fsync ────────────
   2. The simulator; then replication over 3 replicas with fixed membership, under it, with
      catch-up from a peer's partition files, replicas over Flight, and the Helm chart running
      three (built).
-  3. Leadership transfer for rollouts, and readiness once caught up (built); leases as log
-     entries; a replica that lost its disk rejoining as a new member; reads from followers.
+  3. Leadership transfer for rollouts, readiness once caught up, and leases as log entries
+     (built); a replica that lost its disk rejoining as a new member; reads from followers.
   4. Local disks, one replica per node (built).
   5. Later: more shards, and changing a shard's members otherwise.
 

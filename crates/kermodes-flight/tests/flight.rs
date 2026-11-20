@@ -193,7 +193,7 @@ fn a_waiting_writer_resumes_after_the_last_writers_final_batch() {
     let old = Client::connect(&url).unwrap();
     old.create_table(&ticks(), &schema()).unwrap();
     let writer = old.writer(&ticks(), &feed, false).unwrap();
-    assert_eq!(writer.epoch(), Some(1));
+    let first = writer.epoch().expect("an epoch once the lease is held");
     assert!(writer.write(&batch(0..3), None).unwrap());
 
     let waiting = {
@@ -209,7 +209,12 @@ fn a_waiting_writer_resumes_after_the_last_writers_final_batch() {
     assert!(writer.write(&batch(3..4), None).unwrap());
     assert!(writer.write(&batch(4..5), None).unwrap());
     drop(writer);
-    assert_eq!(waiting.join().unwrap(), (Some(2), Some(3)));
+    let (epoch, last_seq) = waiting.join().unwrap();
+    assert!(
+        epoch.is_some_and(|epoch| epoch > first),
+        "{epoch:?} after {first}"
+    );
+    assert_eq!(last_seq, Some(3));
 }
 
 /// A write is one atomic batch over Flight up to 64 MiB, far past gRPC's 4 MiB default; a larger

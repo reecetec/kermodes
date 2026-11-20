@@ -324,11 +324,11 @@ fn one_process_owns_a_store_and_one_writer_owns_a_source() {
 #[test]
 fn a_waiting_writer_takes_the_lease_with_a_new_epoch() {
     let dir = TempDir::new();
-    {
+    let (e1, e2) = {
         let store = Arc::new(Store::open(&dir.0).unwrap());
         store.create_table(&ticks(), &schema()).unwrap();
         let first = store.writer(&ticks(), &source("feed"), false).unwrap();
-        assert_eq!(first.epoch(), 1);
+        let e1 = first.epoch();
         first.write(&batch(0..2), None).unwrap();
 
         // A second writer waits for the first to go, then resumes after its last batch.
@@ -343,13 +343,21 @@ fn a_waiting_writer_takes_the_lease_with_a_new_epoch() {
         std::thread::sleep(std::time::Duration::from_millis(50));
         first.write(&batch(2..4), None).unwrap();
         drop(first);
-        assert_eq!(waiting.join().unwrap(), (2, Some(2)));
-    }
+        let (e2, last_seq) = waiting.join().unwrap();
+        assert!(e2 > e1, "{e2} after {e1}");
+        assert_eq!(last_seq, Some(2));
+        (e1, e2)
+    };
 
     // Epochs outlive the store's process: the next lease is above every earlier one.
     let store = Store::open(&dir.0).unwrap();
     let writer = store.writer(&ticks(), &source("feed"), false).unwrap();
-    assert_eq!(writer.epoch(), 3);
+    let e3 = writer.epoch();
+    assert!(e3 > e2, "{e3} after {e2}");
+    assert_eq!(
+        store.source_state(&ticks(), &source("feed")).unwrap(),
+        (Some(2), Some(e3))
+    );
     writer.write(&batch(4..5), None).unwrap();
 
     // Each index record (format 2, 56 bytes) carries the epoch of the lease its batch was
@@ -365,7 +373,7 @@ fn a_waiting_writer_takes_the_lease_with_a_new_epoch() {
                 .collect::<Vec<_>>()
         })
         .collect();
-    assert_eq!(epochs, [1, 1, 3]);
+    assert_eq!(epochs, [e1, e1, e3]);
 }
 
 #[test]
