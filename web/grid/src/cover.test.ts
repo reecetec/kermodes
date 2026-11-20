@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { viewerCover } from './cover';
 
-const ticking = { status: 'ticking · updated in cycle 7' };
+const ticking = { status: 'ticking' };
 
 describe('viewerCover', () => {
   it('covers current rows with nothing', () => {

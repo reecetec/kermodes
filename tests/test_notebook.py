@@ -58,7 +58,7 @@ def test_the_widget_carries_frames_and_shows_the_viewers_state():
     header, rows, _ = view.sent[-1]
     assert (header["type"], header["start"], header["total"]) == ("rows", 0, 4)
     assert view.row_count == 4
-    assert view.status == f"ticking · updated in cycle {src._changed}"
+    assert view.status == "ticking"
 
     # Sort and filter in the engine; the traits show what applies and what did not.
     view.ask(type="sort", by=[{"column": "price", "descending": True}])

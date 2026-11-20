@@ -1720,8 +1720,9 @@ proven parts.
 - Hosts: Jupyter, JupyterLab, and VS Code through anywidget, installed with the
   `kermodes[notebook]` extra (`anywidget`, `ipywidgets`, `jupyterlab-widgets`,
   `widgetsnbextension`, `psygnal`; IPython and the kernel are already there). Without the extra,
-  or in kernels without IPython's widget comms (Tern's), tables keep the live HTML preview. The
-  web UI hosts the same component in React.
+  or in kernels without IPython's widget comms (Tern's), a table shows as its text (`repr`),
+  which the viewer's output carries too, for agents. The web UI hosts the same component in
+  React.
 - The bundle (`web/widget`, one ES module with React, the grid, and `apache-arrow`, 141 KB
   gzipped) is built by `bun run build` into `python/kermodes/static/`, which the wheel ships; it
   is not checked in.

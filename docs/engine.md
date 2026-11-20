@@ -256,19 +256,18 @@ vol = ticks.rolling("sym", rows=100, std_price="std(price)")  # or time="5m", at
 
 ## 8. Notebook view
 
-- Displaying a table shows its first 20 rows in key order as HTML, with column types and the row
-  count, rendered in Rust (the wheel has no Python dependencies).
-- A ticking table's output is re-rendered in place through Jupyter's `update_display_data`: one
-  background thread checks every live output ten times a second and re-renders those whose
-  table changed since. This works in any frontend that honours display updates (Jupyter, VS
-  Code, Tern), with no front-end code; `examples/live.ipynb` shows it.
-- Neither live outputs nor IPython's output history keep a table alive: views hold tables
+- Displaying a table shows the table viewer (`architecture.md` §15.3), where `kermodes[notebook]`
+  is installed: a canvas grid subscribed to a viewport, with scrolling over every row, sort,
+  filters, and copying. A ticking table's viewer follows it: one background thread checks every
+  live view ten times a second and pushes fresh rows to those whose table changed since.
+- The same output carries the table as text (`repr`): whether it ticks, its row count, how it
+  was built, its columns and types, and its first 10 rows (or its error). An agent reading cell
+  outputs reads that; a terminal shows it, and so do frontends without widgets, which get the
+  text alone. There is no HTML view: a grid for people, text for programs.
+- Neither live views nor IPython's output history keep a table alive: views hold tables
   weakly, and after each cell the history (`Out`, `_`, `__`, `___`, `_N`) keeps weak proxies to
   tables in place of the tables. A re-run cell's old table goes once its name is rebound, and
-  its output stays as last rendered.
-- The table viewer (`architecture.md` §15.3) replaces this view where `kermodes[notebook]` is
-  installed: a canvas grid subscribed to a viewport, with scrolling over every row, sort,
-  filters, and copying. The HTML view stays for frontends without widget support.
+  its view stays as last shown.
 
 ## 9. Testing
 

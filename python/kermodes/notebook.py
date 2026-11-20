@@ -3,11 +3,13 @@
 The viewer's work (rows by position, sorting and quick filters in the engine, fetches) is the
 engine's `Viewer`, shared with the web UI's server. This widget only carries its messages over
 the notebook comm: grid messages in, frames out (a header and two buffers, the rows as Arrow IPC
-and their keys), and the viewer's state as synced traits. Needs the `kermodes[notebook]` extra;
-`kermodes._live` (how tables display) falls back to the HTML view without it.
+and their keys), and the viewer's state as synced traits. Its output carries the table as text
+too, for an agent reading cell outputs. Needs the `kermodes[notebook]` extra; `kermodes._live`
+(how tables display) shows the text alone without it.
 """
 
 import threading
+import weakref
 from pathlib import Path
 
 import anywidget
@@ -35,11 +37,17 @@ class TableView(anywidget.AnyWidget):
     def __init__(self, table: Table) -> None:
         super().__init__(columns=[{"name": n, "type": t} for n, t in table.columns])
         self._viewer = Viewer(table)
+        self._table = weakref.ref(table)
         # Cycles push from the refresher thread while requests arrive from the kernel; frames
         # go out in the order they were read.
         self._lock = threading.Lock()
         self.on_msg(self._receive)
         self.push()
+
+    def __repr__(self) -> str:
+        """The table it shows, as text: what its output carries beside the grid."""
+        table = self._table()
+        return repr(table) if table is not None else object.__repr__(self)
 
     def _receive(self, _widget: object, content: dict, _buffers: list) -> None:
         with self._lock:
@@ -60,7 +68,7 @@ class TableView(anywidget.AnyWidget):
         header, rows, keys = frame
         if header["type"] == "rows":
             self.row_count = header["total"]
-            self.status = self._viewer.status(header["cycle"])
+            self.status = self._viewer.status()
             self.sort = [{"column": c, "descending": d} for c, d in self._viewer.sort]
             self.filters = self._viewer.filters
             self.filter_errors = self._viewer.filter_errors

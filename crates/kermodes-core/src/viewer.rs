@@ -153,13 +153,12 @@ impl Viewer {
         &self.filter_errors
     }
 
-    /// "loading…" (a live table not yet given all its store held), "static", or "ticking ·
-    /// updated in cycle N".
-    pub fn status(&self, cycle: u64) -> String {
+    /// "loading…" (a live table not yet given all its store held), "ticking", or "static".
+    pub fn status(&self) -> String {
         if self.table.upgrade().is_some_and(|table| table.is_loading()) {
             "loading…".to_owned()
         } else if self.refreshing {
-            format!("ticking · updated in cycle {cycle}")
+            "ticking".to_owned()
         } else {
             "static".to_owned()
         }

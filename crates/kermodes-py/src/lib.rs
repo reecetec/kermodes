@@ -1615,25 +1615,7 @@ impl Table {
         py.detach(|| self.0.changed())
     }
 
-    /// The first `rows` rows as an HTML table, with the row count, or the table's error.
-    fn _preview_html(&self, py: Python<'_>, rows: usize) -> PyResult<String> {
-        let (preview, status) = py.detach(|| {
-            let status = if self.0.is_loading() {
-                "loading…".to_owned()
-            } else if self.0.is_refreshing() {
-                format!("ticking · updated in cycle {}", self.0.changed())
-            } else {
-                "static".to_owned()
-            };
-            (self.0.rows_at(0, rows), status)
-        });
-        match preview {
-            Ok(window) => preview_html(&window.rows, window.total, &status).map_err(arrow_error),
-            Err(error) => Ok(failure_html(&error.to_string())),
-        }
-    }
-
-    /// Notebook display: a live view for ticking tables (see `kermodes._live`).
+    /// Notebook display: the table viewer, ticking with the table (see `kermodes._live`).
     fn _ipython_display_(slf: &Bound<'_, Self>) -> PyResult<()> {
         slf.py()
             .import("kermodes._live")?
@@ -1641,17 +1623,35 @@ impl Table {
         Ok(())
     }
 
+    /// The table as text, for a terminal and for an agent reading cell outputs: whether it
+    /// ticks, its row count, how it was built, its columns with their types, and its first rows;
+    /// or its error.
     fn __repr__(&self, py: Python<'_>) -> String {
-        let columns = self
-            .columns()
-            .iter()
-            .map(|(name, type_name)| format!("{name}: {type_name}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let (refreshing, description) =
-            py.detach(|| (self.0.is_refreshing(), self.0.description()));
-        let kind = if refreshing { "ticking" } else { "static" };
-        format!("<kermodes.Table {description} [{kind}] {{{columns}}}>")
+        let (head, status, description) = py.detach(|| {
+            let status = if self.0.is_loading() {
+                "loading…"
+            } else if self.0.is_refreshing() {
+                "ticking"
+            } else {
+                "static"
+            };
+            (
+                self.0.rows_at(0, PREVIEW_ROWS),
+                status,
+                self.0.description(),
+            )
+        });
+        match head {
+            Ok(window) => {
+                let header = format!(
+                    "kermodes.Table · {status} · {}\n{description}",
+                    row_count(window.total)
+                );
+                preview_text(&window.rows, window.total, &header)
+                    .unwrap_or_else(|e| format!("{header}\n(its rows cannot be shown: {e})"))
+            }
+            Err(error) => format!("kermodes.Table · failed\n{description}\n{error}"),
+        }
     }
 }
 
@@ -1820,9 +1820,9 @@ impl Viewer {
         self.lock().applied()
     }
 
-    /// "static", or "ticking · updated in cycle N".
-    fn status(&self, cycle: u64) -> String {
-        self.lock().status(cycle)
+    /// "loading…", "ticking", or "static".
+    fn status(&self) -> String {
+        self.lock().status()
     }
 }
 
@@ -1847,76 +1847,80 @@ mod _native {
     }
 }
 
-const CAPTION: &str = "font:12px ui-monospace,monospace;opacity:0.65;margin:2px 0";
-const CELL: &str = "padding:2px 10px;white-space:nowrap";
+/// Rows a table's text form shows (`Table.__repr__`).
+const PREVIEW_ROWS: usize = 10;
+/// The most characters of a value its text form shows; a longer one ends in `…`.
+const PREVIEW_WIDTH: usize = 40;
 
-/// HTML for a table's first rows: column names and types, then the rows, then how many more.
-fn preview_html(head: &RecordBatch, total: usize, status: &str) -> Result<String, ArrowError> {
+/// A table's first rows as text under `header`: a line of column names, one of their types,
+/// the rows (numbers aligned right), then how many more.
+fn preview_text(head: &RecordBatch, total: usize, header: &str) -> Result<String, ArrowError> {
     let options = FormatOptions::default()
         .with_null("null")
         .with_timestamp_tz_format(Some("%Y-%m-%d %H:%M:%S%.f"));
-    let columns: Vec<ArrayRef> = head.columns().iter().map(displayable).collect();
-    let formatters = columns
-        .iter()
-        .map(|c| ArrayFormatter::try_new(c.as_ref(), &options))
-        .collect::<Result<Vec<_>, _>>()?;
     let schema = head.schema();
-    let mut html = format!(
-        "<div><div style=\"{CAPTION}\">{} · {} rows</div>",
-        escape(status),
-        thousands(total)
-    );
-    html.push_str("<table style=\"border-collapse:collapse;font:12px ui-monospace,monospace\">");
-    html.push_str("<thead><tr>");
-    for field in schema.fields() {
-        html.push_str(&format!(
-            "<th style=\"{CELL};text-align:{};border-bottom:1px solid #8886\">{} \
-             <span style=\"opacity:0.5;font-weight:normal\">{}</span></th>",
-            alignment(field.data_type()),
-            escape(field.name()),
-            escape(&kermodes_core::type_name(field.data_type())),
-        ));
-    }
-    html.push_str("</tr></thead><tbody>");
-    for row in 0..head.num_rows() {
-        html.push_str("<tr>");
-        for ((formatter, column), field) in formatters.iter().zip(&columns).zip(schema.fields()) {
-            let value = escape(&formatter.value(row).try_to_string()?);
-            let value = if column.is_null(row) {
-                format!("<span style=\"opacity:0.4\">{value}</span>")
-            } else {
-                value
-            };
-            html.push_str(&format!(
-                "<td style=\"{CELL};text-align:{}\">{value}</td>",
-                alignment(field.data_type())
-            ));
+    let mut columns = Vec::with_capacity(schema.fields().len());
+    for (field, column) in schema.fields().iter().zip(head.columns()) {
+        let column = displayable(column);
+        let formatter = ArrayFormatter::try_new(column.as_ref(), &options)?;
+        let mut cells = vec![
+            field.name().clone(),
+            kermodes_core::type_name(field.data_type()),
+        ];
+        for row in 0..head.num_rows() {
+            cells.push(clip(formatter.value(row).try_to_string()?));
         }
-        html.push_str("</tr>");
+        let width = cells
+            .iter()
+            .map(|cell| cell.chars().count())
+            .max()
+            .unwrap_or(0);
+        columns.push((cells, width, is_numeric(field.data_type())));
     }
-    html.push_str("</tbody></table>");
+    let mut text = header.to_owned();
+    for line in 0..2 + head.num_rows() {
+        let cells: Vec<String> = columns
+            .iter()
+            .map(|(cells, width, numeric)| {
+                // Names and types read from the left; figures line up on the right.
+                if *numeric && line >= 2 {
+                    format!("{:>width$}", cells[line])
+                } else {
+                    format!("{:<width$}", cells[line])
+                }
+            })
+            .collect();
+        text.push('\n');
+        text.push_str(cells.join("  ").trim_end());
+    }
     if total > head.num_rows() {
-        html.push_str(&format!(
-            "<div style=\"{CAPTION}\">… {} more rows</div>",
-            thousands(total - head.num_rows())
-        ));
+        text.push_str(&format!("\n… and {}", row_count(total - head.num_rows())));
     }
-    html.push_str("</div>");
-    Ok(html)
+    Ok(text)
 }
 
-fn failure_html(message: &str) -> String {
-    format!(
-        "<div style=\"font:12px ui-monospace,monospace;color:#d33\">{}</div>",
-        escape(message)
+fn clip(value: String) -> String {
+    if value.chars().count() <= PREVIEW_WIDTH {
+        return value;
+    }
+    let mut clipped: String = value.chars().take(PREVIEW_WIDTH - 1).collect();
+    clipped.push('…');
+    clipped
+}
+
+/// `1 row`, `1,234 rows`.
+fn row_count(n: usize) -> String {
+    match n {
+        1 => "1 row".to_owned(),
+        n => format!("{} rows", thousands(n)),
+    }
+}
+
+fn is_numeric(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int32 | DataType::Int64 | DataType::Float64
     )
-}
-
-fn alignment(data_type: &DataType) -> &'static str {
-    match data_type {
-        DataType::Int32 | DataType::Int64 | DataType::Float64 => "right",
-        _ => "left",
-    }
 }
 
 /// UTC timestamps relabelled with the fixed offset `+00:00`: same instants, but they format
@@ -1931,20 +1935,6 @@ fn displayable(column: &ArrayRef) -> ArrayRef {
         ),
         _ => column.clone(),
     }
-}
-
-fn escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            _ => out.push(c),
-        }
-    }
-    out
 }
 
 /// `1234567` as `1,234,567`.

@@ -1,10 +1,10 @@
 """Tables in notebooks.
 
-Displaying a table shows the table viewer (`kermodes.notebook`, with the `kermodes[notebook]` extra) or,
-without it, its first rows as HTML. A ticking table's view then follows it: the viewer gets
-fresh rows, the HTML is re-rendered in place (Jupyter's `update_display_data`), at most ten
-times a second and only after a cycle that changed the table. One background thread serves
-every live view in the process. This module imports IPython, so only notebooks load it,
+Displaying a table shows the table viewer (`kermodes.notebook`, with the `kermodes[notebook]` extra),
+whose output also carries the table as text (`repr`), for an agent reading cell outputs. Where
+widgets cannot run, the text alone. A ticking table's viewer then follows it, fresh rows pushed at
+most ten times a second and only after a cycle that changed the table. One background thread
+serves every live view in the process. This module imports IPython, so only notebooks load it,
 through `Table._ipython_display_`.
 
 Neither the live views nor IPython's output history keep a table alive: re-running a cell
@@ -17,16 +17,17 @@ import re
 import threading
 import time
 import weakref
-from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from IPython import get_ipython
 from IPython.display import display
 
 from kermodes._native import Table
 
-ROWS = 20
+if TYPE_CHECKING:
+    from kermodes.notebook import TableView
+
 INTERVAL = 0.1
 # The names IPython gives cell results: `_`, `__`, `___`, and `_<n>`.
 _HISTORY = re.compile(r"_{1,3}|_\d+")
@@ -35,10 +36,7 @@ _HISTORY = re.compile(r"_{1,3}|_\d+")
 @dataclass
 class _View:
     table: weakref.ref[Table]
-    # Shows the table's current rows: re-renders the HTML, or pushes rows to the viewer.
-    update: Callable[[Table], None]
-    # Called once the table is gone: the viewer drops the sorted or filtered table it built.
-    release: Callable[[], None]
+    viewer: "TableView"
     seen: int
 
 
@@ -49,14 +47,10 @@ _refresher: threading.Thread | None = None
 _watched: "weakref.WeakSet[Any]" = weakref.WeakSet()
 
 
-def _bundle(table: Table) -> dict[str, str]:
-    return {"text/html": table._preview_html(ROWS), "text/plain": repr(table)}
-
-
-def _viewer() -> "type | None":
+def _viewer() -> "type[TableView] | None":
     """The table viewer's class where it can run: the `kermodes[notebook]` extra and its bundle are
     installed, and the kernel is IPython's, whose comms widgets talk over. Other kernels (Tern's
-    own) get the HTML view."""
+    own) get the text."""
     shell = get_ipython()
     if (
         getattr(shell, "kernel", None) is None
@@ -73,28 +67,18 @@ def show(table: Table) -> None:
     if shell is not None and shell not in _watched:
         shell.events.register("post_run_cell", _unpin_history)
         _watched.add(shell)
+    viewer_class = _viewer()
+    if viewer_class is None:
+        display({"text/plain": repr(table)}, raw=True)
+        return
     seen = table._changed
-    if (viewer_class := _viewer()) is not None:
-        viewer = viewer_class(table)
-        display(viewer)
-        update: Callable[[Table], None] = viewer.push
-        release: Callable[[], None] = viewer.release
-    else:
-        handle = display(_bundle(table), raw=True, display_id=True)
-        if handle is None:
-            return
-
-        def update(table: Table) -> None:
-            handle.update(_bundle(table), raw=True)
-
-        def release() -> None:
-            pass
-
+    viewer = viewer_class(table)
+    display(viewer)
     if not table.is_refreshing:
         return
     global _refresher
     with _lock:
-        _views.append(_View(weakref.ref(table), update, release, seen))
+        _views.append(_View(weakref.ref(table), viewer, seen))
         if _refresher is None:
             _refresher = threading.Thread(
                 target=_refresh, name="kermodes-live", daemon=True
@@ -111,7 +95,7 @@ def _refresh() -> None:
             _views[:] = [view for view in _views if view.table() is not None]
             views = list(_views)
         for view in gone:
-            view.release()
+            view.viewer.release()
         for view in views:
             table = view.table()
             if table is None:
@@ -119,7 +103,7 @@ def _refresh() -> None:
             changed = table._changed
             if changed != view.seen:
                 view.seen = changed
-                view.update(table)
+                view.viewer.push()
             del table
 
 

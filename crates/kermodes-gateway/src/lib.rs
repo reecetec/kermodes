@@ -1493,7 +1493,7 @@ fn state(id: u64, open: &Open, frame: &Frame) -> Message {
         })
     };
     let state = match (&open.series, &open.viewer) {
-        (Some(series), _) => status(lock(series).status(frame.cycle)),
+        (Some(series), _) => status(lock(series).status()),
         (None, Some(viewer)) => {
             let viewer = lock(viewer);
             let sort: Vec<Value> = viewer
@@ -1505,7 +1505,7 @@ fn state(id: u64, open: &Open, frame: &Frame) -> Message {
                 "type": "state",
                 "view": id,
                 "row_count": frame.total,
-                "status": viewer.status(frame.cycle),
+                "status": viewer.status(),
                 "sort": sort,
                 "filters": viewer.filters(),
                 "filter_errors": viewer.filter_errors(),

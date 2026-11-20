@@ -193,11 +193,11 @@ impl Series {
     }
 
     /// As `Viewer::status`.
-    pub fn status(&self, cycle: u64) -> String {
+    pub fn status(&self) -> String {
         if self.table.upgrade().is_some_and(|table| table.is_loading()) {
             "loading…".to_owned()
         } else if self.refreshing {
-            format!("ticking · updated in cycle {cycle}")
+            "ticking".to_owned()
         } else {
             "static".to_owned()
         }
