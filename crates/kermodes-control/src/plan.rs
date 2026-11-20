@@ -34,14 +34,20 @@ pub struct Lake {
     pub secret: String,
 }
 
-/// A merge Job that exists: the table and date it merges, whether it is still running, and
-/// whether it ended in failure.
+/// A merge Job that exists: the table and date it merges, and how far it has got.
 #[derive(Clone, Debug)]
 pub struct MergeJob {
     pub table: String,
     pub date: Date,
-    pub active: bool,
-    pub failed: bool,
+    pub outcome: JobOutcome,
+}
+
+/// Where a Job is: still running, or ended one way or the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobOutcome {
+    Running,
+    Succeeded,
+    Failed,
 }
 
 /// How long after a date's midnight (UTC) its merge waits: a write timestamped just before
@@ -61,7 +67,10 @@ pub fn merges_due(
     const NS_PER_DAY: i64 = 86_400_000_000_000;
     let mut due = Vec::new();
     for (table, dates) in held {
-        if jobs.iter().any(|job| &job.table == table && job.active) {
+        if jobs
+            .iter()
+            .any(|job| &job.table == table && job.outcome == JobOutcome::Running)
+        {
             continue;
         }
         let next = dates
@@ -1421,11 +1430,10 @@ mod tests {
         let held = |table: &str, dates: &[&str]| {
             (table.to_string(), dates.iter().map(|d| day(d)).collect())
         };
-        let job = |table: &str, date: &str, active: bool| MergeJob {
+        let job = |table: &str, date: &str, outcome: JobOutcome| MergeJob {
             table: table.into(),
             date: day(date),
-            active,
-            failed: false,
+            outcome,
         };
         type Case<'a> = (
             &'a str,
@@ -1460,14 +1468,14 @@ mod tests {
                 "one merge of a table at a time",
                 at(9, 0),
                 vec![held("md.ticks", &["2026-11-13"])],
-                vec![job("md.ticks", "2026-11-12", true)],
+                vec![job("md.ticks", "2026-11-12", JobOutcome::Running)],
                 vec![],
             ),
             (
                 "a date with a Job, finished, is not merged again while it lasts",
                 at(9, 0),
                 vec![held("md.ticks", &["2026-11-12", "2026-11-13"])],
-                vec![job("md.ticks", "2026-11-12", false)],
+                vec![job("md.ticks", "2026-11-12", JobOutcome::Succeeded)],
                 vec![("md.ticks", "2026-11-13")],
             ),
             (
@@ -1477,7 +1485,7 @@ mod tests {
                     held("md.ticks", &["2026-11-13"]),
                     held("md.quotes", &["2026-11-12"]),
                 ],
-                vec![job("md.other", "2026-11-12", true)],
+                vec![job("md.other", "2026-11-12", JobOutcome::Running)],
                 vec![("md.ticks", "2026-11-13"), ("md.quotes", "2026-11-12")],
             ),
             (

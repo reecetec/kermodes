@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use tokio_postgres::{Client, NoTls};
 
+use crate::manifest::Manifest;
 use crate::plan;
 
 /// Held while creating the controller's tables, so replicas starting together do not collide.
@@ -23,8 +24,7 @@ pub struct Commit {
     /// The git tree of the project's directory: equal trees are the same code. Unknown for
     /// commits synced before it was recorded.
     pub tree: Option<String>,
-    pub manifest: Option<String>,
-    pub error: Option<String>,
+    pub discovery: Discovery,
     /// The platform image whose `kermodes manifest` read it; unknown for commits read before
     /// this was recorded.
     pub discovered_by: Option<String>,
@@ -33,14 +33,41 @@ pub struct Commit {
     pub lock: Option<String>,
 }
 
+/// What discovery has made of a commit: not yet run (or interrupted), the manifest it printed,
+/// or why the commit cannot deploy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Discovery {
+    Pending,
+    Found(String),
+    Failed(String),
+}
+
+impl Commit {
+    /// The manifest discovery found; a commit without one has nothing to deploy.
+    pub fn manifest(&self) -> Result<Manifest, String> {
+        match &self.discovery {
+            Discovery::Found(json) => Manifest::parse(json),
+            Discovery::Pending => Err(format!("{} is not discovered yet", self.commit)),
+            Discovery::Failed(why) => Err(format!("{} is not deployable: {why}", self.commit)),
+        }
+    }
+}
+
 const COMMIT_COLUMNS: &str = "commit, tree, manifest, error, discovered_by, lock";
 
 fn commit_row(row: tokio_postgres::Row) -> Commit {
+    let manifest: Option<String> = row.get(2);
+    let error: Option<String> = row.get(3);
+    // A manifest wins over an error: one read again keeps its old manifest (`rediscovered`).
+    let discovery = match (manifest, error) {
+        (Some(manifest), _) => Discovery::Found(manifest),
+        (None, Some(error)) => Discovery::Failed(error),
+        (None, None) => Discovery::Pending,
+    };
     Commit {
         commit: row.get(0),
         tree: row.get(1),
-        manifest: row.get(2),
-        error: row.get(3),
+        discovery,
         discovered_by: row.get(4),
         lock: row.get(5),
     }
@@ -577,7 +604,7 @@ pub(crate) async fn test_database(name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{State, plan};
+    use super::{Discovery, State, plan};
 
     /// A commit that fails discovery is never what a project runs: the newest deployable commit
     /// stays the one before it.
@@ -617,24 +644,26 @@ mod tests {
             .unwrap();
         let kept = state.latest_discovered("ticker").await.unwrap().unwrap();
         assert_eq!(
-            (kept.manifest.as_deref(), kept.discovered_by.as_deref()),
-            (Some("{\"manifest\": \"a\"}"), Some("img:2"))
+            (kept.discovery, kept.discovered_by.as_deref()),
+            (
+                Discovery::Found("{\"manifest\": \"a\"}".into()),
+                Some("img:2")
+            )
         );
         state
             .rediscovered("ticker", "a", "img:3", Some("{\"manifest\": \"a3\"}"))
             .await
             .unwrap();
         let read = state.latest_discovered("ticker").await.unwrap().unwrap();
-        assert_eq!(read.manifest.as_deref(), Some("{\"manifest\": \"a3\"}"));
+        assert_eq!(
+            read.discovery,
+            Discovery::Found("{\"manifest\": \"a3\"}".into())
+        );
         // The mainline is at the failed commit; it shows as failed, not as what runs.
         let head = state.latest("ticker").await.unwrap().unwrap();
         assert_eq!(
-            (
-                head.commit.as_str(),
-                head.tree.as_deref(),
-                head.error.as_deref()
-            ),
-            ("b", Some("tree b"), Some("SyntaxError"))
+            (head.commit.as_str(), head.tree.as_deref(), head.discovery),
+            ("b", Some("tree b"), Discovery::Failed("SyntaxError".into()))
         );
         assert_eq!(
             state
@@ -642,9 +671,8 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap()
-                .error
-                .as_deref(),
-            Some("SyntaxError")
+                .discovery,
+            Discovery::Failed("SyntaxError".into())
         );
         assert_eq!(
             state.snapshot("ticker", "b").await.unwrap().as_deref(),

@@ -16,7 +16,7 @@ use kube::api::{
 };
 
 use crate::git::{Credentials, RepositorySecret, SECRET_TYPE, Scope};
-use crate::plan::{MergeJob, Placement};
+use crate::plan::{JobOutcome, MergeJob, Placement};
 use crate::report::{self, Observed};
 use crate::system;
 
@@ -744,7 +744,7 @@ impl Kube {
         Ok(())
     }
 
-    /// The merge Jobs that exist (`plan::merge_job`), and whether each is still running.
+    /// The merge Jobs that exist (`plan::merge_job`), and whether each is running or how it ended.
     pub async fn merge_jobs(&self) -> Result<Vec<MergeJob>, String> {
         let jobs = self
             .jobs
@@ -767,12 +767,17 @@ impl Kube {
                         .iter()
                         .any(|c| c.type_ == kind && c.status == "True")
                 };
-                let failed = ended("Failed");
+                let outcome = if ended("Failed") {
+                    JobOutcome::Failed
+                } else if ended("Complete") {
+                    JobOutcome::Succeeded
+                } else {
+                    JobOutcome::Running
+                };
                 Some(MergeJob {
                     table,
                     date,
-                    active: !failed && !ended("Complete"),
-                    failed,
+                    outcome,
                 })
             })
             .collect())

@@ -7,7 +7,7 @@ use serde::Serialize;
 use kermodes_weir::Date;
 
 use crate::k8s::Rollout;
-use crate::plan::MergeJob;
+use crate::plan::{JobOutcome, MergeJob};
 
 /// The components' `app.kubernetes.io/component` labels, in the order they are shown.
 pub const COMPONENTS: [&str; 4] = ["weir", "database", "control", "ui"];
@@ -157,7 +157,7 @@ pub fn lake_status(
     if let Err(why) = probe {
         return ("Unreachable".into(), Some(why.clone()));
     }
-    if let Some(job) = jobs.iter().find(|j| j.failed) {
+    if let Some(job) = jobs.iter().find(|j| j.outcome == JobOutcome::Failed) {
         return (
             "Merge failed".into(),
             Some(format!(
@@ -174,7 +174,7 @@ pub fn lake_status(
             )),
         );
     }
-    if jobs.iter().any(|j| j.active) {
+    if jobs.iter().any(|j| j.outcome == JobOutcome::Running) {
         return ("Merging".into(), None);
     }
     // Fine reads the same word as every other part that is fine
@@ -203,17 +203,16 @@ mod tests {
         Disk, Instance, image_tag, lake_status, postgres_disks, recovered, status, weir_disk,
     };
     use crate::k8s::Rollout;
-    use crate::plan::MergeJob;
+    use crate::plan::{JobOutcome, MergeJob};
     use kermodes_weir::Date;
 
     #[test]
     fn the_lake_says_what_is_wrong_most_pressing_first() {
         let day = Date::parse("2026-11-14").unwrap();
-        let job = |active: bool, failed: bool| MergeJob {
+        let job = |outcome: JobOutcome| MergeJob {
             table: "md.ticks".into(),
             date: day,
-            active,
-            failed,
+            outcome,
         };
         let overdue = vec![("md.ticks".to_owned(), day)];
         let down: Result<(), String> = Err("connection refused".into());
@@ -225,16 +224,26 @@ mod tests {
         );
         let cases: Vec<Case> = vec![
             (&Ok(()), vec![], &[], "Running"),
-            (&Ok(()), vec![job(false, false)], &[], "Running"),
-            (&Ok(()), vec![job(true, false)], &[], "Merging"),
-            (&Ok(()), vec![job(true, false)], &overdue, "Merge overdue"),
+            (&Ok(()), vec![job(JobOutcome::Succeeded)], &[], "Running"),
+            (&Ok(()), vec![job(JobOutcome::Running)], &[], "Merging"),
             (
                 &Ok(()),
-                vec![job(true, false), job(false, true)],
+                vec![job(JobOutcome::Running)],
+                &overdue,
+                "Merge overdue",
+            ),
+            (
+                &Ok(()),
+                vec![job(JobOutcome::Running), job(JobOutcome::Failed)],
                 &overdue,
                 "Merge failed",
             ),
-            (&down, vec![job(false, true)], &overdue, "Unreachable"),
+            (
+                &down,
+                vec![job(JobOutcome::Failed)],
+                &overdue,
+                "Unreachable",
+            ),
         ];
         for (probe, jobs, overdue, expected) in cases {
             assert_eq!(

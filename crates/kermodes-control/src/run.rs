@@ -21,7 +21,7 @@ use crate::leader::{Leadership, Wake};
 use crate::manifest::{Manifest, Resource, Update};
 use crate::plan::{self, Build, Decision, Target};
 use crate::report;
-use crate::state::{Commit, State};
+use crate::state::{Commit, Discovery, State};
 use crate::system;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -232,7 +232,7 @@ impl Controller {
             let Some(latest) = state.latest_discovered(&project.name).await? else {
                 continue;
             };
-            let manifest = Manifest::parse(latest.manifest.as_deref().unwrap_or_default())?;
+            let manifest = latest.manifest()?;
             let builds = state.builds(&project.name).await?;
             let deployed = state.deployed(&project.name).await?;
             for (app, commit) in plan::builds_in_use(&manifest.resources, &latest.commit, &deployed)
@@ -614,7 +614,7 @@ async fn build_once(
         )
     };
     let Some(latest) = latest else { return Ok(()) };
-    let manifest = Manifest::parse(latest.manifest.as_deref().unwrap_or_default())?;
+    let manifest = latest.manifest()?;
     // A build ends with its Job; what it uploaded is what makes it built.
     let mut built_any = false;
     for record in records.iter().filter(|r| r.state == Build::Building) {
@@ -725,7 +725,7 @@ async fn report_once(controller: &Controller) -> Result<RecordBatch, String> {
             )
         };
         let Some(latest) = latest else { continue };
-        let manifest = Manifest::parse(latest.manifest.as_deref().unwrap_or_default())?;
+        let manifest = latest.manifest()?;
         for resource in &manifest.resources {
             let name = plan::object_name(&project.name, &resource.name)?;
             rows.push(report::Row::new(
@@ -894,7 +894,7 @@ async fn sync(controller: &Controller, project: &ProjectConfig) -> Result<(), St
             Some((snapshot.commit, lock))
         }
         // Discovery was interrupted (the controller restarted): run it again.
-        Some(c) if c.manifest.is_none() && c.error.is_none() => Some((c.commit, c.lock)),
+        Some(c) if c.discovery == Discovery::Pending => Some((c.commit, c.lock)),
         Some(_) => None,
     };
     if let Some((commit, lock)) = pending {
@@ -1000,7 +1000,7 @@ async fn rediscover_if_stale(
     let image = &controller.config.image;
     let stale = |c: &Commit| c.discovered_by.as_deref() != Some(image.as_str());
     let head = controller.state.lock().await.latest(&project.name).await?;
-    if let Some(head) = head.filter(|c| c.error.is_some() && stale(c)) {
+    if let Some(head) = head.filter(|c| matches!(c.discovery, Discovery::Failed(_)) && stale(c)) {
         let lock = head.lock.as_deref();
         let result = match environment(controller, project, &head.commit, lock).await? {
             Environment::Waiting => return Ok(()),
@@ -1101,7 +1101,7 @@ async fn reconcile(controller: &Controller, project: &ProjectConfig) -> Result<(
         _ => None,
     };
     let mut state = controller.state.lock().await;
-    let manifest = Manifest::parse(latest.manifest.as_deref().unwrap_or_default())?;
+    let manifest = latest.manifest()?;
     let names = plan::object_names(&project.name, &manifest.resources)?;
     let stopped = state.stopped(&project.name).await?;
     for resource in &manifest.resources {
@@ -1207,7 +1207,7 @@ pub async fn roll_out(
         .latest_discovered(project)
         .await?
         .ok_or_else(|| format!("{project} has no deployable commit"))?;
-    let manifest = Manifest::parse(latest.manifest.as_deref().unwrap_or_default())?;
+    let manifest = latest.manifest()?;
     let declared = manifest
         .resources
         .iter()
@@ -1256,13 +1256,13 @@ pub async fn status(controller: &Controller) -> Result<Value, String> {
         let deployed = state.deployed(&project.name).await?;
         drop(state);
         // The mainline's newest commit, when its discovery failed: what runs stays on `commit`.
-        let failed = head.and_then(|head| {
-            let error = head.error?;
-            Some(json!({"commit": head.commit, "error": error}))
+        let failed = head.and_then(|head| match head.discovery {
+            Discovery::Failed(error) => Some(json!({"commit": head.commit, "error": error})),
+            Discovery::Pending | Discovery::Found(_) => None,
         });
         let mut resources = Vec::new();
         if let Some(latest) = &latest {
-            let manifest = Manifest::parse(latest.manifest.as_deref().unwrap_or_default())?;
+            let manifest = latest.manifest()?;
             for resource in &manifest.resources {
                 let running = deployed.get(&resource.name);
                 let name = plan::object_name(&project.name, &resource.name)?;
@@ -1308,16 +1308,13 @@ async fn source(
         .await
         .commit(&project.name, commit)
         .await?;
-    let defined_at = stored
-        .and_then(|c| c.manifest)
-        .and_then(|manifest| Manifest::parse(&manifest).ok())
-        .and_then(|manifest| {
-            let resource = manifest
-                .resources
-                .into_iter()
-                .find(|r| r.name == resource)?;
-            resource.defined_at
-        });
+    let defined_at = stored.and_then(|c| c.manifest().ok()).and_then(|manifest| {
+        let resource = manifest
+            .resources
+            .into_iter()
+            .find(|r| r.name == resource)?;
+        resource.defined_at
+    });
     let directory = project.path.trim_matches('/');
     Ok(match defined_at {
         Some(at) => {
