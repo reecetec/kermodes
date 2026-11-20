@@ -159,7 +159,7 @@ describe('KermodesConnection', () => {
         type: 'state',
         view: trades.id,
         row_count: 42,
-        status: 'ticking · cycle 3',
+        status: 'ticking',
         sort: [{ column: 'px', descending: true }],
         filters: {},
         filter_errors: {},
@@ -167,7 +167,7 @@ describe('KermodesConnection', () => {
       })
     );
     expect(tradesStates).toBe(1);
-    expect(trades.state()).toMatchObject({ row_count: 42, status: 'ticking · cycle 3' });
+    expect(trades.state()).toMatchObject({ row_count: 42, status: 'ticking' });
     expect(symbols.state().row_count).toBe(0);
 
     sockets[0].receive(
@@ -184,7 +184,7 @@ describe('KermodesConnection', () => {
         type: 'state',
         view: trades.id,
         row_count: 42,
-        status: 'ticking · cycle 4',
+        status: 'ticking',
         sort: [],
         filters: {},
         filter_errors: {},

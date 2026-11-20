@@ -1678,13 +1678,9 @@ impl Table {
     /// or its error.
     fn __repr__(&self, py: Python<'_>) -> String {
         let (head, status, description) = py.detach(|| {
-            let status = if self.0.is_loading() {
-                "loading…"
-            } else if self.0.is_refreshing() {
-                "ticking"
-            } else {
-                "static"
-            };
+            let status =
+                kermodes_core::viewer::Status::new(self.0.is_loading(), self.0.is_refreshing())
+                    .as_str();
             (
                 self.0.rows_at(0, PREVIEW_ROWS),
                 status,
@@ -1871,8 +1867,8 @@ impl Viewer {
     }
 
     /// "loading…", "ticking", or "static".
-    fn status(&self) -> String {
-        self.lock().status()
+    fn status(&self) -> &'static str {
+        self.lock().status().as_str()
     }
 }
 

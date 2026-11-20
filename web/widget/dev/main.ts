@@ -114,7 +114,7 @@ function compareValues(a: unknown, b: unknown): number {
 const traits: ViewerState = {
   columns: data.map(({ name, type }) => ({ name, type })),
   row_count: ROWS,
-  status: 'ticking · updated in cycle 1',
+  status: 'ticking',
   sort: [],
   filters: {},
   filter_errors: {},
@@ -181,7 +181,7 @@ function derive(): void {
 
 function push(): void {
   setTrait('row_count', shown.length);
-  setTrait('status', `ticking · updated in cycle ${cycle}`);
+  setTrait('status', 'ticking');
   emit('msg:custom', { type: 'rows', start: window.start, total: shown.length, cycle }, rowsAt(window.start, window.count));
 }
 

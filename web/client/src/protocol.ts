@@ -10,12 +10,18 @@ export type SortKey = {
   descending: boolean;
 };
 
+/**
+ * Whether a table's rows still change, as the engine spells it: "loading…" while a live table
+ * catches up with its store, then "ticking"; "static" for one that never changes. The client
+ * says "opening…" until the engine first answers.
+ */
+export type ViewerStatus = 'opening…' | 'loading…' | 'ticking' | 'static';
+
 /** What the engine side keeps in sync with the viewer */
 export type ViewerState = {
   columns: ViewportColumn[];
   row_count: number;
-  // "loading…" while a live table catches up with its store, "static", or "ticking · …"
-  status: string;
+  status: ViewerStatus;
   // Sort keys in priority order
   sort: SortKey[];
   // Quick filter text by column name

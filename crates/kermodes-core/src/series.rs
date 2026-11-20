@@ -25,7 +25,7 @@ use arrow::datatypes::{
 use arrow::ipc::writer::StreamWriter;
 
 use crate::session::{Table, WeakTable};
-use crate::viewer::Frame;
+use crate::viewer::{Frame, Status};
 use crate::{Error, type_name};
 
 /// The fewest and most points a chart may ask for.
@@ -193,14 +193,9 @@ impl Series {
     }
 
     /// As `Viewer::status`.
-    pub fn status(&self) -> String {
-        if self.table.upgrade().is_some_and(|table| table.is_loading()) {
-            "loading…".to_owned()
-        } else if self.refreshing {
-            "ticking".to_owned()
-        } else {
-            "static".to_owned()
-        }
+    pub fn status(&self) -> Status {
+        let loading = self.table.upgrade().is_some_and(|table| table.is_loading());
+        Status::new(loading, self.refreshing)
     }
 }
 

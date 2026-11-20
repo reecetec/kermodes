@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'bun:test';
-import { viewerCover } from './cover';
+import { type ViewerState } from '@kermodes/client';
+import { viewerCover as coverOf, viewerShowing } from './cover';
 
-const ticking = { status: 'ticking' };
+type Viewed = Pick<ViewerState, 'status' | 'error' | 'retrying'>;
+
+const viewerCover = (state: Viewed, hasRows: boolean, isUpdating: boolean) =>
+  coverOf(state, viewerShowing(state.status, hasRows, isUpdating));
+
+const ticking: Viewed = { status: 'ticking' };
 
 describe('viewerCover', () => {
   it('covers current rows with nothing', () => {

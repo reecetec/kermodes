@@ -37,7 +37,7 @@ import {
   planCopy,
   writeClipboard,
 } from './copy';
-import { viewerCover, type Cover } from './cover';
+import { viewerCover, viewerShowing, type Cover } from './cover';
 import { shownValue, type ShownValue } from './cellValue';
 import ValuePopover, { type CellRect } from './ValuePopover';
 
@@ -891,7 +891,8 @@ export function TableViewer({
 
   const filterBarHeight = isFilterBarShown ? FILTER_BAR_HEIGHT : 0;
   const hasFilters = Object.values(state.filters).some(text => text.trim() !== '');
-  const cover = viewerCover(state, hasRows, isUpdating);
+  const showing = viewerShowing(state.status, hasRows, isUpdating);
+  const cover = viewerCover(state, showing);
   const gridHeight =
     maxGridHeight == null
       ? undefined
@@ -1021,7 +1022,7 @@ export function TableViewer({
           {hasFilters ? 'Filtered' : 'Filter'}
         </button>
         {/* A live table still loading has no count worth reading yet */}
-        {hasRows && !state.status.startsWith('loading') && (
+        {showing.kind === 'rows' && !showing.tableLoading && (
           <span>
             {rowCount.toLocaleString('en-US')} {rowCount === 1 ? 'row' : 'rows'}
           </span>

@@ -79,7 +79,7 @@ export function tableStatus(
   if (state.error != null) {
     return state.retrying === true ? 'reconnecting' : 'failed';
   }
-  if (!hasRows || state.status.startsWith('loading')) {
+  if (!hasRows || state.status === 'loading…') {
     return 'loading';
   }
   return state.status === 'static' ? 'static' : 'live';

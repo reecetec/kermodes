@@ -88,7 +88,7 @@ export function fakeKermodes(tables: Readonly<Record<string, readonly TableRow[]
       state: {
         columns: [],
         row_count: 0,
-        status: 'loading',
+        status: 'loading…',
         sort: [],
         filters: {},
         filter_errors: {},

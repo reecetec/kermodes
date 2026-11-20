@@ -58,6 +58,36 @@ pub struct Frame {
     pub keys: Vec<u8>,
 }
 
+/// Whether a table's rows still change, as viewers show it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    /// A live table not yet given all its store held: it ticks once it has.
+    Loading,
+    Ticking,
+    Static,
+}
+
+impl Status {
+    pub fn new(loading: bool, refreshing: bool) -> Self {
+        if loading {
+            Self::Loading
+        } else if refreshing {
+            Self::Ticking
+        } else {
+            Self::Static
+        }
+    }
+
+    /// As the viewer protocol and a table's `repr` spell it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Loading => "loading…",
+            Self::Ticking => "ticking",
+            Self::Static => "static",
+        }
+    }
+}
+
 pub struct Viewer {
     table: WeakTable,
     types: BTreeMap<String, DataType>,
@@ -153,15 +183,9 @@ impl Viewer {
         &self.filter_errors
     }
 
-    /// "loading…" (a live table not yet given all its store held), "ticking", or "static".
-    pub fn status(&self) -> String {
-        if self.table.upgrade().is_some_and(|table| table.is_loading()) {
-            "loading…".to_owned()
-        } else if self.refreshing {
-            "ticking".to_owned()
-        } else {
-            "static".to_owned()
-        }
+    pub fn status(&self) -> Status {
+        let loading = self.table.upgrade().is_some_and(|table| table.is_loading());
+        Status::new(loading, self.refreshing)
     }
 
     fn frame(

@@ -43,7 +43,7 @@ type StateMessage = {
   type: 'state';
   view: number;
   row_count: number;
-  status: string;
+  status: ViewerState['status'];
   sort: ViewerState['sort'];
   filters: ViewerState['filters'];
   filter_errors: ViewerState['filter_errors'];

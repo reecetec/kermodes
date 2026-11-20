@@ -50,7 +50,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use kermodes_core::series::Series;
-use kermodes_core::viewer::{FETCH_LIMIT, Frame, Request, SortKey, Viewer};
+use kermodes_core::viewer::{FETCH_LIMIT, Frame, Request, SortKey, Status, Viewer};
 use kermodes_core::{Session, Table, type_name};
 use serde_json::{Value, json};
 use tokio::sync::{oneshot, watch};
@@ -1480,12 +1480,12 @@ fn answer(id: u64, open: &Open, reply: Reply) -> Vec<Message> {
 }
 
 fn state(id: u64, open: &Open, frame: &Frame) -> Message {
-    let status = |status: String| {
+    let status = |status: Status| {
         json!({
             "type": "state",
             "view": id,
             "row_count": frame.total,
-            "status": status,
+            "status": status.as_str(),
             "sort": [],
             "filters": {},
             "filter_errors": {},
@@ -1505,14 +1505,14 @@ fn state(id: u64, open: &Open, frame: &Frame) -> Message {
                 "type": "state",
                 "view": id,
                 "row_count": frame.total,
-                "status": viewer.status(),
+                "status": viewer.status().as_str(),
                 "sort": sort,
                 "filters": viewer.filters(),
                 "filter_errors": viewer.filter_errors(),
                 "applied": viewer.applied(),
             })
         }
-        (None, None) => status("ticking".to_owned()),
+        (None, None) => status(Status::Ticking),
     };
     Message::Text(state.to_string().into())
 }
