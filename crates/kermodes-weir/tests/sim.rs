@@ -1102,6 +1102,18 @@ fn a_leader_hands_over_its_lead() {
         .collect();
     assert_eq!(leaders.len(), 1, "{leaders:?}");
     assert_ne!(leaders[0], was);
+    // A write to the replica that no longer leads is refused as not leading, which sends a
+    // remote writer to the leader to resend it, rather than failing it as refused for good.
+    let (_, writers) = shard.writers.as_ref().expect("resolved");
+    let pending = writers[0][0]
+        .send(Change::Rows, &rows(vec![0], vec![1]), None)
+        .unwrap();
+    shard.stores[was].as_ref().unwrap().step();
+    let refused = pending.wait();
+    assert!(
+        matches!(refused, Err(kermodes_weir::Error::NotLeader(_))),
+        "{refused:?}"
+    );
 }
 
 /// A replica that never had a log joins its shard however late, the others having elected a

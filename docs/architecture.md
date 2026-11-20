@@ -674,8 +674,9 @@ writers ─► leader ── append + fsync ────────────
   by `(source, seq)` (§6.1), so every replica decides it alike. A leader proposes the next group
   only once it has applied every entry before it, since merging a group's writes (§7.1) tells a
   resend by the seqs its tables hold; pipelining groups needs the seqs in flight tracked too. A
-  write a replica refuses (it does not lead) or loses (it stopped leading first) fails as busy:
-  its producer resends it, and the resend is recognised if it was written.
+  write a replica refuses (it does not lead) or loses (it stopped leading first) fails as not
+  leading (unavailable): its producer resends it to the leader, and the resend is recognised if
+  it was written.
 - **Positions.** The LSN is the same on every replica: a shard's entries are in one total order,
   across all its producers, identical live, on a follower, and in a replay. A subscriber's
   position is one LSN per shard it reads; reconnecting, to the same replica or another, it asks

@@ -1891,14 +1891,16 @@ impl Committer {
     /// Takes writes and drops to propose (`propose`); each is answered once its entry is
     /// applied, or now if this replica cannot take it.
     fn submit(&mut self, group: Vec<Submitted>, drops: Vec<Dropping>) {
-        let refused = match &self.broken {
-            Some(why) => Some(stopped(why)),
-            None => (!self.is_leader()).then(|| self.not_leader()),
-        };
-        if let Some(refused) = refused {
+        if self.broken.is_some() || !self.is_leader() {
+            // Each refused as what it is: not leading sends a writer to the next replica to
+            // resend there; weir stopped says to restart it.
+            let refused = || match &self.broken {
+                Some(why) => stopped(why),
+                None => self.not_leader(),
+            };
             let answers = group.into_iter().map(|submitted| submitted.answer);
             for answer in answers.chain(drops.into_iter().map(|dropping| dropping.answer)) {
-                answer.send(Err(Error::Busy(refused.to_string())));
+                answer.send(Err(refused()));
             }
             return;
         }
