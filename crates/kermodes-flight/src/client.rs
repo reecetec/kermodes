@@ -466,11 +466,9 @@ impl Client {
             }
         })?;
         let stream = Arc::new(Mutex::new(Stream {
-            sender: Some(opened.sender),
+            link: Link::Open(opened.sender),
             unacked: VecDeque::new(),
             sent: opened.last_seq,
-            refused: None,
-            dropped: false,
         }));
         let acked = Arc::new(Mutex::new(opened.last_seq));
         let epoch = Arc::new(Mutex::new(opened.epoch));
@@ -795,17 +793,78 @@ impl WriteTarget {
 /// A remote writer's stream and the writes it has not acknowledged. Its lock keeps writes in
 /// the order sent, across a reconnect's resending too.
 struct Stream {
-    /// Where writes go; none while the stream is being opened again.
-    sender: Option<mpsc::UnboundedSender<FlightData>>,
+    link: Link,
     /// Writes not yet acknowledged, oldest first: each one's seq, message (its buffers shared,
     /// not copied), and answer. Resent after a break.
     unacked: VecDeque<(u64, FlightData, Answer)>,
     /// The highest seq sent: the next unnumbered write's is one above.
     sent: Option<u64>,
-    /// Why writing stopped for good: the server refused a write.
-    refused: Option<String>,
-    /// The writer was dropped: its stream is closed, and is not opened again.
-    dropped: bool,
+}
+
+/// Where a remote writer's stream stands.
+enum Link {
+    /// Writes go here.
+    Open(mpsc::UnboundedSender<FlightData>),
+    /// The stream broke and is being opened again: writes wait in `unacked` to be resent.
+    Reconnecting,
+    /// Writing stopped for good: the server refused a write, for this reason.
+    Refused(String),
+    /// The writer was dropped: its stream is closed, and is not opened again. Nothing writes
+    /// after this, so a dropped writer is never open, and a refusal after it changes nothing.
+    Dropped,
+}
+
+impl Stream {
+    /// Queues a write and sends it if the stream is open; a send that fails means the stream
+    /// broke, and the write waits with the others to be resent.
+    fn push(&mut self, seq: u64, data: FlightData, answer: Answer) {
+        if let Link::Open(sender) = &self.link
+            && sender.send(data.clone()).is_err()
+        {
+            self.broke();
+        }
+        self.unacked.push_back((seq, data, answer));
+        self.sent = Some(self.sent.map_or(seq, |last| last.max(seq)));
+    }
+
+    /// The stream broke: returns whether to open it again, which a dropped writer's is not.
+    fn broke(&mut self) -> bool {
+        if matches!(self.link, Link::Dropped) {
+            return false;
+        }
+        self.link = Link::Reconnecting;
+        true
+    }
+
+    /// The stream opened again, its unacknowledged writes resent on `sender`. A writer dropped
+    /// meanwhile closes its new stream at once: the server answers what was resent, then ends
+    /// it.
+    fn reopened(&mut self, sender: mpsc::UnboundedSender<FlightData>) {
+        if !matches!(self.link, Link::Dropped) {
+            self.link = Link::Open(sender);
+        }
+    }
+
+    /// Fails the oldest unacknowledged write with `error`, every other one as following it, and
+    /// every later write too.
+    fn refuse(&mut self, error: Error) {
+        let why = error.to_string();
+        self.link = Link::Refused(why.clone());
+        let mut unacked = self.unacked.drain(..);
+        if let Some((_, _, answer)) = unacked.next() {
+            answer.send(Err(error));
+        }
+        for (_, _, answer) in unacked {
+            answer.send(Err(Error::Io(format!(
+                "not written: an earlier write was refused ({why})"
+            ))));
+        }
+    }
+
+    /// The writer was dropped: closes the stream, which is not opened again.
+    fn dropped(&mut self) {
+        self.link = Link::Dropped;
+    }
 }
 
 /// How a write stream stopped.
@@ -866,14 +925,13 @@ async fn keep_writing(
             }
         };
         let why = match stopped {
-            Stopped::Refused(error) => return refuse(&stream, error),
+            Stopped::Refused(error) => return lock(&stream).refuse(error),
             Stopped::Broke(why) => why,
         };
         let down = Instant::now();
         {
             let mut stream = lock(&stream);
-            stream.sender = None;
-            if stream.dropped {
+            if !stream.broke() {
                 // Dropped and done: the server answers every write before closing.
                 for (_, _, answer) in stream.unacked.drain(..) {
                     answer.send(Err(Error::Io(format!(
@@ -902,7 +960,7 @@ async fn keep_writing(
                 Ok(opened) => break opened,
                 Err(error @ (Error::Schema(_) | Error::NotFound(_) | Error::Corrupt(_))) => {
                     eprintln!("kermodes: the write stream of {who} cannot reconnect: {error}");
-                    return refuse(&stream, error);
+                    return lock(&stream).refuse(error);
                 }
                 // Gone, or not leading: the next replica at once, and a short pause once all
                 // were tried, while they elect a leader.
@@ -947,32 +1005,10 @@ async fn keep_writing(
             down.elapsed().as_secs_f64(),
             stream.unacked.len()
         );
-        // A writer dropped meanwhile closes its new stream at once: the server answers what was
-        // resent, then ends it.
-        if !stream.dropped {
-            stream.sender = Some(opened.sender);
-        }
+        stream.reopened(opened.sender);
         drop(stream);
         acks = opened.acks;
         index = opened.index;
-    }
-}
-
-/// Fails the oldest unacknowledged write with `error`, every other one as following it, and
-/// every later write too.
-fn refuse(stream: &Mutex<Stream>, error: Error) {
-    let mut stream = lock(stream);
-    let why = error.to_string();
-    stream.sender = None;
-    stream.refused = Some(why.clone());
-    let mut unacked = stream.unacked.drain(..);
-    if let Some((_, _, answer)) = unacked.next() {
-        answer.send(Err(error));
-    }
-    for (_, _, answer) in unacked {
-        answer.send(Err(Error::Io(format!(
-            "not written: an earlier write was refused ({why})"
-        ))));
     }
 }
 
@@ -1120,7 +1156,7 @@ impl RemoteWriter {
         // Waits while the budget is full: a stream long broken slows its producer this way.
         let (pending, answer) = self.in_flight.send(bytes, &self.gone);
         let mut stream = lock(&self.stream);
-        if let Some(why) = &stream.refused {
+        if let Link::Refused(why) = &stream.link {
             answer.send(Err(Error::Io(format!(
                 "{} cannot be written: {why}",
                 self.table
@@ -1137,13 +1173,7 @@ impl RemoteWriter {
         data.app_metadata = metadata.into();
         // While the stream is being opened again, the write waits with those unacknowledged,
         // to be sent with them.
-        if let Some(sender) = &stream.sender
-            && sender.send(data.clone()).is_err()
-        {
-            stream.sender = None;
-        }
-        stream.unacked.push_back((seq, data, answer));
-        stream.sent = Some(stream.sent.map_or(seq, |last| last.max(seq)));
+        stream.push(seq, data, answer);
         Ok(pending)
     }
 
@@ -1157,9 +1187,7 @@ impl Drop for RemoteWriter {
     /// Closes the stream: the server answers the writes on it, then ends it and lets the
     /// source's lease go.
     fn drop(&mut self) {
-        let mut stream = lock(&self.stream);
-        stream.dropped = true;
-        stream.sender = None;
+        lock(&self.stream).dropped();
     }
 }
 
