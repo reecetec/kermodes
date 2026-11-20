@@ -99,6 +99,11 @@ pub(crate) enum Command {
         rows: u64,
         now_ns: i64,
     },
+    /// A writer took the lease on one of `table`'s sources (§7.4); the entry's index is its
+    /// epoch.
+    Lease {
+        table: i64,
+    },
 }
 
 /// Encodes a drop of `table`'s past `date` as an entry's data (`Command::Drop`).
