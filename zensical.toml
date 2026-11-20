@@ -10,6 +10,8 @@ docs_dir = "docs"
 site_dir = "site"
 # A broken link or anchor fails the build
 strict = true
+# The palette in Kermodes' tokens (theme.md)
+extra_css = ["stylesheets/extra.css"]
 nav = [
   { "Home" = "index.md" },
   { "Architecture" = "architecture.md" },
@@ -18,6 +20,8 @@ nav = [
 ]
 
 [project.theme]
+# Material for MkDocs' look: the same HTML, its classic styles
+variant = "classic"
 features = [
   "content.action.copy",
   "content.action.edit",
@@ -29,13 +33,22 @@ features = [
   "toc.follow",
 ]
 
+# The app's typefaces (theme.md)
+[project.theme.font]
+text = "Fira Sans"
+code = "Fira Mono"
+
 [[project.theme.palette]]
 scheme = "slate"
+primary = "custom"
+accent = "custom"
 toggle.icon = "lucide/sun"
 toggle.name = "Light"
 
 [[project.theme.palette]]
 scheme = "default"
+primary = "custom"
+accent = "custom"
 toggle.icon = "lucide/moon"
 toggle.name = "Dark"
 
