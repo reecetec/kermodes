@@ -6,9 +6,10 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
+use arrow::array::{RecordBatch, RecordBatchOptions, UInt64Array};
+use arrow::compute::take;
 use arrow::datatypes::SchemaRef;
-use kermodes_weir::{Date, Error, TableEntry, TableName};
+use kermodes_weir::{ColumnId, Date, Error, TableEntry, TableName};
 
 use crate::bounds::Bound;
 use crate::files::{
@@ -109,40 +110,150 @@ pub fn explain_history(
     history(weir, lake, &entry, &reading, false).map(|history| history.explain)
 }
 
-/// One part of a table's history, read on whichever thread runs it: its batches in order, as
-/// `read_history` gives them.
-pub type HistoryPart = Box<dyn FnOnce() -> Result<HistoryBatches, Error> + Send>;
 pub type HistoryBatches = Box<dyn Iterator<Item = Result<RecordBatch, Error>> + Send>;
 
-/// `entry`'s history as `read_history` reads it, as parts to read independently and in
-/// parallel: all of part i's rows come before part i+1's. A part is a run of row groups of one
-/// file (each file's footer read here, once) or one past date weir holds (read here: `weir` is
-/// only borrowed). With a `limit`, only the leading parts that hold at least that many rows. The
-/// caller's `entry`, so the rows it reads beside history (today's) are of the same columns.
+/// `entry`'s history as `read_history` reads it, planned once, as parts to read independently
+/// and in parallel (`HistoryParts`). A part is a run of row groups of one file (each file's
+/// footer read here, once) or one past date weir holds (read here: `weir` is only borrowed).
+/// With a `limit`, only the leading parts that hold at least that many rows. The caller's
+/// `entry`, so the rows it reads beside history (today's) are of the same columns.
 pub fn history_parts(
     weir: &dyn Weir,
     lake: &Arc<Lake>,
     entry: &TableEntry,
     reading: &Reading<'_>,
-) -> Result<(SchemaRef, Vec<HistoryPart>), Error> {
+) -> Result<HistoryParts, Error> {
     let planned = plan(weir, lake, entry, reading, true)?;
-    let parts = planned
-        .pieces
-        .into_iter()
-        .map(|piece| -> HistoryPart {
-            match piece {
-                Piece::File(file, part) => {
-                    let (lake, mut current) = (lake.clone(), planned.current.clone());
-                    Box::new(move || {
-                        let batches = PartBatches::new(lake, &file, part)?;
-                        Ok(Box::new(batches.map(move |batch| current.batch(batch?))))
+    Ok(HistoryParts {
+        schema: planned.schema,
+        lake: lake.clone(),
+        entry: entry.clone(),
+        ids: planned.ids,
+        pieces: planned.pieces,
+    })
+}
+
+/// A table's history as parts, `read_history`'s rows in its order: all of part i's rows come
+/// before part i+1's. A part reads the same rows in the same order whichever of its columns
+/// are read, so a reader can choose rows by some columns, then read the others for the rows it
+/// keeps alone (engine.md §4.1).
+pub struct HistoryParts {
+    /// The columns read: `Date`, a keyed table's `Op`, then the reading's columns of the table.
+    pub schema: SchemaRef,
+    lake: Arc<Lake>,
+    entry: TableEntry,
+    /// The IDs of `schema`'s columns of the table, after history's own.
+    ids: Arc<[ColumnId]>,
+    pieces: Vec<Piece>,
+}
+
+impl HistoryParts {
+    pub fn len(&self) -> usize {
+        self.pieces.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pieces.is_empty()
+    }
+
+    /// Part `part`'s rows, a batch at a time, decoded on whichever thread takes them: only
+    /// `schema`'s columns at `columns` (ascending), and only the rows at `rows` (positions among
+    /// the part's rows, ascending; all where `None`). Of a file, only the columns, row groups,
+    /// and (by the page index) pages these need are read.
+    pub fn read(
+        &self,
+        part: usize,
+        columns: &[usize],
+        rows: Option<&[u64]>,
+    ) -> Result<HistoryBatches, Error> {
+        let piece = self
+            .pieces
+            .get(part)
+            .ok_or_else(|| Error::NotFound(format!("part {part} of {}", self.pieces.len())))?;
+        let schema = Arc::new(self.schema.project(columns).map_err(arrow_error)?);
+        let options = |rows: usize| RecordBatchOptions::new().with_row_count(Some(rows));
+        match piece {
+            Piece::File(file, whole) => {
+                let system = self.schema.fields().len() - self.ids.len();
+                let ids: Vec<ColumnId> = columns
+                    .iter()
+                    .filter_map(|&at| at.checked_sub(system).map(|at| self.ids[at]))
+                    .collect();
+                // Where each column is in what a file reads as now: history's own columns, then
+                // the table's columns wanted, in order.
+                let mut next = system;
+                let read_at: Vec<usize> = columns
+                    .iter()
+                    .map(|&at| {
+                        if at < system {
+                            return at;
+                        }
+                        next += 1;
+                        next - 1
                     })
-                }
-                Piece::Weir(batches) => Box::new(move || Ok(Box::new(batches.into_iter().map(Ok)))),
+                    .collect();
+                let mask = file.mask(&Projection { system, ids: &ids });
+                let part = match rows {
+                    Some(rows) => file.chosen(whole, rows)?,
+                    None => whole.clone(),
+                };
+                let batches = PartBatches::new(self.lake.clone(), file, part, mask)?;
+                let mut current = AsCurrent::new(&self.entry, Some(&ids))?;
+                Ok(Box::new(batches.map(move |batch| {
+                    let batch = current.batch(batch?)?;
+                    let columns = read_at.iter().map(|&at| batch.column(at).clone());
+                    RecordBatch::try_new_with_options(
+                        schema.clone(),
+                        columns.collect(),
+                        &options(batch.num_rows()),
+                    )
+                    .map_err(arrow_error)
+                })))
             }
-        })
-        .collect();
-    Ok((planned.schema, parts))
+            Piece::Weir(batches) => {
+                let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                if let Some(&last) = rows.and_then(<[u64]>::last)
+                    && last >= total as u64
+                {
+                    return Err(Error::NotFound(format!(
+                        "row {last} of a part of {total} rows"
+                    )));
+                }
+                let mut read = Vec::with_capacity(batches.len());
+                let mut start = 0;
+                for batch in batches {
+                    let end = start + batch.num_rows() as u64;
+                    let kept = columns.iter().map(|&at| batch.column(at).clone());
+                    let (kept, count) = match rows {
+                        None => (kept.collect(), batch.num_rows()),
+                        Some(rows) => {
+                            let from = rows.partition_point(|&row| row < start);
+                            let to = rows.partition_point(|&row| row < end);
+                            let indices = UInt64Array::from_iter_values(
+                                rows[from..to].iter().map(|row| row - start),
+                            );
+                            let kept = kept
+                                .map(|column| take(&column, &indices, None))
+                                .collect::<Result<_, _>>()
+                                .map_err(arrow_error)?;
+                            (kept, to - from)
+                        }
+                    };
+                    start = end;
+                    if count > 0 {
+                        let batch = RecordBatch::try_new_with_options(
+                            schema.clone(),
+                            kept,
+                            &options(count),
+                        )
+                        .map_err(arrow_error)?;
+                        read.push(Ok(batch));
+                    }
+                }
+                Ok(Box::new(read.into_iter()))
+            }
+        }
+    }
 }
 
 /// Of the rows a part of a file gathers row groups up to: enough to be worth a thread, few
@@ -167,6 +278,8 @@ struct Planned {
     explain: Explain,
     /// Files' batches as the table's columns are now.
     current: AsCurrent,
+    /// The IDs of `schema`'s columns of the table.
+    ids: Arc<[ColumnId]>,
     pieces: Vec<Piece>,
 }
 
@@ -336,6 +449,7 @@ fn plan(
         schema,
         explain,
         current: AsCurrent::new(entry, wanted.as_deref())?,
+        ids: kept.ids,
         pieces,
     })
 }

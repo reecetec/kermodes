@@ -586,7 +586,7 @@ impl Lake {
     pub(crate) fn read_part(&self, file: &FileRead, part: FilePart) -> Result<Batches<'_>, Error> {
         Ok(Batches {
             runtime: &self.runtime,
-            stream: file.stream(part)?,
+            stream: file.stream(part, file.mask.clone())?,
             row_groups: file.row_groups,
             rows: file.rows,
             columns: file.columns,
@@ -897,6 +897,7 @@ pub(crate) struct FileRead {
 }
 
 /// Some of a file's wanted row groups, read on their own.
+#[derive(Clone)]
 pub(crate) struct FilePart {
     groups: Vec<usize>,
     selection: Option<RowSelection>,
@@ -938,9 +939,58 @@ impl FileRead {
         parts
     }
 
+    /// The rows of `part` at `rows` (positions among the rows it reads, ascending), as a part
+    /// of their own: only the row groups holding them and, with the page index, only the pages.
+    pub(crate) fn chosen(&self, part: &FilePart, rows: &[u64]) -> Result<FilePart, Error> {
+        if let Some(&last) = rows.last()
+            && last >= part.rows
+        {
+            return Err(Error::NotFound(format!(
+                "row {last} of a part of {} rows",
+                part.rows
+            )));
+        }
+        let all = self.reader.metadata().row_groups();
+        let in_groups: usize = part
+            .groups
+            .iter()
+            .map(|&g| all[g].num_rows() as usize)
+            .sum();
+        let read = part
+            .selection
+            .clone()
+            .unwrap_or_else(|| RowSelection::from(vec![RowSelector::select(in_groups)]));
+        let chosen = RowSelection::from_consecutive_ranges(
+            rows.iter().map(|&row| row as usize..row as usize + 1),
+            part.rows as usize,
+        );
+        let mut chosen = read.and_then(&chosen);
+        let (mut groups, mut selectors) = (Vec::new(), Vec::new());
+        for &group in &part.groups {
+            let of_group = chosen.split_off(all[group].num_rows() as usize);
+            if of_group.selects_any() {
+                groups.push(group);
+                selectors.extend(of_group.iter().copied());
+            }
+        }
+        Ok(FilePart {
+            groups,
+            selection: Some(RowSelection::from(selectors)),
+            rows: rows.len() as u64,
+        })
+    }
+
+    /// The file's columns to read for `projection`: `None` for all of them, as for a file
+    /// written before columns had IDs.
+    pub(crate) fn mask(&self, projection: &Projection) -> Option<ProjectionMask> {
+        let roots = roots(self.reader.schema(), projection)?;
+        Some(ProjectionMask::roots(self.reader.parquet_schema(), roots))
+    }
+
     fn stream(
         &self,
         part: FilePart,
+        mask: Option<ProjectionMask>,
     ) -> Result<ParquetRecordBatchStream<Box<dyn AsyncFileReader>>, Error> {
         let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
             self.source.reader(),
@@ -950,8 +1000,8 @@ impl FileRead {
         if let Some(selection) = part.selection {
             builder = builder.with_row_selection(selection);
         }
-        if let Some(mask) = &self.mask {
-            builder = builder.with_projection(mask.clone());
+        if let Some(mask) = mask {
+            builder = builder.with_projection(mask);
         }
         builder.build().map_err(parquet_error)
     }
@@ -965,9 +1015,15 @@ pub(crate) struct PartBatches {
 }
 
 impl PartBatches {
-    pub(crate) fn new(lake: Arc<Lake>, file: &FileRead, part: FilePart) -> Result<Self, Error> {
+    /// `part` of `file`, reading the columns `mask` keeps (all where `None`).
+    pub(crate) fn new(
+        lake: Arc<Lake>,
+        file: &FileRead,
+        part: FilePart,
+        mask: Option<ProjectionMask>,
+    ) -> Result<Self, Error> {
         Ok(Self {
-            stream: file.stream(part)?,
+            stream: file.stream(part, mask)?,
             lake,
         })
     }

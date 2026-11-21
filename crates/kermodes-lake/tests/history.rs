@@ -3,18 +3,24 @@
 //! asked for, unmerged ones from weir.
 
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch};
+use arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch, UInt64Array};
+use arrow::compute::take_record_batch;
 use arrow::datatypes::{DataType, Date32Type, Field, Int64Type, Schema, SchemaRef};
+use bytes::Bytes;
 use kermodes_lake::{
-    History, HistoryPart, Lake, Merged, Reading, Weir, collect_garbage, column_bounds,
+    History, HistoryParts, Lake, Merged, Reading, Weir, collect_garbage, column_bounds,
     history_parts, merge, read_history, write_history,
 };
 use kermodes_weir::{Date, Error, HistoryCommit, SourceId, Store, TableName};
+use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 
 struct TempDir(PathBuf);
 
@@ -335,9 +341,9 @@ fn a_date_rewritten_reads_as_its_new_file() {
         write_history(&store, &lake, &ticks(), d(5), &[batch(values)]).unwrap();
         let whole = read_history(&store, &lake, &ticks(), &day).unwrap();
         let entry = store.table(&ticks()).unwrap();
-        let (schema, parts) = history_parts(&store, &lake, &entry, &day).unwrap();
+        let parts = history_parts(&store, &lake, &entry, &day).unwrap();
         assert_eq!(
-            concat(&schema, &run_parts(parts)),
+            concat(&parts.schema, &run_parts(&parts)),
             concat(&whole.schema, &whole.batches)
         );
         rows(&whole).into_iter().map(|(_, n)| n).collect::<Vec<_>>()
@@ -658,13 +664,20 @@ fn numbered(k: u32, count: usize) -> RecordBatch {
     .unwrap()
 }
 
-/// Every part run on a thread of its own, started last first, and their batches in part order.
-fn run_parts(parts: Vec<HistoryPart>) -> Vec<RecordBatch> {
+/// Every part, all its columns, read on a thread of its own, started last first, and their
+/// batches in part order.
+fn run_parts(parts: &HistoryParts) -> Vec<RecordBatch> {
+    let all: Vec<usize> = (0..parts.schema.fields().len()).collect();
     std::thread::scope(|scope| {
-        let mut running: Vec<_> = parts
-            .into_iter()
+        let mut running: Vec<_> = (0..parts.len())
             .rev()
-            .map(|part| scope.spawn(move || part().unwrap().collect::<Result<Vec<_>, _>>()))
+            .map(|part| {
+                let all = &all;
+                scope.spawn(move || {
+                    let batches = parts.read(part, all, None).unwrap();
+                    batches.collect::<Result<Vec<_>, _>>()
+                })
+            })
             .collect();
         running.reverse();
         running
@@ -680,7 +693,8 @@ fn concat(schema: &SchemaRef, batches: &[RecordBatch]) -> RecordBatch {
 
 /// History read as parts, each on its own thread in any order, gives `read_history`'s rows in
 /// its order: from files of several row groups and from past dates weir holds, with bounds and
-/// columns, and through a reader holding no lake keys. A limit takes only the leading parts.
+/// columns, and through a reader holding no lake keys. A part read again, some of its columns or
+/// some of its rows, is those of its rows. A limit takes only the leading parts.
 #[test]
 fn history_read_in_parallel_parts_is_history_read_in_order() {
     let dir = TempDir::new();
@@ -743,15 +757,30 @@ fn history_read_in_parallel_parts_is_history_read_in_order() {
 
     // `read_history` with the lake's keys is the oracle.
     let same = |weir: &dyn Weir, parts_from: &Arc<Lake>, reading: &Reading| {
-        let (schema, parts) = history_parts(weir, parts_from, &entry, reading).unwrap();
-        let count = parts.len();
+        let parts = history_parts(weir, parts_from, &entry, reading).unwrap();
         let read = read_history(&*store, &lake, &name, reading).unwrap();
-        assert_eq!(schema, read.schema);
+        assert_eq!(parts.schema, read.schema);
         assert_eq!(
-            concat(&schema, &run_parts(parts)),
+            concat(&parts.schema, &run_parts(&parts)),
             concat(&read.schema, &read.batches)
         );
-        count
+        // Read again, a part's last column of all its rows, and all its columns of every
+        // seventh row, are those of its rows read whole.
+        let all: Vec<usize> = (0..parts.schema.fields().len()).collect();
+        let last = all.len() - 1;
+        let read = |part, columns: &[usize], rows: Option<&[u64]>| {
+            let schema = Arc::new(parts.schema.project(columns).unwrap());
+            let batches = parts.read(part, columns, rows).unwrap();
+            concat(&schema, &batches.collect::<Result<Vec<_>, _>>().unwrap())
+        };
+        for part in 0..parts.len() {
+            let whole = read(part, &all, None);
+            assert_eq!(read(part, &[last], None), whole.project(&[last]).unwrap());
+            let rows: Vec<u64> = (0..whole.num_rows() as u64).step_by(7).collect();
+            let taken = take_record_batch(&whole, &UInt64Array::from(rows.clone())).unwrap();
+            assert_eq!(read(part, &all, Some(&rows)), taken);
+        }
+        parts.len()
     };
     // A part a big date, or the small dates after one: three of the first file, two of the
     // second, one each of weir's dates.
@@ -770,9 +799,9 @@ fn history_read_in_parallel_parts_is_history_read_in_order() {
         limit: Some(150_001),
         ..Reading::default()
     };
-    let (_, parts) = history_parts(&*store, &lake, &entry, &limited).unwrap();
+    let parts = history_parts(&*store, &lake, &entry, &limited).unwrap();
     assert_eq!(parts.len(), 2);
-    let rows: usize = run_parts(parts).iter().map(RecordBatch::num_rows).sum();
+    let rows: usize = run_parts(&parts).iter().map(RecordBatch::num_rows).sum();
     assert!(rows >= 150_001);
 
     let vending = lake.clone();
@@ -781,4 +810,286 @@ fn history_read_in_parallel_parts_is_history_read_in_order() {
     let client = kermodes_flight::Client::connect(&format!("grpc://{}", server.addr())).unwrap();
     let reader = Arc::new(Lake::reader().unwrap());
     assert_eq!(same(&client, &reader, &Reading::default()), 7);
+}
+
+/// Byte ranges asked of a file server, by the file's path.
+type Asked = Arc<Mutex<Vec<(String, Range<u64>)>>>;
+
+/// Serves a lake's files over HTTP by byte range, as a store's presigned URLs do, logging each
+/// range asked.
+fn serve_ranges(root: PathBuf) -> (SocketAddr, Asked) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let asked = Asked::default();
+    let log = asked.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let (root, log) = (root.clone(), log.clone());
+            std::thread::spawn(move || answer(stream.unwrap(), &root, &log));
+        }
+    });
+    (addr, asked)
+}
+
+/// Answers one `GET /path` with `Range: bytes=a-b` or `bytes=-n`, then closes.
+fn answer(mut stream: TcpStream, root: &Path, log: &Mutex<Vec<(String, Range<u64>)>>) {
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let path = line.split_whitespace().nth(1).unwrap()[1..].to_owned();
+    let mut range = String::new();
+    loop {
+        let mut header = String::new();
+        reader.read_line(&mut header).unwrap();
+        if header.trim().is_empty() {
+            break;
+        }
+        if let Some((name, value)) = header.split_once(':')
+            && name.eq_ignore_ascii_case("range")
+        {
+            range = value.trim().trim_start_matches("bytes=").to_owned();
+        }
+    }
+    let bytes = fs::read(root.join(&path)).unwrap();
+    let total = bytes.len() as u64;
+    let (start, end) = match range.split_once('-').unwrap() {
+        ("", suffix) => (total - suffix.parse::<u64>().unwrap(), total),
+        (first, last) => (first.parse().unwrap(), last.parse::<u64>().unwrap() + 1),
+    };
+    log.lock().unwrap().push((path, start..end));
+    write!(
+        stream,
+        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{}/{total}\r\nConnection: close\r\n\r\n",
+        end - start,
+        end - 1
+    )
+    .unwrap();
+    stream
+        .write_all(&bytes[start as usize..end as usize])
+        .unwrap();
+}
+
+/// A top-N over a wide table of several files, read as its parts: its sort column of every
+/// row, then every column of the winners alone. Read where weir vends the files, from a server
+/// logging every range asked: the first read asks for only `Date` and the sort column, of every
+/// row group; the second, of the row groups holding winners alone, for only the pages holding
+/// them and the column chunks' dictionaries.
+#[test]
+fn a_top_n_reads_the_other_columns_of_its_winners_pages_alone() {
+    const DATE_ROWS: i64 = 60_000;
+    const ROWS: i64 = 3 * DATE_ROWS;
+    const WIDE: usize = 4;
+    let dir = TempDir::new();
+    let name = TableName::parse("md.wide").unwrap();
+    let mut fields = vec![Field::new("k", DataType::Int64, false)];
+    fields.extend((0..WIDE).map(|i| Field::new(format!("w{i}"), DataType::Int64, false)));
+    let schema = Schema::new(fields);
+    let store = Arc::new(Store::open(&dir.0.join("store")).unwrap());
+    let entry = store.create_table(&name, &schema).unwrap();
+    let lake_dir = dir.0.join("lake");
+    let lake = Lake::open(lake_dir.to_str().unwrap()).unwrap();
+    let with_ids = Schema::new(
+        schema
+            .fields()
+            .iter()
+            .zip(entry.ids.iter())
+            .map(|(field, id)| {
+                field
+                    .as_ref()
+                    .clone()
+                    .with_metadata([("PARQUET:field_id".to_string(), id.0.to_string())])
+            })
+            .collect::<Vec<_>>(),
+    );
+    // Row `i` of history has `k` = i * 7919 + 13 mod the rows, a permutation, so the largest are
+    // scattered; each `w{j}` is `k` * 10 + j.
+    let k_of = |i: i64| (i * 7_919 + 13) % ROWS;
+    let date_rows = |date: Date| {
+        let first = i64::from(date.days() - d(1).days()) * DATE_ROWS;
+        let k: Vec<i64> = (first..first + DATE_ROWS).map(k_of).collect();
+        let mut columns = vec![Arc::new(Int64Array::from(k.clone())) as ArrayRef];
+        for j in 0..WIDE as i64 {
+            let w = k.iter().map(|k| k * 10 + j);
+            columns.push(Arc::new(Int64Array::from_iter_values(w)));
+        }
+        RecordBatch::try_new(Arc::new(schema.clone()), columns).unwrap()
+    };
+    // Two files: dates 1 and 2, then date 3; a row group a date, of pages of 20,000 rows.
+    for dates in [vec![d(1), d(2)], vec![d(3)]] {
+        let rows = |date: Date, each: &mut dyn FnMut(RecordBatch) -> Result<(), Error>| {
+            each(date_rows(date))
+        };
+        let written = lake
+            .write(&entry.location, &with_ids, &[], &dates, rows, u64::MAX)
+            .unwrap();
+        let commit = HistoryCommit {
+            written: dates,
+            replaced: Vec::new(),
+            files: written.files,
+            dates: written.dates,
+        };
+        store.commit_history(&name, &commit).unwrap();
+    }
+    let (addr, asked) = serve_ranges(lake_dir.clone());
+    store.vend_history(Arc::new(move |location, file| {
+        Ok(format!("http://{addr}/{location}/{file}"))
+    }));
+    let reader = Arc::new(Lake::reader().unwrap());
+    let parts = history_parts(&*store, &reader, &entry, &Reading::default()).unwrap();
+    let take_asked = || std::mem::take(&mut *asked.lock().unwrap());
+    // The footers, read while planning.
+    take_asked();
+
+    // The sort column of every row, with the row's part and place in it.
+    let k_at = parts.schema.index_of("k").unwrap();
+    let mut keyed: Vec<(i64, usize, u64)> = Vec::new();
+    for part in 0..parts.len() {
+        let mut row = 0;
+        for batch in parts.read(part, &[k_at], None).unwrap() {
+            for &k in batch
+                .unwrap()
+                .column(0)
+                .as_primitive::<Int64Type>()
+                .values()
+            {
+                keyed.push((k, part, row));
+                row += 1;
+            }
+        }
+    }
+    assert_eq!(keyed.len() as i64, ROWS);
+    let narrow = take_asked();
+    keyed.sort_unstable_by_key(|&(k, ..)| std::cmp::Reverse(k));
+    let winners = &keyed[..5];
+    let all: Vec<usize> = (0..parts.schema.fields().len()).collect();
+    let mut got = Vec::new();
+    for part in 0..parts.len() {
+        let mut rows: Vec<u64> = winners
+            .iter()
+            .filter(|&&(_, of, _)| of == part)
+            .map(|&(_, _, row)| row)
+            .collect();
+        if rows.is_empty() {
+            continue;
+        }
+        rows.sort_unstable();
+        for batch in parts.read(part, &all, Some(&rows)).unwrap() {
+            let batch = batch.unwrap();
+            let k = batch.column(k_at).as_primitive::<Int64Type>();
+            for row in 0..batch.num_rows() {
+                for j in 0..WIDE {
+                    let w = batch.column(k_at + 1 + j).as_primitive::<Int64Type>();
+                    assert_eq!(w.value(row), k.value(row) * 10 + j as i64);
+                }
+                got.push(k.value(row));
+            }
+        }
+    }
+    let wide = take_asked();
+    got.sort_unstable_by_key(|&k| std::cmp::Reverse(k));
+    assert_eq!(got, (ROWS - 5..ROWS).rev().collect::<Vec<_>>());
+
+    // Each file, by its path, in date order: its footer and page index.
+    let files: Vec<(String, ParquetMetaData)> = store
+        .history_files(&name, Date::MIN, Date::MAX)
+        .unwrap()
+        .iter()
+        .map(|file| {
+            let path = format!("{}/{}", entry.location, file.name);
+            let bytes = Bytes::from(fs::read(lake_dir.join(&path)).unwrap());
+            let footer = ParquetMetaDataReader::new()
+                .with_page_index_policy(PageIndexPolicy::Required)
+                .parse_and_finish(&bytes)
+                .unwrap();
+            (path, footer)
+        })
+        .collect();
+    // Each winner's file, row group, and row in it: a row group a date, in date order.
+    let place = |k: i64| {
+        let i = (0..ROWS).find(|&i| k_of(i) == k).unwrap();
+        let group = (i / DATE_ROWS) as usize;
+        let (file, group) = if group < 2 { (0, group) } else { (1, 0) };
+        (file, group, i % DATE_ROWS)
+    };
+    let places: Vec<(usize, usize, i64)> = got.iter().map(|&k| place(k)).collect();
+    // The file, row group, and column holding each range asked.
+    let chunk = |path: &str, range: &Range<u64>| {
+        let file = files.iter().position(|(p, _)| p == path).unwrap();
+        let footer = &files[file].1;
+        for group in 0..footer.num_row_groups() {
+            for (column, chunk) in footer.row_group(group).columns().iter().enumerate() {
+                let (start, length) = chunk.byte_range();
+                if start <= range.start && range.end <= start + length {
+                    return (file, group, column);
+                }
+            }
+        }
+        panic!("{path} {range:?} is in no column chunk");
+    };
+    let name_of = |file: usize, column: usize| {
+        let schema = files[file].1.file_metadata().schema_descr();
+        schema.column(column).name().to_owned()
+    };
+
+    let mut sorted = std::collections::BTreeSet::new();
+    for (path, range) in &narrow {
+        let (file, group, column) = chunk(path, range);
+        let name = name_of(file, column);
+        assert!(
+            name == "Date" || name == "k",
+            "the first read asked for {name}"
+        );
+        if name == "k" {
+            sorted.insert((file, group));
+        }
+    }
+    assert_eq!(
+        sorted.len(),
+        3,
+        "the first read asked for `k` of every row group"
+    );
+
+    assert!(!wide.is_empty());
+    for (path, range) in &wide {
+        let (file, group, column) = chunk(path, range);
+        let rows: Vec<i64> = places
+            .iter()
+            .filter(|&&(f, g, _)| (f, g) == (file, group))
+            .map(|&(_, _, row)| row)
+            .collect();
+        assert!(
+            !rows.is_empty(),
+            "{range:?} of a row group holding no winner"
+        );
+        let footer = &files[file].1;
+        let start = footer.row_group(group).column(column).byte_range().0;
+        let pages = footer
+            .page_index_for_row_group(group)
+            .page_locations(column)
+            .unwrap()
+            .clone();
+        let in_group = footer.row_group(group).num_rows();
+        // The chunk's dictionary, before its first data page, then the pages holding winners.
+        let mut allowed = Vec::new();
+        allowed.push(start..pages[0].offset as u64);
+        for (at, page) in pages.iter().enumerate() {
+            let end = pages
+                .get(at + 1)
+                .map_or(in_group, |next| next.first_row_index);
+            if rows
+                .iter()
+                .any(|&row| page.first_row_index <= row && row < end)
+            {
+                let offset = page.offset as u64;
+                allowed.push(offset..offset + page.compressed_page_size as u64);
+            }
+        }
+        assert!(
+            allowed
+                .iter()
+                .any(|page| page.start <= range.start && range.end <= page.end),
+            "{} asked {range:?}, beyond the pages of its winners {allowed:?}",
+            name_of(file, column)
+        );
+    }
 }

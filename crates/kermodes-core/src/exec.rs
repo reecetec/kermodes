@@ -11,19 +11,28 @@
 //! `last_by`, and `rolling`, which run the engine's own static operators on it in a session of
 //! the query's own, so no caller's graph is held.
 //!
+//! Late materialization: over a source that reads its parts again by column and row
+//! (`Reread`), a head or slice of a sort of the scan, and the scan's predicate where it reads
+//! fewer than half the columns, read first only the columns they choose rows by, each row with
+//! its position, and then the other columns of the rows they keep alone.
+//!
 //! The result equals `Plan::build`'s over static tables of the same rows: same schema, rows, and
 //! order. Each node is also built over empty tables in that session, which gives its schema, and
 //! its errors and description exactly as the engine words them.
 
+use std::collections::BTreeSet;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
-use arrow::datatypes::SchemaRef;
+use arrow::array::{AsArray, RecordBatchOptions, UInt64Array};
+use arrow::compute::{concat_batches, take_record_batch};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, UInt64Type};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 
 use crate::agg::Fold;
+use crate::expr::reads;
 use crate::groups::resolve;
 use crate::ops::Where;
 use crate::parallel::{PIECE_ROWS, offsets, threads};
@@ -34,16 +43,25 @@ use crate::storage::RowKey;
 use crate::{Error, Expression, Session, Table};
 
 /// A table's rows for a plan's scan, as parts read independently and in parallel, in the
-/// table's order: part i's rows all come before part i+1's.
+/// table's order: part i's rows all come before part i+1's. A source that can read its parts
+/// again by column and row says how (`reread`); one that cannot leaves it `None`.
 pub struct Source {
     pub schema: SchemaRef,
     pub parts: Vec<Part>,
+    pub reread: Option<Reread>,
 }
 
 /// Reads one part: its batches in order. Opened on whichever thread runs it.
 pub type Part = Box<dyn FnOnce() -> Result<Batches, Error> + Send>;
 
 pub type Batches = Box<dyn Iterator<Item = Result<RecordBatch, Error>> + Send>;
+
+/// Reads part `part` of a source again: only its columns at `columns` (positions in the
+/// source's schema, ascending), as a schema of those, and only its rows at `rows` (positions
+/// among the part's rows, ascending; all where `None`). A part's rows are the same, in the
+/// same order, however it is read. Called on whichever thread runs it.
+pub type Reread =
+    Arc<dyn Fn(usize, &[usize], Option<&[u64]>) -> Result<Batches, Error> + Send + Sync>;
 
 /// The plan's rows, computed outside any session's graph. `scan` gives each scan's `Source`,
 /// honoring the scan as `Plan::build`'s scan does, except that its predicate is applied here.
@@ -60,9 +78,12 @@ pub fn execute(
     Ok((node.shape.schema().clone(), rows))
 }
 
-/// Bits of an aggregation's row key that number a row within its part; the part's index takes
-/// the rest, so keys follow scan order across parts.
+/// Bits of a row's position that number it within its part (an aggregation's row key, a row
+/// a scan reads again); the part's index takes the rest, so positions follow scan order.
 const PART_BITS: u32 = 40;
+
+/// A row's place in its part, of its position.
+const ROW: u64 = (1 << PART_BITS) - 1;
 
 /// A batch-at-a-time operator: `where`, `update`, `select`.
 type Map = Arc<dyn Fn(RecordBatch) -> Result<RecordBatch, Error> + Send + Sync>;
@@ -84,16 +105,38 @@ enum Rows {
     Parts(Vec<Part>),
     /// A sort not yet done, so a head or slice over it keeps only its rows.
     Sorted(Sort),
+    /// A scan whose source reads again, its predicate not yet applied, so what keeps few of its
+    /// rows reads most columns for those alone.
+    Scanned(Scanned),
 }
 
 struct Sort {
-    input: Vec<Part>,
+    input: Box<Rows>,
     schema: SchemaRef,
     keys: Vec<(usize, bool)>,
     /// The sort's description, for its errors.
     table: String,
     /// Operators over the sorted rows that keep each row in place, run once the rows are known.
     after: Vec<Map>,
+}
+
+struct Scanned {
+    schema: SchemaRef,
+    parts: Vec<Part>,
+    reread: Reread,
+    predicate: Option<String>,
+    /// The scan's description, for its errors.
+    table: String,
+}
+
+/// What a narrow read of a scan's parts reads: some of its columns, then each row's position.
+struct Narrow {
+    /// The source's columns read, ascending.
+    columns: Arc<[usize]>,
+    /// Their schema, then the position's.
+    schema: SchemaRef,
+    /// The scan's predicate, over these columns.
+    filter: Option<Map>,
 }
 
 impl Executor<'_> {
@@ -129,9 +172,9 @@ impl Executor<'_> {
                 let input = inputs.pop().expect("one input");
                 let schema = input.shape.schema();
                 match plan {
-                    Plan::Filter { predicate, .. } => {
-                        input.rows.then(filter(&shape, schema, predicate)?, false)?
-                    }
+                    Plan::Filter { predicate, .. } => input
+                        .rows
+                        .then(filter(shape.description(), schema, predicate)?, false)?,
                     Plan::Update { assignments, .. } => {
                         let update = bind_update(schema, &names(assignments))?;
                         let table = shape.description();
@@ -179,7 +222,7 @@ impl Executor<'_> {
                             .collect::<Result<Vec<_>, Error>>()?;
                         Rows::Sorted(Sort {
                             schema: schema.clone(),
-                            input: input.rows.into_parts()?,
+                            input: Box::new(input.rows),
                             keys,
                             table: shape.description(),
                             after: Vec::new(),
@@ -199,13 +242,27 @@ impl Executor<'_> {
 
     fn scan(&mut self, scan: &Scan) -> Result<Node, Error> {
         let source = (self.scan)(scan)?;
-        let table = self.session.static_table(source.schema, Vec::new())?;
-        let rows = Rows::Parts(source.parts);
-        let Some(predicate) = &scan.predicate else {
-            return Ok(Node { shape: table, rows });
+        let table = self
+            .session
+            .static_table(source.schema.clone(), Vec::new())?;
+        let shape = match &scan.predicate {
+            Some(predicate) => table.filter(predicate)?,
+            None => table,
         };
-        let shape = table.filter(predicate)?;
-        let rows = rows.then(filter(&shape, table.schema(), predicate)?, false)?;
+        let rows = match (source.reread, &scan.predicate) {
+            (Some(reread), predicate) => Rows::Scanned(Scanned {
+                schema: source.schema,
+                parts: source.parts,
+                reread,
+                predicate: predicate.clone(),
+                table: shape.description(),
+            }),
+            (None, Some(predicate)) => Rows::Parts(source.parts).then(
+                filter(shape.description(), &source.schema, predicate)?,
+                false,
+            )?,
+            (None, None) => Rows::Parts(source.parts),
+        };
         Ok(Node { shape, rows })
     }
 
@@ -224,10 +281,9 @@ impl Executor<'_> {
     }
 }
 
-/// `where predicate` over batches of `input`'s columns, failing as `shape` would.
-fn filter(shape: &Table, input: &SchemaRef, predicate: &str) -> Result<Map, Error> {
+/// `where predicate` over batches of `input`'s columns, failing as `table` would.
+fn filter(table: String, input: &Schema, predicate: &str) -> Result<Map, Error> {
     let filter = Where::new(Expression::predicate(predicate, input)?, true);
-    let table = shape.description();
     Ok(Arc::new(move |batch| {
         filter.filter(&batch).map_err(|e| failed(&table, e))
     }))
@@ -256,8 +312,10 @@ impl Rows {
     fn into_parts(self) -> Result<Vec<Part>, Error> {
         match self {
             Rows::Parts(parts) => Ok(parts),
+            Rows::Scanned(scanned) => scanned.into_parts(),
             Rows::Sorted(mut sort) => {
-                let input = collect(std::mem::take(&mut sort.input))?;
+                let input = std::mem::replace(&mut sort.input, Box::new(Rows::Parts(Vec::new())));
+                let input = collect(input.into_parts()?)?;
                 let rows =
                     sorted(&sort.schema, &input, &sort.keys).map_err(|e| failed(&sort.table, e))?;
                 Ok(sort.then(rows))
@@ -272,14 +330,286 @@ impl Rows {
         }
         let parts = match (self, stop) {
             (Rows::Sorted(mut sort), Some(stop)) => {
-                let input = std::mem::take(&mut sort.input);
-                let best = top(input, &sort.schema, &sort.keys, stop, &sort.table)?;
+                let input = std::mem::replace(&mut sort.input, Box::new(Rows::Parts(Vec::new())));
+                let keys: Vec<usize> = sort.keys.iter().map(|&(at, _)| at).collect();
+                let best = match *input {
+                    Rows::Scanned(scanned) => match scanned.narrow(&keys) {
+                        Some(narrow) => scanned.top(&narrow, &sort.keys, stop, &sort.table)?,
+                        None => top(
+                            scanned.into_parts()?,
+                            &sort.schema,
+                            &sort.keys,
+                            stop,
+                            &sort.table,
+                        )?,
+                    },
+                    input => top(
+                        input.into_parts()?,
+                        &sort.schema,
+                        &sort.keys,
+                        stop,
+                        &sort.table,
+                    )?,
+                };
                 sort.then(best)
             }
             (rows, _) => rows.into_parts()?,
         };
         Ok(Rows::Parts(pieces(head(parts, start, stop)?)))
     }
+}
+
+impl Scanned {
+    /// The scan's rows, through its predicate: read narrowly first where the predicate reads
+    /// fewer than half the columns, since reading again costs each part a second read, which
+    /// pays only where most of the columns are left for the rows kept.
+    fn into_parts(self) -> Result<Vec<Part>, Error> {
+        let Some(predicate) = &self.predicate else {
+            return Ok(self.parts);
+        };
+        if let Some(narrow) = self.narrow(&[])
+            && narrow.columns.len() * 2 < self.schema.fields().len()
+        {
+            return Ok(self.filtered(&narrow));
+        }
+        let filter = filter(self.table.clone(), &self.schema, predicate)?;
+        Ok(mapped(self.parts, &filter))
+    }
+
+    /// A narrow read of the columns at `also` and those the predicate reads, if they are fewer
+    /// than all and the predicate is known to read only those.
+    fn narrow(&self, also: &[usize]) -> Option<Narrow> {
+        if self.parts.len() as u64 > u64::MAX >> PART_BITS {
+            return None;
+        }
+        let mut columns: BTreeSet<usize> = also.iter().copied().collect();
+        if let Some(predicate) = &self.predicate {
+            columns.extend(
+                reads(predicate)?
+                    .iter()
+                    .filter_map(|name| self.schema.index_of(name).ok()),
+            );
+        }
+        if columns.len() == self.schema.fields().len() {
+            return None;
+        }
+        let columns: Arc<[usize]> = columns.into_iter().collect();
+        let read = self.schema.project(&columns).ok()?;
+        let filter = match &self.predicate {
+            // A predicate that does not bind to these columns reads more than `reads` says:
+            // the scan is then read whole.
+            Some(predicate) => Some(filter(self.table.clone(), &read, predicate).ok()?),
+            None => None,
+        };
+        let mut fields = read.fields().to_vec();
+        fields.push(Arc::new(Field::new("position", DataType::UInt64, false)));
+        Some(Narrow {
+            columns,
+            schema: Arc::new(Schema::new(fields)),
+            filter,
+        })
+    }
+
+    /// Each part read narrowly, each row with its position, through the predicate.
+    fn narrow_parts(&self, narrow: &Narrow) -> Vec<Part> {
+        (0..self.parts.len())
+            .map(|index| {
+                let reread = self.reread.clone();
+                let (columns, schema) = (narrow.columns.clone(), narrow.schema.clone());
+                let (filter, table) = (narrow.filter.clone(), self.table.clone());
+                Box::new(move || {
+                    let batches = reread(index, &columns, None)?;
+                    let mut next = (index as u64) << PART_BITS;
+                    let positioned = batches.map(move |batch| {
+                        let batch = batch?;
+                        let end = next + batch.num_rows() as u64;
+                        if end > next && (end - 1) >> PART_BITS != index as u64 {
+                            return Err(Error::Unsupported(format!(
+                                "a part of a scan read again reads at most 2^{PART_BITS} rows"
+                            )));
+                        }
+                        let mut columns = batch.columns().to_vec();
+                        columns.push(Arc::new(UInt64Array::from_iter_values(next..end)));
+                        next = end;
+                        let batch = RecordBatch::try_new(schema.clone(), columns)
+                            .map_err(|e| failed(&table, e))?;
+                        match &filter {
+                            Some(filter) => filter(batch),
+                            None => Ok(batch),
+                        }
+                    });
+                    Ok(Box::new(positioned) as Batches)
+                }) as Part
+            })
+            .collect()
+    }
+
+    /// `top` over the scan, choosing rows on the narrow columns alone, then reading every
+    /// column of the winners only.
+    fn top(
+        &self,
+        narrow: &Narrow,
+        keys: &[(usize, bool)],
+        stop: usize,
+        table: &str,
+    ) -> Result<Vec<RecordBatch>, Error> {
+        let keys: Vec<(usize, bool)> = keys
+            .iter()
+            .map(|&(at, descending)| {
+                let at = narrow.columns.binary_search(&at).expect("keys are read");
+                (at, descending)
+            })
+            .collect();
+        let winners = top(
+            self.narrow_parts(narrow),
+            &narrow.schema,
+            &keys,
+            stop,
+            table,
+        )?;
+        let positions: Vec<u64> = winners
+            .iter()
+            .flat_map(|batch| positions_of(batch).values().iter().copied())
+            .collect();
+        self.fetch(&positions)
+    }
+
+    /// Every column of the rows at `positions`, in that order: of each part holding any, those
+    /// rows alone, a group of columns to each thread, since decoding a page of each of many
+    /// columns is most of reading a few rows.
+    fn fetch(&self, positions: &[u64]) -> Result<Vec<RecordBatch>, Error> {
+        if positions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut wanted = positions.to_vec();
+        wanted.sort_unstable();
+        let width = self.schema.fields().len();
+        let groups: Vec<Arc<[usize]>> = offsets(width, width.div_ceil(threads().max(1)))
+            .map(|(start, len)| (start..start + len).collect())
+            .collect();
+        let runs: Vec<(usize, Arc<[u64]>)> = wanted
+            .chunk_by(|a, b| a >> PART_BITS == b >> PART_BITS)
+            .map(|run| {
+                let rows = run.iter().map(|position| position & ROW).collect();
+                ((run[0] >> PART_BITS) as usize, rows)
+            })
+            .collect();
+        let mut reads = Vec::with_capacity(groups.len() * runs.len());
+        for group in &groups {
+            for (part, rows) in &runs {
+                let (reread, group, part, rows) =
+                    (self.reread.clone(), group.clone(), *part, rows.clone());
+                reads.push(Box::new(move || reread(part, &group, Some(&rows))) as Part);
+            }
+        }
+        let mut read = Vec::with_capacity(reads.len());
+        drive(
+            reads,
+            false,
+            |_, batches| batches.collect::<Result<Vec<_>, _>>(),
+            |batches| {
+                read.push(batches);
+                Ok(true)
+            },
+        )?;
+        let mut columns = Vec::with_capacity(width);
+        for (group, read) in groups.iter().zip(read.chunks(runs.len().max(1))) {
+            let schema = self
+                .schema
+                .project(group)
+                .map_err(|e| failed(&self.table, e))?;
+            let read = concat_batches(&Arc::new(schema), read.iter().flatten())
+                .map_err(|e| failed(&self.table, e))?;
+            all_read(&self.table, read.num_rows(), wanted.len())?;
+            columns.extend(read.columns().iter().cloned());
+        }
+        let options = RecordBatchOptions::new().with_row_count(Some(wanted.len()));
+        let read = RecordBatch::try_new_with_options(self.schema.clone(), columns, &options)
+            .map_err(|e| failed(&self.table, e))?;
+        let order: UInt64Array = positions
+            .iter()
+            .map(|position| wanted.binary_search(position).expect("asked") as u64)
+            .collect();
+        let rows = take_record_batch(&read, &order).map_err(|e| failed(&self.table, e))?;
+        Ok(vec![rows])
+    }
+
+    /// Each part through the predicate, reading the predicate's columns for every row, then
+    /// the others for the rows it keeps alone.
+    fn filtered(&self, narrow: &Narrow) -> Vec<Part> {
+        let rest: Arc<[usize]> = (0..self.schema.fields().len())
+            .filter(|at| narrow.columns.binary_search(at).is_err())
+            .collect();
+        let rest_schema = Arc::new(
+            self.schema
+                .project(&rest)
+                .expect("the schema's own columns"),
+        );
+        self.narrow_parts(narrow)
+            .into_iter()
+            .enumerate()
+            .map(|(index, part)| {
+                let schema = self.schema.clone();
+                let (read, rest, rest_schema) =
+                    (narrow.columns.clone(), rest.clone(), rest_schema.clone());
+                let (reread, table) = (self.reread.clone(), self.table.clone());
+                Box::new(move || {
+                    let kept = part()?
+                        .filter(|batch| !matches!(batch, Ok(batch) if batch.num_rows() == 0))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let rows: Vec<u64> = kept
+                        .iter()
+                        .flat_map(|batch| positions_of(batch).values().iter())
+                        .map(|position| position & ROW)
+                        .collect();
+                    if rows.is_empty() {
+                        return Ok(Box::new(std::iter::empty()) as Batches);
+                    }
+                    let others =
+                        reread(index, &rest, Some(&rows))?.collect::<Result<Vec<_>, _>>()?;
+                    let others =
+                        concat_batches(&rest_schema, &others).map_err(|e| failed(&table, e))?;
+                    all_read(&table, others.num_rows(), rows.len())?;
+                    // The kept rows as the predicate's batches left them, beside the others'.
+                    let mut offset = 0;
+                    let mut batches = Vec::with_capacity(kept.len());
+                    for kept in kept {
+                        let others = others.slice(offset, kept.num_rows());
+                        offset += kept.num_rows();
+                        let columns = (0..schema.fields().len())
+                            .map(|at| match read.binary_search(&at) {
+                                Ok(at) => kept.column(at).clone(),
+                                Err(_) => {
+                                    let at = rest.binary_search(&at).expect("the rest");
+                                    others.column(at).clone()
+                                }
+                            })
+                            .collect();
+                        let batch = RecordBatch::try_new(schema.clone(), columns)
+                            .map_err(|e| failed(&table, e));
+                        batches.push(batch);
+                    }
+                    Ok(Box::new(batches.into_iter()) as Batches)
+                }) as Part
+            })
+            .collect()
+    }
+}
+
+/// The positions of a narrow read's rows: its last column.
+fn positions_of(batch: &RecordBatch) -> &UInt64Array {
+    batch.columns()[batch.num_columns() - 1].as_primitive::<UInt64Type>()
+}
+
+/// That a source read again gave as many rows as were asked of it.
+fn all_read(table: &str, read: usize, asked: usize) -> Result<(), Error> {
+    if read == asked {
+        return Ok(());
+    }
+    Err(Error::Source {
+        table: table.to_owned(),
+        message: format!("read again, it gave {read} rows of the {asked} asked"),
+    })
 }
 
 impl Sort {

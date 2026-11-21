@@ -179,6 +179,15 @@ Delta { added: [(keys, rows)], removed: [(keys, last rows)], modified: [(keys, p
 - `head` or `slice` over `sort` is a top-N: each part keeps its best rows, chosen on the sort
   columns alone, and full rows are gathered for the winners. A sort without one sorts all its
   input, stably.
+- Late materialization. A source may read a part again, only some of its columns and only some
+  of its rows by position (`Reread`; a stored table's history by Parquet row selection within
+  the row groups planned, today's rows by index), the part's rows the same however it is read.
+  Over such a source, a top-N right over the scan reads the sort's and the predicate's columns
+  of every row, each with its position (part and row), then every column of the winners alone;
+  the scan's predicate, where it reads fewer than half the scan's columns, reads its own columns
+  of every row, then the others for the rows each part keeps, so a part that keeps none reads
+  nothing more. Reading again costs each part a second read, which a predicate of most of the
+  columns does not repay.
 - Joins, `last_by`, and `rolling` collect their inputs and run the engine's static operators in
   a session of their own, so no caller's graph is held.
 - The engine's static operators are its oracle: seeded random plans over random data, split into

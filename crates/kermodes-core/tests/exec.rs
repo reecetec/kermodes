@@ -1,7 +1,9 @@
 //! `exec::execute` against `Plan::build` over a static table of the same rows: seeded random
 //! data split into random parts, seeded random plans over it, the same schema and rows in the
-//! same order. Plus what streaming promises: a head opens only the parts it needs, and an
-//! aggregation holds no input batch it has folded.
+//! same order, also over a source that reads its parts again by column and row. Plus what
+//! streaming promises: a head opens only the parts it needs, an aggregation holds no input batch
+//! it has folded, and a top-N or a filter over a source read again reads its other columns for
+//! the rows it keeps alone.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::process::Command;
@@ -10,12 +12,12 @@ use std::sync::{Arc, Mutex, Weak};
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int16Array, Int64Array, RecordBatch, StringArray,
-    TimestampNanosecondArray,
+    TimestampNanosecondArray, UInt64Array,
 };
-use arrow::compute::concat_batches;
+use arrow::compute::{concat_batches, take_record_batch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
-use kermodes_core::exec::{Batches, Part, Source, execute};
+use kermodes_core::exec::{Batches, Part, Reread, Source, execute};
 use kermodes_core::plan::{Plan, Scan};
 use kermodes_core::{Error, Session, SortKey, Window};
 
@@ -135,6 +137,51 @@ fn source(parts: &[Vec<RecordBatch>]) -> Source {
                 Box::new(move || Ok(Box::new(batches.into_iter().map(Ok)) as Batches)) as Part
             })
             .collect(),
+        reread: None,
+    }
+}
+
+/// Each read of a source read again: its part, its columns, and how many rows it asked for
+/// (all where `None`).
+type Reads = Arc<Mutex<Vec<(usize, Vec<usize>, Option<usize>)>>>;
+
+/// `parts` as a source that reads them again by column and row, logging each read.
+fn rereadable(parts: &[Vec<RecordBatch>], reads: &Reads) -> Source {
+    let held = Arc::new(parts.to_vec());
+    let count = held.len();
+    let reads = reads.clone();
+    let reread: Reread = Arc::new(move |part, columns, rows| {
+        let asked = rows.map(<[u64]>::len);
+        reads.lock().unwrap().push((part, columns.to_vec(), asked));
+        let mut start = 0;
+        let batches: Vec<_> = held[part]
+            .iter()
+            .map(|batch| {
+                let batch = batch.project(columns).unwrap();
+                let end = start + batch.num_rows() as u64;
+                let taken = rows.map(|rows| {
+                    let from = rows.partition_point(|&row| row < start);
+                    let to = rows.partition_point(|&row| row < end);
+                    let indices =
+                        UInt64Array::from_iter_values(rows[from..to].iter().map(|row| row - start));
+                    take_record_batch(&batch, &indices).unwrap()
+                });
+                start = end;
+                Ok(taken.unwrap_or(batch))
+            })
+            .collect();
+        Ok(Box::new(batches.into_iter()) as Batches)
+    });
+    let all: Arc<[usize]> = (0..schema().fields().len()).collect();
+    Source {
+        schema: schema(),
+        parts: (0..count)
+            .map(|part| {
+                let (reread, all) = (reread.clone(), all.clone());
+                Box::new(move || reread(part, &all, None)) as Part
+            })
+            .collect(),
+        reread: Some(reread),
     }
 }
 
@@ -566,7 +613,12 @@ impl Planner {
 type Outcome = Result<(SchemaRef, RecordBatch), Error>;
 
 fn executed(plan: &Plan, parts: &[Vec<RecordBatch>]) -> Outcome {
-    let (schema, batches) = execute(plan, &mut |_| Ok(source(parts)))?;
+    executed_from(plan, || source(parts))
+}
+
+/// `plan` executed, each of its scans reading what `source` gives.
+fn executed_from(plan: &Plan, mut source: impl FnMut() -> Source) -> Outcome {
+    let (schema, batches) = execute(plan, &mut |_| Ok(source()))?;
     let rows = concat_batches(&schema, &batches).unwrap();
     Ok((schema, rows))
 }
@@ -662,6 +714,99 @@ fn executes_plans_as_the_engine_builds_them() {
     );
 }
 
+/// Over a source that reads its parts again by column and row, plans give the engine's results:
+/// heads of sorts and scans' predicates read narrowly, then the other columns of the rows they
+/// keep.
+#[test]
+fn executes_plans_over_a_source_read_again_as_the_engine_builds_them() {
+    let reads: Reads = Arc::default();
+    for seed in 1..=SEEDS {
+        let mut rng = Rng(seed);
+        let parts = random_parts(&mut rng);
+        let mut planner = Planner { rng, next: 0 };
+        let shaped = planner.plan();
+        for plan in [shaped.plan.clone(), shaped.plan.pushed_down()] {
+            let got = executed_from(&plan, || rereadable(&parts, &reads));
+            assert_eq!(got, built(&plan, &parts), "seed {seed}: {plan:#?}");
+        }
+    }
+    let by_rows = reads
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, _, asked)| asked.is_some())
+        .count();
+    assert!(by_rows > 0, "no rows read again by position");
+}
+
+/// A head of a sort of a scan, over a source read again, reads the sort's and the predicate's
+/// columns of every row, then every column of its winners alone; a scan's predicate reads its
+/// own columns of every row, then the others of the rows it keeps alone.
+#[test]
+fn a_top_n_and_a_filter_read_the_other_columns_of_the_rows_they_keep_alone() {
+    let (mut rng, mut clock) = (Rng(7), 0);
+    let parts: Vec<Vec<RecordBatch>> = (0..8)
+        .map(|_| {
+            (0..3)
+                .map(|_| random_batch(&mut rng, 500, &mut clock))
+                .collect()
+        })
+        .collect();
+    let scan = |predicate: &str| {
+        Plan::Scan(Scan {
+            name: "t".into(),
+            predicate: Some(predicate.into()),
+            columns: None,
+            limit: None,
+            live: false,
+        })
+    };
+    let top = Plan::Head {
+        input: Box::new(Plan::Sort {
+            input: Box::new(scan("n > 0")),
+            by: vec![SortKey {
+                column: "x".into(),
+                descending: true,
+            }],
+        }),
+        rows: 20,
+    };
+    // `x` and `n` for the top-N, which reads them again for its winners; `k` for the filter,
+    // which does not.
+    for (plan, narrow, again) in [(top, vec![3, 4], true), (scan("k = 3"), vec![0], false)] {
+        let reads: Reads = Arc::default();
+        let got = executed_from(&plan, || rereadable(&parts, &reads));
+        assert_eq!(got, built(&plan, &parts));
+        let kept = got.unwrap().1.num_rows();
+        assert!(kept > 0);
+        let reads = reads.lock().unwrap();
+        let mut whole: Vec<usize> = reads
+            .iter()
+            .filter(|(_, _, asked)| asked.is_none())
+            .map(|(part, columns, _)| {
+                assert_eq!(*columns, narrow);
+                *part
+            })
+            .collect();
+        whole.sort_unstable();
+        assert_eq!(whole, (0..parts.len()).collect::<Vec<_>>());
+        // Then each other column (each column, for winners) of the rows kept alone.
+        for column in 0..schema().fields().len() {
+            let asked: usize = reads
+                .iter()
+                .filter(|(_, columns, _)| columns.contains(&column))
+                .filter_map(|(_, _, asked)| *asked)
+                .sum();
+            let wanted = if again || !narrow.contains(&column) {
+                kept
+            } else {
+                0
+            };
+            assert_eq!(asked, wanted, "column {column}");
+        }
+    }
+}
+
 /// What a counted part source has done: parts opened, batches read.
 #[derive(Default)]
 struct Counts {
@@ -688,6 +833,7 @@ fn counted(parts: usize, batches: usize, rows: usize, counts: &Counts) -> Source
                 }) as Part
             })
             .collect(),
+        reread: None,
     }
 }
 
@@ -730,6 +876,7 @@ fn an_aggregation_holds_no_batch_it_has_folded() {
                 }) as Part
             })
             .collect(),
+        reread: None,
     };
     let plan = Plan::Agg {
         input: Box::new(scan().plan),

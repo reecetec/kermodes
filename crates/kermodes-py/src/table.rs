@@ -697,6 +697,7 @@ impl Planned {
                 Ok(kermodes_core::exec::Source {
                     schema: table.schema().clone(),
                     parts: vec![stored::in_memory(batches)],
+                    reread: None,
                 })
             }
             None => stored::source(self.stores()?, scan),

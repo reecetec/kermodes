@@ -4,7 +4,8 @@
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arrow::array::{RecordBatch, RecordBatchOptions};
+use arrow::array::{RecordBatch, RecordBatchOptions, UInt64Array};
+use arrow::compute::take;
 use arrow::datatypes::{Schema, SchemaRef};
 use kermodes_core::plan::Scan;
 use kermodes_weir::{Date, TableEntry, TableName};
@@ -76,10 +77,11 @@ pub(crate) fn live_rows(
 }
 
 /// A stored table's static `scan` for the static executor: history's parts, each decoded on
-/// whichever thread runs it, then today's rows. Today's are read first, from weir, and history up
-/// to the day before the day they were stamped on, so a day that turns between the two reads is
-/// neither missed nor read twice. A keyed table is its keys' latest rows. The executor applies
-/// the scan's predicate.
+/// whichever thread runs it, then today's rows, each part read again by column and row as the
+/// executor asks. Today's are read first, from weir, and history up to the day before the day
+/// they were stamped on, so a day that turns between the two reads is neither missed nor read
+/// twice; both are read once, so a part read again is the same rows. A keyed table is its keys'
+/// latest rows. The executor applies the scan's predicate.
 pub(crate) fn source(stores: &Stores, scan: &Scan) -> PyResult<kermodes_core::exec::Source> {
     let entry = stores.entry(&scan.name)?;
     if !entry.key.is_empty() {
@@ -87,6 +89,7 @@ pub(crate) fn source(stores: &Stores, scan: &Scan) -> PyResult<kermodes_core::ex
         return Ok(kermodes_core::exec::Source {
             schema: entry.schema.clone(),
             parts: vec![in_memory(state)],
+            reread: None,
         });
     }
     let (day, today) = stores
@@ -98,7 +101,7 @@ pub(crate) fn source(stores: &Stores, scan: &Scan) -> PyResult<kermodes_core::ex
         .predicate
         .as_deref()
         .map_or_else(Vec::new, kermodes_lake::column_bounds);
-    let (dated, history) = kermodes_lake::history_parts(
+    let history = kermodes_lake::history_parts(
         stores.tables.weir(),
         &stores.lake()?,
         &entry,
@@ -112,44 +115,92 @@ pub(crate) fn source(stores: &Stores, scan: &Scan) -> PyResult<kermodes_core::ex
     )
     .map_err(store_error)?;
     // History keeps each row's `Date`; readers get the table's columns.
-    let kept: Vec<usize> = (0..dated.fields().len())
-        .filter(|at| dated.field(*at).name() != kermodes_lake::DATE)
+    let kept: Arc<[usize]> = (0..history.schema.fields().len())
+        .filter(|at| history.schema.field(*at).name() != kermodes_lake::DATE)
         .collect();
-    let schema = Arc::new(dated.project(&kept).map_err(arrow_error)?);
-    let failed = |table: &TableName| {
-        let table = table.to_string();
-        move |e: &dyn std::fmt::Display| kermodes_core::Error::Source {
-            table: table.clone(),
-            message: e.to_string(),
-        }
-    };
-    let mut parts: Vec<kermodes_core::exec::Part> = Vec::with_capacity(history.len() + 1);
-    for part in history {
-        let (schema, kept, failed) = (schema.clone(), kept.clone(), failed(&entry.name));
-        parts.push(Box::new(move || {
-            let batches = part().map_err(|e| failed(&e))?;
-            let projected = batches.map(move |batch| {
-                batch
-                    .map_err(|e| failed(&e))
-                    .and_then(|batch| project(&batch, &schema, &kept).map_err(|e| failed(&e)))
-            });
-            Ok(Box::new(projected) as kermodes_core::exec::Batches)
-        }));
-    }
+    let schema = Arc::new(history.schema.project(&kept).map_err(arrow_error)?);
     let columns = positions(&entry.schema, &schema)?;
     let today = today
         .iter()
         .map(|batch| project(batch, &schema, &columns).map_err(arrow_error))
         .collect::<PyResult<Vec<_>>>()?;
-    if !today.is_empty() {
-        parts.push(in_memory(today));
-    }
-    Ok(kermodes_core::exec::Source { schema, parts })
+    let count = history.len() + usize::from(!today.is_empty());
+    let reread: kermodes_core::exec::Reread = {
+        let (history, schema) = (Arc::new(history), schema.clone());
+        let table: Arc<str> = entry.name.to_string().into();
+        Arc::new(move |part, columns, rows| {
+            let table = table.clone();
+            let failed = move |e: &dyn std::fmt::Display| kermodes_core::Error::Source {
+                table: table.to_string(),
+                message: e.to_string(),
+            };
+            if part == history.len() {
+                return rows_at(&today, &schema, columns, rows).map_err(|e| failed(&e));
+            }
+            let columns: Vec<usize> = columns.iter().map(|&at| kept[at]).collect();
+            let batches = history.read(part, &columns, rows).map_err(|e| failed(&e))?;
+            Ok(Box::new(
+                batches.map(move |batch| batch.map_err(|e| failed(&e))),
+            ))
+        })
+    };
+    let all: Arc<[usize]> = (0..schema.fields().len()).collect();
+    let parts = (0..count)
+        .map(|part| {
+            let (reread, all) = (reread.clone(), all.clone());
+            Box::new(move || reread(part, &all, None)) as kermodes_core::exec::Part
+        })
+        .collect();
+    Ok(kermodes_core::exec::Source {
+        schema,
+        parts,
+        reread: Some(reread),
+    })
 }
 
 /// Batches already read, as a part.
 pub(crate) fn in_memory(batches: Vec<RecordBatch>) -> kermodes_core::exec::Part {
     Box::new(move || Ok(Box::new(batches.into_iter().map(Ok)) as kermodes_core::exec::Batches))
+}
+
+/// Of batches of `schema` held in memory, the columns at `columns` (ascending), and only the
+/// rows at `rows` (ascending, counted across the batches; all where `None`).
+fn rows_at(
+    batches: &[RecordBatch],
+    schema: &Schema,
+    columns: &[usize],
+    rows: Option<&[u64]>,
+) -> Result<kermodes_core::exec::Batches, arrow::error::ArrowError> {
+    let schema = Arc::new(schema.project(columns)?);
+    let mut read = Vec::with_capacity(batches.len());
+    let mut start = 0;
+    for batch in batches {
+        let end = start + batch.num_rows() as u64;
+        let kept = columns.iter().map(|&at| batch.column(at).clone());
+        let (kept, count) = match rows {
+            None => (kept.collect(), batch.num_rows()),
+            Some(rows) => {
+                let from = rows.partition_point(|&row| row < start);
+                let to = rows.partition_point(|&row| row < end);
+                let indices =
+                    UInt64Array::from_iter_values(rows[from..to].iter().map(|row| row - start));
+                let kept = kept
+                    .map(|column| take(&column, &indices, None))
+                    .collect::<Result<_, _>>()?;
+                (kept, to - from)
+            }
+        };
+        start = end;
+        if count > 0 {
+            let options = RecordBatchOptions::new().with_row_count(Some(count));
+            read.push(Ok(RecordBatch::try_new_with_options(
+                schema.clone(),
+                kept,
+                &options,
+            )?));
+        }
+    }
+    Ok(Box::new(read.into_iter()))
 }
 
 /// What `rows(scan)` would read, and whether it ticks.
