@@ -227,33 +227,41 @@ export function Chart({ table, x, y, where, points: budget, type = 'line', class
     };
   }, []);
 
-  // Loading looks as a table's does: the same spinner over faint placeholder bars, so a chart
-  // that has not drawn yet never reads as an empty one.
+  // Loading and reconnecting look as a table's do: the same spinner in a pill, over faint
+  // placeholder bars before any points, or over the last points dimmed, so a chart that is not
+  // current never reads as an empty or a failed one.
   useEffect(() => injectGridStyles(host.current?.ownerDocument), []);
-  const loading = series.error == null && points == null;
-  const empty = series.error != null ? 'This chart cannot be shown' : loading || drawable ? null : 'No rows';
+  const failed = series.status === 'failed';
+  const busy = failed ? null : series.status === 'reconnecting' ? 'Reconnecting' : points == null ? 'Loading' : null;
+  const empty = failed ? 'This chart cannot be shown' : busy != null || drawable ? null : 'No rows';
   return (
     <div className={className} style={{ position: 'relative', width: '100%', height: '100%', ...style }}>
       <div ref={host} style={{ position: 'absolute', inset: 0 }} />
-      {loading && (
-        <div className="km-chart-loading" aria-busy="true" aria-label="Loading chart">
-          <div className="km-chart-skeleton" aria-hidden="true">
-            {SKELETON_BARS.map((height, at) => (
-              // Fixed placeholders that never reorder
-              // eslint-disable-next-line react/no-array-index-key
-              <span key={at} className="kermodes-skeleton-bar" style={{ height: `${height}%` }} />
-            ))}
-          </div>
+      {busy != null && (
+        <div
+          className={points == null ? 'km-chart-loading' : 'km-chart-loading km-chart-dim'}
+          aria-busy="true"
+          aria-label={busy}
+        >
+          {points == null && (
+            <div className="km-chart-skeleton" aria-hidden="true">
+              {SKELETON_BARS.map((height, at) => (
+                // Fixed placeholders that never reorder
+                // eslint-disable-next-line react/no-array-index-key
+                <span key={at} className="kermodes-skeleton-bar" style={{ height: `${height}%` }} />
+              ))}
+            </div>
+          )}
           <span className="kermodes-busy" role="status">
             <Spinner />
-            Loading
+            {busy}
           </span>
         </div>
       )}
       {empty != null && (
         <div className="km-chart-empty">
           <span>{empty}</span>
-          {series.error != null && <span className="km-chart-reason">{series.error}</span>}
+          {failed && series.error != null && <span className="km-chart-reason">{series.error}</span>}
         </div>
       )}
     </div>

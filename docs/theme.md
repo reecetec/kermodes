@@ -105,7 +105,7 @@ it is `--primary-foreground` (`#0b1220`), since white on the light blue would no
 | State | What shows |
 |---|---|
 | Connected, ticking | Nothing extra. Changed cells flash. |
-| Reconnecting | A quiet "Reconnecting" with a spinner in the top bar; open views dim until fresh data arrives. |
+| Reconnecting | A quiet "Reconnecting" with a spinner in the top bar; open views dim until fresh data arrives, each under the same spinner, a chart over its last points. |
 | Loading a view | From the first paint, before the connection is open: skeleton rows (placeholder columns until the table's own are known); a chart, the spinner over faint placeholder bars; a figure (`Stat` given its table's `status`), a bar where its value goes. Never a blank panel, a 0, or a dash that reads as data. |
 | Updating a sort or filter | The current rows dim under a spinner until the engine applies it. |
 | Failed | The view says what failed and why, in place of the rows. |

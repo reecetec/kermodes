@@ -151,6 +151,10 @@
   text-align: center;
 }
 
+/* Reconnecting with points drawn: the last points stay, dimmed, as the grid dims its rows */
+.km-chart-dim {
+  background: color-mix(in srgb, var(--background) 60%, transparent);
+}
 /* A chart before its first points: the grid's spinner over faint bars where the series will be */
 .km-chart-loading {
   position: absolute;
