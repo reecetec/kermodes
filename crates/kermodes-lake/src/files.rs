@@ -32,7 +32,7 @@ use parquet::arrow::async_reader::{
     AsyncFileReader, MetadataSuffixFetch, ParquetRecordBatchStream,
 };
 use parquet::arrow::async_writer::AsyncArrowWriter;
-use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder};
+use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::errors::ParquetError;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
@@ -89,13 +89,47 @@ pub fn file_columns(entry: &TableEntry) -> Result<Schema, Error> {
     Ok(Schema::new(fields))
 }
 
+/// The table columns a read of history keeps, by ID (§5.4), after the columns history always
+/// reads (`Date`, and a keyed table's `Op`): `system` of them.
+pub struct Projection<'a> {
+    pub system: usize,
+    pub ids: &'a [ColumnId],
+}
+
+/// The table's current columns, all of them or those with the `wanted` IDs, in its order.
+pub fn projected(entry: &TableEntry, wanted: Option<&[ColumnId]>) -> Shape {
+    let Some(wanted) = wanted else {
+        return entry.shape();
+    };
+    let keep: Vec<usize> = (0..entry.ids.len())
+        .filter(|&i| wanted.contains(&entry.ids[i]))
+        .collect();
+    Shape::new(
+        Arc::new(
+            entry
+                .schema
+                .project(&keep)
+                .expect("positions of the table's own columns"),
+        ),
+        keep.iter().map(|&i| entry.ids[i]).collect(),
+    )
+}
+
 /// A history file's batch as the table's history has it now (`Date`, then
-/// `history_columns`): its columns matched by ID, so a file written under earlier columns reads
-/// under the current ones (§5.4); one written before columns had IDs, by position.
-pub fn as_current(entry: &TableEntry, batch: RecordBatch) -> Result<RecordBatch, Error> {
-    let schema = with_date_column(&history_columns(entry)?);
+/// `history_columns`, all of them or those with the `wanted` IDs): its columns matched by ID,
+/// so a file written under earlier columns reads under the current ones (§5.4); one written
+/// before columns had IDs, by position (such a file is read whole: `Lake::read`).
+pub fn as_current(
+    entry: &TableEntry,
+    batch: RecordBatch,
+    wanted: Option<&[ColumnId]>,
+) -> Result<RecordBatch, Error> {
+    let full = with_date_column(&history_columns(entry)?);
     // `Date`, and a keyed table's `Op`, are history's own.
-    let system = schema.fields().len() - entry.ids.len();
+    let system = full.fields().len() - entry.ids.len();
+    let current = projected(entry, wanted);
+    let mut fields = full.fields()[..system].to_vec();
+    fields.extend(current.schema.fields().iter().cloned());
     let written = batch.schema();
     let data = Schema::new(written.fields()[system..].to_vec());
     let shape = Shape::with_ids(&data, |_, field| {
@@ -106,7 +140,6 @@ pub fn as_current(entry: &TableEntry, batch: RecordBatch) -> Result<RecordBatch,
             .map(ColumnId)
     });
     let mut columns = batch.columns()[..system].to_vec();
-    let current = entry.shape();
     if shape.reads_as(&current) {
         columns.extend(batch.columns()[system..].iter().cloned());
     } else {
@@ -119,11 +152,29 @@ pub fn as_current(entry: &TableEntry, batch: RecordBatch) -> Result<RecordBatch,
         columns.extend(shape.project(&data, &current)?.columns().iter().cloned());
     }
     RecordBatch::try_new_with_options(
-        schema,
+        Arc::new(Schema::new(fields)),
         columns,
         &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
     )
     .map_err(arrow_error)
+}
+
+/// The columns of a file to read for `projection`: those history always reads, and each table
+/// column the file holds under a wanted ID. `None` for a file written before columns had IDs,
+/// whose columns are known only by position among all of them: it is read whole.
+fn roots(file: &Schema, projection: &Projection) -> Option<Vec<usize>> {
+    let mut roots: Vec<usize> = (0..projection.system.min(file.fields().len())).collect();
+    for (i, field) in file.fields().iter().enumerate().skip(projection.system) {
+        let id = field
+            .metadata()
+            .get(PARQUET_FIELD_ID_META_KEY)
+            .and_then(|id| id.parse().ok())
+            .map(ColumnId)?;
+        if projection.ids.contains(&id) {
+            roots.push(i);
+        }
+    }
+    Some(roots)
 }
 
 /// A batch weir holds, as history keeps it (`history_columns`).
@@ -326,8 +377,9 @@ impl Lake {
     }
 
     /// The rows of `first` to `last` in a history file, reading only the row groups of those
-    /// dates; and of those, only the row groups and pages whose statistics allow `bounds`. The
-    /// rows read may still include some outside them: the caller applies its predicate.
+    /// dates; and of those, only the row groups and pages whose statistics allow `bounds`, and
+    /// only the columns `projection` keeps (all if `None`). The rows read may still include some
+    /// outside them: the caller applies its predicate.
     pub fn read(
         &self,
         location: &str,
@@ -335,6 +387,7 @@ impl Lake {
         first: Date,
         last: Date,
         bounds: &[Bound],
+        projection: Option<&Projection>,
     ) -> Result<Batches<'_>, Error> {
         let path = Path::from(format!("{location}/{file}"));
         let reader = StoreReader {
@@ -433,12 +486,20 @@ impl Lake {
             if let Some(selection) = selection {
                 builder = builder.with_row_selection(selection);
             }
+            let in_file = builder.schema().fields().len();
+            let mut columns = (in_file, in_file);
+            if let Some(roots) = projection.and_then(|p| roots(builder.schema(), p)) {
+                columns.0 = roots.len();
+                let mask = ProjectionMask::roots(builder.parquet_schema(), roots);
+                builder = builder.with_projection(mask);
+            }
             let stream = builder.build().map_err(parquet_error)?;
             Ok(Batches {
                 runtime: &self.runtime,
                 stream,
                 row_groups,
                 rows: (selected, in_groups),
+                columns,
             })
         })
     }
@@ -542,6 +603,8 @@ pub struct Batches<'a> {
     pub row_groups: (usize, usize),
     /// Rows read (the pages bounds allow), and in the row groups read.
     pub rows: (u64, u64),
+    /// Columns read, and in the file.
+    pub columns: (usize, usize),
 }
 
 /// Which of a column's row groups or pages, given their minimums and maximums, may hold values

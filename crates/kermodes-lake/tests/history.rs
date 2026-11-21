@@ -86,7 +86,10 @@ fn history(store: &Store, lake: &Lake, first: Date, last: Date) -> Vec<i64> {
     let location = store.table(&ticks()).unwrap().location;
     let mut n = Vec::new();
     for file in store.history_files(&ticks(), first, last).unwrap() {
-        for batch in lake.read(&location, &file.name, first, last, &[]).unwrap() {
+        for batch in lake
+            .read(&location, &file.name, first, last, &[], None)
+            .unwrap()
+        {
             let batch = batch.unwrap();
             n.extend(batch.column(1).as_primitive::<Int64Type>().values().iter());
         }
@@ -180,7 +183,7 @@ fn a_merge_cut_short_after_its_commit_finishes_by_dropping() {
     let store = store_with(&root, &[(d(1), &[("a", &[1, 2])])]);
     assert_eq!(store.date_rows(&ticks(), d(1)).unwrap().0, 2);
     // In both places: a read takes it from history alone.
-    let read = read_history(&store, &lake, &ticks(), None, None, &[]).unwrap();
+    let read = read_history(&store, &lake, &ticks(), None, None, &[], None).unwrap();
     assert_eq!((rows(&read).len(), read.explain.weir_dates), (2, 0));
 
     assert_eq!(
@@ -274,7 +277,7 @@ fn a_batch_job_writes_a_past_date_straight_into_history() {
 
     write_history(&store, &lake, &ticks(), d(5), &[]).unwrap();
     assert_eq!(history(&store, &lake, d(1), d(6)), [1, 2, 14]);
-    let read = read_history(&store, &lake, &ticks(), Some(d(5)), Some(d(5)), &[]).unwrap();
+    let read = read_history(&store, &lake, &ticks(), Some(d(5)), Some(d(5)), &[], None).unwrap();
     assert_eq!(rows(&read), []);
 }
 
@@ -320,6 +323,75 @@ fn writing_history_is_refused_where_a_date_would_be_served_twice_or_the_rows_do_
     assert!(matches!(keyed, Err(Error::Schema(_))), "{keyed:?}");
 }
 
+/// A read of some columns gives `Date` and those, in the table's order, from history files and
+/// from past dates weir still holds alike; a column renamed since a file was written is read by
+/// its new name; `EXPLAIN` counts the columns read.
+#[test]
+fn a_read_of_some_columns_reads_only_those() {
+    let dir = TempDir::new();
+    let root = dir.0.join("store");
+    let wide = TableName::parse("md.wide").unwrap();
+    let int = |values: &[i64]| Arc::new(Int64Array::from(values.to_vec())) as ArrayRef;
+    let rows = |a: &[i64], b: &[i64], c: &[i64]| {
+        RecordBatch::try_from_iter([("a", int(a)), ("b", int(b)), ("c", int(c))]).unwrap()
+    };
+    let store = Store::open(&root).unwrap();
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int64, true),
+        Field::new("b", DataType::Int64, true),
+        Field::new("c", DataType::Int64, true),
+    ]);
+    let location = store.create_table(&wide, &schema).unwrap().location;
+    let lake = Lake::open(dir.0.join("lake").to_str().unwrap()).unwrap();
+    write_history(
+        &store,
+        &lake,
+        &wide,
+        d(1),
+        &[rows(&[1, 2], &[10, 20], &[100, 200])],
+    )
+    .unwrap();
+    // A past date still in weir: written today, then its directory renamed to the date.
+    let writer = store
+        .writer(&wide, &SourceId::parse("feed").unwrap(), false)
+        .unwrap();
+    writer.write(&rows(&[3], &[30], &[300]), None).unwrap();
+    drop((writer, store));
+    let weir = root.join("weir").join(&location);
+    fs::rename(weir.join(today().to_string()), weir.join(d(2).to_string())).unwrap();
+    let store = Store::open(&root).unwrap();
+    // `c` renamed `z` after the file was written.
+    let renamed = Schema::new(vec![
+        Field::new("a", DataType::Int64, true),
+        Field::new("b", DataType::Int64, true),
+        kermodes_weir::column("z", "int64 was c").unwrap(),
+    ]);
+    store.create_table(&wide, &renamed).unwrap();
+
+    let columns = ["z".to_string(), "a".to_string(), "nowhere".to_string()];
+    let read = read_history(&store, &lake, &wide, None, None, &[], Some(&columns)).unwrap();
+    let names: Vec<&str> = read
+        .schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    assert_eq!(names, ["Date", "a", "z"]);
+    let mut got = Vec::new();
+    for batch in &read.batches {
+        assert_eq!(batch.schema(), read.schema);
+        let (a, z) = (batch.column(1).as_primitive::<Int64Type>(), batch.column(2));
+        for row in 0..batch.num_rows() {
+            got.push((a.value(row), z.as_primitive::<Int64Type>().value(row)));
+        }
+    }
+    assert_eq!(got, [(1, 100), (2, 200), (3, 300)]);
+    assert_eq!(read.explain.columns, (3, 4));
+    assert_eq!(read.explain.weir_dates, 1);
+    let all = read_history(&store, &lake, &wide, None, None, &[], None).unwrap();
+    assert_eq!(all.explain.columns, (4, 4));
+}
+
 /// Each row read: its `Date` (as days) and its `n`.
 fn rows(history: &History) -> Vec<(i32, i64)> {
     let mut rows = Vec::new();
@@ -358,7 +430,8 @@ fn history_reads_only_the_dates_asked_for() {
 
     let (one, two, three) = (d(1).days(), d(2).days(), d(3).days());
     for weir in [&*store as &dyn Weir, &client] {
-        let read = |first, last| read_history(weir, &lake, &ticks(), first, last, &[]).unwrap();
+        let read =
+            |first, last| read_history(weir, &lake, &ticks(), first, last, &[], None).unwrap();
 
         let all = read(None, None);
         let mut expected: Vec<(i32, i64)> = [1, 2, 3, 4, 5].map(|n| (one, n)).to_vec();
@@ -434,7 +507,8 @@ fn a_keyed_tables_history_is_its_log_of_changes() {
     let store = Store::open(&dir.0).unwrap();
     let lake = Lake::open(dir.0.join("lake").to_str().unwrap()).unwrap();
     let log = |store: &Store| -> Vec<(String, i64)> {
-        let history = read_history(store, &lake, &quotes, Some(d(1)), Some(d(1)), &[]).unwrap();
+        let history =
+            read_history(store, &lake, &quotes, Some(d(1)), Some(d(1)), &[], None).unwrap();
         let mut log = Vec::new();
         for batch in &history.batches {
             let ops = batch.column(1).as_string::<i32>();

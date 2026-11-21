@@ -29,21 +29,26 @@ impl StoredTable {
     /// or missed. A keyed table is its latest state, ticking.
     #[pyo3(name = "where")]
     fn where_(&self, py: Python<'_>, predicate: &str) -> PyResult<Table> {
-        py.detach(|| self.rows(Some(predicate))).map(Table)
+        py.detach(|| self.rows(Some(predicate), None)).map(Table)
     }
 
     /// What `where(predicate)` would read of history (files, row groups, and bytes, from the
     /// catalog and the files' footers alone), and whether today follows from weir.
     fn explain(&self, py: Python<'_>, predicate: &str) -> PyResult<String> {
-        py.detach(|| self.describe(Some(predicate)))
+        py.detach(|| self.describe(Some(predicate), None))
             .map(|(described, _)| described)
     }
 }
 
 impl StoredTable {
-    /// The rows `where(predicate)` gives; with no predicate, a keyed table's latest state (an
-    /// append table's rows need dates).
-    pub(crate) fn rows(&self, predicate: Option<&str>) -> PyResult<kermodes_core::Table> {
+    /// The rows `where(predicate)` gives, with only `columns` (all if `None`) of an append
+    /// table's; with no predicate, a keyed table's latest state (an append table's rows need
+    /// dates).
+    pub(crate) fn rows(
+        &self,
+        predicate: Option<&str>,
+        columns: Option<&[String]>,
+    ) -> PyResult<kermodes_core::Table> {
         let name = &self.entry.name;
         if !self.entry.key.is_empty() {
             let state = self.live(name, Fed::State { keyed: true }, &self.entry.schema)?;
@@ -65,18 +70,28 @@ impl StoredTable {
             let yesterday = Date::from_days(today.days() - 1);
             let before = last.map_or(yesterday, |last| last.min(yesterday));
             parts.push(
-                self.history(first, before, predicate)?
+                self.history(first, before, predicate, columns)?
                     .filter(predicate)
                     .map_err(engine_error)?,
             );
         }
         if last.is_none_or(|last| last >= today) {
             let schema = kermodes_lake::with_date_column(&self.entry.schema);
-            parts.push(
-                self.live(name, Fed::Dated(schema.clone()), &schema)?
-                    .filter(predicate)
-                    .map_err(engine_error)?,
-            );
+            let mut today = self
+                .live(name, Fed::Dated(schema.clone()), &schema)?
+                .filter(predicate)
+                .map_err(engine_error)?;
+            // The columns history reads, in its order, so the two parts are one table.
+            if let Some(columns) = columns {
+                let kept: Vec<&str> = schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .filter(|n| *n == kermodes_lake::DATE || columns.iter().any(|c| c == n))
+                    .collect();
+                today = today.select(&kept).map_err(engine_error)?;
+            }
+            parts.push(today);
         }
         match parts.as_slice() {
             [only] => Ok(only.clone()),
@@ -86,8 +101,12 @@ impl StoredTable {
         }
     }
 
-    /// What `rows(predicate)` would read, and whether it ticks.
-    pub(crate) fn describe(&self, predicate: Option<&str>) -> PyResult<(String, bool)> {
+    /// What `rows(predicate, columns)` would read, and whether it ticks.
+    pub(crate) fn describe(
+        &self,
+        predicate: Option<&str>,
+        columns: Option<&[String]>,
+    ) -> PyResult<(String, bool)> {
         let name = &self.entry.name;
         if !self.entry.key.is_empty() {
             return Ok((format!("{name}'s latest state, ticking from weir"), true));
@@ -105,6 +124,7 @@ impl StoredTable {
                 Some(first),
                 Some(before),
                 &predicate.map_or_else(Vec::new, kermodes_lake::column_bounds),
+                columns,
             )
             .map_err(store_error)?;
             lines.push(format!("{name} {first} to {before}: {explain}"));
@@ -121,8 +141,14 @@ impl StoredTable {
     }
 
     /// `first` to `last` of history, read now: only the row groups and pages `predicate`'s
-    /// bounds allow.
-    fn history(&self, first: Date, last: Date, predicate: &str) -> PyResult<kermodes_core::Table> {
+    /// bounds allow, and only `columns` (all if `None`).
+    fn history(
+        &self,
+        first: Date,
+        last: Date,
+        predicate: &str,
+        columns: Option<&[String]>,
+    ) -> PyResult<kermodes_core::Table> {
         let lake = self.lake()?;
         let history = kermodes_lake::read_history(
             self.tables.weir(),
@@ -131,6 +157,7 @@ impl StoredTable {
             Some(first),
             Some(last),
             &kermodes_lake::column_bounds(predicate),
+            columns,
         )
         .map_err(store_error)?;
         self.engine

@@ -69,8 +69,12 @@ fn rows(
     match source(scan, passed)? {
         Source::Passed(table) => filtered(table.clone()),
         Source::Live(name) => filtered(session.live(&name)?),
-        Source::Hist(name) => session.historical(&name)?.rows(predicate),
-        Source::Stored(name) => stored(session, &name, scan)?.rows(predicate),
+        Source::Hist(name) => session
+            .historical(&name)?
+            .rows(predicate, scan.columns.as_deref()),
+        Source::Stored(name) => {
+            stored(session, &name, scan)?.rows(predicate, scan.columns.as_deref())
+        }
     }
 }
 
@@ -90,10 +94,11 @@ fn describe(
         Source::Hist(name) => Ok((
             session
                 .historical(&name)?
-                .describe(scan.predicate.as_deref())?,
+                .describe(scan.predicate.as_deref(), scan.columns.as_deref())?,
             false,
         )),
-        Source::Stored(name) => stored(session, &name, scan)?.describe(scan.predicate.as_deref()),
+        Source::Stored(name) => stored(session, &name, scan)?
+            .describe(scan.predicate.as_deref(), scan.columns.as_deref()),
     }
 }
 

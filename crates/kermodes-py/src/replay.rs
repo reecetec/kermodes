@@ -79,6 +79,7 @@ impl Replay {
                 Some(date),
                 Some(date),
                 &[],
+                None,
             )
             .map_err(|e| kermodes_core::Error::Compute {
                 table: failed.clone(),

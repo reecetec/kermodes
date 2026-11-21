@@ -56,7 +56,9 @@ fn d(day: u32) -> Date {
 
 /// Each row read: its `Date` and its `n`.
 fn read(lake: &Lake, file: &str, first: Date, last: Date) -> (Vec<(i32, i64)>, (usize, usize)) {
-    let mut batches = lake.read("md/ticks.1", file, first, last, &[]).unwrap();
+    let mut batches = lake
+        .read("md/ticks.1", file, first, last, &[], None)
+        .unwrap();
     let mut rows = Vec::new();
     for batch in batches.by_ref() {
         let batch = batch.unwrap();
@@ -200,7 +202,10 @@ fn a_sorted_tables_dates_are_written_in_sort_order() {
     let file = &written.files[0].name;
     for day in 1..=3 {
         let mut syms = Vec::new();
-        for batch in lake.read("md/ticks.1", file, d(day), d(day), &[]).unwrap() {
+        for batch in lake
+            .read("md/ticks.1", file, d(day), d(day), &[], None)
+            .unwrap()
+        {
             let batch = batch.unwrap();
             let column = batch.column(2).as_string::<i32>();
             syms.extend((0..batch.num_rows()).map(|i| column.value(i).to_string()));
@@ -252,7 +257,9 @@ fn a_bounded_read_of_a_sorted_date_skips_the_pages_it_cannot_need() {
         .unwrap();
     let file = &written.files[0].name;
     let bounds = kermodes_lake::column_bounds("sym = 'sym-00000042'");
-    let mut batches = lake.read("md/ticks.1", file, d(1), d(1), &bounds).unwrap();
+    let mut batches = lake
+        .read("md/ticks.1", file, d(1), d(1), &bounds, None)
+        .unwrap();
     let (mut matching, mut returned) = (0, 0);
     for batch in batches.by_ref() {
         let batch = batch.unwrap();

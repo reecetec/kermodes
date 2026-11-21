@@ -177,8 +177,8 @@ fn replace_date(
                 }
                 // A neighbour rewritten into the new file, from the file it was in.
                 for from in held.iter().filter(|h| h.date == day) {
-                    for batch in lake.read(&entry.location, &from.file, day, day, &[])? {
-                        push(without_date(as_current(entry, batch?)?)?)?;
+                    for batch in lake.read(&entry.location, &from.file, day, day, &[], None)? {
+                        push(without_date(as_current(entry, batch?, None)?)?)?;
                     }
                 }
                 Ok(())

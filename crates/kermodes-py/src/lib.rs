@@ -848,38 +848,46 @@ impl HistoricalTable {
     /// (`sym = 'AAPL'`) skip the row groups and pages whose statistics rule them out.
     #[pyo3(name = "where")]
     fn where_(&self, py: Python<'_>, predicate: &str) -> PyResult<Table> {
-        py.detach(|| self.rows(Some(predicate))).map(Table)
+        py.detach(|| self.rows(Some(predicate), None)).map(Table)
     }
 
     /// All of it.
     fn table(&self, py: Python<'_>) -> PyResult<Table> {
-        py.detach(|| self.rows(None)).map(Table)
+        py.detach(|| self.rows(None, None)).map(Table)
     }
 
     /// What `where(predicate)`, or `table()` without one, would read: files, row groups, rows,
-    /// and bytes, from the catalog and the files' footers and page indexes alone.
+    /// columns, and bytes, from the catalog and the files' footers and page indexes alone.
     #[pyo3(signature = (predicate=None))]
     fn explain(&self, py: Python<'_>, predicate: Option<&str>) -> PyResult<String> {
-        py.detach(|| self.describe(predicate))
+        py.detach(|| self.describe(predicate, None))
     }
 }
 
 impl HistoricalTable {
     /// The rows for which `predicate` is true, all of them without one: only the dates, files,
-    /// row groups, and pages its bounds allow are read.
-    fn rows(&self, predicate: Option<&str>) -> PyResult<kermodes_core::Table> {
+    /// row groups, and pages its bounds allow are read, and only `columns` (all if `None`).
+    pub(crate) fn rows(
+        &self,
+        predicate: Option<&str>,
+        columns: Option<&[String]>,
+    ) -> PyResult<kermodes_core::Table> {
         let Some(predicate) = predicate else {
-            return self.read(None, None, &[]);
+            return self.read(None, None, &[], columns);
         };
         let (first, last) = kermodes_lake::date_bounds(predicate);
         let bounds = kermodes_lake::column_bounds(predicate);
-        self.read(first, last, &bounds)?
+        self.read(first, last, &bounds, columns)?
             .filter(predicate)
             .map_err(engine_error)
     }
 
-    /// What `rows(predicate)` would read.
-    fn describe(&self, predicate: Option<&str>) -> PyResult<String> {
+    /// What `rows(predicate, columns)` would read.
+    pub(crate) fn describe(
+        &self,
+        predicate: Option<&str>,
+        columns: Option<&[String]>,
+    ) -> PyResult<String> {
         let (first, last) = predicate.map_or((None, None), kermodes_lake::date_bounds);
         let bounds = predicate.map_or_else(Vec::new, kermodes_lake::column_bounds);
         let explain = kermodes_lake::explain_history(
@@ -889,6 +897,7 @@ impl HistoricalTable {
             first,
             last,
             &bounds,
+            columns,
         )
         .map_err(store_error)?;
         let bound =
@@ -906,6 +915,7 @@ impl HistoricalTable {
         first: Option<kermodes_weir::Date>,
         last: Option<kermodes_weir::Date>,
         bounds: &[kermodes_lake::Bound],
+        columns: Option<&[String]>,
     ) -> PyResult<kermodes_core::Table> {
         let history = kermodes_lake::read_history(
             self.tables.weir(),
@@ -914,6 +924,7 @@ impl HistoricalTable {
             first,
             last,
             bounds,
+            columns,
         )
         .map_err(store_error)?;
         self.engine

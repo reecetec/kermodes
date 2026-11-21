@@ -4,13 +4,16 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use kermodes_weir::{Date, Error, TableName};
 
 use crate::bounds::Bound;
-use crate::files::{Lake, as_current, dated, history_columns, with_date_column, with_op};
+use crate::files::{
+    Lake, Projection, as_current, dated, history_columns, projected, with_date_column, with_op,
+};
 use crate::weir::Weir;
 
 /// Dates of a table's history, read.
@@ -30,6 +33,8 @@ pub struct Explain {
     pub row_groups: (usize, usize),
     /// Rows read from files (the pages bounds allow), and in the row groups read.
     pub rows: (u64, u64),
+    /// Columns read, and in the table's history (with `Date`).
+    pub columns: (usize, usize),
     /// Bytes of the dates read, and of the table's whole history.
     pub bytes: (u64, u64),
     /// Past dates read from weir, not merged yet.
@@ -40,13 +45,15 @@ impl fmt::Display for Explain {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} of {} files, {} of {} row groups, {} of {} rows, {} of {}",
+            "{} of {} files, {} of {} row groups, {} of {} rows, {} of {} columns, {} of {}",
             self.files.0,
             self.files.1,
             self.row_groups.0,
             self.row_groups.1,
             self.rows.0,
             self.rows.1,
+            self.columns.0,
+            self.columns.1,
             size(self.bytes.0),
             size(self.bytes.1)
         )?;
@@ -59,8 +66,9 @@ impl fmt::Display for Explain {
 }
 
 /// `name`'s history from `first` to `last` (all of it where `None`), reading from files only
-/// the row groups and pages `bounds` allow. Rows outside the bounds may still be read: the
-/// caller applies its predicate.
+/// the row groups and pages `bounds` allow, and only the table's `columns` (all where `None`;
+/// `Date`, and a keyed table's `Op`, always). Rows outside the bounds may still be read: the
+/// caller applies its predicate. A name the table lacks reads nothing.
 pub fn read_history(
     weir: &dyn Weir,
     lake: &Lake,
@@ -68,8 +76,9 @@ pub fn read_history(
     first: Option<Date>,
     last: Option<Date>,
     bounds: &[Bound],
+    columns: Option<&[String]>,
 ) -> Result<History, Error> {
-    history(weir, lake, name, first, last, bounds, true)
+    history(weir, lake, name, first, last, bounds, columns, true)
 }
 
 /// What `read_history` would touch, from the catalog and the files' footers and page indexes
@@ -81,10 +90,12 @@ pub fn explain_history(
     first: Option<Date>,
     last: Option<Date>,
     bounds: &[Bound],
+    columns: Option<&[String]>,
 ) -> Result<Explain, Error> {
-    history(weir, lake, name, first, last, bounds, false).map(|history| history.explain)
+    history(weir, lake, name, first, last, bounds, columns, false).map(|history| history.explain)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn history(
     weir: &dyn Weir,
     lake: &Lake,
@@ -92,15 +103,40 @@ fn history(
     first: Option<Date>,
     last: Option<Date>,
     bounds: &[Bound],
+    columns: Option<&[String]>,
     rows: bool,
 ) -> Result<History, Error> {
     let entry = weir.entry(name)?;
-    let schema = with_date_column(&history_columns(&entry)?);
+    let full = with_date_column(&history_columns(&entry)?);
+    let system = full.fields().len() - entry.ids.len();
+    let wanted: Option<Vec<_>> = columns.map(|names| {
+        entry
+            .schema
+            .fields()
+            .iter()
+            .zip(entry.ids.iter())
+            .filter(|(field, _)| names.iter().any(|n| n == field.name()))
+            .map(|(_, id)| *id)
+            .collect()
+    });
+    let kept = projected(&entry, wanted.as_deref());
+    // Where the kept columns are among all of them, for weir's dates, read whole.
+    let positions: Vec<usize> = (0..system)
+        .chain(
+            kept.schema
+                .fields()
+                .iter()
+                .filter_map(|f| full.index_of(f.name()).ok()),
+        )
+        .collect();
+    let schema = Arc::new(full.project(&positions).map_err(arrow_error)?);
+    let projection = wanted.as_deref().map(|ids| Projection { system, ids });
     let first = first.unwrap_or(Date::MIN);
     let last = last.unwrap_or(Date::MAX);
     let held = weir.history(name)?;
     let in_range = |date: Date| first <= date && date <= last;
     let mut explain = Explain {
+        columns: (schema.fields().len(), full.fields().len()),
         bytes: (
             held.iter()
                 .filter(|h| in_range(h.date))
@@ -116,11 +152,20 @@ fn history(
     if first <= last {
         for file in weir.history_files(name, first, last)? {
             // A file's footer is read here; its row groups only as the batches are taken.
-            let mut batches = lake.read(&entry.location, &file.name, first, last, bounds)?;
+            let mut batches = lake.read(
+                &entry.location,
+                &file.name,
+                first,
+                last,
+                bounds,
+                projection.as_ref(),
+            )?;
             let read = if rows {
                 batches
                     .by_ref()
-                    .map(|batch| batch.and_then(|batch| as_current(&entry, batch)))
+                    .map(|batch| {
+                        batch.and_then(|batch| as_current(&entry, batch, wanted.as_deref()))
+                    })
                     .collect::<Result<Vec<_>, _>>()?
             } else {
                 Vec::new()
@@ -141,11 +186,8 @@ fn history(
             let mut read = Vec::new();
             if rows {
                 weir.read_date(name, date, &mut |batch, stamp| {
-                    read.push(dated(
-                        &schema,
-                        date,
-                        &with_op(&entry, batch, stamp.change)?,
-                    )?);
+                    let whole = dated(&full, date, &with_op(&entry, batch, stamp.change)?)?;
+                    read.push(whole.project(&positions).map_err(arrow_error)?);
                     Ok(())
                 })?;
             }
@@ -159,6 +201,10 @@ fn history(
         batches: parts.into_iter().flat_map(|(_, batches)| batches).collect(),
         explain,
     })
+}
+
+fn arrow_error(e: arrow::error::ArrowError) -> Error {
+    Error::Arrow(e.to_string())
 }
 
 fn size(bytes: u64) -> String {
