@@ -7,35 +7,42 @@
 //! read alone go with its scan (`Scan::predicate`), so a store reads only the dates, files, and
 //! row groups they allow; the rest filter the joined rows.
 //!
-//! Supported: `SELECT` (columns, `*`, expressions named with `AS`), `WHERE`, `GROUP BY` with
-//! aggregates (`count`, `sum`, `avg`, `min`, `max`, `first`, `last`, `stddev`) and expressions
-//! over them, `HAVING`, `ORDER BY` columns of the result, `LIMIT`, `LEFT JOIN … ON` keys (one
-//! right row per key), `ASOF JOIN … MATCH_CONDITION (left >= right) ON` keys, `UNION ALL`, `WITH`,
-//! and subqueries in `FROM`. Anything else is refused, naming the nearest supported form.
+//! Supported, with DuckDB's meaning: `SELECT` (columns, `*`, expressions; one not named with
+//! `AS` takes the name DuckDB gives it, as `count_star()` or `sum((a + 1))`), `WHERE`, `GROUP
+//! BY` columns, expressions, aliases, and positions, with aggregates (`count`, `count(DISTINCT
+//! …)`, `sum`, `avg`, `min`, `max`, `first`, `last`, `stddev`) and expressions over them,
+//! `HAVING`, `ORDER BY` result columns (by name, position, or expression) and other expressions,
+//! `LIMIT` and `OFFSET`, `LEFT JOIN … ON` keys (one right row per key), `ASOF JOIN …
+//! MATCH_CONDITION (left >= right) ON` keys, `UNION ALL`, `WITH`, and subqueries in `FROM`.
+//! Anything else is refused, naming the nearest supported form.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-    Ident, JoinConstraint, JoinOperator, LimitClause, ObjectNamePart, OrderByKind, OrderBySort,
-    Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor, Value,
+    BinaryOperator, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
+    FunctionArguments, GroupByExpr, Ident, InTarget, JoinConstraint, JoinOperator, LimitClause,
+    ObjectNamePart, OrderByExpr, OrderByKind, OrderBySort, Query, Select, SelectItem, SetExpr,
+    SetOperator, SetQuantifier, Statement, TableFactor, UnaryOperator, Value, VisitMut, VisitorMut,
     visit_expressions, visit_expressions_mut,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use crate::Error;
 use crate::session::Table;
+use crate::{Error, SortKey};
 
 /// A table a query reads, by the name it is written with (`ns.table`, `live.ns.table`,
-/// `hist.ns.table`, or a name the caller supplies), and the conditions on it alone: a store reads
-/// only the dates and files they allow. A caller's scan gives the rows that satisfy them.
+/// `hist.ns.table`, or a name the caller supplies), the conditions on it alone, and the columns
+/// the query may read of it (all where `None`): a store reads only the dates, files, and
+/// columns they allow. A caller's scan gives the rows that satisfy them, with at least those
+/// columns; a name among them the table lacks is no column of it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Scan {
     pub name: String,
     pub predicate: Option<String>,
+    pub columns: Option<Vec<String>>,
 }
 
 /// A query as the engine's operators, each input built before the operator over it.
@@ -54,18 +61,32 @@ pub enum Plan {
         input: Box<Plan>,
         columns: Vec<String>,
     },
+    /// `agg_by`. `aliases`: names `GROUP BY` took as the aliases of other expressions, which
+    /// must not be columns of the input: SQL groups by the column of that name instead.
     Agg {
         input: Box<Plan>,
         by: Vec<String>,
         aggregations: Vec<(String, String)>,
+        aliases: Vec<String>,
     },
     Sort {
         input: Box<Plan>,
-        by: Vec<String>,
+        by: Vec<SortKey>,
     },
     Head {
         input: Box<Plan>,
         rows: usize,
+    },
+    /// The rows at positions `start` up to `stop` (to the end if `None`), in the input's order.
+    Slice {
+        input: Box<Plan>,
+        start: usize,
+        stop: Option<usize>,
+    },
+    /// Every column but these: those `ORDER BY` read and the result does not show.
+    Drop {
+        input: Box<Plan>,
+        columns: Vec<String>,
     },
     /// A `LEFT JOIN` (`at` empty, `natural_join`) or `ASOF JOIN` (`as_of_join`). It adds the
     /// right table's `columns` (`r.c=c`: its `c` as a column `r.c`, all of them if `None`), and
@@ -106,7 +127,7 @@ pub fn parse(sql: &str) -> Result<Parsed, Error> {
         },
         _ => return Err(unsupported("queries only: SELECT ...")),
     };
-    let plan = Binder::default().query(query)?;
+    let (plan, _) = Binder::default().query(query)?;
     Ok(Parsed { plan, explain })
 }
 
@@ -133,15 +154,40 @@ impl Plan {
                 input,
                 by,
                 aggregations,
+                aliases,
             } => {
+                let input = input.build(scan)?;
+                if let Some(alias) = aliases
+                    .iter()
+                    .find(|alias| input.schema().field_with_name(alias).is_ok())
+                {
+                    return Err(unsupported(&format!(
+                        "GROUP BY {alias}: {alias} is both a column of the table and an alias in \
+                         SELECT, and SQL groups by the column; name the alias apart"
+                    )));
+                }
                 let aggregations: Vec<(&str, &str)> = aggregations
                     .iter()
                     .map(|(name, spec)| (name.as_str(), spec.as_str()))
                     .collect();
-                input.build(scan)?.agg_by(&names(by), &aggregations)
+                input.agg_by(&names(by), &aggregations)
             }
-            Plan::Sort { input, by } => input.build(scan)?.sort(&names(by)),
+            Plan::Sort { input, by } => input.build(scan)?.sort_by(by),
             Plan::Head { input, rows } => input.build(scan)?.head(*rows),
+            Plan::Slice { input, start, stop } => {
+                input.build(scan)?.slice(*start, stop.unwrap_or(usize::MAX))
+            }
+            Plan::Drop { input, columns } => {
+                let input = input.build(scan)?;
+                let kept: Vec<String> = input
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .filter(|name| !columns.contains(name))
+                    .collect();
+                input.select(&names(&kept))
+            }
             Plan::Join {
                 left,
                 right,
@@ -229,7 +275,9 @@ impl Plan {
             | Plan::Select { input, .. }
             | Plan::Agg { input, .. }
             | Plan::Sort { input, .. }
-            | Plan::Head { input, .. } => vec![input],
+            | Plan::Head { input, .. }
+            | Plan::Slice { input, .. }
+            | Plan::Drop { input, .. } => vec![input],
             Plan::Join { left, right, .. } => vec![left, right],
             Plan::Merge(parts) => parts.iter().collect(),
         }
@@ -251,8 +299,16 @@ impl Plan {
                     .collect();
                 format!("agg_by [{}]: {}", by.join(", "), aggregations.join(", "))
             }
-            Plan::Sort { by, .. } => format!("sort {}", by.join(", ")),
+            Plan::Sort { by, .. } => {
+                let by: Vec<String> = by.iter().map(SortKey::to_string).collect();
+                format!("sort {}", by.join(", "))
+            }
             Plan::Head { rows, .. } => format!("head {rows}"),
+            Plan::Slice { start, stop, .. } => match stop {
+                Some(stop) => format!("slice {start}..{stop}"),
+                None => format!("slice {start}.."),
+            },
+            Plan::Drop { columns, .. } => format!("drop {}", columns.join(", ")),
             Plan::Join {
                 on, at, columns, ..
             } => {
@@ -350,6 +406,207 @@ fn column(expr: &Expr) -> Option<&Ident> {
     }
 }
 
+/// The name a result column takes when `SELECT` gives it none: its expression as DuckDB prints
+/// it (function names lower case, each operation in parentheses, `count(*)` as `count_star()`,
+/// `<>` as `!=`, `LIKE` as `~~`), so results name their columns as DuckDB's do.
+fn duck_name(expr: &Expr) -> String {
+    printed(expr, &[])
+}
+
+/// `expr` as `duck_name` prints it, its columns named as the joined table has them
+/// (`qualified`, with `rights`): two expressions print alike exactly when SQL takes them for the
+/// same, which is how `GROUP BY` and `ORDER BY` find the result columns they name.
+fn printed(expr: &Expr, rights: &[String]) -> String {
+    let all = |exprs: &[Expr]| {
+        exprs
+            .iter()
+            .map(|e| printed(e, rights))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let not = |negated: bool| if negated { "NOT " } else { "" };
+    match expr {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => name(expr, rights).unwrap_or_default(),
+        Expr::Nested(inner) => printed(inner, rights),
+        Expr::Value(value) => match &value.value {
+            Value::SingleQuotedString(s) => format!("'{}'", s.replace('\'', "''")),
+            Value::Boolean(b) => b.to_string(),
+            Value::Null => "NULL".to_owned(),
+            other => other.to_string(),
+        },
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => match expr.as_ref() {
+            Expr::Value(v) if matches!(v.value, Value::Number(..)) => format!("-{}", v.value),
+            other => format!("(-({}))", printed(other, rights)),
+        },
+        Expr::UnaryOp { op, expr } => format!("({op} {})", printed(expr, rights)),
+        Expr::BinaryOp { left, op, right } => {
+            let op = match op {
+                BinaryOperator::NotEq => "!=".to_owned(),
+                other => other.to_string(),
+            };
+            format!(
+                "({} {op} {})",
+                printed(left, rights),
+                printed(right, rights)
+            )
+        }
+        Expr::Like {
+            negated,
+            expr,
+            pattern,
+            ..
+        } => {
+            let op = if *negated { "!~~" } else { "~~" };
+            format!(
+                "({} {op} {})",
+                printed(expr, rights),
+                printed(pattern, rights)
+            )
+        }
+        Expr::ILike {
+            negated,
+            expr,
+            pattern,
+            ..
+        } => {
+            let op = if *negated { "!~~*" } else { "~~*" };
+            format!(
+                "({} {op} {})",
+                printed(expr, rights),
+                printed(pattern, rights)
+            )
+        }
+        Expr::IsNull(e) => format!("({} IS NULL)", printed(e, rights)),
+        Expr::IsNotNull(e) => format!("({} IS NOT NULL)", printed(e, rights)),
+        Expr::In {
+            expr,
+            target: InTarget::List(list),
+            negated,
+            ..
+        } => format!(
+            "({} {}IN ({}))",
+            printed(expr, rights),
+            not(*negated),
+            all(list)
+        ),
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => format!(
+            "({} {}BETWEEN {} AND {})",
+            printed(expr, rights),
+            not(*negated),
+            printed(low, rights),
+            printed(high, rights)
+        ),
+        Expr::Extract { field, expr, .. } => format!(
+            "date_part('{}', {})",
+            field.to_string().to_ascii_uppercase(),
+            printed(expr, rights)
+        ),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            // DuckDB prints a simple CASE as the searched one it means.
+            let mut out = "CASE ".to_owned();
+            for when in conditions {
+                let condition = match operand {
+                    Some(operand) => format!(
+                        "({} = {})",
+                        printed(operand, rights),
+                        printed(&when.condition, rights)
+                    ),
+                    None => printed(&when.condition, rights),
+                };
+                let result = printed(&when.result, rights);
+                write!(out, " WHEN ({condition}) THEN ({result})").ok();
+            }
+            let otherwise = else_result
+                .as_deref()
+                .map_or_else(|| "NULL".to_owned(), |e| printed(e, rights));
+            write!(out, " ELSE {otherwise} END").ok();
+            out
+        }
+        Expr::Function(function) => {
+            let name = function_name(function).to_ascii_lowercase();
+            let FunctionArguments::List(list) = &function.args else {
+                return format!("{name}()");
+            };
+            let args: Vec<String> = list
+                .args
+                .iter()
+                .map(|arg| match arg {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => printed(e, rights),
+                    other => other.to_string(),
+                })
+                .collect();
+            if name == "count"
+                && matches!(
+                    list.args.as_slice(),
+                    [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]
+                )
+            {
+                return "count_star()".to_owned();
+            }
+            let distinct = if matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct))
+            {
+                "DISTINCT "
+            } else {
+                ""
+            };
+            // Keywords in DuckDB's grammar, so it quotes them.
+            let shown = if matches!(name.as_str(), "first" | "last") {
+                format!("\"{name}\"")
+            } else {
+                name
+            };
+            format!("{shown}({distinct}{})", args.join(", "))
+        }
+        other => other.to_string(),
+    }
+}
+
+/// `name` as an identifier in an engine expression: quoted unless it is a plain word.
+fn ident(name: &str) -> Ident {
+    let plain = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if plain {
+        Ident::new(name)
+    } else {
+        Ident::with_quote('"', name)
+    }
+}
+
+/// Replaces each part of an expression that prints as a group key (`printed`) by the key's
+/// column, outermost first: a key inside a larger key is the larger one.
+struct Keys<'a> {
+    keys: &'a [(String, String)],
+    rights: &'a [String],
+}
+
+impl VisitorMut for Keys<'_> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+        let shown = printed(expr, self.rights);
+        if let Some((_, column)) = self.keys.iter().find(|(key, _)| *key == shown) {
+            *expr = Expr::Identifier(ident(column));
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 /// The qualifiers of the columns `expr` reads, and whether it reads any unqualified.
 fn qualifiers(expr: &Expr) -> (Vec<String>, bool) {
     let (mut found, mut bare) = (Vec::new(), false);
@@ -407,14 +664,15 @@ fn and(conditions: &[String]) -> Option<String> {
 }
 
 impl Binder {
-    fn query(&self, query: &Query) -> Result<Plan, Error> {
+    /// The query's operators, and its result's columns in order (`None` after `SELECT *`).
+    fn query(&self, query: &Query) -> Result<(Plan, Option<Vec<String>>), Error> {
         let mut scope = self.clone();
         if let Some(with) = &query.with {
             if with.recursive {
                 return Err(unsupported("WITH RECURSIVE"));
             }
             for cte in &with.cte_tables {
-                let plan = scope.query(&cte.query)?;
+                let (plan, _) = scope.query(&cte.query)?;
                 scope.ctes.insert(cte.alias.name.value.clone(), plan);
             }
         }
@@ -426,65 +684,88 @@ impl Binder {
             || !query.pipe_operators.is_empty()
         {
             return Err(unsupported(
-                "this clause; a query is SELECT ... [ORDER BY ...] [LIMIT n]",
+                "this clause; a query is SELECT ... [ORDER BY ...] [LIMIT n [OFFSET m]]",
             ));
         }
-        let mut plan = scope.set(&query.body)?;
-        if let Some(order) = &query.order_by {
-            let OrderByKind::Expressions(items) = &order.kind else {
-                return Err(unsupported("ORDER BY ALL: name the columns"));
-            };
-            let by = items
-                .iter()
-                .map(|item| {
-                    let Some(name) = column(&item.expr) else {
-                        return Err(unsupported(&format!(
-                            "ORDER BY {}: order by a column of the result, by name",
+        let order: &[OrderByExpr] = match &query.order_by {
+            None => &[],
+            Some(order) => match &order.kind {
+                OrderByKind::Expressions(items) => items,
+                OrderByKind::All(_) => return Err(unsupported("ORDER BY ALL: name the columns")),
+            },
+        };
+        for item in order {
+            if item.options.nulls_first.is_some() || item.with_fill.is_some() {
+                return Err(unsupported("NULLS FIRST/LAST and WITH FILL in ORDER BY"));
+            }
+            if matches!(item.options.sort, Some(OrderBySort::Using(_))) {
+                return Err(unsupported("ORDER BY ... USING"));
+            }
+        }
+        let Selected {
+            mut plan,
+            outputs,
+            sort,
+            hidden,
+        } = match query.body.as_ref() {
+            SetExpr::Select(select) => scope.select(select, order)?,
+            body => {
+                let (plan, outputs) = scope.set(body)?;
+                let sort = order
+                    .iter()
+                    .map(|item| match output_named(&item.expr, outputs.as_deref())? {
+                        Some(column) => Ok(sort_key(column, item)),
+                        None => Err(unsupported(&format!(
+                            "ORDER BY {}: order a UNION by its columns, by name or position",
                             item.expr
-                        )));
-                    };
-                    if item.options.nulls_first.is_some() || item.with_fill.is_some() {
-                        return Err(unsupported("NULLS FIRST/LAST and WITH FILL in ORDER BY"));
-                    }
-                    Ok(match item.options.sort {
-                        Some(OrderBySort::Desc) => format!("{} desc", name.value),
-                        Some(OrderBySort::Asc) | None => name.value.clone(),
-                        Some(OrderBySort::Using(_)) => {
-                            return Err(unsupported("ORDER BY ... USING"));
-                        }
+                        ))),
                     })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Result<_, _>>()?;
+                Selected {
+                    plan,
+                    outputs,
+                    sort,
+                    hidden: Vec::new(),
+                }
+            }
+        };
+        let (offset, limit) = window(query.limit_clause.as_ref())?;
+        let sorted = !sort.is_empty();
+        if sorted {
             plan = Plan::Sort {
                 input: Box::new(plan),
-                by,
+                by: sort,
             };
         }
-        if let Some(limit) = &query.limit_clause {
-            let LimitClause::LimitOffset {
-                limit,
-                offset,
-                limit_by,
-            } = limit
-            else {
-                return Err(unsupported("LIMIT offset, n: write LIMIT n"));
+        // Rows by position follow a sort's order, which a ticking sort keeps only in how its
+        // rows are read: a slice reads them so, where `head` would take the first by key.
+        if offset > 0 || (sorted && (limit.is_some() || !hidden.is_empty())) {
+            plan = Plan::Slice {
+                input: Box::new(plan),
+                start: offset,
+                stop: limit.map(|rows| offset + rows),
             };
-            if offset.is_some() || !limit_by.is_empty() {
-                return Err(unsupported("OFFSET and LIMIT BY"));
-            }
-            if let Some(limit) = limit {
-                plan = Plan::Head {
-                    input: Box::new(plan),
-                    rows: rows(limit)?,
-                };
-            }
+        } else if let Some(rows) = limit {
+            plan = Plan::Head {
+                input: Box::new(plan),
+                rows,
+            };
         }
-        Ok(plan)
+        if !hidden.is_empty() {
+            plan = Plan::Drop {
+                input: Box::new(plan),
+                columns: hidden,
+            };
+        }
+        Ok((plan, outputs))
     }
 
-    fn set(&self, body: &SetExpr) -> Result<Plan, Error> {
+    fn set(&self, body: &SetExpr) -> Result<(Plan, Option<Vec<String>>), Error> {
         match body {
-            SetExpr::Select(select) => self.select(select),
+            SetExpr::Select(select) => {
+                let selected = self.select(select, &[])?;
+                Ok((selected.plan, selected.outputs))
+            }
             SetExpr::Query(query) => self.query(query),
             SetExpr::SetOperation {
                 op: SetOperator::Union,
@@ -492,14 +773,17 @@ impl Binder {
                 left,
                 right,
             } => {
-                let mut parts = Vec::new();
+                let (mut parts, mut columns) = (Vec::new(), None);
                 for side in [left, right] {
-                    match self.set(side)? {
+                    let (plan, outputs) = self.set(side)?;
+                    // A union's columns are named by its first part, as in SQL.
+                    columns = columns.or(Some(outputs));
+                    match plan {
                         Plan::Merge(more) => parts.extend(more),
                         one => parts.push(one),
                     }
                 }
-                Ok(Plan::Merge(parts))
+                Ok((Plan::Merge(parts), columns.flatten()))
             }
             SetExpr::SetOperation {
                 op: SetOperator::Union,
@@ -536,6 +820,7 @@ impl Binder {
                     [_] | [_, _] | ["live" | "hist", _, _] => Plan::Scan(Scan {
                         name: parts.join("."),
                         predicate: None,
+                        columns: None,
                     }),
                     _ => {
                         return Err(unsupported(&format!(
@@ -559,7 +844,7 @@ impl Binder {
                 let known = alias
                     .as_ref()
                     .map_or_else(String::new, |a| a.name.value.clone());
-                Ok((self.query(subquery)?, known))
+                Ok((self.query(subquery)?.0, known))
             }
             _ => Err(unsupported(
                 "this FROM: a table name, or a subquery in parentheses",
@@ -567,7 +852,8 @@ impl Binder {
         }
     }
 
-    fn select(&self, select: &Select) -> Result<Plan, Error> {
+    /// `select` bound for `order`, its query's `ORDER BY`.
+    fn select(&self, select: &Select, order: &[OrderByExpr]) -> Result<Selected, Error> {
         if select.distinct.is_some()
             || select.top.is_some()
             || select.into.is_some()
@@ -611,7 +897,7 @@ impl Binder {
         };
         let mut read: HashMap<&str, BTreeSet<String>> = HashMap::new();
         let mut bare = BTreeSet::new();
-        for expr in expressions(select) {
+        for expr in expressions(select, order) {
             let _ = visit_expressions(expr, |e| {
                 match e {
                     Expr::Identifier(ident) => {
@@ -643,6 +929,66 @@ impl Binder {
             let mut all: Vec<String> = scan.predicate.take().into_iter().collect();
             all.extend(pushed.iter().map(|c| text(c, &rights)));
             scan.predicate = and(&all);
+        }
+        // What each table's scan reads: every column after `*`; otherwise each column the query
+        // names bare (which table holds it is the table's to say) or by that table's name.
+        if !every {
+            let mut named: HashMap<String, BTreeSet<String>> = HashMap::new();
+            let (mut joined, mut all_bare): (Vec<&Expr>, _) = (Vec::new(), bare.clone());
+            for (join, _, _) in &joins {
+                let (constraint, condition) = match &join.join_operator {
+                    JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => (c, None),
+                    JoinOperator::AsOf {
+                        match_condition,
+                        constraint,
+                    } => (constraint, Some(match_condition)),
+                    _ => continue,
+                };
+                joined.extend(condition);
+                match constraint {
+                    JoinConstraint::On(expr) => joined.push(expr),
+                    JoinConstraint::Using(names) => {
+                        all_bare.extend(names.iter().map(|n| n.to_string()));
+                    }
+                    _ => {}
+                }
+            }
+            for expr in expressions(select, order).into_iter().chain(joined) {
+                let _ = visit_expressions(expr, |e| {
+                    match e {
+                        Expr::Identifier(ident) => {
+                            all_bare.insert(ident.value.clone());
+                        }
+                        Expr::CompoundIdentifier(parts) => {
+                            if let [.., table, column] = parts.as_slice() {
+                                named
+                                    .entry(table.value.clone())
+                                    .or_default()
+                                    .insert(column.value.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                    ControlFlow::<()>::Continue(())
+                });
+            }
+            let columns = |known: &str| {
+                let mut columns = all_bare.clone();
+                columns.extend(named.get(known).into_iter().flatten().cloned());
+                Some(columns.into_iter().collect::<Vec<_>>())
+            };
+            if let Plan::Scan(scan) = &mut plan
+                && scan.columns.is_none()
+            {
+                scan.columns = columns(&first);
+            }
+            for (_, right, name) in &mut joins {
+                if let Plan::Scan(scan) = right
+                    && scan.columns.is_none()
+                {
+                    scan.columns = columns(name);
+                }
+            }
         }
         for (join, right, name) in joins {
             let (on, at) = match &join.join_operator {
@@ -690,35 +1036,132 @@ impl Binder {
                 predicate,
             };
         }
-        let by: Vec<String> = match &select.group_by {
-            GroupByExpr::Expressions(exprs, modifiers) if modifiers.is_empty() => exprs
-                .iter()
-                .map(|e| {
-                    name(e, &rights).ok_or_else(|| {
-                        unsupported(&format!("GROUP BY {e}: group by columns, by name"))
-                    })
-                })
-                .collect::<Result<_, _>>()?,
+        let group: &[Expr] = match &select.group_by {
+            GroupByExpr::Expressions(exprs, modifiers) if modifiers.is_empty() => exprs,
             _ => return Err(unsupported("GROUP BY ALL, ROLLUP, and CUBE")),
         };
-        let aggregating = !by.is_empty()
+        let aggregating = !group.is_empty()
             || select.having.is_some()
             || select.projection.iter().any(|item| match item {
                 SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
                     has_aggregate(e)
                 }
                 _ => false,
-            });
+            })
+            || order.iter().any(|item| has_aggregate(&item.expr));
         if aggregating {
-            aggregated(plan, select, by, &rights)
+            aggregated(plan, select, group, &rights, order)
         } else {
-            projected(plan, select, &rights)
+            projected(plan, select, &rights, order)
         }
     }
 }
 
-/// The expressions of a `SELECT` that read columns of its `FROM`.
-fn expressions(select: &Select) -> Vec<&Expr> {
+/// A `SELECT` bound for its query's `ORDER BY`: its operators up to its result's columns and
+/// those `ORDER BY` reads that the result does not show (`hidden`), the result's columns
+/// (`None` after `SELECT *`), and the sort.
+struct Selected {
+    plan: Plan,
+    outputs: Option<Vec<String>>,
+    sort: Vec<SortKey>,
+    hidden: Vec<String>,
+}
+
+fn sort_key(column: String, item: &OrderByExpr) -> SortKey {
+    SortKey {
+        column,
+        descending: matches!(item.options.sort, Some(OrderBySort::Desc)),
+    }
+}
+
+/// The result column `expr` in `ORDER BY` names, if it names one: by its position (from 1), or
+/// by its name (a name the result has, whatever the tables have, as in SQL). `outputs`: the
+/// result's columns, `None` after `SELECT *`, where any name may be one.
+fn output_named(expr: &Expr, outputs: Option<&[String]>) -> Result<Option<String>, Error> {
+    if let Expr::Value(value) = expr
+        && let Value::Number(n, _) = &value.value
+    {
+        let Some(outputs) = outputs else {
+            return Err(unsupported(&format!(
+                "ORDER BY {n} after SELECT *: order by a column's name"
+            )));
+        };
+        return match n.parse::<usize>() {
+            Ok(at) if (1..=outputs.len()).contains(&at) => Ok(Some(outputs[at - 1].clone())),
+            _ => Err(unsupported(&format!(
+                "ORDER BY {n}: the result has columns 1 to {}",
+                outputs.len()
+            ))),
+        };
+    }
+    Ok(match (expr, outputs) {
+        (Expr::Identifier(ident), None) => Some(ident.value.clone()),
+        (Expr::Identifier(ident), Some(outputs)) => outputs
+            .iter()
+            .find(|output| **output == ident.value)
+            .cloned(),
+        _ => None,
+    })
+}
+
+/// `LIMIT` and `OFFSET`: the rows skipped, and how many after them are kept (all if `None`).
+fn window(clause: Option<&LimitClause>) -> Result<(usize, Option<usize>), Error> {
+    let Some(clause) = clause else {
+        return Ok((0, None));
+    };
+    let LimitClause::LimitOffset {
+        limit,
+        offset,
+        limit_by,
+    } = clause
+    else {
+        return Err(unsupported("LIMIT offset, n: write LIMIT n OFFSET offset"));
+    };
+    if !limit_by.is_empty() {
+        return Err(unsupported("LIMIT BY"));
+    }
+    let offset = offset.as_ref().map(|o| rows(&o.value)).transpose()?;
+    Ok((offset.unwrap_or(0), limit.as_ref().map(rows).transpose()?))
+}
+
+/// Each of a `SELECT`'s result columns: its expression and its name, given or DuckDB's
+/// (`duck_name`); `None` for `*`, which keeps every column.
+fn items(select: &Select) -> Result<Vec<Option<(&Expr, String)>>, Error> {
+    select
+        .projection
+        .iter()
+        .map(|item| match item {
+            SelectItem::UnnamedExpr(expr) => Ok(Some((expr, duck_name(expr)))),
+            SelectItem::ExprWithAlias { expr, alias } => Ok(Some((expr, alias.value.clone()))),
+            SelectItem::Wildcard(options) => {
+                if options.opt_exclude.is_some()
+                    || options.opt_except.is_some()
+                    || options.opt_replace.is_some()
+                    || options.opt_rename.is_some()
+                    || options.opt_ilike.is_some()
+                {
+                    return Err(unsupported("SELECT * with EXCLUDE, REPLACE, or RENAME"));
+                }
+                Ok(None)
+            }
+            _ => Err(unsupported("t.*: write * or name the columns")),
+        })
+        .collect()
+}
+
+/// Whether `name` is already among the result's columns: SQL allows two of one name, a table
+/// does not.
+fn named_once(names: &[String], name: &str) -> Result<(), Error> {
+    if names.iter().any(|n| n == name) {
+        return Err(unsupported(&format!(
+            "two columns named {name}: name them apart with AS"
+        )));
+    }
+    Ok(())
+}
+
+/// The expressions of a `SELECT`, and of its query's `ORDER BY`, that read columns of its `FROM`.
+fn expressions<'a>(select: &'a Select, order: &'a [OrderByExpr]) -> Vec<&'a Expr> {
     let mut all: Vec<&Expr> = select
         .projection
         .iter()
@@ -732,6 +1175,7 @@ fn expressions(select: &Select) -> Vec<&Expr> {
         all.extend(exprs);
     }
     all.extend(&select.having);
+    all.extend(order.iter().map(|item| &item.expr));
     all
 }
 
@@ -875,13 +1319,16 @@ impl Aggregates<'_> {
                 "{function}: an aggregate of one column or *"
             )));
         };
-        if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+        let distinct = matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct));
+        if (distinct && kind != "count") || !list.clauses.is_empty() {
             return Err(unsupported(&format!(
-                "{function}: DISTINCT inside an aggregate"
+                "{function}: DISTINCT inside an aggregate other than count"
             )));
         }
         let argument = match list.args.as_slice() {
-            [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)] if kind == "count" => "*".to_owned(),
+            [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)] if kind == "count" && !distinct => {
+                "*".to_owned()
+            }
             [FunctionArg::Unnamed(FunctionArgExpr::Expr(arg))] => match name(arg, self.rights) {
                 Some(column) => column,
                 None => {
@@ -897,6 +1344,7 @@ impl Aggregates<'_> {
                 )));
             }
         };
+        let kind = if distinct { "count_distinct" } else { kind };
         let spec = format!("{kind}({argument})");
         if let Some((column, _)) = self.aggregations.iter().find(|(_, s)| *s == spec) {
             return Ok(column.clone());
@@ -907,135 +1355,241 @@ impl Aggregates<'_> {
     }
 }
 
-/// A grouped query over `plan`: grouped by `by`, then each output computed from the groups'
-/// columns and aggregates, then `HAVING`, then only the outputs kept.
+/// A grouped query over `plan`, as SQL groups (DuckDB the oracle). Each `GROUP BY` item is a
+/// result column's position, the alias of a result expression, or an expression; a key that is
+/// not a column is computed before grouping. Each result column, `HAVING`, and each `ORDER BY`
+/// item that names no result column is then computed from the keys and aggregates: a part that
+/// is a key reads the key's column.
 fn aggregated(
     mut plan: Plan,
     select: &Select,
-    by: Vec<String>,
+    group: &[Expr],
     rights: &[String],
-) -> Result<Plan, Error> {
+    order: &[OrderByExpr],
+) -> Result<Selected, Error> {
+    let items: Vec<(&Expr, String)> = items(select)?
+        .into_iter()
+        .map(|item| {
+            item.ok_or_else(|| {
+                unsupported("SELECT * with GROUP BY: name the grouped columns and aggregates")
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    // Each key as it prints, and the column holding it.
+    let mut keys: Vec<(String, String)> = Vec::new();
+    let (mut before, mut aliases) = (Vec::new(), Vec::new());
+    for (i, expr) in group.iter().enumerate() {
+        let expr = if let Expr::Value(value) = expr
+            && let Value::Number(n, _) = &value.value
+        {
+            match n.parse::<usize>() {
+                Ok(at) if (1..=items.len()).contains(&at) => items[at - 1].0,
+                _ => {
+                    return Err(unsupported(&format!(
+                        "GROUP BY {n}: the result has columns 1 to {}",
+                        items.len()
+                    )));
+                }
+            }
+        } else if let Expr::Identifier(id) = expr
+            && let Some((aliased, _)) = items.iter().find(|(e, alias)| {
+                *alias == id.value && column(e).is_none_or(|c| c.value != id.value)
+            })
+        {
+            aliases.push(id.value.clone());
+            aliased
+        } else {
+            expr
+        };
+        if has_aggregate(expr) {
+            return Err(unsupported(&format!(
+                "GROUP BY {expr}: an aggregate is computed from the groups, not grouped by"
+            )));
+        }
+        let shown = printed(expr, rights);
+        if keys.iter().any(|(key, _)| *key == shown) {
+            continue;
+        }
+        let column = match name(expr, rights) {
+            Some(column) => column,
+            None => {
+                let column = format!("__g{i}");
+                before.push(format!("{column} = {}", text(expr, rights)));
+                column
+            }
+        };
+        keys.push((shown, column));
+    }
     let mut aggregates = Aggregates {
         rights,
         aggregations: Vec::new(),
         before: Vec::new(),
     };
-    let (mut names, mut assignments) = (Vec::<String>::new(), Vec::<String>::new());
-    for item in &select.projection {
-        let (expr, alias) = match item {
-            SelectItem::UnnamedExpr(e) => (e, None),
-            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias)),
-            _ => {
-                return Err(unsupported(
-                    "SELECT * with GROUP BY: name the grouped columns and aggregates",
-                ));
-            }
-        };
-        let rewritten = aggregates.rewrite(expr)?;
-        // Only grouped columns and aggregates remain once grouped.
-        let mut stray = None;
-        let _ = visit_expressions(&rewritten, |e| {
-            if matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
-                && let Some(column) = name(e, rights)
-                && !column.starts_with("__a")
-                && !by.contains(&column)
-            {
-                stray = Some(column);
-                return ControlFlow::Break(());
-            }
-            ControlFlow::Continue(())
-        });
-        if let Some(stray) = stray {
-            return Err(unsupported(&format!(
-                "{stray} is neither grouped by nor inside an aggregate"
-            )));
-        }
-        let output = match (alias, column(expr), expr) {
-            (Some(alias), _, _) => alias.value.clone(),
-            (None, Some(c), _) => c.value.clone(),
-            (None, None, Expr::Function(f)) if aggregate(&function_name(f)).is_some() => {
-                function_name(f).to_ascii_lowercase()
-            }
-            (None, None, _) => {
-                return Err(unsupported(&format!("name the expression: {expr} AS name")));
-            }
-        };
-        if names.contains(&output) {
-            return Err(unsupported(&format!(
-                "two columns named {output}: name them apart with AS"
-            )));
-        }
-        if name(&rewritten, rights).as_ref() != Some(&output) {
-            let computed = text(&rewritten, rights);
-            assignments.push(format!("{} = {computed}", Ident::new(&output)));
-        }
-        names.push(output);
+    let mut names = Vec::new();
+    let mut results = Vec::new();
+    for (expr, output) in &items {
+        named_once(&names, output)?;
+        results.push((output, grouped(expr, &mut aggregates, &keys, rights)?));
+        names.push(output.clone());
     }
     let having = select
         .having
         .as_ref()
-        .map(|h| aggregates.rewrite(h).map(|e| text(&e, rights)))
+        .map(|h| grouped(h, &mut aggregates, &keys, rights).map(|e| text(&e, rights)))
         .transpose()?;
-    if !aggregates.before.is_empty() {
+    let (mut assignments, mut hidden, mut sort) = (Vec::new(), Vec::new(), Vec::new());
+    for (i, item) in order.iter().enumerate() {
+        let column = match ordered(&item.expr, &items, &names, rights)? {
+            Some(column) => column,
+            None => {
+                let computed = grouped(&item.expr, &mut aggregates, &keys, rights)?;
+                let column = format!("__o{i}");
+                assignments.push(format!("{column} = {}", text(&computed, rights)));
+                hidden.push(column.clone());
+                column
+            }
+        };
+        sort.push(sort_key(column, item));
+    }
+    // After the hidden columns, which may read a key a result column of its name replaces.
+    for (output, computed) in results {
+        if name(&computed, rights).as_ref() != Some(output) {
+            assignments.push(format!("{} = {}", ident(output), text(&computed, rights)));
+        }
+    }
+    before.extend(aggregates.before);
+    if !before.is_empty() {
         plan = Plan::Update {
             input: Box::new(plan),
-            assignments: aggregates.before,
+            assignments: before,
         };
     }
     plan = Plan::Agg {
         input: Box::new(plan),
-        by,
+        by: keys.into_iter().map(|(_, column)| column).collect(),
         aggregations: aggregates.aggregations,
+        aliases,
     };
-    if !assignments.is_empty() {
-        plan = Plan::Update {
-            input: Box::new(plan),
-            assignments,
-        };
-    }
+    // Before the result's columns, which may replace a key `HAVING` reads.
     if let Some(predicate) = having {
         plan = Plan::Filter {
             input: Box::new(plan),
             predicate,
         };
     }
-    Ok(Plan::Select {
-        input: Box::new(plan),
-        columns: names,
+    if !assignments.is_empty() {
+        plan = Plan::Update {
+            input: Box::new(plan),
+            assignments,
+        };
+    }
+    let mut columns = names.clone();
+    columns.extend(hidden.iter().cloned());
+    Ok(Selected {
+        plan: Plan::Select {
+            input: Box::new(plan),
+            columns,
+        },
+        outputs: Some(names),
+        sort,
+        hidden,
     })
 }
 
-/// An ungrouped query over `plan`: its expressions computed, then its columns kept (all of
-/// them with `*`).
-fn projected(mut plan: Plan, select: &Select, rights: &[String]) -> Result<Plan, Error> {
-    let (mut names, mut assignments, mut every) = (Vec::new(), Vec::new(), false);
-    for item in &select.projection {
-        let (expr, output) = match item {
-            SelectItem::Wildcard(options) => {
-                if options.opt_exclude.is_some()
-                    || options.opt_except.is_some()
-                    || options.opt_replace.is_some()
-                    || options.opt_rename.is_some()
-                    || options.opt_ilike.is_some()
-                {
-                    return Err(unsupported("SELECT * with EXCLUDE, REPLACE, or RENAME"));
-                }
-                every = true;
-                continue;
-            }
-            SelectItem::UnnamedExpr(expr) => match column(expr) {
-                Some(c) => (expr, c.clone()),
-                None => {
-                    return Err(unsupported(&format!("name the expression: {expr} AS name")));
-                }
-            },
-            SelectItem::ExprWithAlias { expr, alias } => (expr, alias.clone()),
-            _ => return Err(unsupported("t.*: write * or name the columns")),
-        };
-        if name(expr, rights).as_ref() != Some(&output.value) {
-            assignments.push(format!("{output} = {}", text(expr, rights)));
+/// `expr` as computed from the groups: its aggregates in their columns (`Aggregates`), then
+/// each part that is a group key in the key's column. Any other column is refused: it is
+/// neither grouped by nor inside an aggregate.
+fn grouped(
+    expr: &Expr,
+    aggregates: &mut Aggregates,
+    keys: &[(String, String)],
+    rights: &[String],
+) -> Result<Expr, Error> {
+    let mut rewritten = aggregates.rewrite(expr)?;
+    let _ = rewritten.visit(&mut Keys { keys, rights });
+    let mut stray = None;
+    let _ = visit_expressions(&rewritten, |e| {
+        if matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+            && let Some(column) = name(e, rights)
+            && !column.starts_with("__a")
+            && !keys.iter().any(|(_, key)| *key == column)
+        {
+            stray = Some(column);
+            return ControlFlow::Break(());
         }
-        names.push(output.value);
+        ControlFlow::Continue(())
+    });
+    match stray {
+        Some(stray) => Err(unsupported(&format!(
+            "{stray} is neither grouped by nor inside an aggregate"
+        ))),
+        None => Ok(rewritten),
+    }
+}
+
+/// The result column an `ORDER BY` item names: by position or name (`output_named`), or by
+/// being the same expression as a result column's.
+fn ordered(
+    expr: &Expr,
+    items: &[(&Expr, String)],
+    names: &[String],
+    rights: &[String],
+) -> Result<Option<String>, Error> {
+    if let Some(column) = output_named(expr, Some(names))? {
+        return Ok(Some(column));
+    }
+    let shown = printed(expr, rights);
+    Ok(items
+        .iter()
+        .find(|(e, _)| printed(e, rights) == shown)
+        .map(|(_, name)| name.clone()))
+}
+
+/// An ungrouped query over `plan`: its expressions computed, then its columns kept (all of
+/// them with `*`), with those `ORDER BY` reads that the result does not show.
+fn projected(
+    mut plan: Plan,
+    select: &Select,
+    rights: &[String],
+    order: &[OrderByExpr],
+) -> Result<Selected, Error> {
+    let items = items(select)?;
+    let every = items.iter().any(Option::is_none);
+    let items: Vec<(&Expr, String)> = items.into_iter().flatten().collect();
+    let mut names = Vec::new();
+    for (_, output) in &items {
+        named_once(&names, output)?;
+        names.push(output.clone());
+    }
+    let (mut assignments, mut hidden, mut sort) = (Vec::new(), Vec::new(), Vec::new());
+    for (i, item) in order.iter().enumerate() {
+        let named = match output_named(&item.expr, (!every).then_some(names.as_slice()))? {
+            Some(column) => Some(column),
+            None => ordered(&item.expr, &items, &names, rights)?,
+        };
+        let column = match (named, name(&item.expr, rights)) {
+            (Some(column), _) => column,
+            // A column of the table the result does not show: kept until sorted.
+            (None, Some(column)) => {
+                if !every && !hidden.contains(&column) {
+                    hidden.push(column.clone());
+                }
+                column
+            }
+            (None, None) => {
+                let column = format!("__o{i}");
+                assignments.push(format!("{column} = {}", text(&item.expr, rights)));
+                hidden.push(column.clone());
+                column
+            }
+        };
+        sort.push(sort_key(column, item));
+    }
+    // After the hidden columns, which may read a column a result column of its name replaces.
+    for (expr, output) in &items {
+        if name(expr, rights).as_ref() != Some(output) {
+            assignments.push(format!("{} = {}", ident(output), text(expr, rights)));
+        }
     }
     if !assignments.is_empty() {
         plan = Plan::Update {
@@ -1044,10 +1598,17 @@ fn projected(mut plan: Plan, select: &Select, rights: &[String]) -> Result<Plan,
         };
     }
     if !every {
+        let mut columns = names.clone();
+        columns.extend(hidden.iter().cloned());
         plan = Plan::Select {
             input: Box::new(plan),
-            columns: names,
+            columns,
         };
     }
-    Ok(plan)
+    Ok(Selected {
+        plan,
+        outputs: (!every).then_some(names),
+        sort,
+        hidden,
+    })
 }
