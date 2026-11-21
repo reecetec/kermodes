@@ -162,6 +162,8 @@ pub struct Store {
     /// (`take_messages`, `take_outgoing`).
     outgoing: Mutex<Option<Outgoing>>,
     driver: Driver,
+    /// Where readers read history files, when this store's server vends them.
+    vend: Mutex<Option<Vend>>,
 }
 
 /// A replica's messages for the other replicas of its shard: each one encoded, with the ID of the
@@ -170,6 +172,10 @@ pub type Outgoing = Receiver<(u64, Vec<u8>)>;
 
 /// Reads the time, in nanoseconds since the Unix epoch: the system's, or a simulation's.
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
+
+/// Where a reader without the lake's keys reads a history file: given the table's location and
+/// the file's name, a URL (a presigned one, or a `file://` path).
+pub type Vend = Arc<dyn Fn(&str, &str) -> Result<String, Error> + Send + Sync>;
 
 /// The system's clock.
 pub fn system_clock() -> Clock {
@@ -728,6 +734,7 @@ impl Store {
             shard,
             outgoing: Mutex::new(Some(outgoing_from)),
             driver,
+            vend: Mutex::new(None),
         })
     }
 
@@ -1121,8 +1128,20 @@ impl Store {
         first: Date,
         last: Date,
     ) -> Result<Vec<HistoryFile>, Error> {
-        let id = self.table(name)?.id;
-        lock(&self.catalog).history_files(id, first, last)
+        let entry = self.table(name)?;
+        let mut files = lock(&self.catalog).history_files(entry.id, first, last)?;
+        if let Some(vend) = lock(&self.vend).clone() {
+            for file in &mut files {
+                file.at = Some(vend(&entry.location, &file.name)?);
+            }
+        }
+        Ok(files)
+    }
+
+    /// Has `history_files` say where a reader without the lake's keys reads each file
+    /// (architecture.md §8.4); a later call replaces the earlier.
+    pub fn vend_history(&self, vend: Vend) {
+        *lock(&self.vend) = Some(vend);
     }
 
     /// Commits a write of `name`'s history in one transaction (§8.2). `Busy` when the history

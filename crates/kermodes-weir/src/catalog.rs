@@ -56,6 +56,9 @@ pub struct HistoryFile {
     pub last: Date,
     pub rows: u64,
     pub bytes: u64,
+    /// Where a reader without the lake's keys reads the file, when the store's server vends it
+    /// (`Store::vend_history`); `None` from the catalog itself.
+    pub at: Option<String>,
 }
 
 /// A date of a table's history in one of its files, with its rows and bytes there; a date past

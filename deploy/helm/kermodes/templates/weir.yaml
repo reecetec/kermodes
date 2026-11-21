@@ -92,14 +92,32 @@ spec:
           {{- else }}
           args: [weir, --data-dir, /var/lib/kermodes, --host, 0.0.0.0, --port, "8731"]
           {{- end }}
-          {{- with .Values.catalog.secretName }}
-          # The catalog in Postgres, shared by every weir (§8.2); without it, SQLite on the PVC.
+          {{- if or .Values.catalog.secretName .Values.lake.url }}
           env:
+            {{- with .Values.catalog.secretName }}
+            # The catalog in Postgres, shared by every weir (§8.2); without it, SQLite on the PVC.
             - name: KERMODES_CATALOG
               valueFrom:
                 secretKeyRef:
                   name: {{ . }}
                   key: {{ $.Values.catalog.secretKey }}
+            {{- end }}
+            {{- if .Values.lake.url }}
+            # Weir vends history files to readers, who hold no lake keys (architecture.md §8.4).
+            - name: KERMODES_LAKE
+              value: {{ .Values.lake.url | quote }}
+            - name: AWS_ENDPOINT
+              value: {{ .Values.lake.endpoint | quote }}
+            - name: AWS_ALLOW_HTTP
+              value: {{ hasPrefix "http://" .Values.lake.endpoint | quote }}
+            - name: AWS_REGION
+              value: us-east-1
+            {{- end }}
+          {{- end }}
+          {{- if and .Values.lake.url .Values.lake.secretName }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.lake.secretName }}
           {{- end }}
           ports:
             - name: flight

@@ -87,7 +87,7 @@ fn history(store: &Store, lake: &Lake, first: Date, last: Date) -> Vec<i64> {
     let mut n = Vec::new();
     for file in store.history_files(&ticks(), first, last).unwrap() {
         for batch in lake
-            .read(&location, &file.name, first, last, &[], None)
+            .read(&location, &file.name, None, first, last, &[], None)
             .unwrap()
         {
             let batch = batch.unwrap();
@@ -183,7 +183,7 @@ fn a_merge_cut_short_after_its_commit_finishes_by_dropping() {
     let store = store_with(&root, &[(d(1), &[("a", &[1, 2])])]);
     assert_eq!(store.date_rows(&ticks(), d(1)).unwrap().0, 2);
     // In both places: a read takes it from history alone.
-    let read = read_history(&store, Some(&lake), &ticks(), &Reading::default()).unwrap();
+    let read = read_history(&store, &lake, &ticks(), &Reading::default()).unwrap();
     assert_eq!((rows(&read).len(), read.explain.weir_dates), (2, 0));
 
     assert_eq!(
@@ -241,6 +241,35 @@ fn a_merge_over_flight_moves_dates_the_same() {
     ));
 }
 
+/// A reader holding no lake keys reads history where weir says each file is: the rows a read
+/// with the lake's keys gives. A store that does not say leaves it nothing to read.
+#[test]
+fn a_reader_without_lake_keys_reads_the_files_weir_vends() {
+    let dir = TempDir::new();
+    let store = Arc::new(store_with(
+        &dir.0.join("store"),
+        &[(d(1), &[("a", &[1, 2, 3])]), (d(2), &[("a", &[4, 5])])],
+    ));
+    let lake = Arc::new(Lake::open(dir.0.join("lake").to_str().unwrap()).unwrap());
+    merge(store.as_ref(), &lake, &ticks(), d(1)).unwrap();
+    let local = read_history(store.as_ref(), &lake, &ticks(), &Reading::default()).unwrap();
+    assert_eq!(rows(&local).len(), 5);
+
+    let reader = Lake::reader().unwrap();
+    let server = kermodes_flight::serve(store.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+    let client = kermodes_flight::Client::connect(&format!("grpc://{}", server.addr())).unwrap();
+    assert!(matches!(
+        read_history(&client, &reader, &ticks(), &Reading::default()),
+        Err(Error::NotFound(_))
+    ));
+
+    let vending = lake.clone();
+    store.vend_history(Arc::new(move |location, file| vending.vend(location, file)));
+    let read = read_history(&client, &reader, &ticks(), &Reading::default()).unwrap();
+    assert_eq!(rows(&read), rows(&local));
+    assert_eq!(read.explain, local.explain);
+}
+
 /// A batch job writes a past date straight into history, not through weir: the date then
 /// holds exactly those rows, written again it holds the new ones in their place, and written
 /// with none it holds none. Its neighbours are kept as they were.
@@ -282,7 +311,7 @@ fn a_batch_job_writes_a_past_date_straight_into_history() {
         last: Some(d(5)),
         ..Reading::default()
     };
-    let read = read_history(&store, Some(&lake), &ticks(), &day).unwrap();
+    let read = read_history(&store, &lake, &ticks(), &day).unwrap();
     assert_eq!(rows(&read), []);
 }
 
@@ -307,7 +336,7 @@ fn a_limited_read_takes_the_first_rows_in_date_order() {
             limit: Some(limit),
             ..Reading::default()
         };
-        read_history(&store, Some(&lake), &ticks(), &first).unwrap()
+        read_history(&store, &lake, &ticks(), &first).unwrap()
     };
     let values =
         |history: &History| -> Vec<i64> { rows(history).into_iter().map(|(_, n)| n).collect() };
@@ -413,7 +442,7 @@ fn a_read_of_some_columns_reads_only_those() {
         columns: Some(&columns),
         ..Reading::default()
     };
-    let read = read_history(&store, Some(&lake), &wide, &some).unwrap();
+    let read = read_history(&store, &lake, &wide, &some).unwrap();
     let names: Vec<&str> = read
         .schema
         .fields()
@@ -432,7 +461,7 @@ fn a_read_of_some_columns_reads_only_those() {
     assert_eq!(got, [(1, 100), (2, 200), (3, 300)]);
     assert_eq!(read.explain.columns, (3, 4));
     assert_eq!(read.explain.weir_dates, 1);
-    let all = read_history(&store, Some(&lake), &wide, &Reading::default()).unwrap();
+    let all = read_history(&store, &lake, &wide, &Reading::default()).unwrap();
     assert_eq!(all.explain.columns, (4, 4));
 }
 
@@ -480,7 +509,7 @@ fn history_reads_only_the_dates_asked_for() {
                 last,
                 ..Reading::default()
             };
-            read_history(weir, Some(&lake), &ticks(), &dates).unwrap()
+            read_history(weir, &lake, &ticks(), &dates).unwrap()
         };
 
         let all = read(None, None);
@@ -562,7 +591,7 @@ fn a_keyed_tables_history_is_its_log_of_changes() {
             last: Some(d(1)),
             ..Reading::default()
         };
-        let history = read_history(store, Some(&lake), &quotes, &day).unwrap();
+        let history = read_history(store, &lake, &quotes, &day).unwrap();
         let mut log = Vec::new();
         for batch in &history.batches {
             let ops = batch.column(1).as_string::<i32>();

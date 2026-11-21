@@ -206,13 +206,17 @@ fn history_date_from_json(value: &Value) -> Result<HistoryDate, Error> {
 }
 
 fn history_file_json(file: &HistoryFile) -> Value {
-    json!({
+    let mut value = json!({
         "name": file.name,
         "first": file.first.to_string(),
         "last": file.last.to_string(),
         "rows": file.rows,
         "bytes": file.bytes,
-    })
+    });
+    if let Some(at) = &file.at {
+        value["at"] = json!(at);
+    }
+    value
 }
 
 fn history_file_from_json(value: &Value) -> Result<HistoryFile, Error> {
@@ -222,6 +226,7 @@ fn history_file_from_json(value: &Value) -> Result<HistoryFile, Error> {
         last: date_from_json(&value["last"])?,
         rows: u64_from_json(value, "rows")?,
         bytes: u64_from_json(value, "bytes")?,
+        at: value["at"].as_str().map(str::to_owned),
     })
 }
 

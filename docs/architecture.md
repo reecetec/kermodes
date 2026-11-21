@@ -148,6 +148,10 @@ crate to the build.
 RE2's, which DuckDB uses, so DuckDB's patterns mean the same here, except that `\d`, `\w`, and
 `\s` also match non-ASCII digits, letters, and spaces.
 
+`reqwest` (already compiled in through object_store, with the same version and features) reads
+history files weir vends at presigned URLs (§8.4) in ranged GETs: object_store's own HTTP store
+cannot take a URL whose query is its signature.
+
 `rusqlite` (with SQLite bundled) holds the local catalog: a synchronous, in-process database is
 what an embedded store (`km.connect(path)`) and `kermodes dev` need, with no runtime to start. The
 cluster's catalog is Postgres, shared by every weir, through the rust-postgres family: weir's
@@ -980,9 +984,10 @@ unit, and out of what readers get.
   reads history again. A keyed table is its latest state, ticking. A live table starts when
   first used: a session that runs its own cycles waits for the cycle that loads it; a manual
   session's loads at its next `step`.
-- A process reads the lake only when the table has files in it: a table never merged needs no
-  `KERMODES_LAKE`. In the cluster, runs and the UI get the lake's location and keys, as merge
-  Jobs do.
+- Readers hold no lake keys. Weir's `history_files` answer vends each file: a presigned GET URL
+  valid for an hour for an S3 lake, or a local path in dev (`kermodes dev`, a session's
+  `serve_store`). The reader reads it there, all query work in its own process; weir never
+  scans data. Only weir and merge Jobs hold the lake's keys (`KERMODES_LAKE` and its Secret).
 - Later: a date replaced while an engine runs reaches it on restart only; catalog notifications
   could swap it as a remove-then-add delta. Workers may cache fetched files on local NVMe.
 
@@ -1625,6 +1630,19 @@ Authorization
 Enforcement points: control plane (spec operations, pipeline), gateway (which workers a caller may
 reach), weir (per-table writes; reads by workers only), workers (table opens checked against the
 worker's token).
+
+Read authorization
+
+- Weir is where reads are authorized: it owns the catalog, and a reader learns where a table's
+  history files are only from weir (§8.4). Built: vending, with no check yet.
+- Vending gives table-level control with all query work in the reader's process, as DuckLake
+  does: weir vends a table's files only to a caller allowed to read the table. Not built.
+- Row-level policies are exact with local compute when a restricted table's files are laid out
+  by its policy columns: weir vends only the files the caller is permitted. Not built.
+- Otherwise the permitted rows are read and filtered server-side, by a process apart from weir
+  (weir is the ingest hop, §3), which weir points the reader to: a fallback for a policy no file
+  layout matches, built with identity. Not built.
+- Today's live rows come from weir, which filters them per subscriber. Not built.
 
 Isolation and quotas
 

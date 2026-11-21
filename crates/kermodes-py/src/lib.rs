@@ -844,6 +844,8 @@ impl Session {
         let addr: SocketAddr = format!("{host}:{port}")
             .parse()
             .map_err(|e| PyValueError::new_err(format!("cannot listen on {host}:{port}: {e}")))?;
+        // Its clients read history where this process says each file is, holding no lake keys.
+        store.vend_history(vending(self.lake()?));
         let store = store.clone();
         let server = py
             .detach(|| kermodes_flight::serve(store, addr))
@@ -1186,6 +1188,13 @@ fn serve_replica(
         .parse()
         .map_err(|e| PyValueError::new_err(format!("cannot listen on {host}:{port}: {e}")))?;
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // With the lake's keys, the replica says where each history file is: its clients hold none.
+    let vend = match std::env::var("KERMODES_LAKE") {
+        Ok(url) => Some(vending(Arc::new(
+            kermodes_lake::Lake::open(&url).map_err(store_error)?,
+        ))),
+        Err(_) => None,
+    };
     let running = {
         let stop = stop.clone();
         std::thread::Builder::new()
@@ -1198,7 +1207,7 @@ fn serve_replica(
                     limits: kermodes_weir::LogLimits::default(),
                 };
                 kermodes_flight::serve_replica(
-                    &data_dir, &catalog, &branch, shard, &peers, addr, &stop,
+                    &data_dir, &catalog, &branch, shard, &peers, addr, &stop, vend,
                 )
             })
             .map_err(|e| PyRuntimeError::new_err(format!("cannot start the replica: {e}")))?
@@ -1215,6 +1224,11 @@ fn serve_replica(
     py.detach(|| running.join())
         .map_err(|_| PyRuntimeError::new_err("the replica's thread panicked"))?
         .map_err(store_error)
+}
+
+/// Says where a reader without the lake's keys reads each history file, as `lake` vends it.
+fn vending(lake: Arc<kermodes_lake::Lake>) -> kermodes_weir::Vend {
+    Arc::new(move |location, file| lake.vend(location, file))
 }
 
 /// Serves a synthetic feed on `host:port` (port 0 picks a free one): about `rate` ticks a second

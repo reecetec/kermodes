@@ -439,6 +439,7 @@ fn simulate(seed: u64, actions: usize, failing_syncs: u64) -> (u64, Vec<u64>) {
                                     last: date,
                                     rows,
                                     bytes: 0,
+                                    at: None,
                                 }],
                                 dates: vec![HistoryDate {
                                     date,
@@ -917,6 +918,7 @@ impl Shard {
                             last: date,
                             rows,
                             bytes: 0,
+                            at: None,
                         }],
                         dates: vec![HistoryDate {
                             date,

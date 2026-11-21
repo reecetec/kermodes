@@ -1346,7 +1346,6 @@ fn target(
         app_builds: config.app_builds.clone().unwrap_or_default(),
         environment,
         pull_secrets: config.pull_secrets.clone(),
-        lake: config.lake.clone(),
     }
 }
 

@@ -276,6 +276,7 @@ fn file(name: &str, first: &str, last: &str, rows: u64) -> HistoryFile {
         last: date(last),
         rows,
         bytes: rows * 10,
+        at: None,
     }
 }
 

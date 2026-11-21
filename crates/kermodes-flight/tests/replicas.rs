@@ -114,7 +114,9 @@ impl Shard {
             },
         };
         let running = thread::spawn(move || {
-            serve_replica(&root, &catalog, &branch, replica, &peers, addr, &stopping)
+            serve_replica(
+                &root, &catalog, &branch, replica, &peers, addr, &stopping, None,
+            )
         });
         self.running[i] = Some((stop, running));
     }

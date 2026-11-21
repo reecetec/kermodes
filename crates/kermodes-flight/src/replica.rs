@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use kermodes_weir::{Error, Replica, Store, machine_disk, replica_name, slot};
+use kermodes_weir::{Error, Replica, Store, Vend, machine_disk, replica_name, slot};
 
 use crate::carrier::carry;
 use crate::client::Client;
@@ -20,7 +20,9 @@ const WATCH: Duration = Duration::from_millis(100);
 
 /// Runs `replica` of the shard whose replicas serve at `peers` (replica `n` at `peers[n - 1]`),
 /// its store in `root` with the catalog every replica shares in Postgres at `catalog`, the
-/// tables of `branch`; serving on `addr` until `stop` is set.
+/// tables of `branch`; serving on `addr` until `stop` is set. With `vend`, each history file it
+/// lists says where a reader without the lake's keys reads it (`Store::vend_history`).
+#[allow(clippy::too_many_arguments)]
 pub fn serve_replica(
     root: &Path,
     catalog: &str,
@@ -29,6 +31,7 @@ pub fn serve_replica(
     peers: &[String],
     addr: SocketAddr,
     stop: &AtomicBool,
+    vend: Option<Vend>,
 ) -> Result<(), Error> {
     let (id, count) = (replica.id, peers.len() as u64);
     if id == 0 || id > count || replica.voters != (1..=count).collect::<Vec<_>>() {
@@ -50,6 +53,9 @@ pub fn serve_replica(
     let shard_url = format!("grpc://{}", hosts.join(","));
     loop {
         let store = Arc::new(Store::open_shard(root, catalog, branch, replica.clone())?);
+        if let Some(vend) = &vend {
+            store.vend_history(vend.clone());
+        }
         let me = replica_name(store.replica_id());
         let outgoing = store
             .take_outgoing()

@@ -70,6 +70,17 @@ def test_past_days_merge_into_history_and_read_back_like_pyarrow(tmp_path):
     assert "1 of 1 files, 1 of 2 row groups" in plan and "1 date from weir" in plan
 
 
+def test_a_client_without_lake_keys_reads_the_history_weir_vends(tmp_path, monkeypatch):
+    monkeypatch.delenv("KERMODES_LAKE", raising=False)
+    s = store_with_past_days(tmp_path)
+    s.merge_history("md.ticks", "2026-11-01")
+    s.merge_history("md.ticks", "2026-11-02")
+    server = s.serve_store()
+    # Connected over Flight, the client is told where each history file is.
+    con = km.connect(server.url, manual=True)
+    assert rows(con.table("md.ticks")) == expected(lambda *_: True)
+
+
 def test_today_is_not_history_yet(tmp_path):
     s = km.connect(tmp_path, manual=True)
     s.create_table("md.ticks", COLUMNS)

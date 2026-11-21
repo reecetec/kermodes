@@ -80,11 +80,11 @@ pub struct Reading<'a> {
 }
 
 /// `name`'s history, as `reading` says: at least `limit` rows where there are that many, each
-/// file and row group read only while they are still needed. `lake` may be `None` for a table
-/// whose history is all still in weir; a file to read without one is `NotFound`.
+/// file and row group read only while they are still needed. A file is read where weir says it
+/// is (its `at`), else through `lake`'s own store, which a reader holding no lake keys lacks.
 pub fn read_history(
     weir: &dyn Weir,
-    lake: Option<&Lake>,
+    lake: &Lake,
     name: &TableName,
     reading: &Reading<'_>,
 ) -> Result<History, Error> {
@@ -95,7 +95,7 @@ pub fn read_history(
 /// and page indexes alone.
 pub fn explain_history(
     weir: &dyn Weir,
-    lake: Option<&Lake>,
+    lake: &Lake,
     name: &TableName,
     reading: &Reading<'_>,
 ) -> Result<Explain, Error> {
@@ -114,7 +114,7 @@ enum Part<'a> {
 
 fn history(
     weir: &dyn Weir,
-    lake: Option<&Lake>,
+    lake: &Lake,
     name: &TableName,
     reading: &Reading<'_>,
     rows: bool,
@@ -190,15 +190,11 @@ fn history(
             }
             match part {
                 Part::File(file) => {
-                    let lake = lake.ok_or_else(|| {
-                        Error::NotFound(format!(
-                            "{name}'s history files: no lake to read them from"
-                        ))
-                    })?;
                     // A file's footer is read here; its row groups only as the batches are taken.
                     let mut read = lake.read(
                         &entry.location,
                         &file.name,
+                        file.at.as_deref(),
                         first,
                         last,
                         bounds,

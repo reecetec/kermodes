@@ -253,6 +253,7 @@ impl Postgres {
                 last: Date::from_days(row.get(2)),
                 rows: row.get::<_, i64>(3) as u64,
                 bytes: row.get::<_, i64>(4) as u64,
+                at: None,
             })
             .collect())
     }

@@ -5,9 +5,10 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{
     Array, ArrayRef, AsArray, Date32Array, Float64Array, Int64Array, RecordBatch,
@@ -20,11 +21,12 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt, TryFutureExt};
 use kermodes_weir::{Change, ColumnId, Date, Error, HistoryDate, HistoryFile, Shape, TableEntry};
-use object_store::aws::AmazonS3Builder;
+use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::buffered::BufWriter;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use object_store::prefix::PrefixStore;
+use object_store::signer::{Method, Signer};
 use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt};
 use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 use parquet::arrow::arrow_reader::{ArrowReaderOptions, RowSelection, RowSelector};
@@ -207,11 +209,54 @@ pub fn with_op(
 
 /// Where a store's history files live: a local directory, or `s3://bucket[/prefix]` with
 /// credentials and endpoint from the usual `AWS_*` variables (`AWS_ENDPOINT`, and
-/// `AWS_ALLOW_HTTP=true` for a store served over plain HTTP inside the cluster).
+/// `AWS_ALLOW_HTTP=true` for a store served over plain HTTP inside the cluster). Opened with
+/// its keys (`open`) by weir and merge Jobs only; every other process reads history through a
+/// `reader`, from where weir says each file is (architecture.md §8.4).
 pub struct Lake {
-    store: Arc<dyn ObjectStore>,
-    runtime: Runtime,
+    keys: Option<Keys>,
+    runtime: OwnRuntime,
+    /// Reads files weir vends at an `http(s)://` URL.
+    http: reqwest::Client,
 }
+
+/// The lake's own tokio runtime, shut down without waiting when the lake goes: a lake may go
+/// inside another runtime (a Flight server's, holding the function that vends its files), where
+/// waiting for a runtime's threads is not allowed.
+struct OwnRuntime(Option<Runtime>);
+
+impl std::ops::Deref for OwnRuntime {
+    type Target = Runtime;
+
+    fn deref(&self) -> &Runtime {
+        self.0.as_ref().expect("held until the lake goes")
+    }
+}
+
+impl Drop for OwnRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+/// A lake opened with its keys: its store, and how it says where a reader without them reads
+/// a file.
+struct Keys {
+    store: Arc<dyn ObjectStore>,
+    vending: Vending,
+}
+
+enum Vending {
+    /// The lake's directory, absolute: a reader on the same machine reads the file itself.
+    Local(PathBuf),
+    /// The bucket's client, which signs, and the lake's prefix in the bucket.
+    S3 { s3: AmazonS3, prefix: String },
+}
+
+/// How long a vended URL is valid. Every ranged GET of a read is checked against it, not only
+/// the first, so it must outlast the slowest read of one file.
+const VENDED_FOR: Duration = Duration::from_secs(60 * 60);
 
 /// What a write produced, for the catalog commit.
 #[derive(Debug, Default)]
@@ -239,38 +284,92 @@ struct Open {
 impl Lake {
     pub fn open(url: &str) -> Result<Self, Error> {
         let io = |e: object_store::Error| Error::Io(format!("lake {url}: {e}"));
-        let store: Arc<dyn ObjectStore> = match url.strip_prefix("s3://") {
+        let (store, vending): (Arc<dyn ObjectStore>, Vending) = match url.strip_prefix("s3://") {
             Some(rest) => {
                 let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
                 let s3 = AmazonS3Builder::from_env()
                     .with_bucket_name(bucket)
                     .build()
                     .map_err(io)?;
-                match prefix.trim_matches('/') {
-                    "" => Arc::new(s3),
-                    prefix => Arc::new(PrefixStore::new(s3, prefix)),
-                }
+                let prefix = prefix.trim_matches('/').to_owned();
+                let store: Arc<dyn ObjectStore> = match prefix.as_str() {
+                    "" => Arc::new(s3.clone()),
+                    prefix => Arc::new(PrefixStore::new(s3.clone(), prefix)),
+                };
+                (store, Vending::S3 { s3, prefix })
             }
             None => {
                 let dir = url.strip_prefix("file://").unwrap_or(url);
-                std::fs::create_dir_all(dir).map_err(|e| Error::Io(format!("lake {dir}: {e}")))?;
-                Arc::new(LocalFileSystem::new_with_prefix(dir).map_err(io)?)
+                let missing = |e: std::io::Error| Error::Io(format!("lake {dir}: {e}"));
+                std::fs::create_dir_all(dir).map_err(missing)?;
+                let dir = std::fs::canonicalize(dir).map_err(missing)?;
+                let store = Arc::new(LocalFileSystem::new_with_prefix(&dir).map_err(io)?);
+                (store, Vending::Local(dir))
             }
         };
+        Self::with(Some(Keys { store, vending }))
+    }
+
+    /// A lake held without its keys: it reads only files weir says where to read (their `at`),
+    /// and writes nothing.
+    pub fn reader() -> Result<Self, Error> {
+        Self::with(None)
+    }
+
+    fn with(keys: Option<Keys>) -> Result<Self, Error> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("kermodes-lake")
             .enable_all()
             .build()
             .map_err(|e| Error::Io(format!("cannot start the lake's runtime: {e}")))?;
-        Ok(Self { store, runtime })
+        let http = reqwest::Client::builder()
+            .build()
+            .map_err(|e| Error::Io(format!("cannot start the lake's HTTP client: {e}")))?;
+        Ok(Self {
+            keys,
+            runtime: OwnRuntime(Some(runtime)),
+            http,
+        })
+    }
+
+    /// The lake's own store, which only a lake opened with its keys has.
+    fn store(&self) -> Result<&Arc<dyn ObjectStore>, Error> {
+        self.keys.as_ref().map(|keys| &keys.store).ok_or_else(|| {
+            Error::NotFound(
+                "writing the lake needs its keys: this process holds none (set KERMODES_LAKE)"
+                    .into(),
+            )
+        })
+    }
+
+    /// Where a reader without the lake's keys reads `file` of the table at `location`: a
+    /// `file://` path for a local lake, a presigned GET URL valid for an hour for S3.
+    pub fn vend(&self, location: &str, file: &str) -> Result<String, Error> {
+        match self.keys.as_ref().map(|keys| &keys.vending) {
+            None => Err(Error::NotFound(format!(
+                "cannot say where {location}/{file} is: this process holds no lake keys"
+            ))),
+            Some(Vending::Local(dir)) => Ok(format!("file://{}/{location}/{file}", dir.display())),
+            Some(Vending::S3 { s3, prefix }) => {
+                let path = match prefix.as_str() {
+                    "" => Path::from(format!("{location}/{file}")),
+                    prefix => Path::from(format!("{prefix}/{location}/{file}")),
+                };
+                let url = self
+                    .runtime
+                    .block_on(s3.signed_url(Method::GET, &path, VENDED_FOR))
+                    .map_err(|e| Error::Io(format!("cannot sign {path}: {e}")))?;
+                Ok(url.to_string())
+            }
+        }
     }
 
     /// Whether the store answers: lists its first object, if it has one. A missing bucket, a
     /// refused credential, or an endpoint that does not answer is an error.
     pub fn probe(&self) -> Result<(), Error> {
         self.runtime.block_on(async {
-            match self.store.list(None).next().await {
+            match self.store()?.list(None).next().await {
                 Some(Err(e)) => Err(Error::Io(format!("lake: {e}"))),
                 _ => Ok(()),
             }
@@ -379,20 +478,53 @@ impl Lake {
     /// The rows of `first` to `last` in a history file, reading only the row groups of those
     /// dates; and of those, only the row groups and pages whose statistics allow `bounds`, and
     /// only the columns `projection` keeps (all if `None`). The rows read may still include some
-    /// outside them: the caller applies its predicate.
+    /// outside them: the caller applies its predicate. The file is read `at` where weir vended it
+    /// (a `file://` path or an `http(s)://` URL), else through the lake's own store.
+    #[allow(clippy::too_many_arguments)]
     pub fn read(
         &self,
         location: &str,
         file: &str,
+        at: Option<&str>,
         first: Date,
         last: Date,
         bounds: &[Bound],
         projection: Option<&Projection>,
     ) -> Result<Batches<'_>, Error> {
-        let path = Path::from(format!("{location}/{file}"));
-        let reader = StoreReader {
-            store: self.store.clone(),
-            path,
+        let reader: Box<dyn AsyncFileReader> = match at {
+            Some(at) => match at.strip_prefix("file://") {
+                Some(local) => Box::new(StoreReader {
+                    store: Arc::new(LocalFileSystem::new()),
+                    path: Path::from_filesystem_path(local)
+                        .map_err(|e| Error::Io(format!("history file {at}: {e}")))?,
+                }),
+                None if at.starts_with("https://") || at.starts_with("http://") => {
+                    Box::new(HttpReader {
+                        client: self.http.clone(),
+                        url: at.to_owned(),
+                    })
+                }
+                None => {
+                    return Err(Error::Corrupt(format!(
+                        "weir vended {location}/{file} at {at}, which is neither file:// nor \
+                         http(s)://"
+                    )));
+                }
+            },
+            None => Box::new(StoreReader {
+                store: self
+                    .keys
+                    .as_ref()
+                    .ok_or_else(|| {
+                        Error::NotFound(format!(
+                            "history file {location}/{file}: this process holds no lake keys, \
+                             and weir did not say where the file is"
+                        ))
+                    })?
+                    .store
+                    .clone(),
+                path: Path::from(format!("{location}/{file}")),
+            }),
         };
         let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
         self.runtime.block_on(async {
@@ -507,7 +639,7 @@ impl Lake {
     /// Deletes a history file; one already gone is deleted.
     pub fn delete(&self, location: &str, file: &str) -> Result<(), Error> {
         let path = Path::from(format!("{location}/{file}"));
-        match self.runtime.block_on(self.store.delete(&path)) {
+        match self.runtime.block_on(self.store()?.delete(&path)) {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(e) => Err(Error::Io(format!("cannot delete {path}: {e}"))),
         }
@@ -521,7 +653,7 @@ impl Lake {
             .set_statistics_enabled(EnabledStatistics::Page)
             .build();
         let writer = AsyncArrowWriter::try_new(
-            BufWriter::new(self.store.clone(), path),
+            BufWriter::new(self.store()?.clone(), path),
             schema.clone(),
             Some(props),
         )
@@ -590,6 +722,7 @@ impl Lake {
             last: file.last,
             rows: file.rows,
             bytes,
+            at: None,
         });
         Ok(())
     }
@@ -598,7 +731,7 @@ impl Lake {
 /// A history file's rows, a batch at a time, from the row groups of the dates asked for.
 pub struct Batches<'a> {
     runtime: &'a Runtime,
-    stream: ParquetRecordBatchStream<StoreReader>,
+    stream: ParquetRecordBatchStream<Box<dyn AsyncFileReader>>,
     /// Row groups read, and in the file.
     pub row_groups: (usize, usize),
     /// Rows read (the pages bounds allow), and in the row groups read.
@@ -762,4 +895,110 @@ impl MetadataSuffixFetch for &mut StoreReader {
 
 fn store_to_parquet(error: object_store::Error) -> ParquetError {
     ParquetError::External(Box::new(error))
+}
+
+/// A history file weir vended at an `http(s)://` URL (a presigned one), read in ranged GETs as
+/// `StoreReader` reads the store: the footer, then the row groups wanted.
+struct HttpReader {
+    client: reqwest::Client,
+    url: String,
+}
+
+impl HttpReader {
+    /// The bytes `range` names (an HTTP `Range` value): only a partial answer is them, since a
+    /// server ignoring the range answers the whole file.
+    async fn get(&self, range: String) -> parquet::errors::Result<Bytes> {
+        let response = self
+            .client
+            .get(&self.url)
+            .header(reqwest::header::RANGE, &range)
+            .send()
+            .await
+            .map_err(http_to_parquet)?;
+        let status = response.status();
+        if status != reqwest::StatusCode::PARTIAL_CONTENT {
+            // The URL's query is its signature: kept out of the error.
+            let url = self.url.split('?').next().unwrap_or_default();
+            return Err(ParquetError::General(format!(
+                "reading {range} of {url} answered {status}"
+            )));
+        }
+        response.bytes().await.map_err(http_to_parquet)
+    }
+}
+
+impl AsyncFileReader for HttpReader {
+    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
+        self.get(format!("bytes={}-{}", range.start, range.end - 1))
+            .boxed()
+    }
+
+    fn get_metadata<'a>(
+        &'a mut self,
+        options: Option<&'a ArrowReaderOptions>,
+    ) -> BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
+        async move {
+            let metadata = ParquetMetaDataReader::new()
+                .with_arrow_reader_options(options)
+                .load_via_suffix_and_finish(self)
+                .await?;
+            Ok(Arc::new(metadata))
+        }
+        .boxed()
+    }
+}
+
+impl MetadataSuffixFetch for &mut HttpReader {
+    fn fetch_suffix(&mut self, suffix: usize) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
+        self.get(format!("bytes=-{suffix}")).boxed()
+    }
+}
+
+fn http_to_parquet(error: reqwest::Error) -> ParquetError {
+    // Without the URL, whose query is its signature.
+    ParquetError::External(Box::new(error.without_url()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An S3 lake vends a URL signed for its bucket and the file's whole path, prefix included,
+    /// valid for an hour; signing is local, so no endpoint need answer.
+    #[test]
+    fn an_s3_lake_vends_a_presigned_url_for_the_files_path() {
+        let s3 = AmazonS3Builder::new()
+            .with_bucket_name("history")
+            .with_region("us-east-1")
+            .with_endpoint("http://lake.invalid:9000")
+            .with_allow_http(true)
+            .with_access_key_id("key")
+            .with_secret_access_key("secret")
+            .build()
+            .unwrap();
+        let lake = Lake::with(Some(Keys {
+            store: Arc::new(s3.clone()),
+            vending: Vending::S3 {
+                s3,
+                prefix: "prod".into(),
+            },
+        }))
+        .unwrap();
+        let url = lake.vend("main/md/ticks.1", "f.parquet").unwrap();
+        let (path, query) = url.split_once('?').unwrap();
+        assert_eq!(
+            path,
+            "http://lake.invalid:9000/history/prod/main/md/ticks.1/f.parquet"
+        );
+        assert!(query.contains("X-Amz-Expires=3600"), "{query}");
+        assert!(query.contains("X-Amz-Signature="), "{query}");
+        assert!(query.contains("X-Amz-Credential=key%2F"), "{query}");
+    }
+
+    #[test]
+    fn a_reader_lake_writes_nothing_and_vends_nothing() {
+        let lake = Lake::reader().unwrap();
+        assert!(matches!(lake.delete("t", "f"), Err(Error::NotFound(_))));
+        assert!(matches!(lake.vend("t", "f"), Err(Error::NotFound(_))));
+    }
 }

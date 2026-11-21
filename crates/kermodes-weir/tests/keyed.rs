@@ -227,6 +227,7 @@ fn dropping_a_day_keeps_the_state_it_carried() {
         last: day,
         rows: rows_held,
         bytes,
+        at: None,
     };
     s.commit_history(
         &quotes(),

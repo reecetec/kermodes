@@ -22,39 +22,26 @@ pub(crate) struct Stores {
 
 impl Stores {
     /// The lake: at `KERMODES_LAKE` (`s3://bucket/prefix` in the cluster), or in `lake` beside a
-    /// store this process owns.
+    /// store this process owns; otherwise held without its keys, reading each history file
+    /// where weir says it is (architecture.md §8.4).
     pub(crate) fn lake(&self) -> PyResult<Arc<kermodes_lake::Lake>> {
         if let Some(lake) = self.lake.get() {
             return Ok(lake.clone());
         }
-        let url = match (std::env::var("KERMODES_LAKE").ok(), &self.tables) {
-            (Some(url), _) => url,
-            (None, Tables::Local(store)) => store.root().join("lake").display().to_string(),
-            (None, Tables::Remote(_)) => {
-                return Err(KermodesError::new_err(
-                    "history is in the lake in object storage: set KERMODES_LAKE to where \
-                     (s3://bucket/prefix)",
-                ));
+        let lake = match (std::env::var("KERMODES_LAKE").ok(), &self.tables) {
+            (Some(url), _) => kermodes_lake::Lake::open(&url),
+            (None, Tables::Local(store)) => {
+                kermodes_lake::Lake::open(&store.root().join("lake").display().to_string())
             }
+            (None, Tables::Remote(_)) => kermodes_lake::Lake::reader(),
         };
-        let lake = Arc::new(kermodes_lake::Lake::open(&url).map_err(store_error)?);
+        let lake = Arc::new(lake.map_err(store_error)?);
         Ok(self.lake.get_or_init(|| lake).clone())
     }
 
     pub(crate) fn entry(&self, name: &str) -> PyResult<TableEntry> {
         let name = TableName::parse(name).map_err(store_error)?;
         self.tables.entry(&name).map_err(store_error)
-    }
-
-    /// The lake if `name`'s history up to `last` has files in it; `None` if it is all in weir,
-    /// so a table never merged reads without knowing where the lake is.
-    fn lake_for(&self, name: &TableName, last: Date) -> PyResult<Option<Arc<kermodes_lake::Lake>>> {
-        let held = self.tables.weir().history(name).map_err(store_error)?;
-        if held.iter().any(|h| h.date <= last) {
-            self.lake().map(Some)
-        } else {
-            Ok(None)
-        }
     }
 }
 
@@ -131,10 +118,10 @@ pub(crate) fn describe(stores: &Stores, scan: &Scan) -> PyResult<(String, bool)>
         .predicate
         .as_deref()
         .map_or_else(Vec::new, kermodes_lake::column_bounds);
-    let lake = stores.lake_for(&entry.name, last)?;
+    let lake = stores.lake()?;
     let explain = kermodes_lake::explain_history(
         stores.tables.weir(),
-        lake.as_deref(),
+        &lake,
         &entry.name,
         &kermodes_lake::Reading {
             last: Some(last),
@@ -191,10 +178,10 @@ fn read(
         .predicate
         .as_deref()
         .map_or_else(Vec::new, kermodes_lake::column_bounds);
-    let lake = stores.lake_for(&entry.name, last)?;
+    let lake = stores.lake()?;
     let history = kermodes_lake::read_history(
         stores.tables.weir(),
-        lake.as_deref(),
+        &lake,
         &entry.name,
         &kermodes_lake::Reading {
             last: Some(last),
