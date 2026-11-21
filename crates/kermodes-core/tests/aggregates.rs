@@ -396,6 +396,123 @@ fn count_distinct_of_churning_strings_matches_its_recomputation() {
     }
 }
 
+const EXTREMES: &[(&str, &str)] = &[
+    ("n", "count(*)"),
+    ("fs", "count(f)"),
+    ("i_low", "min(i)"),
+    ("i_high", "max(i)"),
+    ("f_low", "min(f)"),
+    ("f_high", "max(f)"),
+    ("s_low", "min(s)"),
+    ("s_high", "max(s)"),
+    ("b_low", "min(b)"),
+    ("b_high", "max(b)"),
+    ("d_low", "min(d)"),
+    ("t_high", "max(t)"),
+    ("i_first", "first(i)"),
+    ("f_last", "last(f)"),
+    ("s_first", "first(s)"),
+    ("b_last", "last(b)"),
+    ("d_last", "last(d)"),
+    ("t_first", "first(t)"),
+];
+
+fn present(rng: &mut Rng) -> bool {
+    rng.below(10) > 0
+}
+
+/// Rows of `kinds_schema` with keys `ids`, in groups "a" to "c", one value in ten NULL and the
+/// rest drawn from a few, so they tie; floats include NaNs of two bit patterns and both zeros.
+fn random_kinds(rng: &mut Rng, ids: impl Iterator<Item = i64>) -> RecordBatch {
+    let floats = [
+        f64::NAN,
+        f64::from_bits(0xfff8_0000_0000_0001),
+        0.0,
+        -0.0,
+        1.5,
+        -1.5,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    let rows: Vec<Kinds<'_>> = ids
+        .map(|id| {
+            (
+                id,
+                ["a", "b", "c"][rng.below(3) as usize],
+                present(rng).then(|| rng.below(5) as i32 - 2),
+                present(rng).then(|| floats[rng.below(8) as usize]),
+                present(rng).then(|| ["", "x", "xy", "y"][rng.below(4) as usize]),
+                present(rng).then(|| rng.below(2) == 0),
+                present(rng).then(|| rng.below(4) as i32),
+                present(rng).then(|| rng.below(4) as i64 * 1_000),
+            )
+        })
+        .collect();
+    kinds(&rows)
+}
+
+/// Without group columns every row is in one group, whose batches fold whole (`min` and `max`
+/// through Arrow's kernels); with them, rows fold one by one. Each group's rows aggregated alone
+/// give that group's row of the aggregation by group, over NULLs, ties, NaNs of two bit patterns,
+/// and both zeros, computed once and ticking under upserts and deletes.
+#[test]
+fn one_group_aggregates_as_each_group_among_many() {
+    let session = Session::new();
+    let mut rng = Rng(7);
+    let groups = ["a", "b", "c"];
+    let built = |input: &Table| {
+        let grouped = input.agg_by(&["g"], EXTREMES).unwrap();
+        let alone: Vec<Table> = groups
+            .iter()
+            .map(|g| {
+                input
+                    .filter(&format!("g = '{g}'"))
+                    .unwrap()
+                    .agg_by(&[], EXTREMES)
+                    .unwrap()
+            })
+            .collect();
+        (grouped, alone)
+    };
+    let check = |(grouped, alone): &(Table, Vec<Table>), context: &str| {
+        for (g, alone) in groups.iter().zip(alone) {
+            let among = grouped.filter(&format!("g = '{g}'")).unwrap();
+            let rows = |table: &Table| concat_batches(table.schema(), &table.snapshot().unwrap());
+            let (alone, among) = (rows(alone).unwrap(), rows(&among).unwrap());
+            for (name, _) in EXTREMES {
+                assert_eq!(
+                    alone.column_by_name(name),
+                    among.column_by_name(name),
+                    "{context}: {name} of {g}"
+                );
+            }
+        }
+    };
+
+    let batches = (0..3)
+        .map(|part| random_kinds(&mut rng, part * 5_000..(part + 1) * 5_000))
+        .collect();
+    let fixed = session
+        .static_table(Arc::new(kinds_schema()), batches)
+        .unwrap();
+    check(&built(&fixed), "static");
+
+    let input = session.keyed_input_table(&kinds_schema(), &["id"]).unwrap();
+    let ticking = built(&input);
+    for cycle in 0..20 {
+        let keys: Vec<i64> = (0..300).map(|_| rng.below(2_000) as i64).collect();
+        input
+            .upsert(&[random_kinds(&mut rng, keys.into_iter())])
+            .unwrap();
+        let gone: Vec<i64> = (0..rng.below(200))
+            .map(|_| rng.below(2_000) as i64)
+            .collect();
+        input.delete(&[ids(&gone)]).unwrap();
+        session.step();
+        check(&ticking, &format!("cycle {cycle}"));
+    }
+}
+
 fn readings(rows: &[(i64, &str, f64)]) -> RecordBatch {
     let columns: Vec<(&str, ArrayRef)> = vec![
         (

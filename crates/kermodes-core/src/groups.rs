@@ -332,8 +332,16 @@ pub(crate) fn split(
     let encoded = kind.encode(batch)?;
     let keys = kind.keys(batch, encoded.as_ref());
     let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); shards];
-    for row in 0..batch.num_rows() {
-        buckets[shard_of(keys.hash(row), shards)].push(offset + row as u32);
+    let rows = batch.num_rows() as u32;
+    if let Keys::None = keys {
+        // One key for every row: one hash, one shard.
+        if rows > 0 {
+            buckets[shard_of(keys.hash(0), shards)] = (offset..offset + rows).collect();
+        }
+        return Ok(buckets);
+    }
+    for row in 0..rows {
+        buckets[shard_of(keys.hash(row as usize), shards)].push(offset + row);
     }
     Ok(buckets)
 }
@@ -350,6 +358,15 @@ impl LocalGroups {
     /// Groups the rows, using `table` as scratch: it is cleared but keeps its capacity.
     pub fn build(keys: &Keys<'_>, rows: usize, table: &mut HashTable<LocalEntry>) -> Self {
         table.clear();
+        if let Keys::None = keys {
+            // One key for every row: one group, and no row to hash.
+            let one = rows > 0;
+            return Self {
+                ids: vec![0; rows],
+                hash: if one { vec![keys.hash(0)] } else { Vec::new() },
+                first_row: if one { vec![0] } else { Vec::new() },
+            };
+        }
         let mut groups = Self {
             ids: Vec::with_capacity(rows),
             hash: Vec::new(),
@@ -544,7 +561,8 @@ impl Membership {
         let kind = std::mem::replace(&mut self.kind, KeyKind::None);
         let result = kind.encode(batch).map(|encoded| {
             let keys = kind.keys(batch, encoded.as_ref());
-            let mut ids = Vec::with_capacity(rows.map_or(batch.num_rows(), <[u32]>::len));
+            let count = rows.map_or(batch.num_rows(), <[u32]>::len);
+            let mut ids = Vec::with_capacity(count);
             let mut each = |row: usize| {
                 let id = self.group(
                     keys.hash(row),
@@ -554,6 +572,11 @@ impl Membership {
                 ids.push(id);
             };
             match rows {
+                // One key for every row: look its group up once.
+                _ if matches!(keys, Keys::None) && count > 0 => {
+                    each(0);
+                    ids.resize(count, ids[0]);
+                }
                 None => (0..batch.num_rows()).for_each(&mut each),
                 Some(rows) => rows.iter().for_each(|row| each(*row as usize)),
             }

@@ -25,10 +25,11 @@ use arrow::array::{
     Array, ArrayRef, ArrowPrimitiveType, AsArray, Float64Array, Int64Array, PrimitiveArray,
     UInt32Array, new_null_array,
 };
+use arrow::compute::kernels::aggregate;
 use arrow::compute::{concat_batches, interleave, take, take_record_batch};
 use arrow::datatypes::{
-    DataType, Date32Type, Field, Float64Type, Int16Type, Int32Type, Int64Type, Schema, SchemaRef,
-    TimeUnit, TimestampNanosecondType,
+    ArrowNativeTypeOp, DataType, Date32Type, Field, Float64Type, Int16Type, Int32Type, Int64Type,
+    Schema, SchemaRef, TimeUnit, TimestampNanosecondType,
 };
 use arrow::error::ArrowError;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
@@ -475,6 +476,11 @@ impl Accumulator {
     ) -> Result<(), ArrowError> {
         let row_of = |i: usize| rows.map_or(i, |r| r[i] as usize);
         match self {
+            Accumulator::Count { column, n } if rows.is_none() && n.len() == 1 => {
+                // One group holds every row: count the batch at once.
+                let nulls = column.map_or(0, |c| batch.column(c).null_count());
+                n[0] += (ids.len() - nulls) as i64;
+            }
             Accumulator::Count { column: None, n } => {
                 for &group in ids {
                     n[group as usize] += 1;
@@ -518,36 +524,46 @@ impl Accumulator {
                     state[group].add(wides, x, false);
                 });
             }
+            Accumulator::Extreme { column, max, kept }
+                if rows.is_none() && kept.best.len() == 1 =>
+            {
+                // One group holds every row: only the batch's own winner can win, so only it is
+                // encoded.
+                let array = batch.column(*column);
+                if let Some(row) = kept.extreme_row(array, keys, *max)? {
+                    let encoded = kept.encode_row(array, row)?;
+                    kept.offer_extreme(0, *max, encoded.row(0).data(), keys[row]);
+                }
+            }
             Accumulator::Extreme { column, max, kept } => {
                 let (array, encoded) = kept.encode(batch.column(*column), rows)?;
                 for (i, &group) in ids.iter().enumerate() {
-                    if array.is_null(i) {
-                        continue;
+                    if array.is_valid(i) {
+                        let key = keys[row_of(i)];
+                        kept.offer_extreme(group as usize, *max, encoded.row(i).data(), key);
                     }
-                    let (candidate, key) = (encoded.row(i).data(), keys[row_of(i)]);
-                    let better = match &kept.best[group as usize] {
-                        None => true,
-                        Some((value, held)) => {
-                            beats(*max, candidate.cmp(value.as_slice()), key, *held)
-                        }
-                    };
-                    if better {
-                        kept.set(group as usize, candidate, key);
-                    }
+                }
+            }
+            Accumulator::Edge { column, last, kept } if rows.is_none() && kept.best.len() == 1 => {
+                // One group holds every row: only the batch's first (or last) row can win, so
+                // only it is encoded.
+                let by_key = |row: &usize| keys[*row];
+                let rows = 0..batch.num_rows();
+                let row = if *last {
+                    rows.max_by_key(by_key)
+                } else {
+                    rows.min_by_key(by_key)
+                };
+                if let Some(row) = row {
+                    let encoded = kept.encode_row(batch.column(*column), row)?;
+                    kept.offer_edge(0, *last, encoded.row(0).data(), keys[row]);
                 }
             }
             Accumulator::Edge { column, last, kept } => {
                 let (_, encoded) = kept.encode(batch.column(*column), rows)?;
                 for (i, &group) in ids.iter().enumerate() {
-                    let candidate = keys[row_of(i)];
-                    let better = match &kept.best[group as usize] {
-                        None => true,
-                        Some((_, held)) if *last => candidate > *held,
-                        Some((_, held)) => candidate < *held,
-                    };
-                    if better {
-                        kept.set(group as usize, encoded.row(i).data(), candidate);
-                    }
+                    let key = keys[row_of(i)];
+                    kept.offer_edge(group as usize, *last, encoded.row(i).data(), key);
                 }
             }
             Accumulator::CountDistinct { column, values } => {
@@ -671,25 +687,12 @@ impl Accumulator {
             }
             (Accumulator::Extreme { max, kept, .. }, Accumulator::Extreme { kept: theirs, .. }) => {
                 if let Some((value, key)) = &theirs.best[from] {
-                    let better = match &kept.best[into] {
-                        None => true,
-                        Some((held, held_key)) => beats(*max, value.cmp(held), *key, *held_key),
-                    };
-                    if better {
-                        kept.set(into, value, *key);
-                    }
+                    kept.offer_extreme(into, *max, value, *key);
                 }
             }
             (Accumulator::Edge { last, kept, .. }, Accumulator::Edge { kept: theirs, .. }) => {
-                if let Some((value, candidate)) = &theirs.best[from] {
-                    let better = match &kept.best[into] {
-                        None => true,
-                        Some((_, held)) if *last => candidate > held,
-                        Some((_, held)) => candidate < held,
-                    };
-                    if better {
-                        kept.set(into, value, *candidate);
-                    }
+                if let Some((value, key)) = &theirs.best[from] {
+                    kept.offer_edge(into, *last, value, *key);
                 }
             }
             (
@@ -792,6 +795,79 @@ impl Kept {
         Ok((array, encoded))
     }
 
+    /// The encoding of `array`'s row `row` alone.
+    fn encode_row(&self, array: &ArrayRef, row: usize) -> Result<EncodedRows, ArrowError> {
+        self.converter.convert_columns(&[array.slice(row, 1)])
+    }
+
+    /// The row of `array` with the smallest value (the largest if `max`), ties to the smallest
+    /// key; `None` without a value. For the engine's types, Arrow's min/max kernels find the
+    /// value and one pass over the values finds its rows, so no value is encoded.
+    fn extreme_row(
+        &self,
+        array: &ArrayRef,
+        keys: &[RowKey],
+        max: bool,
+    ) -> Result<Option<usize>, ArrowError> {
+        let valid = |row: &usize| array.is_valid(*row);
+        Ok(match array.data_type() {
+            DataType::Int16 => primitive_extreme(array.as_primitive::<Int16Type>(), keys, max),
+            DataType::Int32 => primitive_extreme(array.as_primitive::<Int32Type>(), keys, max),
+            DataType::Int64 => primitive_extreme(array.as_primitive::<Int64Type>(), keys, max),
+            DataType::Float64 => primitive_extreme(array.as_primitive::<Float64Type>(), keys, max),
+            DataType::Date32 => primitive_extreme(array.as_primitive::<Date32Type>(), keys, max),
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                primitive_extreme(array.as_primitive::<TimestampNanosecondType>(), keys, max)
+            }
+            DataType::Utf8 => {
+                let strings = array.as_string::<i32>();
+                let best = if max {
+                    aggregate::max_string(strings)
+                } else {
+                    aggregate::min_string(strings)
+                };
+                best.and_then(|best| {
+                    smallest_key(
+                        keys,
+                        (0..array.len())
+                            .filter(valid)
+                            .filter(|r| strings.value(*r) == best),
+                    )
+                })
+            }
+            DataType::Boolean => {
+                let bools = array.as_boolean();
+                let best = if max {
+                    aggregate::max_boolean(bools)
+                } else {
+                    aggregate::min_boolean(bools)
+                };
+                best.and_then(|best| {
+                    smallest_key(
+                        keys,
+                        (0..array.len())
+                            .filter(valid)
+                            .filter(|r| bools.value(*r) == best),
+                    )
+                })
+            }
+            // Other types (a computed column's NULL type): compare encoded values.
+            _ => {
+                let encoded = self
+                    .converter
+                    .convert_columns(std::slice::from_ref(array))?;
+                (0..array.len()).filter(valid).reduce(|best, row| {
+                    let order = encoded.row(row).cmp(&encoded.row(best));
+                    if beats(max, order, keys[row], keys[best]) {
+                        row
+                    } else {
+                        best
+                    }
+                })
+            }
+        })
+    }
+
     fn set(&mut self, group: usize, value: &[u8], key: RowKey) {
         match &mut self.best[group] {
             Some((held, at)) => {
@@ -800,6 +876,31 @@ impl Kept {
                 *at = key;
             }
             none => *none = Some((value.to_vec(), key)),
+        }
+    }
+
+    /// Keeps `value`, of the row keyed `key`, for `group` if it beats the value held: as `min`
+    /// (`max` if `max`) orders values, ties to the smaller key.
+    fn offer_extreme(&mut self, group: usize, max: bool, value: &[u8], key: RowKey) {
+        let better = match &self.best[group] {
+            None => true,
+            Some((held, at)) => beats(max, value.cmp(held.as_slice()), key, *at),
+        };
+        if better {
+            self.set(group, value, key);
+        }
+    }
+
+    /// Keeps `value`, of the row keyed `key`, for `group` if its key is smaller than the held
+    /// one's (larger if `last`).
+    fn offer_edge(&mut self, group: usize, last: bool, value: &[u8], key: RowKey) {
+        let better = match &self.best[group] {
+            None => true,
+            Some((_, held)) if last => key > *held,
+            Some((_, held)) => key < *held,
+        };
+        if better {
+            self.set(group, value, key);
         }
     }
 
@@ -1119,6 +1220,32 @@ impl Strings {
 fn beats(max: bool, order: std::cmp::Ordering, candidate: RowKey, held: RowKey) -> bool {
     let order = if max { order } else { order.reverse() };
     order.is_gt() || (order.is_eq() && candidate < held)
+}
+
+/// The row of `array` with the smallest value (the largest if `max`), ties to the smallest key;
+/// `None` without a value. Arrow's kernel orders floats as the row encoding does: by IEEE 754
+/// total order.
+fn primitive_extreme<T: ArrowPrimitiveType>(
+    array: &PrimitiveArray<T>,
+    keys: &[RowKey],
+    max: bool,
+) -> Option<usize> {
+    let best = if max {
+        aggregate::max(array)
+    } else {
+        aggregate::min(array)
+    }?;
+    let rows = array.values().iter().enumerate();
+    smallest_key(
+        keys,
+        rows.filter(|(row, value)| value.is_eq(best) && array.is_valid(*row))
+            .map(|(row, _)| row),
+    )
+}
+
+/// Of `rows`, the one with the smallest key.
+fn smallest_key(keys: &[RowKey], rows: impl Iterator<Item = usize>) -> Option<usize> {
+    rows.min_by_key(|row| keys[*row])
 }
 
 /// Calls `f(group, value)` for each row with a value, in order: every row of `array`, or the
@@ -2039,7 +2166,13 @@ impl Fold {
             self.keys
                 .push(RecordBatch::try_new(self.key_schema.clone(), columns)?);
         }
-        let ids: Vec<u32> = local.ids.iter().map(|g| ids[*g as usize]).collect();
+        // When the batch's groups are numbered as the part's (its first batch, or every batch
+        // of an aggregation without group columns), its ids serve as they are.
+        let ids = if ids.iter().enumerate().all(|(g, id)| *id as usize == g) {
+            local.ids
+        } else {
+            local.ids.iter().map(|g| ids[*g as usize]).collect()
+        };
         self.row_keys.clear();
         if self.positions {
             self.row_keys.extend(first..first + rows as RowKey);

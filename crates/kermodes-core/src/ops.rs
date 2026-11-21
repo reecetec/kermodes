@@ -45,6 +45,15 @@ impl Operator {
             Operator::Rolling(op) => op.process(delta),
         }
     }
+
+    /// Whether its rows keep their input rows' keys, rather than having keys of its own.
+    pub fn keeps_keys(&self) -> bool {
+        match self {
+            Operator::Where(op) => !op.rekey,
+            Operator::Update(_) | Operator::Edge(_) | Operator::Rolling(_) => true,
+            Operator::LastBy(_) | Operator::AggBy(_) | Operator::Slice(_) => false,
+        }
+    }
 }
 
 pub(crate) struct Where {

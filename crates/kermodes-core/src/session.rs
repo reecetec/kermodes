@@ -257,6 +257,9 @@ struct TableState {
     /// A fed table not yet given what its store held when it subscribed (`Feed::ready`): its
     /// writes wait, so it loads in one cycle rather than in pieces.
     loading: bool,
+    /// Merge lanes its row keys take (`Lanes`): 1, unless its keys are a merge's or kept from
+    /// one.
+    lanes: RowKey,
 }
 
 /// One cycle's changes to a table, as Arrow: rows added, rows removed (with their last values),
@@ -290,6 +293,7 @@ enum Source {
     /// Every row of `inputs`, read through them: a merge stores nothing.
     Merge {
         inputs: Vec<usize>,
+        lanes: Lanes,
     },
     /// The parent's rows, read in `order` (a ticking sort): stores nothing.
     Order {
@@ -306,7 +310,7 @@ impl Source {
                 (Some(*parent), None, &[])
             }
             Source::Join { left, right, .. } => (Some(*left), Some(*right), &[]),
-            Source::Merge { inputs } => (None, None, inputs),
+            Source::Merge { inputs, .. } => (None, None, inputs),
             Source::Append | Source::Fed | Source::Keyed(_) | Source::Static => (None, None, &[]),
         };
         first.into_iter().chain(second).chain(rest.iter().copied())
@@ -315,46 +319,71 @@ impl Source {
 
 const STORED: &str = "only joins and merges compute their rows; other tables store theirs";
 
-/// Bits of a merged row's key that hold its input's key; the input's index takes the top 8.
+/// Bits of a row key below its merge lane (see `Lanes`).
 const MERGE_KEY_BITS: u32 = 56;
 
-/// The merged key of input `index`'s row `key`.
-fn merged_key(index: usize, key: RowKey) -> Result<RowKey, ArrowError> {
-    if key >> MERGE_KEY_BITS != 0 {
-        return Err(ArrowError::ComputeError(format!(
-            "merge: input row key {key} needs more than {MERGE_KEY_BITS} bits"
-        )));
-    }
-    Ok(((index as RowKey) << MERGE_KEY_BITS) | key)
+/// Where a merge puts its inputs' row keys: input `i`'s rows in lanes `starts[i]..starts[i + 1]`,
+/// a key's lane being its bits above `MERGE_KEY_BITS`, so merged keys order by input first.
+/// Tables' keys are in lane 0, except a merge's and those of a table that keeps a merge's keys
+/// (a filter or update over a ticking merge, which follows rows by key): such an input takes as
+/// many lanes as its keys use (`TableState::lanes`), so it can be merged again.
+struct Lanes {
+    starts: Vec<RowKey>,
 }
 
-fn merged_keys(index: usize, keys: &[RowKey]) -> Result<Vec<RowKey>, ArrowError> {
-    keys.iter().map(|key| merged_key(index, *key)).collect()
+impl Lanes {
+    /// Input `index`'s row `key` as the merge's: moved up to the input's first lane.
+    fn key(&self, index: usize, key: RowKey) -> Result<RowKey, ArrowError> {
+        let (start, end) = (self.starts[index], self.starts[index + 1]);
+        if key >> MERGE_KEY_BITS >= end - start {
+            return Err(ArrowError::ComputeError(format!(
+                "merge: input row key {key} needs more than {MERGE_KEY_BITS} bits"
+            )));
+        }
+        Ok(key + (start << MERGE_KEY_BITS))
+    }
+
+    fn keys(&self, index: usize, keys: &[RowKey]) -> Result<Vec<RowKey>, ArrowError> {
+        keys.iter().map(|key| self.key(index, *key)).collect()
+    }
+
+    /// The input a merged key is from, and the key there; `None` past the last input's lanes.
+    fn input(&self, key: RowKey) -> Option<(usize, RowKey)> {
+        let lane = key >> MERGE_KEY_BITS;
+        let index = self.starts.partition_point(|start| *start <= lane) - 1;
+        (index + 1 < self.starts.len())
+            .then(|| (index, key - (self.starts[index] << MERGE_KEY_BITS)))
+    }
+
+    fn count(&self) -> RowKey {
+        *self.starts.last().expect("lanes start at 0")
+    }
 }
 
 /// Inputs' changes as a merged table's: the same rows (shared, not copied) under merged keys and
 /// the merged schema. `deltas` pairs each changed input's index with its delta.
 fn merged_delta<'a>(
     schema: &SchemaRef,
+    lanes: &Lanes,
     deltas: impl Iterator<Item = (usize, &'a Delta)>,
 ) -> Result<Delta, ArrowError> {
     let mut out = Delta::default();
     for (index, delta) in deltas {
         for rows in &delta.added {
             out.added.push(Rows {
-                keys: merged_keys(index, &rows.keys)?,
+                keys: lanes.keys(index, &rows.keys)?,
                 batch: rows.batch.clone().with_schema(schema.clone())?,
             });
         }
         for rows in &delta.removed {
             out.removed.push(Rows {
-                keys: merged_keys(index, &rows.keys)?,
+                keys: lanes.keys(index, &rows.keys)?,
                 batch: rows.batch.clone().with_schema(schema.clone())?,
             });
         }
         for modified in &delta.modified {
             out.modified.push(Modified {
-                keys: merged_keys(index, &modified.keys)?,
+                keys: lanes.keys(index, &modified.keys)?,
                 previous: modified.previous.clone().with_schema(schema.clone())?,
                 current: modified.current.clone().with_schema(schema.clone())?,
             });
@@ -382,6 +411,7 @@ enum Place<'a> {
     },
     Merged {
         inputs: &'a [usize],
+        lanes: &'a Lanes,
         schema: &'a SchemaRef,
     },
     Ordered {
@@ -411,8 +441,9 @@ impl<'a> Reader<'a> {
                 left: Self::new(self.tables, *left),
                 right: Self::new(self.tables, *right),
             },
-            (None, Source::Merge { inputs }) => Place::Merged {
+            (None, Source::Merge { inputs, lanes }) => Place::Merged {
                 inputs,
+                lanes,
                 schema: &table.schema,
             },
             (None, Source::Order { parent, order }) => Place::Ordered {
@@ -441,17 +472,21 @@ impl<'a> Reader<'a> {
         match self.place() {
             Place::Stored(storage) => storage.gather(keys),
             Place::Joined { join, left, right } => join.rows(&left.gather(keys)?, right),
-            Place::Merged { inputs, schema } => {
+            Place::Merged {
+                inputs,
+                lanes,
+                schema,
+            } => {
                 // Each key's input and position among the keys asked of that input.
                 let mut wanted = vec![Vec::new(); inputs.len()];
                 let mut at = Vec::with_capacity(keys.len());
                 for key in keys {
-                    let index = (key >> MERGE_KEY_BITS) as usize;
-                    let Some(input_keys) = wanted.get_mut(index) else {
+                    let Some((index, input_key)) = lanes.input(*key) else {
                         return Err(ArrowError::InvalidArgumentError(format!("no row {key}")));
                     };
+                    let input_keys: &mut Vec<RowKey> = &mut wanted[index];
                     at.push((index, input_keys.len()));
-                    input_keys.push(key & ((1 << MERGE_KEY_BITS) - 1));
+                    input_keys.push(input_key);
                 }
                 let batches = inputs
                     .iter()
@@ -514,7 +549,7 @@ impl<'a> Reader<'a> {
             Place::Stored(storage) => Ok(storage.keys_at(start, count)),
             Place::Joined { left, .. } => left.keys_at(start, count),
             // Merged keys order by input first: skip whole inputs before `start`.
-            Place::Merged { inputs, .. } => {
+            Place::Merged { inputs, lanes, .. } => {
                 let (mut skip, mut keys) = (start, Vec::new());
                 for (index, id) in inputs.iter().enumerate() {
                     if keys.len() == count {
@@ -528,7 +563,7 @@ impl<'a> Reader<'a> {
                     }
                     let found = input.keys_at(skip, count - keys.len())?;
                     skip = 0;
-                    keys.extend(merged_keys(index, &found)?);
+                    keys.extend(lanes.keys(index, &found)?);
                 }
                 Ok(keys)
             }
@@ -548,11 +583,14 @@ impl<'a> Reader<'a> {
             Place::Joined { left, .. } => left.edge_keys(end, n, bound),
             // Merged keys order by input first: walk the inputs from `end`, starting at the
             // bound's input, until `n` keys are found.
-            Place::Merged { inputs, .. } => {
-                let bound = bound.map(|b| {
-                    let index = (b >> MERGE_KEY_BITS) as usize;
-                    (index, b & ((1 << MERGE_KEY_BITS) - 1))
-                });
+            Place::Merged { inputs, lanes, .. } => {
+                let bound = bound
+                    .map(|b| {
+                        lanes
+                            .input(b)
+                            .ok_or_else(|| ArrowError::InvalidArgumentError(format!("no row {b}")))
+                    })
+                    .transpose()?;
                 let (mut chunks, mut found) = (Vec::new(), 0);
                 for step in 0..inputs.len() {
                     if found == n {
@@ -573,7 +611,7 @@ impl<'a> Reader<'a> {
                         .input(inputs[index])
                         .edge_keys(end, n - found, within)?;
                     found += keys.len();
-                    chunks.push(merged_keys(index, &keys)?);
+                    chunks.push(lanes.keys(index, &keys)?);
                 }
                 if end == End::Last {
                     chunks.reverse();
@@ -593,7 +631,7 @@ impl<'a> Reader<'a> {
                 .iter()
                 .map(|batch| join.rows(batch, right))
                 .collect(),
-            Place::Merged { inputs, schema } => {
+            Place::Merged { inputs, schema, .. } => {
                 let mut batches = Vec::new();
                 for id in inputs {
                     for batch in self.input(*id).snapshot()? {
@@ -620,13 +658,17 @@ impl<'a> Reader<'a> {
                 }
                 Ok(delta)
             }
-            Place::Merged { inputs, schema } => {
+            Place::Merged {
+                inputs,
+                lanes,
+                schema,
+            } => {
                 // The inputs' key vectors are this call's own: re-key them in place.
                 let mut out = Delta::default();
                 for (index, id) in inputs.iter().enumerate() {
                     for mut rows in self.input(*id).as_added()?.added {
                         for key in &mut rows.keys {
-                            *key = merged_key(index, *key)?;
+                            *key = lanes.key(index, *key)?;
                         }
                         rows.batch = rows.batch.with_schema(schema.clone())?;
                         out.added.push(rows);
@@ -1088,8 +1130,9 @@ impl Session {
                     Reader::new(before, *right),
                     delta_of(*right),
                 ),
-                Source::Merge { inputs } => merged_delta(
+                Source::Merge { inputs, lanes } => merged_delta(
                     &table.schema,
+                    lanes,
                     inputs
                         .iter()
                         .enumerate()
@@ -1337,6 +1380,7 @@ impl TableState {
             },
             listeners: Vec::new(),
             loading: false,
+            lanes: 1,
         }
     }
 
@@ -1702,7 +1746,7 @@ impl Table {
                 .as_added()
                 .and_then(|everything| order.apply(&everything))
                 .map_err(compute)?;
-            let state = TableState::new(
+            let mut state = TableState::new(
                 description.clone(),
                 self.schema.clone(),
                 true,
@@ -1712,6 +1756,7 @@ impl Table {
                     order: Box::new(order),
                 },
             );
+            state.lanes = table.lanes;
             let id = graph.push(state)?;
             drop(graph);
             idle();
@@ -2181,6 +2226,8 @@ impl Table {
             },
             source,
         );
+        // Its rows are the left side's, under its keys.
+        state.lanes = left.lanes;
         let (left_rows, right_rows) = (
             Reader::new(&graph.tables, self.id),
             Reader::new(&graph.tables, right.id),
@@ -2246,6 +2293,7 @@ impl Table {
         }
         let mut graph = first.session.write();
         let mut inputs = Vec::new();
+        let mut starts = vec![0];
         for table in tables {
             let state = &graph.tables[table.id];
             if let Some(cause) = &state.failure {
@@ -2254,14 +2302,26 @@ impl Table {
                     cause: Arc::new(cause.clone()),
                 });
             }
+            let start = *starts.last().expect("lanes start at 0");
             match &state.source {
-                Source::Merge { inputs: theirs } => inputs.extend(theirs),
-                _ => inputs.push(table.id),
+                Source::Merge {
+                    inputs: theirs,
+                    lanes,
+                } => {
+                    inputs.extend(theirs);
+                    starts.extend(lanes.starts[1..].iter().map(|end| start + end));
+                }
+                _ => {
+                    inputs.push(table.id);
+                    starts.push(start + state.lanes);
+                }
             }
         }
-        if inputs.len() > 1 << (RowKey::BITS - MERGE_KEY_BITS) {
+        let lanes = Lanes { starts };
+        if lanes.count() > 1 << (RowKey::BITS - MERGE_KEY_BITS) {
             return Err(Error::Unsupported(format!(
-                "merge takes at most {} tables",
+                "merge takes at most {} tables, a table that keeps a merge's row keys counting \
+                 as that merge's tables",
                 1 << (RowKey::BITS - MERGE_KEY_BITS)
             )));
         }
@@ -2276,7 +2336,7 @@ impl Table {
             })
             .collect();
         let schema = Arc::new(Schema::new(fields));
-        let state = TableState::new(
+        let mut state = TableState::new(
             format!("merge({} tables)", inputs.len()),
             schema.clone(),
             inputs.iter().any(|id| graph.tables[*id].refreshing),
@@ -2288,8 +2348,12 @@ impl Table {
             } else {
                 Growth::Changing
             },
-            Source::Merge { inputs },
+            Source::Merge { inputs, lanes },
         );
+        let Source::Merge { lanes, .. } = &state.source else {
+            unreachable!("built as a merge above");
+        };
+        state.lanes = lanes.count();
         let id = graph.push(state)?;
         drop(graph);
         idle();
@@ -2393,6 +2457,11 @@ impl Table {
     ) -> Result<Table, Error> {
         let mut graph = self.session.write();
         let parent = &graph.tables[self.id];
+        let lanes = if operator.keeps_keys() {
+            parent.lanes
+        } else {
+            1
+        };
         let source = Source::Derived {
             parent: self.id,
             operator: Box::new(operator),
@@ -2404,6 +2473,7 @@ impl Table {
             growth,
             source,
         );
+        state.lanes = lanes;
         if let Some(cause) = &parent.failure {
             return Err(Error::Upstream {
                 table: state.description,

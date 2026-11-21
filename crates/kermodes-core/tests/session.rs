@@ -373,6 +373,32 @@ fn rows_at_positions_match_the_snapshot() {
     }
 }
 
+/// A table that keeps a merge's row keys (a filter over a merge of aggregations, which tick and
+/// so are followed by key) can be merged again, ticking and static.
+#[test]
+fn a_merge_takes_a_table_keyed_by_a_merge() {
+    let session = Session::new();
+    let input = session.input_table(&schema()).unwrap();
+    let fixed = session
+        .static_table(Arc::new(schema()), vec![rows(&["a", "b", "a"], &[1, 2, 3])])
+        .unwrap();
+    let merged_twice = |table: &Table| {
+        let totals = table.agg_by(&["sym"], &[("size", "sum(size)")]).unwrap();
+        let both = Table::merge(&[&totals, &totals]).unwrap();
+        let big = both.filter("size > 2").unwrap();
+        Table::merge(&[&big, &both, &big]).unwrap()
+    };
+    let (ticking, static_) = (merged_twice(&input), merged_twice(&fixed));
+    assert_eq!(sizes(&static_), [4, 4, 4, 2, 4, 2, 4, 4]);
+
+    input.append(&[rows(&["a", "b", "a"], &[1, 2, 3])]).unwrap();
+    session.step();
+    assert_eq!(sizes(&ticking), [4, 4, 4, 2, 4, 2, 4, 4]);
+    input.append(&[rows(&["b"], &[5])]).unwrap();
+    session.step();
+    assert_eq!(sizes(&ticking), [4, 7, 4, 7, 4, 7, 4, 7, 4, 7, 4, 7]);
+}
+
 /// A table built on a fed table keeps it fed after the code that made the fed table let it go
 /// (`live_table(...).where(...)`); once nothing uses it, the feed says it is gone.
 #[test]

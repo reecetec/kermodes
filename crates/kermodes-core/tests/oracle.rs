@@ -115,6 +115,12 @@ const PIPELINES: &[(&str, Pipeline)] = &[
         let inner = Table::merge(&[t, &latest]).unwrap();
         Table::merge(&[&latest, &inner]).unwrap()
     }),
+    ("merge of a filter keeping a merge's keys", |t| {
+        let latest = t.last_by(&["sym"]).unwrap();
+        let both = Table::merge(&[&latest, t]).unwrap();
+        let flagged = both.filter("flag").unwrap();
+        Table::merge(&[&flagged, &both, &flagged]).unwrap()
+    }),
     ("head", |t| t.head(5).unwrap()),
     ("select", |t| {
         t.select(&[
