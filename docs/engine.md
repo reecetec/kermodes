@@ -22,7 +22,8 @@ multi-threaded cycles, memory budget enforcement.
 
 ### 2.1 Types
 
-`bool`, `int32`, `int64`, `float64`, `utf8`, `date32`, `timestamp[ns, UTC]`. Nulls everywhere.
+`bool`, `int16`, `int32`, `int64`, `float64`, `utf8`, `date32`, `timestamp[ns, UTC]`. Nulls
+everywhere.
 Creating a table with any other column type fails. More types (decimal, dictionary, lists,
 `utf8_view`) when a slice needs them.
 

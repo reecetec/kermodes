@@ -5,7 +5,9 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int64Array, StringArray};
+use arrow::array::{
+    Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int16Array, Int64Array, StringArray,
+};
 use arrow::compute::{SortColumn, concat_batches, lexsort_to_indices, take_record_batch};
 use arrow::datatypes::{DataType, Field, Float64Type, Schema};
 use arrow::record_batch::RecordBatch;
@@ -25,6 +27,10 @@ const AGGREGATIONS: &[(&str, &str)] = &[
     ("high", "max(sym)"),
     ("first_price", "first(price)"),
     ("last_size", "last(size)"),
+    ("lots", "sum(lot)"),
+    ("avg_lot", "mean(lot)"),
+    ("low_lot", "min(lot)"),
+    ("last_lot", "last(lot)"),
 ];
 
 const PIPELINES: &[(&str, Pipeline)] = &[
@@ -35,6 +41,8 @@ const PIPELINES: &[(&str, Pipeline)] = &[
             "half = size / 2",
             "rest = size % 3",
             "neg = -size",
+            "twice_lot = lot * 2",
+            "lot_ratio = size / lot",
             "known = sym IS NOT NULL",
         ])
         .unwrap()
@@ -54,6 +62,10 @@ const PIPELINES: &[(&str, Pipeline)] = &[
     ("last_by two keys", |t| t.last_by(&["sym", "flag"]).unwrap()),
     ("agg_by", |t| t.agg_by(&["sym"], AGGREGATIONS).unwrap()),
     ("agg_by all rows", |t| t.agg_by(&[], AGGREGATIONS).unwrap()),
+    ("agg_by int16", |t| {
+        t.agg_by(&["lot"], AGGREGATIONS).unwrap()
+    }),
+    ("last_by int16", |t| t.last_by(&["lot"]).unwrap()),
     ("where then agg_by", |t| {
         t.filter("size > 2")
             .unwrap()
@@ -160,6 +172,7 @@ fn schema() -> Schema {
         Field::new("price", DataType::Float64, true),
         Field::new("size", DataType::Int64, true),
         Field::new("flag", DataType::Boolean, true),
+        Field::new("lot", DataType::Int16, true),
     ])
 }
 
@@ -170,12 +183,14 @@ fn random_batch(rng: &mut Rng, rows: usize) -> RecordBatch {
     let mut price = Vec::with_capacity(rows);
     let mut size = Vec::with_capacity(rows);
     let mut flag = Vec::with_capacity(rows);
+    let mut lot = Vec::with_capacity(rows);
     for _ in 0..rows {
         id.push(Some(rng.below(12) as i64));
         sym.push((!rng.null()).then(|| ["a", "b", "c", "d"][rng.below(4) as usize]));
         price.push((!rng.null()).then(|| (rng.below(1000) as f64 - 500.0) / 100.0));
         size.push((!rng.null()).then(|| rng.below(13) as i64 - 3));
         flag.push((!rng.null()).then(|| rng.below(2) == 0));
+        lot.push((!rng.null()).then(|| rng.below(7) as i16 - 3));
     }
     let columns: Vec<(&str, ArrayRef)> = vec![
         ("id", Arc::new(Int64Array::from(id))),
@@ -183,6 +198,7 @@ fn random_batch(rng: &mut Rng, rows: usize) -> RecordBatch {
         ("price", Arc::new(Float64Array::from(price))),
         ("size", Arc::new(Int64Array::from(size))),
         ("flag", Arc::new(BooleanArray::from(flag))),
+        ("lot", Arc::new(Int16Array::from(lot))),
     ];
     RecordBatch::try_from_iter(columns).unwrap()
 }
@@ -286,6 +302,7 @@ fn parallel_aggregation_matches_cycle_by_cycle_aggregation() {
         input.agg_by(&["sym"], AGGREGATIONS).unwrap(),
         input.agg_by(&["id"], AGGREGATIONS).unwrap(),
         input.agg_by(&["sym", "flag"], AGGREGATIONS).unwrap(),
+        input.agg_by(&["lot"], AGGREGATIONS).unwrap(),
         input.agg_by(&[], AGGREGATIONS).unwrap(),
     ];
     for _ in 0..100 {
@@ -299,6 +316,7 @@ fn parallel_aggregation_matches_cycle_by_cycle_aggregation() {
         everything.agg_by(&["sym"], AGGREGATIONS).unwrap(),
         everything.agg_by(&["id"], AGGREGATIONS).unwrap(),
         everything.agg_by(&["sym", "flag"], AGGREGATIONS).unwrap(),
+        everything.agg_by(&["lot"], AGGREGATIONS).unwrap(),
         everything.agg_by(&[], AGGREGATIONS).unwrap(),
     ];
     for (ticking, fixed) in grouped.iter().zip(&all_at_once) {

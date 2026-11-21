@@ -267,7 +267,7 @@ Change classes, determined by `plan`
 | Change | Class | Effect |
 |---|---|---|
 | Add column | compatible | Applies at once. Older segments and files read it as null. |
-| Widen type (int32 → int64 or float64, the lossless ones) | compatible | Cast on read. |
+| Widen type (int16 → int32, int64 or float64; int32 → int64 or float64: the lossless ones) | compatible | Cast on read. |
 | Rename column | compatible | Metadata only. Dependents referencing the old name are reported and must change in the same commit or a dependent project's next commit. |
 | Drop column | contract | Refused for now. Later: hidden from reads immediately; stored data kept until an explicit purge job. |
 | Incompatible type change, recomputed values | rewrite | Refused for now. Later: backfill DAG with one task per date: rewrite Parquet with a transform expression, commit each date atomically. Resumable. |

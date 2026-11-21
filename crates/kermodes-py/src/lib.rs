@@ -1993,7 +1993,7 @@ fn row_count(n: usize) -> String {
 fn is_numeric(data_type: &DataType) -> bool {
     matches!(
         data_type,
-        DataType::Int32 | DataType::Int64 | DataType::Float64
+        DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Float64
     )
 }
 

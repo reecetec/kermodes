@@ -18,7 +18,9 @@ use arrow::array::{
     UInt32Array,
 };
 use arrow::compute::take;
-use arrow::datatypes::{DataType, Field, Float64Type, Int32Type, Int64Type, Schema, SchemaRef};
+use arrow::datatypes::{
+    DataType, Field, Float64Type, Int16Type, Int32Type, Int64Type, Schema, SchemaRef,
+};
 use arrow::error::ArrowError;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use arrow::row::{OwnedRow, RowConverter, Rows as EncodedRows, SortField};
@@ -141,7 +143,7 @@ impl Call {
         let input_type = schema.field(column).data_type();
         let numeric = matches!(
             input_type,
-            DataType::Int32 | DataType::Int64 | DataType::Float64
+            DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Float64
         );
         if matches!(function, "sum" | "mean" | "std") && !numeric {
             return Err(error(format!(
@@ -686,6 +688,9 @@ fn each<T: ArrowPrimitiveType>(
 
 fn each_f64(array: &dyn Array, ids: &[u32], rows: Option<&[u32]>, mut f: impl FnMut(usize, f64)) {
     match array.data_type() {
+        DataType::Int16 => each(array.as_primitive::<Int16Type>(), ids, rows, |g, v| {
+            f(g, f64::from(v));
+        }),
         DataType::Int32 => each(array.as_primitive::<Int32Type>(), ids, rows, |g, v| {
             f(g, f64::from(v));
         }),
@@ -698,6 +703,9 @@ fn each_f64(array: &dyn Array, ids: &[u32], rows: Option<&[u32]>, mut f: impl Fn
 
 fn each_i64(array: &dyn Array, ids: &[u32], rows: Option<&[u32]>, mut f: impl FnMut(usize, i64)) {
     match array.data_type() {
+        DataType::Int16 => each(array.as_primitive::<Int16Type>(), ids, rows, |g, v| {
+            f(g, i64::from(v));
+        }),
         DataType::Int32 => each(array.as_primitive::<Int32Type>(), ids, rows, |g, v| {
             f(g, i64::from(v));
         }),

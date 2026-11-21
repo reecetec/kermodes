@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{
-    ArrayRef, AsArray, BooleanArray, Date32Array, Float64Array, Int64Array, RecordBatch,
-    StringArray, TimestampNanosecondArray,
+    ArrayRef, AsArray, BooleanArray, Date32Array, Float64Array, Int16Array, Int64Array,
+    RecordBatch, StringArray, TimestampNanosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Float64Type, Schema, TimeUnit};
 use arrow::ipc::reader::StreamReader;
@@ -54,6 +54,7 @@ fn every_type(session: &Session) -> Table {
         Field::new("sym", DataType::Utf8, true),
         Field::new("price", DataType::Float64, true),
         Field::new("n", DataType::Int64, true),
+        Field::new("q", DataType::Int16, true),
         Field::new("flag", DataType::Boolean, true),
         Field::new("day", DataType::Date32, true),
         Field::new(
@@ -78,6 +79,7 @@ fn every_type(session: &Session) -> Table {
             None,
         ])),
         Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3), None])),
+        Arc::new(Int16Array::from(vec![Some(-300), Some(0), Some(300), None])),
         Arc::new(BooleanArray::from(vec![
             Some(true),
             Some(false),
@@ -116,6 +118,8 @@ fn quick_filters_follow_each_column_type() {
         ("price", "-2", &["it's"]),
         ("price", "<= 1.5e0", &["Apple", "it's"]),
         ("n", "!= 2", &["Apple", "pear"]),
+        ("q", "> -300", &["it's", "pear"]),
+        ("q", "< 70000", &["Apple", "it's", "pear"]),
         ("flag", "FALSE", &["it's"]),
         ("day", ">= 2026-01-01", &["it's", "pear"]),
         ("ts", "< 2026-01-01T00:00:00Z", &["Apple"]),

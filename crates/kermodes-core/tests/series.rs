@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch,
-    StringArray, TimestampNanosecondArray,
+    Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int16Array, Int32Array, Int64Array,
+    RecordBatch, StringArray, TimestampNanosecondArray,
 };
 use arrow::compute::{cast, concat_batches};
 use arrow::datatypes::{DataType, Field, Float64Type, Schema};
@@ -38,13 +38,21 @@ fn keyed_schema() -> Schema {
         Field::new("a", DataType::Float64, true),
         Field::new("b", DataType::Int32, true),
         Field::new("flag", DataType::Boolean, true),
+        Field::new("c", DataType::Int16, true),
     ])
 }
 
 /// Rows over a range of ids wide enough to need downsampling, narrow enough that writes collide.
 /// x repeats (ties) and is sometimes NULL or NaN; so are the ys.
 fn random_rows(rng: &mut Rng, rows: usize) -> RecordBatch {
-    let mut columns = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut columns = (
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
     for _ in 0..rows {
         columns.0.push(rng.below(300) as i64);
         columns.1.push(match rng.below(20) {
@@ -59,6 +67,9 @@ fn random_rows(rng: &mut Rng, rows: usize) -> RecordBatch {
             .3
             .push((!rng.null()).then(|| rng.below(50) as i32 - 25));
         columns.4.push((!rng.null()).then(|| rng.below(2) == 0));
+        columns
+            .5
+            .push((!rng.null()).then(|| rng.below(40) as i16 - 8));
     }
     RecordBatch::try_new(
         Arc::new(keyed_schema()),
@@ -68,6 +79,7 @@ fn random_rows(rng: &mut Rng, rows: usize) -> RecordBatch {
             Arc::new(Float64Array::from(columns.2)),
             Arc::new(Int32Array::from(columns.3)),
             Arc::new(BooleanArray::from(columns.4)),
+            Arc::new(Int16Array::from(columns.5)),
         ],
     )
     .unwrap()
@@ -198,12 +210,19 @@ fn expected(
         .collect()
 }
 
-/// A chart under test: its series, the table it should match, its ys, budget, and range.
-type Charted<'a> = (Series, &'a Table, Vec<&'a str>, usize, Option<(f64, f64)>);
+/// A chart under test: its series, the table it should match, its x and ys, budget, and range.
+type Charted<'a> = (
+    Series,
+    &'a Table,
+    &'a str,
+    Vec<&'a str>,
+    usize,
+    Option<(f64, f64)>,
+);
 
 #[test]
 fn series_over_upserts_and_deletes_match_their_recomputation() {
-    let ys = ["a".to_owned(), "b".to_owned()];
+    let ys = ["a".to_owned(), "b".to_owned(), "c".to_owned()];
     for seed in 1..=60 {
         let mut rng = Rng(seed);
         let session = Session::new();
@@ -220,13 +239,15 @@ fn series_over_upserts_and_deletes_match_their_recomputation() {
                     (
                         Series::new(&input, "x", &ys, None, points).unwrap(),
                         &input,
-                        vec!["a", "b"],
+                        "x",
+                        vec!["a", "b", "c"],
                         points,
                         None,
                     ),
                     (
                         Series::new(&input, "x", &ys[..1], None, points).unwrap(),
                         &input,
+                        "x",
                         vec!["a"],
                         points,
                         None,
@@ -234,11 +255,28 @@ fn series_over_upserts_and_deletes_match_their_recomputation() {
                     (
                         Series::new(&input, "x", &ys[1..], Some("flag"), points).unwrap(),
                         &filtered,
-                        vec!["b"],
+                        "x",
+                        vec!["b", "c"],
                         points,
                         None,
                     ),
-                    (ranged, &input, vec!["a", "b"], points, Some((5.0, 20.25))),
+                    (
+                        ranged,
+                        &input,
+                        "x",
+                        vec!["a", "b", "c"],
+                        points,
+                        Some((5.0, 20.25)),
+                    ),
+                    // An int16 x.
+                    (
+                        Series::new(&input, "c", &ys[..2], None, points).unwrap(),
+                        &input,
+                        "c",
+                        vec!["a", "b"],
+                        points,
+                        None,
+                    ),
                 ]
             })
             .collect();
@@ -253,7 +291,7 @@ fn series_over_upserts_and_deletes_match_their_recomputation() {
                 }
             }
             session.step();
-            for (series, table, ys, budget, range) in &charts {
+            for (series, table, x, ys, budget, range) in &charts {
                 let got = points(series);
                 assert!(
                     got.num_rows() <= *budget,
@@ -261,7 +299,7 @@ fn series_over_upserts_and_deletes_match_their_recomputation() {
                 );
                 assert_eq!(
                     rows_of(&got),
-                    expected(table, "x", ys, *budget, *range),
+                    expected(table, x, ys, *budget, *range),
                     "seed {seed} cycle {cycle}: {ys:?} in {budget} points, range {range:?}"
                 );
                 assert_eq!(

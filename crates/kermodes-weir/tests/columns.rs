@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{ArrayRef, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
+use arrow::array::{
+    ArrayRef, Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
+};
 use arrow::datatypes::Schema;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use kermodes_weir::{ColumnId, Error, SourceId, Store, TableName, column};
@@ -370,4 +372,58 @@ fn readers_and_writers_keep_their_columns_across_a_change() {
             "n=4 symbol=e q=5000000000 px=2.5"
         ]
     );
+}
+
+/// int16 widens to each wider number; segments written as int16 read back from disk in the
+/// widened type, and narrowing back is refused.
+#[test]
+fn int16_columns_widen_and_their_segments_read_back() {
+    for (wide, shown) in [
+        ("int32", "-32768"),
+        ("int64", "-32768"),
+        ("float64", "-32768.0"),
+    ] {
+        let dir = TempDir::new();
+        let store = Store::open(&dir.0).unwrap();
+        let narrow = [("n", "int64"), ("lot", "int16")];
+        store.create_table(&ticks(), &declared(&narrow)).unwrap();
+        let source = SourceId::parse("west").unwrap();
+        let writer = store.writer(&ticks(), &source, false).unwrap();
+        writer
+            .write(
+                &batch(vec![
+                    ("n", Arc::new(Int64Array::from(vec![0])) as ArrayRef),
+                    ("lot", Arc::new(Int16Array::from(vec![i16::MIN]))),
+                ]),
+                None,
+            )
+            .unwrap();
+        drop(writer);
+        assert_eq!(subscribe(&store).rows(), ["n=0 lot=-32768"], "{wide}");
+
+        store
+            .create_table(&ticks(), &declared(&[("n", "int64"), ("lot", wide)]))
+            .unwrap();
+        assert_eq!(
+            columns(&store),
+            (
+                vec!["n int64".to_owned(), format!("lot {wide}")],
+                vec![1, 2]
+            )
+        );
+        let Err(Error::Schema(message)) = store.create_table(&ticks(), &declared(&narrow)) else {
+            panic!("{wide} cannot narrow back to int16");
+        };
+        assert!(
+            message.contains("making it int16 is not a compatible change"),
+            "{message}"
+        );
+        drop(store);
+        let store = Store::open(&dir.0).unwrap();
+        assert_eq!(
+            subscribe(&store).rows(),
+            [format!("n=0 lot={shown}")],
+            "{wide}"
+        );
+    }
 }

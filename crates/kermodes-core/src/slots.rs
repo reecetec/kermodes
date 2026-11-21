@@ -8,7 +8,7 @@ use arrow::array::{
 };
 use arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{
-    ArrowNativeType, DataType, Date32Type, Float64Type, Int32Type, Int64Type, Schema,
+    ArrowNativeType, DataType, Date32Type, Float64Type, Int16Type, Int32Type, Int64Type, Schema,
     TimestampNanosecondType,
 };
 use arrow::error::ArrowError;
@@ -152,6 +152,7 @@ impl Strings {
 
 enum Values {
     Bool(Bits),
+    I16(Vec<i16>),
     /// `int32` and `date32`.
     I32(Vec<i32>),
     /// `int64` and `timestamp`.
@@ -219,6 +220,7 @@ impl Column {
     fn new(data_type: &DataType) -> Self {
         let values = match data_type {
             DataType::Boolean => Values::Bool(Bits::default()),
+            DataType::Int16 => Values::I16(Vec::new()),
             DataType::Int32 | DataType::Date32 => Values::I32(Vec::new()),
             DataType::Int64 | DataType::Timestamp(_, _) => Values::I64(Vec::new()),
             DataType::Float64 => Values::F64(Vec::new()),
@@ -236,6 +238,7 @@ impl Column {
         self.valid.resize(len);
         match &mut self.values {
             Values::Bool(bits) => bits.resize(len),
+            Values::I16(values) => values.resize(len, 0),
             Values::I32(values) => values.resize(len, 0),
             Values::I64(values) => values.resize(len, 0),
             Values::F64(values) => values.resize(len, 0.0),
@@ -253,6 +256,9 @@ impl Column {
                 for (row, slot) in slots.iter().enumerate() {
                     bits.set(*slot as usize, array.value(row));
                 }
+            }
+            Values::I16(values) => {
+                scatter(values, array.as_primitive::<Int16Type>().values(), slots);
             }
             Values::I32(values) => scatter(values, i32_values(array), slots),
             Values::I64(values) => scatter(values, i64_values(array), slots),
@@ -285,6 +291,10 @@ impl Column {
                 BooleanBuffer::from_iter(
                     slots.iter().map(|s| s.slot().is_some_and(|s| bits.get(s))),
                 ),
+                nulls,
+            )),
+            (Values::I16(values), _) => Arc::new(PrimitiveArray::<Int16Type>::new(
+                gather(values, slots),
                 nulls,
             )),
             (Values::I32(values), DataType::Date32) => Arc::new(PrimitiveArray::<Date32Type>::new(

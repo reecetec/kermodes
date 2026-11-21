@@ -311,7 +311,7 @@ pub fn quick_filter(column: &str, data_type: &DataType, text: &str) -> Result<St
         return Err("needs a value".to_owned());
     }
     match data_type {
-        DataType::Int32 | DataType::Int64 | DataType::Float64 => {
+        DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Float64 => {
             if !is_number(value) {
                 return Err(format!("`{value}` is not a number"));
             }

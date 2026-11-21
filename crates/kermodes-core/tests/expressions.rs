@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array, StringArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+    StringArray,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -24,6 +25,10 @@ fn batch() -> RecordBatch {
         (
             "small",
             Arc::new(Int32Array::from(vec![Some(3), Some(-4), Some(5)])),
+        ),
+        (
+            "tiny",
+            Arc::new(Int16Array::from(vec![Some(7), Some(0), Some(i16::MAX)])),
         ),
         (
             "flag",
@@ -69,6 +74,22 @@ fn values_follow_sql_semantics() {
         ("size % 3", ints(&[Some(1), Some(0), None])),
         ("small + 1", ints(&[Some(4), Some(-3), Some(6)])),
         ("-small", Arc::new(Int32Array::from(vec![-3, 4, -5]))),
+        ("-tiny", Arc::new(Int16Array::from(vec![-7, 0, -i16::MAX]))),
+        (
+            "tiny / tiny",
+            Arc::new(Int16Array::from(vec![Some(1), None, Some(1)])),
+        ),
+        ("tiny % 0", ints(&[None, None, None])),
+        (
+            "tiny + small",
+            Arc::new(Int32Array::from(vec![10, -4, 32_772])),
+        ),
+        ("tiny + 1", ints(&[Some(8), Some(1), Some(32_768)])),
+        (
+            "tiny * 0.5",
+            floats(&[Some(3.5), Some(0.0), Some(16_383.5)]),
+        ),
+        ("tiny > 5", bools(&[Some(true), Some(false), Some(true)])),
         ("1 + 2 * 3", ints(&[Some(7), Some(7), Some(7)])),
         ("price > 1", bools(&[Some(true), Some(false), None])),
         ("sym = 'a'", bools(&[Some(true), Some(false), None])),
@@ -110,8 +131,10 @@ fn values_follow_sql_semantics() {
 
 #[test]
 fn integer_overflow_fails_evaluation() {
-    let error = eval("big * 2").unwrap_err();
-    assert!(error.contains("Overflow"), "{error}");
+    for text in ["big * 2", "tiny * tiny"] {
+        let error = eval(text).unwrap_err();
+        assert!(error.contains("Overflow"), "{text}: {error}");
+    }
 }
 
 #[test]

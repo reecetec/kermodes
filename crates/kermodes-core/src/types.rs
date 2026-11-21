@@ -2,12 +2,13 @@ use arrow::datatypes::{DataType, Schema, TimeUnit};
 
 use crate::Error;
 
-const NAMES: &str = "bool, int32, int64, float64, utf8, date32, timestamp";
+const NAMES: &str = "bool, int16, int32, int64, float64, utf8, date32, timestamp";
 
 /// Parses a column type name as used by the Python API.
 pub fn parse_type(name: &str) -> Result<DataType, Error> {
     Ok(match name {
         "bool" => DataType::Boolean,
+        "int16" => DataType::Int16,
         "int32" => DataType::Int32,
         "int64" => DataType::Int64,
         "float64" => DataType::Float64,
@@ -30,6 +31,7 @@ pub(crate) fn check_types(schema: &Schema) -> Result<(), Error> {
         let supported = matches!(
             data_type,
             DataType::Boolean
+                | DataType::Int16
                 | DataType::Int32
                 | DataType::Int64
                 | DataType::Float64
@@ -51,6 +53,7 @@ pub(crate) fn check_types(schema: &Schema) -> Result<(), Error> {
 pub fn type_name(data_type: &DataType) -> String {
     match data_type {
         DataType::Boolean => "bool".into(),
+        DataType::Int16 => "int16".into(),
         DataType::Int32 => "int32".into(),
         DataType::Int64 => "int64".into(),
         DataType::Float64 => "float64".into(),

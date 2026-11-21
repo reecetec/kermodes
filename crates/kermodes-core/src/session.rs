@@ -1785,7 +1785,11 @@ impl Table {
                 let data_type = self.schema.field(at).data_type();
                 if !matches!(
                     data_type,
-                    DataType::Int32 | DataType::Int64 | DataType::Date32 | DataType::Timestamp(..)
+                    DataType::Int16
+                        | DataType::Int32
+                        | DataType::Int64
+                        | DataType::Date32
+                        | DataType::Timestamp(..)
                 ) {
                     return Err(Error::Schema(format!(
                         "a rolling time window needs an integer, date, or timestamp column; `{}` \
@@ -1830,7 +1834,8 @@ impl Table {
                 && !matches!(
                     input_type,
                     Some(
-                        DataType::Int32
+                        DataType::Int16
+                            | DataType::Int32
                             | DataType::Int64
                             | DataType::Float64
                             | DataType::Date32
@@ -2057,7 +2062,8 @@ impl Table {
                 same_type(l, r, "time column")?;
                 if !matches!(
                     self.schema.field(l).data_type(),
-                    DataType::Int32
+                    DataType::Int16
+                        | DataType::Int32
                         | DataType::Int64
                         | DataType::Date32
                         | DataType::Timestamp(_, _)

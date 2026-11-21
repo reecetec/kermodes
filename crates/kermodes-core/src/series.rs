@@ -19,8 +19,9 @@ use arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
 use arrow::buffer::NullBuffer;
 use arrow::compute::interleave_record_batch;
 use arrow::datatypes::{
-    DataType, Date32Type, Float64Type, Int32Type, Int64Type, TimeUnit, TimestampMicrosecondType,
-    TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType,
+    DataType, Date32Type, Float64Type, Int16Type, Int32Type, Int64Type, TimeUnit,
+    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+    TimestampSecondType,
 };
 use arrow::ipc::writer::StreamWriter;
 
@@ -67,7 +68,8 @@ impl Series {
         let mut columns = vec![position(x)?];
         let text = match schema.field(columns[0]).data_type() {
             DataType::Utf8 => true,
-            DataType::Int32
+            DataType::Int16
+            | DataType::Int32
             | DataType::Int64
             | DataType::Float64
             | DataType::Date32
@@ -88,7 +90,7 @@ impl Series {
             let data_type = schema.field(at).data_type();
             if !matches!(
                 data_type,
-                DataType::Int32 | DataType::Int64 | DataType::Float64
+                DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Float64
             ) {
                 return Err(Error::Unsupported(format!(
                     "`{y}` in table `{}` is {}: a chart's y is a number",
@@ -203,6 +205,11 @@ impl Series {
 trait Coord: Copy {
     fn at(self) -> f64;
 }
+impl Coord for i16 {
+    fn at(self) -> f64 {
+        f64::from(self)
+    }
+}
 impl Coord for i32 {
     fn at(self) -> f64 {
         f64::from(self)
@@ -221,6 +228,7 @@ impl Coord for f64 {
 
 /// A numeric column's values, by their native type (dates are days, times their unit's count).
 enum Values<'a> {
+    I16(&'a [i16]),
     I32(&'a [i32]),
     I64(&'a [i64]),
     F64(&'a [f64]),
@@ -228,6 +236,7 @@ enum Values<'a> {
 
 fn values(array: &ArrayRef) -> Values<'_> {
     match array.data_type() {
+        DataType::Int16 => Values::I16(array.as_primitive::<Int16Type>().values()),
         DataType::Int32 => Values::I32(array.as_primitive::<Int32Type>().values()),
         DataType::Date32 => Values::I32(array.as_primitive::<Date32Type>().values()),
         DataType::Int64 => Values::I64(array.as_primitive::<Int64Type>().values()),
@@ -277,6 +286,7 @@ fn each_pair<X: Coord, Y: Coord>(
 fn each_x(batch: &RecordBatch, f: impl FnMut(usize, f64)) {
     let x = batch.column(0);
     match values(x) {
+        Values::I16(v) => each(v, x.nulls(), f),
         Values::I32(v) => each(v, x.nulls(), f),
         Values::I64(v) => each(v, x.nulls(), f),
         Values::F64(v) => each(v, x.nulls(), f),
@@ -287,12 +297,19 @@ fn each_xy(batch: &RecordBatch, y: usize, f: impl FnMut(usize, f64, f64)) {
     let (xs, ys) = (batch.column(0), batch.column(y));
     let (xn, yn) = (xs.nulls(), ys.nulls());
     match (values(xs), values(ys)) {
+        (Values::I16(x), Values::I16(y)) => each_pair(x, xn, y, yn, f),
+        (Values::I16(x), Values::I32(y)) => each_pair(x, xn, y, yn, f),
+        (Values::I16(x), Values::I64(y)) => each_pair(x, xn, y, yn, f),
+        (Values::I16(x), Values::F64(y)) => each_pair(x, xn, y, yn, f),
+        (Values::I32(x), Values::I16(y)) => each_pair(x, xn, y, yn, f),
         (Values::I32(x), Values::I32(y)) => each_pair(x, xn, y, yn, f),
         (Values::I32(x), Values::I64(y)) => each_pair(x, xn, y, yn, f),
         (Values::I32(x), Values::F64(y)) => each_pair(x, xn, y, yn, f),
+        (Values::I64(x), Values::I16(y)) => each_pair(x, xn, y, yn, f),
         (Values::I64(x), Values::I32(y)) => each_pair(x, xn, y, yn, f),
         (Values::I64(x), Values::I64(y)) => each_pair(x, xn, y, yn, f),
         (Values::I64(x), Values::F64(y)) => each_pair(x, xn, y, yn, f),
+        (Values::F64(x), Values::I16(y)) => each_pair(x, xn, y, yn, f),
         (Values::F64(x), Values::I32(y)) => each_pair(x, xn, y, yn, f),
         (Values::F64(x), Values::I64(y)) => each_pair(x, xn, y, yn, f),
         (Values::F64(x), Values::F64(y)) => each_pair(x, xn, y, yn, f),
@@ -410,6 +427,7 @@ fn pick(batches: &[RecordBatch], points: usize, range: Option<(f64, f64)>) -> Ve
 /// The x of the row at `at`, which has one.
 fn x_at(batches: &[RecordBatch], (b, row): (usize, usize)) -> f64 {
     match values(batches[b].column(0)) {
+        Values::I16(v) => v[row].at(),
         Values::I32(v) => v[row].at(),
         Values::I64(v) => v[row].at(),
         Values::F64(v) => v[row].at(),

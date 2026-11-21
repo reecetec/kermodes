@@ -3,8 +3,8 @@
 use std::sync::{Arc, LazyLock};
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Datum, Float64Array, Int32Array, Int64Array, NullArray,
-    Scalar, StringArray, UInt32Array,
+    Array, ArrayRef, AsArray, BooleanArray, Datum, Float64Array, Int16Array, Int32Array,
+    Int64Array, NullArray, Scalar, StringArray, UInt32Array,
 };
 use arrow::compute::kernels::comparison::{ilike, like, nilike, nlike};
 use arrow::compute::kernels::{cmp, numeric};
@@ -511,7 +511,10 @@ impl Node {
                 let l = l.eval(batch)?;
                 let mut r = r.eval(batch)?;
                 if matches!(op, Arithmetic::Div | Arithmetic::Rem)
-                    && matches!(r.data_type(), DataType::Int32 | DataType::Int64)
+                    && matches!(
+                        r.data_type(),
+                        DataType::Int16 | DataType::Int32 | DataType::Int64
+                    )
                 {
                     r = r.map(null_integer_zeros)?;
                 }
@@ -606,6 +609,7 @@ fn boolean(
 /// Integer division or remainder by zero yields NULL instead of failing the table.
 fn null_integer_zeros(divisor: &dyn Array) -> Result<ArrayRef, ArrowError> {
     let zero: ArrayRef = match divisor.data_type() {
+        DataType::Int16 => Arc::new(Int16Array::from(vec![0])),
         DataType::Int32 => Arc::new(Int32Array::from(vec![0])),
         _ => Arc::new(Int64Array::from(vec![0])),
     };
@@ -619,9 +623,10 @@ fn is_numeric(data_type: &DataType) -> bool {
 
 fn numeric_rank(data_type: &DataType) -> u8 {
     match data_type {
-        DataType::Int32 => 1,
-        DataType::Int64 => 2,
-        DataType::Float64 => 3,
+        DataType::Int16 => 1,
+        DataType::Int32 => 2,
+        DataType::Int64 => 3,
+        DataType::Float64 => 4,
         _ => 0,
     }
 }

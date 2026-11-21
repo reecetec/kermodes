@@ -59,3 +59,28 @@ def test_changes_that_are_not_compatible_are_refused_by_name(tmp_path):
     # Lossless widening is compatible.
     s.create_table("md.ticks", {"sym": km.string(), "q": km.int64()})
     assert km.float64(was=["a", "b"]) == "float64 was a, b"
+
+
+def test_int16_columns_store_as_int16_and_widen(tmp_path):
+    s = km.connect(tmp_path, manual=True)
+    s.create_table("md.lots", {"n": km.int64(), "lot": km.int16()})
+    s.writer("md.lots", source="feed").write(
+        pa.table(
+            {
+                "n": pa.array([1, 2], pa.int64()),
+                "lot": pa.array([-32768, 7], pa.int16()),
+            }
+        )
+    )
+    live = s.live_table("md.lots")
+    s.step()
+    assert pa.table(live).schema.field("lot").type == pa.int16()
+    assert rows(live, ["n", "lot"]) == [(1, -32768), (2, 7)]
+    # int16 widens to int32; older segments read in the wider type.
+    s.create_table("md.lots", {"n": km.int64(), "lot": km.int32()})
+    widened = s.live_table("md.lots")
+    s.step()
+    assert pa.table(widened).schema.field("lot").type == pa.int32()
+    assert rows(widened, ["n", "lot"]) == [(1, -32768), (2, 7)]
+    with pytest.raises(km.KermodesError, match="making it int16 is not a compatible"):
+        s.create_table("md.lots", {"n": km.int64(), "lot": km.int16()})

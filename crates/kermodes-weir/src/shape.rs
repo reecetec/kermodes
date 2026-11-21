@@ -201,6 +201,9 @@ pub(crate) fn former(field: &Field) -> Vec<String> {
 pub fn widens(from: &DataType, to: &DataType) -> bool {
     matches!(
         (from, to),
-        (DataType::Int32, DataType::Int64) | (DataType::Int32, DataType::Float64)
+        (
+            DataType::Int16,
+            DataType::Int32 | DataType::Int64 | DataType::Float64
+        ) | (DataType::Int32, DataType::Int64 | DataType::Float64)
     )
 }

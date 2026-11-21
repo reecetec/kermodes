@@ -80,7 +80,7 @@ function quickFilter(type: string, entry: string): Predicate {
   const raw = match[2].trim();
   if (raw === '') throw new Error('needs a value');
   let target: number;
-  if (type === 'int32' || type === 'int64' || type === 'float64') {
+  if (type === 'int16' || type === 'int32' || type === 'int64' || type === 'float64') {
     if (!NUMBER.test(raw)) throw new Error(`\`${raw}\` is not a number`);
     target = Number(raw);
   } else if (type === 'bool') {

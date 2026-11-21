@@ -9,7 +9,8 @@ use arrow::array::{Array, ArrayRef, AsArray, StringArray, UInt32Array};
 use arrow::buffer::NullBuffer;
 use arrow::compute::take_record_batch;
 use arrow::datatypes::{
-    DataType, Date32Type, Int32Type, Int64Type, Schema, TimeUnit, TimestampNanosecondType,
+    DataType, Date32Type, Int16Type, Int32Type, Int64Type, Schema, TimeUnit,
+    TimestampNanosecondType,
 };
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
@@ -99,7 +100,8 @@ impl KeyKind {
         Ok(match columns.as_slice() {
             [] => KeyKind::None,
             [column] => match schema.field(*column).data_type() {
-                DataType::Int32
+                DataType::Int16
+                | DataType::Int32
                 | DataType::Int64
                 | DataType::Date32
                 | DataType::Timestamp(TimeUnit::Nanosecond, _) => KeyKind::Int(*column),
@@ -125,6 +127,7 @@ impl KeyKind {
             KeyKind::Int(column) => {
                 let array = batch.column(*column);
                 let values = match array.data_type() {
+                    DataType::Int16 => IntValues::I16(array.as_primitive::<Int16Type>().values()),
                     DataType::Int32 => IntValues::I32(array.as_primitive::<Int32Type>().values()),
                     DataType::Date32 => IntValues::I32(array.as_primitive::<Date32Type>().values()),
                     DataType::Int64 => IntValues::I64(array.as_primitive::<Int64Type>().values()),
@@ -157,6 +160,7 @@ pub(crate) struct Ints<'a> {
 }
 
 enum IntValues<'a> {
+    I16(&'a [i16]),
     I32(&'a [i32]),
     I64(&'a [i64]),
 }
@@ -168,6 +172,7 @@ impl Ints<'_> {
 
     fn get(&self, row: usize) -> i64 {
         match self.values {
+            IntValues::I16(values) => i64::from(values[row]),
             IntValues::I32(values) => i64::from(values[row]),
             IntValues::I64(values) => values[row],
         }

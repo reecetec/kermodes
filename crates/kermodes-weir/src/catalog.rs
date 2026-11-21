@@ -519,8 +519,9 @@ fn synced(
         }
         if retyped && !widens(column.data_type(), field.data_type()) {
             return Err(Error::Schema(format!(
-                "{name}'s column `{}` is {}: making it {} is not a compatible change (int32 \
-                 widens to int64 or float64; anything else is a new table)",
+                "{name}'s column `{}` is {}: making it {} is not a compatible change (int16 \
+                 widens to int32, int64 or float64, int32 to int64 or float64; anything else is \
+                 a new table)",
                 column.name(),
                 type_name(column.data_type()),
                 type_name(field.data_type())

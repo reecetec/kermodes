@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array, StringArray,
-    TimestampNanosecondArray,
+    ArrayRef, BooleanArray, Date32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+    StringArray, TimestampNanosecondArray,
 };
 use arrow::compute::{concat_batches, sort_to_indices, take_record_batch};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -75,6 +75,12 @@ fn every_type(ids: &[i64], round: i64) -> RecordBatch {
             "small",
             Arc::new(Int32Array::from_iter(
                 present(2).map(|(id, p)| p.then_some((id * round) as i32 - 7)),
+            )),
+        ),
+        (
+            "tiny",
+            Arc::new(Int16Array::from_iter(
+                present(3).map(|(id, p)| p.then_some((id - round * 50) as i16)),
             )),
         ),
         (
@@ -378,6 +384,14 @@ fn distinct_keys_stay_distinct_groups() {
 #[test]
 fn integer_keys_stay_distinct_groups() {
     let session = Session::new();
+    let int16 = [
+        None,
+        Some(0),
+        Some(1),
+        Some(-1),
+        Some(i16::MIN),
+        Some(i16::MAX),
+    ];
     let int32 = [
         None,
         Some(0),
@@ -395,7 +409,14 @@ fn integer_keys_stay_distinct_groups() {
         Some(i64::MAX),
     ];
     let render = |key: Option<String>| format!("k={}, n=2", key.as_deref().unwrap_or("null"));
-    let cases: [(ArrayRef, Vec<String>); 2] = [
+    let cases: [(ArrayRef, Vec<String>); 3] = [
+        (
+            Arc::new(Int16Array::from_iter(int16.iter().chain(&int16).copied())),
+            int16
+                .iter()
+                .map(|k| render(k.map(|v| v.to_string())))
+                .collect(),
+        ),
         (
             Arc::new(Int32Array::from_iter(int32.iter().chain(&int32).copied())),
             int32

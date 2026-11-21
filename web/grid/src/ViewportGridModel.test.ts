@@ -4,6 +4,7 @@ import {
   DateDay,
   Field,
   Float64,
+  Int16,
   Int32,
   Int64,
   Schema,
@@ -36,6 +37,7 @@ const COLUMNS: ViewportColumn[] = [
   { name: 'sym', type: 'utf8' },
   { name: 'day', type: 'date32' },
   { name: 'ts', type: 'timestamp' },
+  { name: 'lot', type: 'int16' },
 ];
 
 /** Two rows as an Arrow IPC stream, decoded the way the widget does it */
@@ -52,6 +54,7 @@ function twoRows(): Table {
       [Date.UTC(2026, 10, 11, 9, 38, 37, 123), null],
       new TimestampNanosecond()
     ),
+    vectorFromArray([-32768, 12345], new Int16()),
   ];
   const schema = new Schema(
     COLUMNS.map((column, i) => new Field(column.name, vectors[i].type, true))
@@ -89,6 +92,8 @@ describe('ViewportGridModel', () => {
     expect(model.textForCell(4, 500)).toBe('AAPL');
     expect(model.textForCell(5, 500)).toBe('2026-11-11');
     expect(model.textForCell(6, 500)).toBe('2026-11-11 09:38:37.123Z');
+    expect(model.textForCell(7, 500)).toBe('-32,768');
+    expect(model.textForCell(7, 501)).toBe('12,345');
   });
 
   it('right-aligns numbers only', () => {
@@ -101,6 +106,7 @@ describe('ViewportGridModel', () => {
       'left',
       'left',
       'left',
+      'right',
     ]);
   });
 

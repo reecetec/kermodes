@@ -36,6 +36,7 @@ __all__ = [
     "deployment",
     "float64",
     "ingester",
+    "int16",
     "int32",
     "int64",
     "merge",
@@ -93,6 +94,10 @@ def _column(kind: str, was: Was) -> str:
 
 def boolean(*, was: Was = None) -> str:
     return _column("bool", was)
+
+
+def int16(*, was: Was = None) -> str:
+    return _column("int16", was)
 
 
 def int32(*, was: Was = None) -> str:

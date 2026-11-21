@@ -155,6 +155,37 @@ def test_last_by_and_agg_by_match_a_plain_python_recomputation():
     ]
 
 
+def test_int16_columns_stay_int16_through_operators():
+    s = km.connect(":memory:", manual=True)
+    src = s.input_table({"sym": km.string(), "lot": "int16"})
+    stats = src.agg_by("lot", n="count(*)", total="sum(lot)", low="min(lot)")
+    # Integer literals are int64: an int16 stays int16 only against another int16.
+    computed = src.update("square = lot * lot", "wide = lot + 1", "ratio = lot / 0")
+    ordered = src.sort("lot")
+    src.append(
+        pa.table({"sym": ["a", "b", "c"], "lot": pa.array([3, -3, 3], pa.int16())})
+    )
+    s.step()
+    t = pa.table(stats)
+    assert [t.schema.field(c).type for c in t.column_names] == [
+        pa.int16(),
+        pa.int64(),
+        pa.int64(),
+        pa.int16(),
+    ]
+    assert sorted(t.to_pylist(), key=lambda r: r["lot"]) == [
+        {"lot": -3, "n": 1, "total": -3, "low": -3},
+        {"lot": 3, "n": 2, "total": 6, "low": 3},
+    ]
+    c = pa.table(computed)
+    assert c.schema.field("lot").type == pa.int16()
+    assert c.schema.field("square").type == pa.int16()
+    assert c.schema.field("wide").type == pa.int64()
+    assert c["square"].to_pylist() == [9, 9, 9]
+    assert c["ratio"].to_pylist() == [None, None, None]
+    assert pa.table(ordered)["lot"].to_pylist() == [-3, 3, 3]
+
+
 def test_trades_pick_up_the_prevailing_quote_and_reference_data():
     s = km.connect(":memory:", manual=True)
     stamp = km.timestamp()

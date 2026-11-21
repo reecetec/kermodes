@@ -15,6 +15,7 @@ export const FLASH_DURATION_MS = 600;
 export const FLASH_STEPS = 4;
 
 const IS_NUMERIC: Readonly<Record<string, true>> = {
+  int16: true,
   int32: true,
   int64: true,
   float64: true,
@@ -37,6 +38,7 @@ const decimalFormat = new Intl.NumberFormat('en-US', {
 /** Format one non-null cell value of a column of `type` */
 export function formatValue(type: string, value: unknown): string {
   switch (type) {
+    case 'int16':
     case 'int32':
     case 'int64':
       return integerFormat.format(value as number | bigint);
