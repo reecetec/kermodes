@@ -8,11 +8,11 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
-use kermodes_weir::{ColumnId, Date, Error, TableEntry, TableName};
+use kermodes_weir::{Date, Error, TableEntry, TableName};
 
 use crate::bounds::Bound;
 use crate::files::{
-    FilePart, FileRead, Lake, PartBatches, Projection, as_current, dated, history_columns,
+    AsCurrent, FilePart, FileRead, Lake, PartBatches, Projection, dated, history_columns,
     projected, with_date_column, with_op,
 };
 use crate::weir::Weir;
@@ -89,7 +89,8 @@ pub fn read_history(
     name: &TableName,
     reading: &Reading<'_>,
 ) -> Result<History, Error> {
-    history(weir, lake, name, reading, true)
+    let entry = weir.entry(name)?;
+    history(weir, lake, &entry, reading, true)
 }
 
 /// What `read_history` would touch without a limit, from the catalog and the files' footers
@@ -104,7 +105,8 @@ pub fn explain_history(
         limit: None,
         ..*reading
     };
-    history(weir, lake, name, &reading, false).map(|history| history.explain)
+    let entry = weir.entry(name)?;
+    history(weir, lake, &entry, &reading, false).map(|history| history.explain)
 }
 
 /// One part of a table's history, read on whichever thread runs it: its batches in order, as
@@ -112,31 +114,28 @@ pub fn explain_history(
 pub type HistoryPart = Box<dyn FnOnce() -> Result<HistoryBatches, Error> + Send>;
 pub type HistoryBatches = Box<dyn Iterator<Item = Result<RecordBatch, Error>> + Send>;
 
-/// `name`'s history as `read_history` reads it, as parts to read independently and in parallel:
-/// all of part i's rows come before part i+1's. A part is a run of row groups of one file (each
-/// file's footer read here, once) or one past date weir holds (read here: `weir` is only
-/// borrowed). With a `limit`, only the leading parts that hold at least that many rows.
+/// `entry`'s history as `read_history` reads it, as parts to read independently and in
+/// parallel: all of part i's rows come before part i+1's. A part is a run of row groups of one
+/// file (each file's footer read here, once) or one past date weir holds (read here: `weir` is
+/// only borrowed). With a `limit`, only the leading parts that hold at least that many rows. The
+/// caller's `entry`, so the rows it reads beside history (today's) are of the same columns.
 pub fn history_parts(
     weir: &dyn Weir,
     lake: &Arc<Lake>,
-    name: &TableName,
+    entry: &TableEntry,
     reading: &Reading<'_>,
 ) -> Result<(SchemaRef, Vec<HistoryPart>), Error> {
-    let planned = plan(weir, lake, name, reading, true)?;
-    let entry = Arc::new(planned.entry);
-    let wanted: Option<Arc<[ColumnId]>> = planned.wanted.map(Into::into);
+    let planned = plan(weir, lake, entry, reading, true)?;
     let parts = planned
         .pieces
         .into_iter()
         .map(|piece| -> HistoryPart {
             match piece {
                 Piece::File(file, part) => {
-                    let (lake, entry, wanted) = (lake.clone(), entry.clone(), wanted.clone());
+                    let (lake, mut current) = (lake.clone(), planned.current.clone());
                     Box::new(move || {
                         let batches = PartBatches::new(lake, &file, part)?;
-                        Ok(Box::new(batches.map(move |batch| {
-                            as_current(&entry, batch?, wanted.as_deref())
-                        })))
+                        Ok(Box::new(batches.map(move |batch| current.batch(batch?))))
                     })
                 }
                 Piece::Weir(batches) => Box::new(move || Ok(Box::new(batches.into_iter().map(Ok)))),
@@ -166,8 +165,8 @@ enum Piece {
 struct Planned {
     schema: SchemaRef,
     explain: Explain,
-    entry: TableEntry,
-    wanted: Option<Vec<ColumnId>>,
+    /// Files' batches as the table's columns are now.
+    current: AsCurrent,
     pieces: Vec<Piece>,
 }
 
@@ -175,11 +174,11 @@ struct Planned {
 fn history(
     weir: &dyn Weir,
     lake: &Lake,
-    name: &TableName,
+    entry: &TableEntry,
     reading: &Reading<'_>,
     rows: bool,
 ) -> Result<History, Error> {
-    let planned = plan(weir, lake, name, reading, rows)?;
+    let mut planned = plan(weir, lake, entry, reading, rows)?;
     let covered = |taken| reading.limit.is_some_and(|limit| taken >= limit);
     let mut batches = Vec::new();
     let mut taken = 0;
@@ -190,7 +189,7 @@ fn history(
         match piece {
             Piece::File(file, part) => {
                 for batch in lake.read_part(&file, part)? {
-                    let batch = as_current(&planned.entry, batch?, planned.wanted.as_deref())?;
+                    let batch = planned.current.batch(batch?)?;
                     taken += batch.num_rows();
                     batches.push(batch);
                     if covered(taken) {
@@ -211,13 +210,13 @@ fn history(
     })
 }
 
-/// The parts `reading` reads of `name`'s history, from the catalog and the files' footers, and
+/// The parts `reading` reads of `entry`'s history, from the catalog and the files' footers, and
 /// with `rows` weir's past dates read. Files are opened in date order only until the parts so
 /// far hold `limit` rows.
 fn plan(
     weir: &dyn Weir,
     lake: &Lake,
-    name: &TableName,
+    entry: &TableEntry,
     reading: &Reading<'_>,
     rows: bool,
 ) -> Result<Planned, Error> {
@@ -228,8 +227,8 @@ fn plan(
         columns,
         limit,
     } = *reading;
-    let entry = weir.entry(name)?;
-    let full = with_date_column(&history_columns(&entry)?);
+    let name = &entry.name;
+    let full = with_date_column(&history_columns(entry)?);
     let system = full.fields().len() - entry.ids.len();
     let wanted: Option<Vec<_>> = columns.map(|names| {
         entry
@@ -241,7 +240,7 @@ fn plan(
             .map(|(_, id)| *id)
             .collect()
     });
-    let kept = projected(&entry, wanted.as_deref());
+    let kept = projected(entry, wanted.as_deref());
     // Where the kept columns are among all of them, for weir's dates, read whole.
     let positions: Vec<usize> = (0..system)
         .chain(
@@ -320,7 +319,7 @@ fn plan(
                     let mut batches = Vec::new();
                     if rows {
                         weir.read_date(name, date, &mut |batch, stamp| {
-                            let whole = dated(&full, date, &with_op(&entry, batch, stamp.change)?)?;
+                            let whole = dated(&full, date, &with_op(entry, batch, stamp.change)?)?;
                             let batch = whole.project(&positions).map_err(arrow_error)?;
                             covered += batch.num_rows() as u64;
                             batches.push(batch);
@@ -336,8 +335,7 @@ fn plan(
     Ok(Planned {
         schema,
         explain,
-        entry,
-        wanted,
+        current: AsCurrent::new(entry, wanted.as_deref())?,
         pieces,
     })
 }

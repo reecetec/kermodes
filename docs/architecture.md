@@ -975,7 +975,10 @@ unit, and out of what readers get.
   columns read under their new names; a file written before columns had IDs is read whole. A
   head or slice over a scan, through operators that keep rows in place, reads only the first
   rows it needs, in date order: a notebook's preview of a large table reads one row group.
-  `explain()` shows files, row groups, rows, and columns considered and read.
+  `explain()` shows files, row groups, rows, and columns considered and read. A process keeps
+  the footers and page indexes of the files it read, the least recently used dropped past a
+  bound, so reading a file again reads no footer; a file's name is never reused and a written
+  file never changes, so a footer kept is never stale.
 - Static: today's rows are read first, from weir, and history up to the day before the day they
   were stamped on, so a day that turns between the two reads is neither missed nor read twice.
   A keyed table is its keys' latest rows, folded from today's log as weir folds a checkpoint.

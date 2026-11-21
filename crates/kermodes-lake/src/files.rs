@@ -119,48 +119,70 @@ pub fn projected(entry: &TableEntry, wanted: Option<&[ColumnId]>) -> Shape {
     )
 }
 
-/// A history file's batch as the table's history has it now (`Date`, then
-/// `history_columns`, all of them or those with the `wanted` IDs): its columns matched by ID,
-/// so a file written under earlier columns reads under the current ones (§5.4); one written
-/// before columns had IDs, by position (such a file is read whole: `Lake::read`).
-pub fn as_current(
-    entry: &TableEntry,
-    batch: RecordBatch,
-    wanted: Option<&[ColumnId]>,
-) -> Result<RecordBatch, Error> {
-    let full = with_date_column(&history_columns(entry)?);
-    // `Date`, and a keyed table's `Op`, are history's own.
-    let system = full.fields().len() - entry.ids.len();
-    let current = projected(entry, wanted);
-    let mut fields = full.fields()[..system].to_vec();
-    fields.extend(current.schema.fields().iter().cloned());
-    let written = batch.schema();
-    let data = Schema::new(written.fields()[system..].to_vec());
-    let shape = Shape::with_ids(&data, |_, field| {
-        field
-            .metadata()
-            .get(PARQUET_FIELD_ID_META_KEY)
-            .and_then(|id| id.parse().ok())
-            .map(ColumnId)
-    });
-    let mut columns = batch.columns()[..system].to_vec();
-    if shape.reads_as(&current) {
-        columns.extend(batch.columns()[system..].iter().cloned());
-    } else {
-        let data = RecordBatch::try_new_with_options(
-            shape.schema.clone(),
-            batch.columns()[system..].to_vec(),
-            &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
-        )
-        .map_err(arrow_error)?;
-        columns.extend(shape.project(&data, &current)?.columns().iter().cloned());
+/// History files' batches as the table's history has them now (`Date`, then `history_columns`,
+/// all of them or those with the `wanted` IDs): their columns matched by ID, so a file written
+/// under earlier columns reads under the current ones (§5.4); one written before columns had
+/// IDs, by position (such a file is read whole: `Lake::read`). The table's side is worked out
+/// once, and a file's side once per file: the batches of a read share them, and working them out
+/// per batch clones every field of the table, on every thread reading a part of it at once.
+#[derive(Clone)]
+pub(crate) struct AsCurrent {
+    /// History's own columns, first in every file: `Date`, and a keyed table's `Op`.
+    system: usize,
+    current: Shape,
+    schema: SchemaRef,
+    /// The columns the last file read was written with, as a shape, and whether they read as
+    /// `current` unchanged.
+    written: Option<(SchemaRef, Shape, bool)>,
+}
+
+impl AsCurrent {
+    pub(crate) fn new(entry: &TableEntry, wanted: Option<&[ColumnId]>) -> Result<Self, Error> {
+        let full = with_date_column(&history_columns(entry)?);
+        let system = full.fields().len() - entry.ids.len();
+        let current = projected(entry, wanted);
+        let mut fields = full.fields()[..system].to_vec();
+        fields.extend(current.schema.fields().iter().cloned());
+        Ok(Self {
+            system,
+            current,
+            schema: Arc::new(Schema::new(fields)),
+            written: None,
+        })
     }
-    RecordBatch::try_new_with_options(
-        Arc::new(Schema::new(fields)),
-        columns,
-        &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
-    )
-    .map_err(arrow_error)
+
+    pub(crate) fn batch(&mut self, batch: RecordBatch) -> Result<RecordBatch, Error> {
+        let system = self.system;
+        let file = batch.schema();
+        if self.written.as_ref().is_none_or(|(seen, ..)| *seen != file) {
+            let data = Schema::new(file.fields()[system..].to_vec());
+            let shape = Shape::with_ids(&data, |_, field| {
+                field
+                    .metadata()
+                    .get(PARQUET_FIELD_ID_META_KEY)
+                    .and_then(|id| id.parse().ok())
+                    .map(ColumnId)
+            });
+            let same = shape.reads_as(&self.current);
+            self.written = Some((file, shape, same));
+        }
+        let (_, shape, same) = self.written.as_ref().expect("set above");
+        let rows = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+        let mut columns = batch.columns()[..system].to_vec();
+        if *same {
+            columns.extend(batch.columns()[system..].iter().cloned());
+        } else {
+            let data = RecordBatch::try_new_with_options(
+                shape.schema.clone(),
+                batch.columns()[system..].to_vec(),
+                &rows,
+            )
+            .map_err(arrow_error)?;
+            let data = shape.project(&data, &self.current)?;
+            columns.extend(data.columns().iter().cloned());
+        }
+        RecordBatch::try_new_with_options(self.schema.clone(), columns, &rows).map_err(arrow_error)
+    }
 }
 
 /// The columns of a file to read for `projection`: those history always reads, and each table
@@ -219,6 +241,63 @@ pub struct Lake {
     runtime: OwnRuntime,
     /// Reads files weir vends at an `http(s)://` URL.
     http: reqwest::Client,
+    footers: Footers,
+}
+
+/// How much of history files' footers and page indexes a lake keeps parsed: those of about a
+/// hundred full files of a wide table.
+const FOOTER_BYTES: usize = 128 << 20;
+
+/// History files' footers and page indexes, parsed, by the table's location and the file's
+/// name, the least recently used dropped once they take more than `FOOTER_BYTES`, so a
+/// repeated read of a file reads and parses no footer. Kept by name, a footer can never be
+/// stale: a name is never written twice (`file_name`), and a written file never changes: a
+/// date rewritten goes into a new file, which the catalog names in place of the old one.
+#[derive(Default)]
+struct Footers(std::sync::Mutex<KeptFooters>);
+
+#[derive(Default)]
+struct KeptFooters {
+    /// Each file's footer, its bytes in memory, and when it was last used.
+    files: HashMap<String, (ArrowReaderMetadata, usize, u64)>,
+    bytes: usize,
+    uses: u64,
+}
+
+impl Footers {
+    fn get(&self, path: &str) -> Option<ArrowReaderMetadata> {
+        let mut kept = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        kept.uses += 1;
+        let now = kept.uses;
+        let (footer, _, used) = kept.files.get_mut(path)?;
+        *used = now;
+        Some(footer.clone())
+    }
+
+    fn keep(&self, path: String, footer: &ArrowReaderMetadata) {
+        let bytes = footer.metadata().memory_size();
+        if bytes > FOOTER_BYTES {
+            return;
+        }
+        let mut kept = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        kept.uses += 1;
+        let now = kept.uses;
+        // Two reads of a file may both have read its footer.
+        if let Some((_, was, _)) = kept.files.insert(path, (footer.clone(), bytes, now)) {
+            kept.bytes -= was;
+        }
+        kept.bytes += bytes;
+        while kept.bytes > FOOTER_BYTES {
+            let oldest = kept
+                .files
+                .iter()
+                .min_by_key(|(_, (_, _, used))| *used)
+                .map(|(path, _)| path.clone())
+                .expect("bytes kept are some file's");
+            let (_, dropped, _) = kept.files.remove(&oldest).expect("found above");
+            kept.bytes -= dropped;
+        }
+    }
 }
 
 /// The lake's own tokio runtime, shut down without waiting when the lake goes: a lake may go
@@ -332,6 +411,7 @@ impl Lake {
             keys,
             runtime: OwnRuntime(Some(runtime)),
             http,
+            footers: Footers::default(),
         })
     }
 
@@ -557,10 +637,19 @@ impl Lake {
                 Path::from(format!("{location}/{file}")),
             ),
         };
-        let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
-        let mut footer = source.reader();
-        let reader = ArrowReaderMetadata::load_async(&mut footer, options);
-        let reader = self.runtime.block_on(reader).map_err(parquet_error)?;
+        let path = format!("{location}/{file}");
+        let reader = match self.footers.get(&path) {
+            Some(reader) => reader,
+            None => {
+                let options =
+                    ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
+                let mut footer = source.reader();
+                let reader = ArrowReaderMetadata::load_async(&mut footer, options);
+                let reader = self.runtime.block_on(reader).map_err(parquet_error)?;
+                self.footers.keep(path, &reader);
+                reader
+            }
+        };
         let metadata = reader.metadata().clone();
         let groups = metadata.row_groups();
         let statistics = |column: &str| {

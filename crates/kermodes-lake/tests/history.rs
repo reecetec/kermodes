@@ -316,6 +316,37 @@ fn a_batch_job_writes_a_past_date_straight_into_history() {
     assert_eq!(rows(&read), []);
 }
 
+/// A lake reads a date rewritten by a batch job as its new rows, though it read the date's
+/// earlier file (and its footer) before: its rows, and its statistics for bounds, are the new
+/// file's, whether read whole or in parts.
+#[test]
+fn a_date_rewritten_reads_as_its_new_file() {
+    let dir = TempDir::new();
+    let store = store_with(&dir.0.join("store"), &[(d(1), &[("a", &[1])])]);
+    let lake = Arc::new(Lake::open(dir.0.join("lake").to_str().unwrap()).unwrap());
+    let bounds = column_bounds("n >= 15");
+    let day = Reading {
+        first: Some(d(5)),
+        last: Some(d(5)),
+        bounds: &bounds,
+        ..Reading::default()
+    };
+    let read = |values: &[i64]| {
+        write_history(&store, &lake, &ticks(), d(5), &[batch(values)]).unwrap();
+        let whole = read_history(&store, &lake, &ticks(), &day).unwrap();
+        let entry = store.table(&ticks()).unwrap();
+        let (schema, parts) = history_parts(&store, &lake, &entry, &day).unwrap();
+        assert_eq!(
+            concat(&schema, &run_parts(parts)),
+            concat(&whole.schema, &whole.batches)
+        );
+        rows(&whole).into_iter().map(|(_, n)| n).collect::<Vec<_>>()
+    };
+    assert_eq!(read(&[10, 11, 12]), [] as [i64; 0]);
+    assert_eq!(read(&[20]), [20]);
+    assert_eq!(read(&[30, 31, 32, 33]), [30, 31, 32, 33]);
+}
+
 /// A read that needs only a table's first rows (a notebook's preview) stops once it has them,
 /// in date order across the lake's files and weir's past dates.
 #[test]
@@ -712,7 +743,7 @@ fn history_read_in_parallel_parts_is_history_read_in_order() {
 
     // `read_history` with the lake's keys is the oracle.
     let same = |weir: &dyn Weir, parts_from: &Arc<Lake>, reading: &Reading| {
-        let (schema, parts) = history_parts(weir, parts_from, &name, reading).unwrap();
+        let (schema, parts) = history_parts(weir, parts_from, &entry, reading).unwrap();
         let count = parts.len();
         let read = read_history(&*store, &lake, &name, reading).unwrap();
         assert_eq!(schema, read.schema);
@@ -739,7 +770,7 @@ fn history_read_in_parallel_parts_is_history_read_in_order() {
         limit: Some(150_001),
         ..Reading::default()
     };
-    let (_, parts) = history_parts(&*store, &lake, &name, &limited).unwrap();
+    let (_, parts) = history_parts(&*store, &lake, &entry, &limited).unwrap();
     assert_eq!(parts.len(), 2);
     let rows: usize = run_parts(parts).iter().map(RecordBatch::num_rows).sum();
     assert!(rows >= 150_001);

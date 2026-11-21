@@ -9,7 +9,7 @@ use std::time::Duration;
 use arrow::array::RecordBatch;
 use kermodes_weir::{Date, Error, HistoryCommit, HistoryDate, TableEntry, TableName};
 
-use crate::files::{Lake, TARGET_FILE_BYTES, Written, as_current, file_columns, with_op};
+use crate::files::{AsCurrent, Lake, TARGET_FILE_BYTES, Written, file_columns, with_op};
 use crate::plan::{Held, Incoming, plan};
 use crate::weir::Weir;
 
@@ -178,8 +178,9 @@ fn replace_date(
                 // A neighbour rewritten into the new file, from the file it was in.
                 for from in held.iter().filter(|h| h.date == day) {
                     let read = lake.read(&entry.location, &from.file, None, day, day, &[], None)?;
+                    let mut current = AsCurrent::new(entry, None)?;
                     for batch in read {
-                        push(without_date(as_current(entry, batch?, None)?)?)?;
+                        push(without_date(current.batch(batch?)?)?)?;
                     }
                 }
                 Ok(())

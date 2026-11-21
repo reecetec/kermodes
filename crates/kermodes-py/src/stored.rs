@@ -101,7 +101,7 @@ pub(crate) fn source(stores: &Stores, scan: &Scan) -> PyResult<kermodes_core::ex
     let (dated, history) = kermodes_lake::history_parts(
         stores.tables.weir(),
         &stores.lake()?,
-        &entry.name,
+        &entry,
         &kermodes_lake::Reading {
             last: Some(Date::from_days(day.days() - 1)),
             bounds: &bounds,
