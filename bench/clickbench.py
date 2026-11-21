@@ -222,9 +222,16 @@ def ranked(query: str) -> str | None:
         expression = re.sub(r"\s+ASC$", "", expression, flags=re.IGNORECASE)
         columns.append(f"{expression} AS __k{i}")
         order.append(f"__k{i}{' DESC' if descending else ''}")
-    from_ = re.search(r"\sFROM\s", query, re.IGNORECASE)
-    assert from_, query
-    inner = f"{query[: from_.start()]}, {', '.join(columns)}{query[from_.start() : found.start()]}"
+    # The query's own FROM, not one inside a call such as `extract(minute FROM t)`.
+    depth, start = 0, None
+    for match in re.finditer(r"[()]|\sFROM\s", query, re.IGNORECASE):
+        token = match.group()
+        depth += {"(": 1, ")": -1}.get(token, 0)
+        if token not in "()" and depth == 0:
+            start = match.start()
+            break
+    assert start is not None, query
+    inner = f"{query[:start]}, {', '.join(columns)}{query[start : found.start()]}"
     hidden = ", ".join(f"__k{i}" for i in range(len(keys)))
     return (
         f"SELECT rank() OVER (ORDER BY {', '.join(order)}) AS __rank, "
