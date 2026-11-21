@@ -964,7 +964,7 @@ impl Session {
             rows: KeyKind::new(&schema, columns.clone()).map_err(schema_error)?,
             deletes: KeyKind::new(&key_schema, (0..key.len()).collect()).map_err(schema_error)?,
             key_schema,
-            live: Membership::new(&schema, columns, true, 0, 1).map_err(schema_error)?,
+            live: Membership::new(&schema, columns, true).map_err(schema_error)?,
             latest: Vec::new(),
             new: Vec::new(),
         };
@@ -1941,9 +1941,10 @@ impl Table {
         )
     }
 
-    /// One row per value of `columns`, with each `(name, "function(column)")` aggregation:
-    /// count, count_distinct, sum, mean, std, min, max, first, last. `count(*)` counts rows;
-    /// integer sums and means are exact.
+    /// One row per value of `columns`, in the order the values first appear, with each
+    /// `(name, "function(column)")` aggregation: count, count_distinct, sum, mean, std, min, max,
+    /// first, last. `count(*)` counts rows; sums, means, and standard deviations are exact,
+    /// rounding once.
     pub fn agg_by(&self, columns: &[&str], aggregations: &[(&str, &str)]) -> Result<Table, Error> {
         if aggregations.is_empty() {
             return Err(Error::Unsupported(
@@ -1980,7 +1981,7 @@ impl Table {
 
     fn membership(&self, columns: &[&str]) -> Result<Membership, Error> {
         let columns = resolve(&self.schema, columns)?;
-        Membership::new(&self.schema, columns, self.add_only(), 0, 1).map_err(schema_error)
+        Membership::new(&self.schema, columns, self.add_only()).map_err(schema_error)
     }
 
     /// Each row of this table with columns from the row of `right` whose `on` columns hold the
@@ -1995,8 +1996,7 @@ impl Table {
     ) -> Result<Table, Error> {
         let plan = self.join_plan(right, on, None, joins)?;
         // Group members go unused: the join keeps its own left rows (`Tracking`).
-        let groups =
-            Membership::new(&self.schema, plan.left_on, true, 0, 1).map_err(schema_error)?;
+        let groups = Membership::new(&self.schema, plan.left_on, true).map_err(schema_error)?;
         let tracking = if !right.is_refreshing() {
             Tracking::None
         } else if self.add_only() {
@@ -2034,8 +2034,7 @@ impl Table {
         let (left_at, right_at) = plan.at.expect("planned with `at`");
         let left_at = KeyKind::new(&self.schema, vec![left_at]).map_err(schema_error)?;
         let right_at = KeyKind::new(&right.schema, vec![right_at]).map_err(schema_error)?;
-        let groups =
-            Membership::new(&self.schema, plan.left_on, true, 0, 1).map_err(schema_error)?;
+        let groups = Membership::new(&self.schema, plan.left_on, true).map_err(schema_error)?;
         let description = format!("as_of_join(on=[{}], at={at})", on.join(", "));
         let output = plan.shape.output.clone();
         let tracking = right.is_refreshing();

@@ -1,7 +1,6 @@
 //! The static path is the oracle: after every cycle, each ticking table must equal the same
-//! pipeline computed once over a static copy of its input. Float aggregates may differ in the
-//! last bits (partials merge where piece boundaries fall), so float columns are compared to a
-//! relative 1e-9, with NaN equal to NaN; everything else must match exactly.
+//! pipeline computed once over a static copy of its input, exactly: float aggregates are exact
+//! sums rounded once, so they agree to the bit, with NaN equal to NaN.
 
 use std::sync::Arc;
 
@@ -255,7 +254,7 @@ fn contents(table: &Table) -> RecordBatch {
     take_record_batch(&all, &order).unwrap()
 }
 
-/// Asserts two sorted tables hold the same rows, floats to within a relative 1e-9.
+/// Asserts two sorted tables hold the same rows, floats to the bit, NaN equal to NaN.
 fn assert_same(got: &RecordBatch, want: &RecordBatch, context: &str) {
     assert_eq!(got.schema(), want.schema(), "{context}: schemas differ");
     assert_eq!(
@@ -284,16 +283,11 @@ fn assert_same(got: &RecordBatch, want: &RecordBatch, context: &str) {
                 continue;
             }
             let (x, y): (f64, f64) = (a.value(row), b.value(row));
-            if x.is_nan() || y.is_nan() {
-                assert!(
-                    x.is_nan() && y.is_nan(),
-                    "{context}: `{}` row {row}: {x} vs {y}",
-                    field.name()
-                );
-                continue;
-            }
-            let close = (x - y).abs() <= 1e-9 * x.abs().max(y.abs()) + 1e-12;
-            assert!(close, "{context}: `{}` row {row}: {x} vs {y}", field.name());
+            assert!(
+                x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan()),
+                "{context}: `{}` row {row}: {x} vs {y}",
+                field.name()
+            );
         }
     }
 }

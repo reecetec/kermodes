@@ -4,6 +4,7 @@
 
 mod agg;
 mod error;
+mod exact;
 pub mod exec;
 mod expr;
 mod groups;

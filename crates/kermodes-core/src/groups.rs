@@ -487,6 +487,8 @@ pub(crate) struct Membership {
     table: HashTable<u32>,
     hashes: Vec<u64>,
     owned: Vec<OwnedKey>,
+    /// Each group's output slot, numbered as groups are created. `agg_by`, whose groups are
+    /// created on several shards, numbers its groups itself as it publishes them.
     pub slot: Vec<RowKey>,
     pub members: Vec<Members>,
     touched: Vec<bool>,
@@ -494,21 +496,13 @@ pub(crate) struct Membership {
     /// Ids created or reused since the last `take_created`.
     created: Vec<u32>,
     free: Vec<u32>,
-    /// The next output slot. Slots advance by `slot_stride`, so the shards of one operator,
-    /// started at different offsets, never collide.
+    /// The next output slot.
     next_slot: RowKey,
-    slot_stride: RowKey,
     add_only: bool,
 }
 
 impl Membership {
-    pub fn new(
-        schema: &Schema,
-        columns: Vec<usize>,
-        add_only: bool,
-        slot_offset: RowKey,
-        slot_stride: RowKey,
-    ) -> Result<Self, ArrowError> {
+    pub fn new(schema: &Schema, columns: Vec<usize>, add_only: bool) -> Result<Self, ArrowError> {
         Ok(Self {
             kind: KeyKind::new(schema, columns)?,
             table: HashTable::new(),
@@ -520,8 +514,7 @@ impl Membership {
             touched_list: Vec::new(),
             created: Vec::new(),
             free: Vec::new(),
-            next_slot: slot_offset,
-            slot_stride,
+            next_slot: 0,
             add_only,
         })
     }
@@ -610,7 +603,7 @@ impl Membership {
 
     fn allocate(&mut self, hash: u64, key: OwnedKey) -> u32 {
         let slot = self.next_slot;
-        self.next_slot += self.slot_stride;
+        self.next_slot += 1;
         let id = match self.free.pop() {
             Some(id) => {
                 let i = id as usize;

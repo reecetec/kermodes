@@ -55,10 +55,11 @@ fn schema() -> SchemaRef {
     ]))
 }
 
-/// Floats are multiples of 1/8 below 2^10 in magnitude, so every sum here is exact whatever
-/// order it is added in: float sums are the one result that may otherwise differ from the
-/// engine's in the last bits, where parts and the engine's pieces fall differently. Times never
-/// go back from `clock` on, so rolling time windows over the rows as read hold.
+/// Floats are mostly thousandths, whose sums round, and one in eight a 53-bit value scaled by up
+/// to 2^±384, whose sums need more than 128 bits (and whose squares stay finite, so a rolling
+/// `std` has no NaN to compare). Each is drawn from one random number, as the plans that follow
+/// expect. Times never go back from `clock` on, so rolling time windows over the rows as read
+/// hold.
 fn random_batch(rng: &mut Rng, rows: usize, clock: &mut i64) -> RecordBatch {
     let null = |rng: &mut Rng| rng.chance(10);
     let k: Int64Array = (0..rows)
@@ -71,7 +72,19 @@ fn random_batch(rng: &mut Rng, rows: usize, clock: &mut i64) -> RecordBatch {
         .map(|_| (!null(rng)).then(|| *rng.pick(&["a", "b", "c", "dd", ""])))
         .collect();
     let x: Float64Array = (0..rows)
-        .map(|_| (!null(rng)).then(|| (rng.below(8001) as f64 - 4000.0) / 8.0))
+        .map(|_| {
+            (!null(rng)).then(|| {
+                let bits = rng.below(u64::MAX);
+                let (kind, rest) = (bits & 7, bits >> 3);
+                if kind == 0 {
+                    let exponent = (rest >> 53 & 63) as i32 * 12 - 384;
+                    let value = (rest & ((1 << 53) - 1)) as f64 * 2f64.powi(exponent);
+                    if bits >> 63 == 1 { -value } else { value }
+                } else {
+                    (rest % 2_000_001) as f64 / 1_000.0 - 1_000.0
+                }
+            })
+        })
         .collect();
     let n: Int64Array = (0..rows)
         .map(|_| (!null(rng)).then(|| rng.below(2_000_001) as i64 - 1_000_000))
@@ -595,13 +608,11 @@ fn hash_outcome(outcome: &Outcome, hasher: &mut DefaultHasher) {
 
 const SEEDS: u64 = 400;
 
-/// Run under each `KERMODES_THREADS` by `executes_plans_as_the_engine_builds_them`. The engine's
-/// static `agg_by` orders its groups by thread count, so plans are checked against it on one
-/// thread; on more, the executor's results must hash the same as on one.
+/// Run under each `KERMODES_THREADS` by `executes_plans_as_the_engine_builds_them`: plans must
+/// give the engine's results at every thread count, and the same ones on each.
 #[test]
 #[ignore = "run under each thread count by executes_plans_as_the_engine_builds_them"]
 fn executes_plans_under_the_thread_count() {
-    let one_thread = std::env::var("KERMODES_THREADS").is_ok_and(|threads| threads == "1");
     let mut hasher = DefaultHasher::new();
     for seed in 1..=SEEDS {
         let mut rng = Rng(seed);
@@ -610,9 +621,7 @@ fn executes_plans_under_the_thread_count() {
         let shaped = planner.plan();
         for plan in [shaped.plan.clone(), shaped.plan.pushed_down()] {
             let got = executed(&plan, &parts);
-            if one_thread {
-                assert_eq!(got, built(&plan, &parts), "seed {seed}: {plan:#?}");
-            }
+            assert_eq!(got, built(&plan, &parts), "seed {seed}: {plan:#?}");
             hash_outcome(&got, &mut hasher);
         }
     }

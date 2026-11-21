@@ -6,16 +6,18 @@
 //! modified rows are routed to their group's shard and the groups they touch are recomputed from
 //! their rows.
 //!
-//! Counts, distinct counts, integer sums and means, min/max, and first/last are exact: integer
-//! sums accumulate in 128 bits, so they never wrap and an integer mean divides the exact sum,
-//! rounding once. Float sums, means, and standard deviations depend on where piece boundaries
-//! fall, so a ticking table and a static recomputation can differ in the last bits; piece
-//! boundaries never depend on the number of cores, so results do not either.
+//! Every aggregation is exact in any order, so results never depend on piece boundaries, parts,
+//! or the number of cores: counts, distinct counts, min/max, and first/last trivially; integer
+//! sums in 128 bits, so they never wrap; float sums, means, and standard deviations over exact
+//! sums (`exact`) that round to float64 once, when read.
 //!
 //! The static executor (`exec`) aggregates without engine storage (`Fold`): each part of its
 //! input folds into partial states of its own, and parts merge in their order, so the same
-//! partial states serve both paths and only float sums and means can differ from the engine's
-//! static `agg_by`, where their parts and its pieces fall differently.
+//! partial states serve both paths and give the same results.
+//!
+//! Groups come out in the order their keys first appear in the input. A cycle's new groups follow
+//! every earlier one, in the order the cycle's modified rows (their new values), then its added
+//! rows, first hold their keys.
 
 use std::sync::Arc;
 
@@ -33,6 +35,7 @@ use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use arrow::row::{RowConverter, Rows as EncodedRows, SortField};
 use hashbrown::HashTable;
 
+use crate::exact::{Exact, Scratch, Term, Wides, int_mean, sample_std};
 use crate::groups::{
     HASHER, KeyKind, KeyTable, LocalEntry, LocalGroups, Membership, shard_of, split,
 };
@@ -58,14 +61,19 @@ pub(crate) enum Accumulator {
         sum: Vec<i128>,
         n: Vec<i64>,
     },
-    /// `sum` or `mean` of a float column.
+    /// `sum` or `mean` of a float column, summed exactly.
     SumFloat {
         column: usize,
         state: Vec<FloatSum>,
+        wides: Wides,
         mean: bool,
     },
-    /// The count, sum, and sum of squares, in double-double.
-    Std { column: usize, state: Vec<Moments> },
+    /// The count, exact sum, and exact sum of squares.
+    Std {
+        column: usize,
+        state: Vec<Moments>,
+        wides: Wides,
+    },
     /// `min` or `max`: the winning value and its row key; ties go to the smaller key.
     Extreme {
         column: usize,
@@ -85,115 +93,70 @@ pub(crate) enum Accumulator {
     },
 }
 
-/// One group's float sum and count, kept together so a fold touches one cache line per row.
+/// One group's exact float sum and count, kept together so a fold touches one cache line per row.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct FloatSum {
-    sum: f64,
+    sum: Exact<2>,
     n: i64,
 }
 
-/// One group's count, sum, and sum of squares, each sum a double-double so adding and removing
-/// the same values cancels exactly whenever the sums fit in its ~106 bits, and otherwise leaves a
-/// residue near 2^-106 of the sums. Static and ticking tables share this code, so they round
-/// alike.
+impl FloatSum {
+    #[inline]
+    fn add(&mut self, wides: &mut Wides, x: f64, remove: bool) {
+        if remove {
+            self.n -= 1;
+            if self.n == 0 {
+                self.clear(wides);
+                return;
+            }
+        } else {
+            self.n += 1;
+        }
+        self.sum.add(wides, Term::of_f64(x), remove);
+    }
+
+    /// Empties the group, freeing any wide sum it held.
+    fn clear(&mut self, wides: &mut Wides) {
+        self.sum.clear(wides);
+        self.n = 0;
+    }
+}
+
+/// One group's count, exact sum, and exact sum of squares, so adding, removing, and merging
+/// values in any order leave the same state.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Moments {
     n: i64,
-    sum: Dd,
-    squares: Dd,
+    sum: Exact<2>,
+    squares: Exact<4>,
 }
 
 impl Moments {
-    fn insert(&mut self, x: f64) {
-        self.n += 1;
-        self.sum = self.sum.plus(x);
-        self.squares = self.squares.add(two_product(x, x));
-    }
-
-    fn remove(&mut self, x: f64) {
-        self.n -= 1;
-        if self.n == 0 {
-            // An emptied group restarts exactly.
-            *self = Moments::default();
-            return;
+    #[inline]
+    fn add(&mut self, wides: &mut Wides, x: Term, remove: bool) {
+        if remove {
+            self.n -= 1;
+            if self.n == 0 {
+                self.clear(wides);
+                return;
+            }
+        } else {
+            self.n += 1;
         }
-        self.sum = self.sum.plus(-x);
-        self.squares = self.squares.add(two_product(-x, x));
+        self.sum.add(wides, x, remove);
+        self.squares.add(wides, x.square(), remove);
     }
 
-    fn merge(&mut self, other: &Moments) {
+    fn merge(&mut self, wides: &mut Wides, other: &Moments, theirs: &Wides) {
         self.n += other.n;
-        self.sum = self.sum.add(other.sum);
-        self.squares = self.squares.add(other.squares);
+        self.sum.merge(wides, &other.sum, theirs);
+        self.squares.merge(wides, &other.squares, theirs);
     }
 
-    /// The sample standard deviation, from `(n * squares - sum^2) / (n * (n - 1))`: the
-    /// numerator in double-double (it cancels to exactly 0 when every value is equal and the
-    /// sums are exact), clamped at 0 against rounding, then one division and one square root.
-    fn std(&self) -> Option<f64> {
-        (self.n > 1).then(|| {
-            let n = self.n as f64;
-            let n_squares = self.squares.mul(Dd { hi: n, lo: 0.0 });
-            let spread = n_squares.add(self.sum.mul(self.sum).neg());
-            // `< 0.0` rather than `max`, which would turn a NaN spread into 0.
-            let spread = if spread.hi < 0.0 { 0.0 } else { spread.hi };
-            (spread / (n * (n - 1.0))).sqrt()
-        })
-    }
-}
-
-/// A double-double: the unevaluated sum `hi + lo`, with `lo` below half an ulp of `hi`.
-#[derive(Clone, Copy, Default)]
-struct Dd {
-    hi: f64,
-    lo: f64,
-}
-
-/// `a + b` rounded, and the exact error of that rounding (Knuth's TwoSum).
-fn two_sum(a: f64, b: f64) -> (f64, f64) {
-    let s = a + b;
-    let v = s - a;
-    (s, (a - (s - v)) + (b - v))
-}
-
-/// `a * b` exactly: the rounded product and its error, which a fused multiply-add computes.
-fn two_product(a: f64, b: f64) -> Dd {
-    let hi = a * b;
-    Dd {
-        hi,
-        lo: a.mul_add(b, -hi),
-    }
-}
-
-impl Dd {
-    fn neg(self) -> Dd {
-        Dd {
-            hi: -self.hi,
-            lo: -self.lo,
-        }
-    }
-
-    /// `self + x` for a double `x`.
-    fn plus(self, x: f64) -> Dd {
-        let (s, e) = two_sum(self.hi, x);
-        let (hi, lo) = two_sum(s, e + self.lo);
-        Dd { hi, lo }
-    }
-
-    /// `self + other`, carrying both error terms (the accurate double-double sum).
-    fn add(self, other: Dd) -> Dd {
-        let (s, e) = two_sum(self.hi, other.hi);
-        let (t, f) = two_sum(self.lo, other.lo);
-        let (s, e) = two_sum(s, e + t);
-        let (hi, lo) = two_sum(s, e + f);
-        Dd { hi, lo }
-    }
-
-    fn mul(self, other: Dd) -> Dd {
-        let p = two_product(self.hi, other.hi);
-        let cross = self.hi * other.lo + self.lo * other.hi;
-        let (hi, lo) = two_sum(p.hi, p.lo + cross);
-        Dd { hi, lo }
+    fn clear(&mut self, wides: &mut Wides) {
+        self.sum.clear(wides);
+        self.squares.clear(wides);
+        self.n = 0;
     }
 }
 
@@ -355,6 +318,7 @@ impl Accumulator {
                 Accumulator::SumFloat {
                     column,
                     state: Vec::new(),
+                    wides: Wides::default(),
                     mean: call.function == "mean",
                 },
                 DataType::Float64,
@@ -363,6 +327,7 @@ impl Accumulator {
                 Accumulator::Std {
                     column,
                     state: Vec::new(),
+                    wides: Wides::default(),
                 },
                 DataType::Float64,
             ),
@@ -406,11 +371,13 @@ impl Accumulator {
             Accumulator::SumFloat { column, mean, .. } => Accumulator::SumFloat {
                 column: *column,
                 state: Vec::new(),
+                wides: Wides::default(),
                 mean: *mean,
             },
             Accumulator::Std { column, .. } => Accumulator::Std {
                 column: *column,
                 state: Vec::new(),
+                wides: Wides::default(),
             },
             Accumulator::Extreme { column, max, kept } => Accumulator::Extreme {
                 column: *column,
@@ -481,8 +448,8 @@ impl Accumulator {
         match self {
             Accumulator::Count { n, .. } => n[group] = 0,
             Accumulator::SumInt { sum, n, .. } => (sum[group], n[group]) = (0, 0),
-            Accumulator::SumFloat { state, .. } => state[group] = FloatSum::default(),
-            Accumulator::Std { state, .. } => state[group] = Moments::default(),
+            Accumulator::SumFloat { state, wides, .. } => state[group].clear(wides),
+            Accumulator::Std { state, wides, .. } => state[group].clear(wides),
             Accumulator::Extreme { kept, .. } | Accumulator::Edge { kept, .. } => {
                 kept.best[group] = None
             }
@@ -531,16 +498,24 @@ impl Accumulator {
                     n[group] += 1;
                 });
             }
-            Accumulator::SumFloat { column, state, .. } => {
-                each_f64(batch.column(*column).as_ref(), ids, rows, |group, value| {
-                    let s = &mut state[group];
-                    s.sum += value;
-                    s.n += 1;
+            Accumulator::SumFloat {
+                column,
+                state,
+                wides,
+                ..
+            } => {
+                let values = batch.column(*column).as_primitive::<Float64Type>();
+                each(values, ids, rows, |group, x| {
+                    state[group].add(wides, x, false)
                 });
             }
-            Accumulator::Std { column, state } => {
-                each_f64(batch.column(*column).as_ref(), ids, rows, |group, x| {
-                    state[group].insert(x);
+            Accumulator::Std {
+                column,
+                state,
+                wides,
+            } => {
+                each_term(batch.column(*column).as_ref(), ids, rows, |group, x| {
+                    state[group].add(wides, x, false);
                 });
             }
             Accumulator::Extreme { column, max, kept } => {
@@ -623,25 +598,27 @@ impl Accumulator {
                     },
                 );
             }
-            Accumulator::SumFloat { column, state, .. } => {
-                each_f64(
-                    batch.column(*column).as_ref(),
-                    ids,
-                    Some(rows),
-                    |group, value| {
-                        let s = &mut state[group];
-                        s.n -= 1;
-                        // An emptied group restarts exactly, shedding accumulated rounding.
-                        s.sum = if s.n == 0 { 0.0 } else { s.sum - value };
-                    },
-                );
+            Accumulator::SumFloat {
+                column,
+                state,
+                wides,
+                ..
+            } => {
+                let values = batch.column(*column).as_primitive::<Float64Type>();
+                each(values, ids, Some(rows), |group, x| {
+                    state[group].add(wides, x, true);
+                });
             }
-            Accumulator::Std { column, state } => {
-                each_f64(
+            Accumulator::Std {
+                column,
+                state,
+                wides,
+            } => {
+                each_term(
                     batch.column(*column).as_ref(),
                     ids,
                     Some(rows),
-                    |group, x| state[group].remove(x),
+                    |group, x| state[group].add(wides, x, true),
                 );
             }
             Accumulator::Extreme { kept, .. } | Accumulator::Edge { kept, .. } => {
@@ -670,13 +647,27 @@ impl Accumulator {
                 sum[into] += s[from];
                 n[into] += m[from];
             }
-            (Accumulator::SumFloat { state, .. }, Accumulator::SumFloat { state: theirs, .. }) => {
-                let (s, t) = (&mut state[into], theirs[from]);
-                s.sum += t.sum;
+            (
+                Accumulator::SumFloat { state, wides, .. },
+                Accumulator::SumFloat {
+                    state: theirs,
+                    wides: their_wides,
+                    ..
+                },
+            ) => {
+                let (s, t) = (&mut state[into], &theirs[from]);
+                s.sum.merge(wides, &t.sum, their_wides);
                 s.n += t.n;
             }
-            (Accumulator::Std { state, .. }, Accumulator::Std { state: theirs, .. }) => {
-                state[into].merge(&theirs[from]);
+            (
+                Accumulator::Std { state, wides, .. },
+                Accumulator::Std {
+                    state: theirs,
+                    wides: their_wides,
+                    ..
+                },
+            ) => {
+                state[into].merge(wides, &theirs[from], their_wides);
             }
             (Accumulator::Extreme { max, kept, .. }, Accumulator::Extreme { kept: theirs, .. }) => {
                 if let Some((value, key)) = &theirs.best[from] {
@@ -720,7 +711,7 @@ impl Accumulator {
             Accumulator::SumInt {
                 mean: true, sum, n, ..
             } => Arc::new(Float64Array::from_iter(
-                at.map(|g| (n[g] > 0).then(|| exact_mean(sum[g], n[g]))),
+                at.map(|g| (n[g] > 0).then(|| int_mean(sum[g], n[g]))),
             )),
             Accumulator::SumInt { name, sum, n, .. } => Arc::new(
                 at.map(|g| {
@@ -736,14 +727,24 @@ impl Accumulator {
                 })
                 .collect::<Result<Int64Array, ArrowError>>()?,
             ),
-            Accumulator::SumFloat { state, mean, .. } => {
+            Accumulator::SumFloat {
+                state, wides, mean, ..
+            } => Arc::new(Float64Array::from_iter(at.map(|g| {
+                let s = &state[g];
+                (s.n > 0).then(|| {
+                    if *mean {
+                        s.sum.mean(s.n, wides)
+                    } else {
+                        s.sum.value(wides)
+                    }
+                })
+            }))),
+            Accumulator::Std { state, wides, .. } => {
+                let mut scratch = Scratch::default();
                 Arc::new(Float64Array::from_iter(at.map(|g| {
-                    let s = state[g];
-                    (s.n > 0).then(|| if *mean { s.sum / s.n as f64 } else { s.sum })
+                    let m = &state[g];
+                    (m.n > 1).then(|| sample_std(m.n, &m.sum, &m.squares, wides, &mut scratch))
                 })))
-            }
-            Accumulator::Std { state, .. } => {
-                Arc::new(Float64Array::from_iter(at.map(|g| state[g].std())))
             }
             Accumulator::Extreme { kept, .. } | Accumulator::Edge { kept, .. } => {
                 kept.output(at)?
@@ -813,21 +814,6 @@ impl Kept {
         });
         Ok(self.converter.convert_rows(rows)?.remove(0))
     }
-}
-
-/// `sum / n` rounded once to the nearest float64, as if divided exactly. The magnitude is scaled
-/// up until the integer quotient has at least 55 bits: the 53 a float64 keeps, the rounding bit,
-/// and below it a sticky bit set when the division left a remainder. That quotient rounds as the
-/// true one does; scaling back down by a power of two is exact.
-fn exact_mean(sum: i128, n: i64) -> f64 {
-    let (magnitude, n) = (sum.unsigned_abs(), u128::from(n.unsigned_abs()));
-    let bits = |x: u128| 128 - x.leading_zeros();
-    let shift = (bits(n) + 55).saturating_sub(bits(magnitude));
-    let scaled = magnitude << shift;
-    // The quotient with a sticky bit for any remainder, so the one rounding to f64 is exact.
-    let quotient = (scaled / n) | u128::from(scaled % n != 0);
-    let value = quotient as f64 * f64::from_bits(u64::from(1023 - shift) << 52);
-    if sum < 0 { -value } else { value }
 }
 
 /// `count_distinct`'s state for every group: how many rows hold each distinct non-null value, so
@@ -1168,18 +1154,14 @@ fn each<T: ArrowPrimitiveType>(
     }
 }
 
-fn each_f64(array: &dyn Array, ids: &[u32], rows: Option<&[u32]>, mut f: impl FnMut(usize, f64)) {
+/// Calls `f(group, term)` for each row of a number column with a value, in order (as `each`),
+/// integers exactly rather than through float64.
+fn each_term(array: &dyn Array, ids: &[u32], rows: Option<&[u32]>, mut f: impl FnMut(usize, Term)) {
     match array.data_type() {
-        DataType::Int16 => each(array.as_primitive::<Int16Type>(), ids, rows, |g, v| {
-            f(g, f64::from(v));
+        DataType::Float64 => each(array.as_primitive::<Float64Type>(), ids, rows, |g, v| {
+            f(g, Term::of_f64(v));
         }),
-        DataType::Int32 => each(array.as_primitive::<Int32Type>(), ids, rows, |g, v| {
-            f(g, f64::from(v));
-        }),
-        DataType::Int64 => each(array.as_primitive::<Int64Type>(), ids, rows, |g, v| {
-            f(g, v as f64);
-        }),
-        _ => each(array.as_primitive::<Float64Type>(), ids, rows, f),
+        _ => each_i64(array, ids, rows, |g, v| f(g, Term::of_i64(v))),
     }
 }
 
@@ -1272,6 +1254,9 @@ pub(crate) struct AggBy {
     /// Empty accumulators to copy for each piece's partials.
     templates: Vec<Accumulator>,
     shards: Vec<Shard>,
+    /// The output slot of the next group published, so slots follow first appearance whatever
+    /// shard holds the group.
+    next_slot: RowKey,
 }
 
 impl AggBy {
@@ -1307,14 +1292,8 @@ impl AggBy {
         let count = threads().min(64);
         let mut shards = Vec::with_capacity(count);
         for index in 0..count {
-            let groups = Membership::new(
-                &projected,
-                local_groups.clone(),
-                add_only,
-                index as RowKey,
-                count as RowKey,
-            )
-            .map_err(schema_error)?;
+            let groups = Membership::new(&projected, local_groups.clone(), add_only)
+                .map_err(schema_error)?;
             let accumulators = templates
                 .iter()
                 .map(Accumulator::fresh)
@@ -1326,6 +1305,7 @@ impl AggBy {
                 accumulators,
                 published: Vec::new(),
                 stale: Vec::new(),
+                place: Vec::new(),
             });
         }
         Ok(Self {
@@ -1338,6 +1318,7 @@ impl AggBy {
             },
             templates,
             shards,
+            next_slot: 0,
         })
     }
 
@@ -1380,26 +1361,109 @@ impl AggBy {
             }
         }
         let templates = &self.templates;
-        let partials = run(threads, pieces, |table, (keys, batch)| {
+        let mut partials = run(threads, pieces, |table, (keys, batch)| {
             Partial::build(context, templates, table, keys, batch, shard_count)
         })
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
+        // Where each row that may create a group stands among them: modified rows' new values,
+        // then each piece's groups, in first-appearance order within it.
+        let mut places: u64 = view
+            .modified
+            .iter()
+            .map(|(keys, ..)| keys.len() as u64)
+            .sum();
+        for partial in &mut partials {
+            partial.place = places;
+            places += partial.groups.len() as u64;
+        }
 
         let shards: Vec<&mut Shard> = self.shards.iter_mut().collect();
         let outputs = run(threads, shards, |(), shard| {
             let part = view.part(&routes, shard.index);
             shard.process(context, input, &part, &partials, own)
-        });
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+
+        // New groups take the next slots in the order their keys first appear.
+        let lists: Vec<&[u64]> = outputs.iter().map(|o| o.places.as_slice()).collect();
+        let order = by_place(places as usize, &lists);
+        for (slot, &(shard, index)) in (self.next_slot..).zip(&order) {
+            self.shards[shard].groups.slot[outputs[shard].ids[index] as usize] = slot;
+        }
+        let sources: Vec<&[ArrayRef]> = outputs.iter().map(|o| o.added.columns()).collect();
         let mut out = Delta::default();
-        for part in outputs {
-            let part = part?;
-            out.added.extend(part.added);
-            out.removed.extend(part.removed);
-            out.modified.extend(part.modified);
+        for batch in pick(&sources, &order, &context.output)? {
+            let next = self.next_slot + batch.num_rows() as RowKey;
+            let keys = (self.next_slot..next).collect();
+            self.next_slot = next;
+            out.added.push(Rows { keys, batch });
+        }
+        for published in outputs {
+            out.removed.extend(published.changes.removed);
+            out.modified.extend(published.changes.modified);
         }
         Ok(out)
     }
+}
+
+/// A shard's output for one cycle: its groups' modifies and removes, and the groups it published
+/// for the first time, with their places among the cycle's rows and their rows.
+struct Published {
+    changes: Delta,
+    ids: Vec<u32>,
+    places: Vec<u64>,
+    added: RecordBatch,
+}
+
+/// The items of `lists` as `(list, index)`, in the order of their places: `lists[list][index]`
+/// is the item's place, distinct among all items and below `count`. One bit per place, so linear
+/// in `count`, without a sort.
+fn by_place(count: usize, lists: &[&[u64]]) -> Vec<(usize, usize)> {
+    let mut seen = vec![0u64; count.div_ceil(64)];
+    for list in lists {
+        for &place in *list {
+            seen[place as usize / 64] |= 1 << (place % 64);
+        }
+    }
+    let mut before = Vec::with_capacity(seen.len());
+    let mut total = 0;
+    for word in &seen {
+        before.push(total);
+        total += word.count_ones() as usize;
+    }
+    let mut at = vec![(0, 0); total];
+    for (l, list) in lists.iter().enumerate() {
+        for (index, &place) in list.iter().enumerate() {
+            let (word, bit) = (place as usize / 64, place % 64);
+            let rank = (seen[word] & ((1 << bit) - 1)).count_ones() as usize;
+            at[before[word] + rank] = (l, index);
+        }
+    }
+    at
+}
+
+/// The rows `at` picks, as `(source, row)`, from sources holding `output`'s columns, in pieces
+/// built on every core.
+fn pick(
+    sources: &[&[ArrayRef]],
+    at: &[(usize, usize)],
+    output: &SchemaRef,
+) -> Result<Vec<RecordBatch>, ArrowError> {
+    let pieces: Vec<&[(usize, usize)]> = at.chunks(parallel::PIECE_ROWS).collect();
+    run(threads_for(at.len()), pieces, |(), piece| {
+        let picked = (0..output.fields().len())
+            .map(|column| {
+                let arrays: Vec<&dyn Array> = sources.iter().map(|c| c[column].as_ref()).collect();
+                interleave(&arrays, piece)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let options = RecordBatchOptions::new().with_row_count(Some(piece.len()));
+        RecordBatch::try_new_with_options(output.clone(), picked, &options)
+    })
+    .into_iter()
+    .collect()
 }
 
 /// One piece of added rows, aggregated on its own.
@@ -1414,6 +1478,8 @@ struct Partial {
     keys: Option<Vec<Vec<RowKey>>>,
     /// Local groups per shard, in first-appearance order.
     by_shard: Vec<Vec<u32>>,
+    /// The place of local group 0 among the cycle's rows that may create groups.
+    place: u64,
 }
 
 impl Partial {
@@ -1459,6 +1525,7 @@ impl Partial {
             last,
             keys: all,
             by_shard,
+            place: 0,
         })
     }
 }
@@ -1476,19 +1543,23 @@ struct Route {
     shards: Vec<Vec<u32>>,
 }
 
-/// Rows of one batch that belong to a shard, by index, in order.
+/// Rows of one batch that belong to a shard, by index, in order. `place`: where the batch's
+/// first row stands among the cycle's rows that may create groups (modified rows' new values),
+/// for the groups its rows create.
 struct Selected<'a> {
     keys: &'a [RowKey],
     batch: &'a RecordBatch,
     rows: Vec<u32>,
+    place: u64,
 }
 
-/// Modified rows that stay within a shard.
+/// Modified rows that stay within a shard, with their `place` as `Selected`'s.
 struct SelectedModified<'a> {
     keys: &'a [RowKey],
     previous: &'a RecordBatch,
     current: &'a RecordBatch,
     rows: Vec<u32>,
+    place: u64,
 }
 
 /// One shard's removed and modified rows. A modified row that changes shard is removed from its
@@ -1556,15 +1627,21 @@ impl<'a> View<'a> {
         }
         let mut rows = rows.into_iter();
         let mut part = Part::default();
-        let selected = |keys, batch, rows: Vec<u32>| {
-            (!rows.is_empty()).then_some(Selected { keys, batch, rows })
+        let selected = |keys, batch, rows: Vec<u32>, place| {
+            (!rows.is_empty()).then_some(Selected {
+                keys,
+                batch,
+                rows,
+                place,
+            })
         };
         for (keys, batch) in &self.removed {
             let mine = rows.next().expect("one row list per segment");
-            part.removed.extend(selected(*keys, batch, mine));
+            part.removed.extend(selected(*keys, batch, mine, 0));
         }
         let previous: Vec<Vec<u32>> = rows.by_ref().take(self.modified.len()).collect();
         let current: Vec<Vec<u32>> = rows.collect();
+        let mut place = 0;
         for (((keys, before, after), old), new) in self.modified.iter().zip(previous).zip(current) {
             let (stay, leave, enter) = compare(&old, &new);
             if !stay.is_empty() {
@@ -1573,10 +1650,12 @@ impl<'a> View<'a> {
                     previous: before,
                     current: after,
                     rows: stay,
+                    place,
                 });
             }
-            part.removed.extend(selected(*keys, before, leave));
-            part.added.extend(selected(*keys, after, enter));
+            part.removed.extend(selected(*keys, before, leave, 0));
+            part.added.extend(selected(*keys, after, enter, place));
+            place += keys.len() as u64;
         }
         part
     }
@@ -1619,6 +1698,9 @@ struct Shard {
     published: Vec<bool>,
     /// Recompute from members this cycle, because a row left the group.
     stale: Vec<bool>,
+    /// For a group created this cycle, the earliest place among the cycle's rows that hold its
+    /// key, which orders it among the cycle's new groups.
+    place: Vec<u64>,
 }
 
 impl Shard {
@@ -1627,6 +1709,7 @@ impl Shard {
         let len = self.groups.capacity();
         self.published.resize(len, false);
         self.stale.resize(len, false);
+        self.place.resize(len, u64::MAX);
         for accumulator in &mut self.accumulators {
             accumulator.resize(len);
         }
@@ -1634,6 +1717,7 @@ impl Shard {
             let group = id as usize;
             self.published[group] = false;
             self.stale[group] = false;
+            self.place[group] = u64::MAX;
             for accumulator in &mut self.accumulators {
                 accumulator.reset(group);
             }
@@ -1646,6 +1730,14 @@ impl Shard {
         Ok(ids)
     }
 
+    /// Notes `place + rows[i]` as a place of group `ids[i]`.
+    fn note_places(&mut self, ids: &[u32], rows: &[u32], place: u64) {
+        for (&id, &row) in ids.iter().zip(rows) {
+            let at = &mut self.place[id as usize];
+            *at = (*at).min(place + u64::from(row));
+        }
+    }
+
     fn process(
         &mut self,
         context: &Context,
@@ -1653,7 +1745,7 @@ impl Shard {
         part: &Part<'_>,
         partials: &[Partial],
         own: &Storage,
-    ) -> Result<Delta, ArrowError> {
+    ) -> Result<Published, ArrowError> {
         for selected in &part.removed {
             let ids = self.assign(selected.batch, &selected.rows)?;
             for (&id, &row) in ids.iter().zip(&selected.rows) {
@@ -1672,6 +1764,7 @@ impl Shard {
         for modified in &part.modified {
             let before = self.assign(modified.previous, &modified.rows)?;
             let after = self.assign(modified.current, &modified.rows)?;
+            self.note_places(&after, &modified.rows, modified.place);
             for ((&old, &new), &row) in before.iter().zip(&after).zip(&modified.rows) {
                 let key = modified.keys[row as usize];
                 self.groups.members[old as usize].remove(key)?;
@@ -1695,6 +1788,7 @@ impl Shard {
         }
         for selected in &part.added {
             let ids = self.assign(selected.batch, &selected.rows)?;
+            self.note_places(&ids, &selected.rows, selected.place);
             for (&id, &row) in ids.iter().zip(&selected.rows) {
                 self.groups.members[id as usize].insert(selected.keys[row as usize]);
             }
@@ -1726,17 +1820,25 @@ impl Shard {
             }
         }
 
-        let mut out = Delta::default();
-        let (slots, batch) = self.output_rows(context, input, &added)?;
-        out.added.push(Rows { keys: slots, batch });
-        let (slots, current) = self.output_rows(context, input, &changed)?;
-        out.modified.push(Modified {
+        let places = added.iter().map(|id| self.place[*id as usize]).collect();
+        let added_rows = self.output_rows(context, input, &added)?;
+        let mut changes = Delta::default();
+        let slots: Vec<RowKey> = changed
+            .iter()
+            .map(|id| self.groups.slot[*id as usize])
+            .collect();
+        changes.modified.push(Modified {
             previous: own.gather(&slots)?,
-            current,
+            current: self.output_rows(context, input, &changed)?,
             keys: slots,
         });
-        push_removed(&mut out, own, removed)?;
-        Ok(out)
+        push_removed(&mut changes, own, removed)?;
+        Ok(Published {
+            changes,
+            ids: added,
+            places,
+            added: added_rows,
+        })
     }
 
     /// Merges one piece's partial states for this shard's groups.
@@ -1757,6 +1859,8 @@ impl Shard {
         self.sync();
         for (&local, &id) in mine.iter().zip(&ids) {
             let (local, group) = (local as usize, id as usize);
+            let at = &mut self.place[group];
+            *at = (*at).min(partial.place + local as u64);
             let members = &mut self.groups.members[group];
             match &partial.keys {
                 Some(all) => all[local].iter().for_each(|key| members.insert(*key)),
@@ -1809,7 +1913,7 @@ impl Shard {
         context: &Context,
         input: Reader<'_>,
         ids: &[u32],
-    ) -> Result<(Vec<RowKey>, RecordBatch), ArrowError> {
+    ) -> Result<RecordBatch, ArrowError> {
         let representatives: Vec<RowKey> = ids
             .iter()
             .map(|id| {
@@ -1827,13 +1931,8 @@ impl Shard {
         for accumulator in &self.accumulators {
             columns.push(accumulator.output(ids)?);
         }
-        let slots = ids
-            .iter()
-            .map(|id| self.groups.slot[*id as usize])
-            .collect();
         let options = RecordBatchOptions::new().with_row_count(Some(ids.len()));
-        let batch = RecordBatch::try_new_with_options(context.output.clone(), columns, &options)?;
-        Ok((slots, batch))
+        RecordBatch::try_new_with_options(context.output.clone(), columns, &options)
     }
 }
 
@@ -1991,7 +2090,8 @@ impl Fold {
         Ok(Merged {
             key_schema: self.key_schema.clone(),
             shards,
-            part_groups: Vec::new(),
+            parts: 0,
+            places: 0,
         })
     }
 }
@@ -2003,8 +2103,9 @@ impl Fold {
 pub(crate) struct Merged {
     key_schema: SchemaRef,
     shards: Vec<Merging>,
-    /// Per part merged, by index: how many groups it held.
-    part_groups: Vec<usize>,
+    /// Parts merged so far, and their groups: the next part's groups are placed from there.
+    parts: usize,
+    places: u64,
 }
 
 /// One shard of `Merged`: the groups whose key hashes to it.
@@ -2013,23 +2114,27 @@ struct Merging {
     /// The group columns of each group, by id, in pieces.
     keys: Vec<RecordBatch>,
     accumulators: Vec<Accumulator>,
-    /// Per group, where its key first appears: its part's index in the high 32 bits, its id
-    /// within the part in the low.
+    /// Per group, where its key first appears: the place of its first part's groups, plus its
+    /// id within that part.
     first: Vec<u64>,
 }
 
 impl Merged {
     /// Merges sealed parts, given with their indices in order, after every part merged so far.
     pub fn merge(&mut self, parts: &[(usize, Fold)]) -> Result<(), ArrowError> {
+        let mut starts = Vec::with_capacity(parts.len());
         for (index, part) in parts {
-            debug_assert_eq!(*index, self.part_groups.len(), "parts merge in order");
-            self.part_groups.push(part.groups.len());
+            debug_assert_eq!(*index, self.parts, "parts merge in order");
+            self.parts += 1;
+            starts.push(self.places);
+            self.places += part.groups.len() as u64;
         }
         let shards: Vec<(usize, &mut Merging)> = self.shards.iter_mut().enumerate().collect();
         run(shards.len(), shards, |(), (shard, merging)| {
             parts
                 .iter()
-                .try_for_each(|(index, part)| merging.merge(shard, *index, part))
+                .zip(&starts)
+                .try_for_each(|((_, part), start)| merging.merge(shard, *start, part))
         })
         .into_iter()
         .collect()
@@ -2038,68 +2143,16 @@ impl Merged {
     /// One row per group, in the order their keys first appear, with `output`'s columns (the
     /// group columns, then each aggregation), in pieces built on every core.
     pub fn finish(&self, output: &SchemaRef) -> Result<Vec<RecordBatch>, ArrowError> {
-        let at = self.order();
+        let firsts: Vec<&[u64]> = self.shards.iter().map(|m| m.first.as_slice()).collect();
+        let at = by_place(self.places as usize, &firsts);
         let shards: Vec<&Merging> = self.shards.iter().collect();
         let columns = run(shards.len(), shards, |(), merging| {
             merging.columns(&self.key_schema)
         })
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
-        let pieces: Vec<&[(usize, usize)]> = at.chunks(parallel::PIECE_ROWS).collect();
-        run(threads_for(at.len()), pieces, |(), piece| {
-            let picked = (0..output.fields().len())
-                .map(|column| {
-                    let arrays: Vec<&dyn Array> =
-                        columns.iter().map(|c| c[column].as_ref()).collect();
-                    interleave(&arrays, piece)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let options = RecordBatchOptions::new().with_row_count(Some(piece.len()));
-            RecordBatch::try_new_with_options(output.clone(), picked, &options)
-        })
-        .into_iter()
-        .collect()
-    }
-
-    /// Every group, as `(shard, id)`, in the order its key first appears. A group's place is
-    /// its first part's place among parts, then its id's rank among the ids of that part's
-    /// groups first seen there, counted with one bit per id of every part.
-    fn order(&self) -> Vec<(usize, usize)> {
-        let mut starts = Vec::with_capacity(self.part_groups.len());
-        let mut words = 0;
-        for groups in &self.part_groups {
-            starts.push(words);
-            words += groups.div_ceil(64);
-        }
-        let split = |first: u64| {
-            let (part, id) = (
-                (first >> 32) as usize,
-                (first & u64::from(u32::MAX)) as usize,
-            );
-            (starts[part] + id / 64, id % 64)
-        };
-        let mut seen = vec![0u64; words];
-        for merging in &self.shards {
-            for &first in &merging.first {
-                let (word, bit) = split(first);
-                seen[word] |= 1 << bit;
-            }
-        }
-        let mut before = Vec::with_capacity(words);
-        let mut total = 0;
-        for word in &seen {
-            before.push(total);
-            total += word.count_ones() as usize;
-        }
-        let mut at = vec![(0, 0); total];
-        for (shard, merging) in self.shards.iter().enumerate() {
-            for (id, &first) in merging.first.iter().enumerate() {
-                let (word, bit) = split(first);
-                let rank = (seen[word] & ((1 << bit) - 1)).count_ones() as usize;
-                at[before[word] + rank] = (shard, id);
-            }
-        }
-        at
+        let sources: Vec<&[ArrayRef]> = columns.iter().map(Vec::as_slice).collect();
+        pick(&sources, &at, output)
     }
 }
 
@@ -2114,8 +2167,8 @@ impl Merging {
         Ok(columns)
     }
 
-    /// Merges this shard's groups of the sealed part `part`, the input's `index`th.
-    fn merge(&mut self, shard: usize, index: usize, part: &Fold) -> Result<(), ArrowError> {
+    /// Merges this shard's groups of the sealed part `part`, whose groups are placed from `start`.
+    fn merge(&mut self, shard: usize, start: u64, part: &Fold) -> Result<(), ArrowError> {
         let [theirs] = part.keys.as_slice() else {
             unreachable!("a merged part is sealed");
         };
@@ -2130,7 +2183,7 @@ impl Merging {
                         .id(&keys, group as usize, part.groups.hash(group as usize));
                 if created {
                     new.push(group);
-                    self.first.push(((index as u64) << 32) | u64::from(group));
+                    self.first.push(start + u64::from(group));
                 }
                 id
             })
