@@ -160,32 +160,26 @@ function TopBar({
   page: Page;
   onPage: (page: Page) => void;
   pages: readonly Page[];
-  /** Whether the brand opens Deployments, the home page wherever a controller runs */
-  home: boolean;
+  /** The home page the brand opens: Deployments wherever a controller runs, else Tables */
+  home: Page;
 }) {
   const apps = useApps();
   return (
     <header className="flex h-12 shrink-0 items-center gap-3 border-b bg-sidebar px-4">
-      {home ? (
-        <button
-          type="button"
-          onClick={() => onPage('deployments')}
-          aria-current={page === 'deployments' ? 'page' : undefined}
-          title="Deployments"
-          className={cn(
-            '-ml-2 flex h-8 items-center gap-2 rounded-md px-2 hover:bg-accent',
-            page === 'deployments' && 'bg-secondary'
-          )}
-        >
-          <Logo className="size-6" />
-          <span className="text-[15px] font-semibold tracking-tight">Kermodes</span>
-        </button>
-      ) : (
-        <div className="flex items-center gap-2">
-          <Logo className="size-6" />
-          <span className="text-[15px] font-semibold tracking-tight">Kermodes</span>
-        </div>
-      )}
+      <button
+        type="button"
+        onClick={() => onPage(home)}
+        aria-current={page === home ? 'page' : undefined}
+        title={PAGE_LABEL[home]}
+        className={cn(
+          '-ml-2 flex h-8 items-center gap-2 rounded-md px-2 hover:bg-accent',
+          // Deployments has no tab of its own: the brand is its tab. Tables has one, which shows it.
+          page === home && !pages.includes(home) && 'bg-secondary'
+        )}
+      >
+        <Logo className="size-6" />
+        <span className="text-[15px] font-semibold tracking-tight">Kermodes</span>
+      </button>
       <nav className="flex items-center gap-1">
         {pages.map(name => (
           <Button
@@ -322,12 +316,14 @@ export default function App({ connection }: { connection: KermodesConnection }) 
   const workspace = useRef<WorkspaceHandle>(null);
   // The canvas draws with the tokens in effect on <html>; recomputed when the theme flips
   const theme = useMemo(() => gridThemeOf(document.documentElement), [themeName]);
-  // Deployments is the main tab wherever a controller reports them, until someone picks a tab.
+  // Deployments is the home page wherever a controller reports them, Tables elsewhere; it shows
+  // until someone picks a tab, and the brand goes back to it.
   const hasDeployments = connection.pages.includes(DEPLOYMENTS_VIEW);
   const hasCatalog = useHasCatalog();
   const pages: Page[] = [...(hasCatalog ? (['catalog'] as const) : []), 'tables'];
+  const home: Page = hasDeployments ? 'deployments' : 'tables';
   const [picked, setPicked] = useState<Page | null>(null);
-  const page: Page = picked ?? (hasDeployments ? 'deployments' : 'tables');
+  const page: Page = picked ?? home;
 
   const openTable = useCallback((table: string) => workspace.current?.open(table), []);
 
@@ -341,7 +337,7 @@ export default function App({ connection }: { connection: KermodesConnection }) 
           page={page}
           onPage={setPicked}
           pages={pages}
-          home={hasDeployments}
+          home={home}
         />
         {page === 'deployments' && <DeploymentsPage connection={connection} />}
         {page === 'catalog' && (
