@@ -6,10 +6,11 @@
 //! modified rows are routed to their group's shard and the groups they touch are recomputed from
 //! their rows.
 //!
-//! Counts, integer sums, min/max, and first/last are exact. Float sums, means, and standard
-//! deviations depend on where piece boundaries fall, so a ticking table and a static
-//! recomputation can differ in the last bits; piece boundaries never depend on the number of
-//! cores, so results do not either.
+//! Counts, distinct counts, integer sums and means, min/max, and first/last are exact: integer
+//! sums accumulate in 128 bits, so they never wrap and an integer mean divides the exact sum,
+//! rounding once. Float sums, means, and standard deviations depend on where piece boundaries
+//! fall, so a ticking table and a static recomputation can differ in the last bits; piece
+//! boundaries never depend on the number of cores, so results do not either.
 
 use std::sync::Arc;
 
@@ -19,14 +20,15 @@ use arrow::array::{
 };
 use arrow::compute::take;
 use arrow::datatypes::{
-    DataType, Field, Float64Type, Int16Type, Int32Type, Int64Type, Schema, SchemaRef,
+    DataType, Date32Type, Field, Float64Type, Int16Type, Int32Type, Int64Type, Schema, SchemaRef,
+    TimeUnit, TimestampNanosecondType,
 };
 use arrow::error::ArrowError;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use arrow::row::{OwnedRow, RowConverter, Rows as EncodedRows, SortField};
 use hashbrown::HashTable;
 
-use crate::groups::{KeyKind, LocalEntry, LocalGroups, Membership, shard_of, split};
+use crate::groups::{HASHER, KeyKind, LocalEntry, LocalGroups, Membership, shard_of, split};
 use crate::ops::{pick_column, push_removed};
 use crate::parallel::{PARALLEL_ROWS, offsets, run, threads};
 use crate::session::Reader;
@@ -40,18 +42,22 @@ const PIECE_ROWS: usize = 1 << 18;
 pub(crate) enum Accumulator {
     /// `count(*)` when `column` is `None`, otherwise non-null values.
     Count { column: Option<usize>, n: Vec<i64> },
+    /// `sum` or `mean` of an integer column, summed exactly in 128 bits. `name` is the column's,
+    /// for the error when a sum does not fit the int64 output.
     SumInt {
         column: usize,
-        sum: Vec<i64>,
+        name: String,
+        mean: bool,
+        sum: Vec<i128>,
         n: Vec<i64>,
     },
-    /// `sum` of a float column, or `mean` of any numeric column.
+    /// `sum` or `mean` of a float column.
     SumFloat {
         column: usize,
         state: Vec<FloatSum>,
         mean: bool,
     },
-    /// Welford's running mean and sum of squared deviations.
+    /// The count, sum, and sum of squares, in double-double.
     Std { column: usize, state: Vec<Moments> },
     /// `min` or `max`: the winning value (comparable encoding) and its row key; ties go to the
     /// smaller key. `column` is read when folding; `source` is the input column the value is
@@ -71,6 +77,8 @@ pub(crate) enum Accumulator {
         last: bool,
         key: Vec<Option<RowKey>>,
     },
+    /// `count_distinct`: the distinct non-null values of `column` per group.
+    CountDistinct { column: usize, values: Distinct },
 }
 
 /// One group's float sum and count, kept together so a fold touches one cache line per row.
@@ -80,19 +88,116 @@ pub(crate) struct FloatSum {
     n: i64,
 }
 
-/// One group's Welford state, kept together for the same reason.
+/// One group's count, sum, and sum of squares, each sum a double-double so adding and removing
+/// the same values cancels exactly whenever the sums fit in its ~106 bits, and otherwise leaves a
+/// residue near 2^-106 of the sums. Static and ticking tables share this code, so they round
+/// alike.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Moments {
     n: i64,
-    mean: f64,
-    m2: f64,
+    sum: Dd,
+    squares: Dd,
+}
+
+impl Moments {
+    fn insert(&mut self, x: f64) {
+        self.n += 1;
+        self.sum = self.sum.plus(x);
+        self.squares = self.squares.add(two_product(x, x));
+    }
+
+    fn remove(&mut self, x: f64) {
+        self.n -= 1;
+        if self.n == 0 {
+            // An emptied group restarts exactly.
+            *self = Moments::default();
+            return;
+        }
+        self.sum = self.sum.plus(-x);
+        self.squares = self.squares.add(two_product(-x, x));
+    }
+
+    fn merge(&mut self, other: &Moments) {
+        self.n += other.n;
+        self.sum = self.sum.add(other.sum);
+        self.squares = self.squares.add(other.squares);
+    }
+
+    /// The sample standard deviation, from `(n * squares - sum^2) / (n * (n - 1))`: the
+    /// numerator in double-double (it cancels to exactly 0 when every value is equal and the
+    /// sums are exact), clamped at 0 against rounding, then one division and one square root.
+    fn std(&self) -> Option<f64> {
+        (self.n > 1).then(|| {
+            let n = self.n as f64;
+            let n_squares = self.squares.mul(Dd { hi: n, lo: 0.0 });
+            let spread = n_squares.add(self.sum.mul(self.sum).neg());
+            // `< 0.0` rather than `max`, which would turn a NaN spread into 0.
+            let spread = if spread.hi < 0.0 { 0.0 } else { spread.hi };
+            (spread / (n * (n - 1.0))).sqrt()
+        })
+    }
+}
+
+/// A double-double: the unevaluated sum `hi + lo`, with `lo` below half an ulp of `hi`.
+#[derive(Clone, Copy, Default)]
+struct Dd {
+    hi: f64,
+    lo: f64,
+}
+
+/// `a + b` rounded, and the exact error of that rounding (Knuth's TwoSum).
+fn two_sum(a: f64, b: f64) -> (f64, f64) {
+    let s = a + b;
+    let v = s - a;
+    (s, (a - (s - v)) + (b - v))
+}
+
+/// `a * b` exactly: the rounded product and its error, which a fused multiply-add computes.
+fn two_product(a: f64, b: f64) -> Dd {
+    let hi = a * b;
+    Dd {
+        hi,
+        lo: a.mul_add(b, -hi),
+    }
+}
+
+impl Dd {
+    fn neg(self) -> Dd {
+        Dd {
+            hi: -self.hi,
+            lo: -self.lo,
+        }
+    }
+
+    /// `self + x` for a double `x`.
+    fn plus(self, x: f64) -> Dd {
+        let (s, e) = two_sum(self.hi, x);
+        let (hi, lo) = two_sum(s, e + self.lo);
+        Dd { hi, lo }
+    }
+
+    /// `self + other`, carrying both error terms (the accurate double-double sum).
+    fn add(self, other: Dd) -> Dd {
+        let (s, e) = two_sum(self.hi, other.hi);
+        let (t, f) = two_sum(self.lo, other.lo);
+        let (s, e) = two_sum(s, e + t);
+        let (hi, lo) = two_sum(s, e + f);
+        Dd { hi, lo }
+    }
+
+    fn mul(self, other: Dd) -> Dd {
+        let p = two_product(self.hi, other.hi);
+        let cross = self.hi * other.lo + self.lo * other.hi;
+        let (hi, lo) = two_sum(p.hi, p.lo + cross);
+        Dd { hi, lo }
+    }
 }
 
 /// An aggregation call `function(column)`, checked against a schema: the function is known
 /// (aliases resolved), `*` only appears in `count(*)`, and the column exists and is a number for
 /// the functions that need one.
 pub(crate) struct Call {
-    /// One of count, sum, mean, std, min, max, first, last.
+    /// One of count, count_distinct, sum, mean, std, min, max, first, last.
     pub function: &'static str,
     /// `None` for `count(*)`.
     pub column: Option<usize>,
@@ -111,6 +216,7 @@ impl Call {
             .trim();
         let function = match name.trim().to_ascii_lowercase().as_str() {
             "count" => "count",
+            "count_distinct" => "count_distinct",
             "sum" => "sum",
             "mean" | "avg" => "mean",
             "std" | "stddev" => "std",
@@ -120,7 +226,8 @@ impl Call {
             "last" => "last",
             other => {
                 return Err(error(format!(
-                    "unknown aggregation `{other}`; expected count, sum, mean, std, min, max, first, or last"
+                    "unknown aggregation `{other}`; expected count, count_distinct, sum, mean, \
+                     std, min, max, first, or last"
                 )));
             }
         };
@@ -149,6 +256,24 @@ impl Call {
             return Err(error(format!(
                 "`{}` needs a number, but `{argument}` is {}",
                 name.trim(),
+                type_name(input_type)
+            )));
+        }
+        let comparable = matches!(
+            input_type,
+            DataType::Null
+                | DataType::Boolean
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Float64
+                | DataType::Utf8
+                | DataType::Date32
+                | DataType::Timestamp(TimeUnit::Nanosecond, _)
+        );
+        if function == "count_distinct" && !comparable {
+            return Err(error(format!(
+                "`count_distinct` cannot compare values of `{argument}`, which is {}",
                 type_name(input_type)
             )));
         }
@@ -189,14 +314,31 @@ impl Accumulator {
                 },
                 DataType::Int64,
             ),
-            "sum" if !float_input => (
-                Accumulator::SumInt {
+            "count_distinct" => (
+                Accumulator::CountDistinct {
                     column,
-                    sum: Vec::new(),
-                    n: Vec::new(),
+                    values: Distinct::new(input_type == DataType::Utf8),
                 },
                 DataType::Int64,
             ),
+            "sum" | "mean" if !float_input => {
+                let mean = call.function == "mean";
+                let sum = Accumulator::SumInt {
+                    column,
+                    name: schema.field(column).name().clone(),
+                    mean,
+                    sum: Vec::new(),
+                    n: Vec::new(),
+                };
+                (
+                    sum,
+                    if mean {
+                        DataType::Float64
+                    } else {
+                        DataType::Int64
+                    },
+                )
+            }
             "sum" | "mean" => (
                 Accumulator::SumFloat {
                     column,
@@ -243,8 +385,12 @@ impl Accumulator {
                 column: *column,
                 n: Vec::new(),
             },
-            Accumulator::SumInt { column, .. } => Accumulator::SumInt {
+            Accumulator::SumInt {
+                column, name, mean, ..
+            } => Accumulator::SumInt {
                 column: *column,
+                name: name.clone(),
+                mean: *mean,
                 sum: Vec::new(),
                 n: Vec::new(),
             },
@@ -282,6 +428,10 @@ impl Accumulator {
                 last: *last,
                 key: Vec::new(),
             },
+            Accumulator::CountDistinct { column, values } => Accumulator::CountDistinct {
+                column: *column,
+                values: Distinct::new(values.strings.is_some()),
+            },
         })
     }
 
@@ -293,7 +443,8 @@ impl Accumulator {
             | Accumulator::SumFloat { column, .. }
             | Accumulator::Std { column, .. }
             | Accumulator::Extreme { column, .. }
-            | Accumulator::Edge { column, .. } => Some(*column),
+            | Accumulator::Edge { column, .. }
+            | Accumulator::CountDistinct { column, .. } => Some(*column),
         }
     }
 
@@ -310,7 +461,8 @@ impl Accumulator {
             | Accumulator::SumFloat { column, .. }
             | Accumulator::Std { column, .. }
             | Accumulator::Extreme { column, .. }
-            | Accumulator::Edge { column, .. } => at(column),
+            | Accumulator::Edge { column, .. }
+            | Accumulator::CountDistinct { column, .. } => at(column),
         }
     }
 
@@ -326,6 +478,7 @@ impl Accumulator {
             Accumulator::Std { state, .. } => state.resize(len, Moments::default()),
             Accumulator::Extreme { best, .. } => best.resize(len, None),
             Accumulator::Edge { key, .. } => key.resize(len, None),
+            Accumulator::CountDistinct { values, .. } => values.resize(len),
         }
     }
 
@@ -337,6 +490,14 @@ impl Accumulator {
             Accumulator::Std { state, .. } => state[group] = Moments::default(),
             Accumulator::Extreme { best, .. } => best[group] = None,
             Accumulator::Edge { key, .. } => key[group] = None,
+            Accumulator::CountDistinct { values, .. } => values.reset(group),
+        }
+    }
+
+    /// Readies a piece's partial states for merging, once all its rows are folded.
+    fn seal(&mut self) {
+        if let Accumulator::CountDistinct { values, .. } = self {
+            values.seal();
         }
     }
 
@@ -367,18 +528,12 @@ impl Accumulator {
                     }
                 }
             }
-            Accumulator::SumInt { column, sum, n } => {
-                let mut overflow = false;
+            Accumulator::SumInt { column, sum, n, .. } => {
+                // An i128 holds the sum of 2^64 int64 values, more rows than a table can hold.
                 each_i64(batch.column(*column).as_ref(), ids, rows, |group, value| {
-                    match sum[group].checked_add(value) {
-                        Some(total) => sum[group] = total,
-                        None => overflow = true,
-                    }
+                    sum[group] += i128::from(value);
                     n[group] += 1;
                 });
-                if overflow {
-                    return Err(overflow_error());
-                }
             }
             Accumulator::SumFloat { column, state, .. } => {
                 each_f64(batch.column(*column).as_ref(), ids, rows, |group, value| {
@@ -389,11 +544,7 @@ impl Accumulator {
             }
             Accumulator::Std { column, state } => {
                 each_f64(batch.column(*column).as_ref(), ids, rows, |group, x| {
-                    let s = &mut state[group];
-                    s.n += 1;
-                    let delta = x - s.mean;
-                    s.mean += delta / s.n as f64;
-                    s.m2 += delta * (x - s.mean);
+                    state[group].insert(x);
                 });
             }
             Accumulator::Extreme {
@@ -442,14 +593,18 @@ impl Accumulator {
                     }
                 }
             }
+            Accumulator::CountDistinct { column, values } => {
+                values.fold(batch.column(*column).as_ref(), ids, rows);
+            }
         }
         Ok(())
     }
 
     /// Takes the selected `rows` of `batch` (`ids[i]` is the group of `rows[i]`) out of their
-    /// groups. Counts and sums subtract; `std` reverses Welford's update. `min`/`max`/`first`/
-    /// `last` cannot be undone, so a group losing its winning row is marked in `stale` for
-    /// recomputation; losing any other row changes nothing.
+    /// groups. Counts and sums subtract; `count_distinct` drops a value with its group's last row
+    /// holding it; `std` subtracts its sums. `min`/`max`/`first`/`last` cannot be undone,
+    /// so a group losing its winning row is marked in `stale` for recomputation; losing any other
+    /// row changes nothing.
     fn unfold(
         &mut self,
         batch: &RecordBatch,
@@ -475,23 +630,16 @@ impl Accumulator {
                     }
                 }
             }
-            Accumulator::SumInt { column, sum, n } => {
-                let mut overflow = false;
+            Accumulator::SumInt { column, sum, n, .. } => {
                 each_i64(
                     batch.column(*column).as_ref(),
                     ids,
                     Some(rows),
                     |group, value| {
-                        match sum[group].checked_sub(value) {
-                            Some(total) => sum[group] = total,
-                            None => overflow = true,
-                        }
+                        sum[group] -= i128::from(value);
                         n[group] -= 1;
                     },
                 );
-                if overflow {
-                    return Err(overflow_error());
-                }
             }
             Accumulator::SumFloat { column, state, .. } => {
                 each_f64(
@@ -511,22 +659,7 @@ impl Accumulator {
                     batch.column(*column).as_ref(),
                     ids,
                     Some(rows),
-                    |group, x| {
-                        let s = &mut state[group];
-                        s.n -= 1;
-                        if s.n == 0 {
-                            *s = Moments::default();
-                            return;
-                        }
-                        let mean = s.mean - (x - s.mean) / s.n as f64;
-                        // Rounding can push a sum of squares just below zero; one value has none.
-                        s.m2 = if s.n == 1 {
-                            0.0
-                        } else {
-                            (s.m2 - (x - mean) * (x - s.mean)).max(0.0)
-                        };
-                        s.mean = mean;
-                    },
+                    |group, x| state[group].remove(x),
                 );
             }
             Accumulator::Extreme { best, .. } => {
@@ -548,6 +681,9 @@ impl Accumulator {
                     }
                 }
             }
+            Accumulator::CountDistinct { column, values } => {
+                values.unfold(batch.column(*column).as_ref(), ids, rows)?;
+            }
         }
         Ok(())
     }
@@ -557,7 +693,7 @@ impl Accumulator {
         match (self, other) {
             (Accumulator::Count { n, .. }, Accumulator::Count { n: m, .. }) => n[into] += m[from],
             (Accumulator::SumInt { sum, n, .. }, Accumulator::SumInt { sum: s, n: m, .. }) => {
-                sum[into] = sum[into].checked_add(s[from]).ok_or_else(overflow_error)?;
+                sum[into] += s[from];
                 n[into] += m[from];
             }
             (Accumulator::SumFloat { state, .. }, Accumulator::SumFloat { state: theirs, .. }) => {
@@ -566,20 +702,7 @@ impl Accumulator {
                 s.n += t.n;
             }
             (Accumulator::Std { state, .. }, Accumulator::Std { state: theirs, .. }) => {
-                // Chan, Golub, and LeVeque's update for combining two partial variances.
-                let (s, t) = (&mut state[into], theirs[from]);
-                if t.n == 0 {
-                    return Ok(());
-                }
-                if s.n == 0 {
-                    *s = t;
-                    return Ok(());
-                }
-                let (a, b) = (s.n as f64, t.n as f64);
-                let delta = t.mean - s.mean;
-                s.mean += delta * (b / (a + b));
-                s.m2 += t.m2 + delta * delta * (a * b / (a + b));
-                s.n += t.n;
+                state[into].merge(&theirs[from]);
             }
             (Accumulator::Extreme { max, best, .. }, Accumulator::Extreme { best: theirs, .. }) => {
                 if let Some((value, key)) = &theirs[from] {
@@ -606,6 +729,10 @@ impl Accumulator {
                     }
                 }
             }
+            (
+                Accumulator::CountDistinct { values, .. },
+                Accumulator::CountDistinct { values: theirs, .. },
+            ) => values.merge(into, theirs, from),
             _ => unreachable!("partials come from the same aggregation"),
         }
         Ok(())
@@ -618,19 +745,34 @@ impl Accumulator {
             Accumulator::Count { n, .. } => {
                 Arc::new(Int64Array::from_iter_values(at.map(|g| n[g])))
             }
-            Accumulator::SumInt { sum, n, .. } => Arc::new(Int64Array::from_iter(
-                at.map(|g| (n[g] > 0).then_some(sum[g])),
+            Accumulator::SumInt {
+                mean: true, sum, n, ..
+            } => Arc::new(Float64Array::from_iter(
+                at.map(|g| (n[g] > 0).then(|| exact_mean(sum[g], n[g]))),
             )),
+            Accumulator::SumInt { name, sum, n, .. } => Arc::new(
+                at.map(|g| {
+                    if n[g] == 0 {
+                        return Ok(None);
+                    }
+                    i64::try_from(sum[g]).map(Some).map_err(|_| {
+                        ArrowError::ComputeError(format!(
+                            "sum of `{name}` is {}, which does not fit in int64",
+                            sum[g]
+                        ))
+                    })
+                })
+                .collect::<Result<Int64Array, ArrowError>>()?,
+            ),
             Accumulator::SumFloat { state, mean, .. } => {
                 Arc::new(Float64Array::from_iter(at.map(|g| {
                     let s = state[g];
                     (s.n > 0).then(|| if *mean { s.sum / s.n as f64 } else { s.sum })
                 })))
             }
-            Accumulator::Std { state, .. } => Arc::new(Float64Array::from_iter(at.map(|g| {
-                let s = state[g];
-                (s.n > 1).then(|| (s.m2 / (s.n - 1) as f64).sqrt())
-            }))),
+            Accumulator::Std { state, .. } => {
+                Arc::new(Float64Array::from_iter(at.map(|g| state[g].std())))
+            }
             Accumulator::Extreme { source, best, .. } => {
                 let keys: Vec<_> = at.map(|g| best[g].as_ref().map(|(_, key)| *key)).collect();
                 pick_column(input, *source, &keys)?
@@ -639,12 +781,325 @@ impl Accumulator {
                 let keys: Vec<_> = at.map(|g| key[g]).collect();
                 pick_column(input, *source, &keys)?
             }
+            Accumulator::CountDistinct { values, .. } => Arc::new(Int64Array::from_iter_values(
+                at.map(|g| values.counts.distinct[g]),
+            )),
         })
     }
 }
 
-fn overflow_error() -> ArrowError {
-    ArrowError::ComputeError("Overflow happened in sum".into())
+/// `sum / n` rounded once to the nearest float64, as if divided exactly. The magnitude is scaled
+/// up until the integer quotient has at least 55 bits: the 53 a float64 keeps, the rounding bit,
+/// and below it a sticky bit set when the division left a remainder. That quotient rounds as the
+/// true one does; scaling back down by a power of two is exact.
+fn exact_mean(sum: i128, n: i64) -> f64 {
+    let (magnitude, n) = (sum.unsigned_abs(), u128::from(n.unsigned_abs()));
+    let bits = |x: u128| 128 - x.leading_zeros();
+    let shift = (bits(n) + 55).saturating_sub(bits(magnitude));
+    let scaled = magnitude << shift;
+    // The quotient with a sticky bit for any remainder, so the one rounding to f64 is exact.
+    let quotient = (scaled / n) | u128::from(scaled % n != 0);
+    let value = quotient as f64 * f64::from_bits(u64::from(1023 - shift) << 52);
+    if sum < 0 { -value } else { value }
+}
+
+/// `count_distinct`'s state for every group: how many rows hold each distinct non-null value, so
+/// removing a row is exact. One table holds every group's values, keyed by group and value, so a
+/// group with few values costs no table of its own and memory follows the distinct values
+/// present. Fixed-width values are stored as 64 bits (`each_bits`); strings are interned once,
+/// their bytes in one buffer, and stored by id.
+pub(crate) struct Distinct {
+    counts: Counts,
+    strings: Option<Strings>,
+    /// A sealed piece's entries, by group: group `g`'s are `sealed[starts[g]..starts[g + 1]]`.
+    starts: Vec<usize>,
+    sealed: Vec<(u64, u64)>,
+}
+
+struct Counts {
+    entries: HashTable<Entry>,
+    /// Per group: its distinct values.
+    distinct: Vec<i64>,
+    /// Per group: the generation its live entries carry. Resetting a group starts a new
+    /// generation rather than searching the table for its entries; the old entries are dead, and
+    /// are swept out once they outnumber the live ones.
+    generation: Vec<u32>,
+    dead: usize,
+}
+
+/// One distinct value of one group, and how many of the group's rows hold it.
+#[derive(Clone, Copy)]
+struct Entry {
+    value: u64,
+    count: u64,
+    group: u32,
+    generation: u32,
+}
+
+fn entry_hash(group: u32, generation: u32, value: u64) -> u64 {
+    HASHER.hash_one((group, generation, value))
+}
+
+impl Counts {
+    /// Adds `count` rows holding `value` to `group`; true if the value is new to the group.
+    fn add(&mut self, group: usize, value: u64, count: u64) -> bool {
+        let (id, generation) = (group as u32, self.generation[group]);
+        let hash = entry_hash(id, generation, value);
+        let same = |e: &Entry| e.value == value && e.group == id && e.generation == generation;
+        if let Some(entry) = self.entries.find_mut(hash, same) {
+            entry.count += count;
+            return false;
+        }
+        let entry = Entry {
+            value,
+            count,
+            group: id,
+            generation,
+        };
+        self.entries
+            .insert_unique(hash, entry, |e| entry_hash(e.group, e.generation, e.value));
+        self.distinct[group] += 1;
+        true
+    }
+
+    /// Takes one row holding `value` out of `group`: whether it was the value's last row, or
+    /// `None` if the group holds no such value.
+    fn remove(&mut self, group: usize, value: u64) -> Option<bool> {
+        let (id, generation) = (group as u32, self.generation[group]);
+        let hash = entry_hash(id, generation, value);
+        let same = |e: &Entry| e.value == value && e.group == id && e.generation == generation;
+        let mut entry = self.entries.find_entry(hash, same).ok()?;
+        entry.get_mut().count -= 1;
+        if entry.get().count > 0 {
+            return Some(false);
+        }
+        entry.remove();
+        self.distinct[group] -= 1;
+        Some(true)
+    }
+}
+
+impl Distinct {
+    fn new(strings: bool) -> Self {
+        Self {
+            counts: Counts {
+                entries: HashTable::new(),
+                distinct: Vec::new(),
+                generation: Vec::new(),
+                dead: 0,
+            },
+            strings: strings.then(Strings::default),
+            starts: Vec::new(),
+            sealed: Vec::new(),
+        }
+    }
+
+    fn resize(&mut self, len: usize) {
+        self.counts.distinct.resize(len, 0);
+        self.counts.generation.resize(len, 0);
+    }
+
+    fn reset(&mut self, group: usize) {
+        let counts = &mut self.counts;
+        let live = std::mem::take(&mut counts.distinct[group]);
+        if live == 0 {
+            return;
+        }
+        // Sweeping once the dead outnumber the live keeps a generation from wrapping around onto
+        // entries still in the table.
+        counts.generation[group] = counts.generation[group].wrapping_add(1);
+        counts.dead += live as usize;
+        if counts.dead * 2 > counts.entries.len() {
+            let Counts {
+                entries,
+                generation,
+                dead,
+                ..
+            } = counts;
+            let strings = &mut self.strings;
+            entries.retain(|e| {
+                let live = e.generation == generation[e.group as usize];
+                if !live && let Some(strings) = strings.as_mut() {
+                    strings.release(e.value as u32);
+                }
+                live
+            });
+            *dead = 0;
+        }
+    }
+
+    fn fold(&mut self, array: &dyn Array, ids: &[u32], rows: Option<&[u32]>) {
+        let counts = &mut self.counts;
+        match &mut self.strings {
+            None => each_bits(array, ids, rows, |group, value| {
+                counts.add(group, value, 1);
+            }),
+            Some(strings) => each_str(array, ids, rows, |group, text| {
+                let id = strings.intern(text, HASHER.hash_one(text));
+                if counts.add(group, u64::from(id), 1) {
+                    strings.refs[id as usize] += 1;
+                }
+            }),
+        }
+    }
+
+    fn unfold(&mut self, array: &dyn Array, ids: &[u32], rows: &[u32]) -> Result<(), ArrowError> {
+        let counts = &mut self.counts;
+        let mut missing = false;
+        match &mut self.strings {
+            None => each_bits(array, ids, Some(rows), |group, value| {
+                missing |= counts.remove(group, value).is_none();
+            }),
+            Some(strings) => each_str(array, ids, Some(rows), |group, text| {
+                let removed = strings
+                    .find(text, HASHER.hash_one(text))
+                    .and_then(|id| Some((id, counts.remove(group, u64::from(id))?)));
+                match removed {
+                    None => missing = true,
+                    Some((id, true)) => strings.release(id),
+                    Some((_, false)) => {}
+                }
+            }),
+        }
+        if missing {
+            return Err(ArrowError::ComputeError(
+                "count_distinct: a removed row's value was not in its group".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Indexes a piece's entries by group for merging, and drops its table.
+    fn seal(&mut self) {
+        let counts = &mut self.counts;
+        let mut starts = Vec::with_capacity(counts.distinct.len() + 1);
+        let mut total = 0;
+        starts.push(0);
+        for &distinct in &counts.distinct {
+            total += distinct as usize;
+            starts.push(total);
+        }
+        let mut next = starts.clone();
+        let mut sealed = vec![(0, 0); total];
+        for e in counts.entries.iter() {
+            let at = &mut next[e.group as usize];
+            sealed[*at] = (e.value, e.count);
+            *at += 1;
+        }
+        counts.entries = HashTable::new();
+        self.starts = starts;
+        self.sealed = sealed;
+    }
+
+    /// Merges group `from` of a sealed piece into group `into`.
+    fn merge(&mut self, into: usize, theirs: &Distinct, from: usize) {
+        let entries = &theirs.sealed[theirs.starts[from]..theirs.starts[from + 1]];
+        let counts = &mut self.counts;
+        match (&mut self.strings, &theirs.strings) {
+            (Some(strings), Some(their_strings)) => {
+                for &(value, count) in entries {
+                    let their_id = value as usize;
+                    let text = their_strings.get(their_id);
+                    let id = strings.intern(text, their_strings.hashes[their_id]);
+                    if counts.add(into, u64::from(id), count) {
+                        strings.refs[id as usize] += 1;
+                    }
+                }
+            }
+            _ => {
+                for &(value, count) in entries {
+                    counts.add(into, value, count);
+                }
+            }
+        }
+    }
+}
+
+/// Interned strings, by id: each one's bytes once, in one buffer.
+#[derive(Default)]
+struct Strings {
+    bytes: Vec<u8>,
+    /// Per id: where its bytes start in `bytes`, and how many there are.
+    spans: Vec<(usize, usize)>,
+    /// Per id: the engine-wide hash of its bytes.
+    hashes: Vec<u64>,
+    /// Per id: the entries holding it. An id no entry holds is freed for reuse.
+    refs: Vec<u32>,
+    free: Vec<u32>,
+    table: HashTable<u32>,
+    /// Bytes of freed strings still in `bytes`.
+    garbage: usize,
+}
+
+impl Strings {
+    fn get(&self, id: usize) -> &[u8] {
+        let (start, len) = self.spans[id];
+        &self.bytes[start..start + len]
+    }
+
+    fn find(&self, text: &[u8], hash: u64) -> Option<u32> {
+        self.table
+            .find(hash, |&id| self.get(id as usize) == text)
+            .copied()
+    }
+
+    /// The id of `text`, whose engine-wide hash is `hash`, interning it if new. A new id is held
+    /// by no entry yet: the caller counts the entry it interned it for.
+    fn intern(&mut self, text: &[u8], hash: u64) -> u32 {
+        if let Some(id) = self.find(text, hash) {
+            return id;
+        }
+        let span = (self.bytes.len(), text.len());
+        self.bytes.extend_from_slice(text);
+        let id = match self.free.pop() {
+            Some(id) => {
+                self.spans[id as usize] = span;
+                self.hashes[id as usize] = hash;
+                id
+            }
+            None => {
+                self.spans.push(span);
+                self.hashes.push(hash);
+                self.refs.push(0);
+                (self.spans.len() - 1) as u32
+            }
+        };
+        let hashes = &self.hashes;
+        self.table
+            .insert_unique(hash, id, |&id| hashes[id as usize]);
+        id
+    }
+
+    /// Drops one entry's hold on `id`, freeing the string with the last.
+    fn release(&mut self, id: u32) {
+        let index = id as usize;
+        self.refs[index] -= 1;
+        if self.refs[index] > 0 {
+            return;
+        }
+        if let Ok(entry) = self
+            .table
+            .find_entry(self.hashes[index], |other| *other == id)
+        {
+            entry.remove();
+        }
+        self.garbage += self.spans[index].1;
+        self.free.push(id);
+        // Compacting only once freed bytes are half the buffer keeps the copying proportional to
+        // the bytes freed.
+        if self.garbage > self.bytes.len() / 2 {
+            let mut bytes = Vec::with_capacity(self.bytes.len() - self.garbage);
+            for (span, &refs) in self.spans.iter_mut().zip(&self.refs) {
+                if refs > 0 {
+                    let (start, len) = *span;
+                    *span = (bytes.len(), len);
+                    bytes.extend_from_slice(&self.bytes[start..start + len]);
+                }
+            }
+            self.bytes = bytes;
+            self.garbage = 0;
+        }
+    }
 }
 
 /// Whether a candidate beats the held value: by value, then the smaller row key on ties.
@@ -710,6 +1165,65 @@ fn each_i64(array: &dyn Array, ids: &[u32], rows: Option<&[u32]>, mut f: impl Fn
             f(g, i64::from(v));
         }),
         _ => each(array.as_primitive::<Int64Type>(), ids, rows, f),
+    }
+}
+
+/// Calls `f(group, bits)` for each row with a value, in order (as `each`), with the value as 64
+/// bits: integers, dates, and timestamps sign-extended, booleans as 0 or 1, and floats by bit
+/// pattern with every NaN made one NaN and -0.0 made 0.0, so values SQL's DISTINCT treats as
+/// equal have equal bits. A column of type null has no values.
+fn each_bits(array: &dyn Array, ids: &[u32], rows: Option<&[u32]>, mut f: impl FnMut(usize, u64)) {
+    match array.data_type() {
+        DataType::Int16 => each(array.as_primitive::<Int16Type>(), ids, rows, |g, v| {
+            f(g, i64::from(v) as u64);
+        }),
+        DataType::Int32 => each(array.as_primitive::<Int32Type>(), ids, rows, |g, v| {
+            f(g, i64::from(v) as u64);
+        }),
+        DataType::Date32 => each(array.as_primitive::<Date32Type>(), ids, rows, |g, v| {
+            f(g, i64::from(v) as u64);
+        }),
+        DataType::Int64 => each(array.as_primitive::<Int64Type>(), ids, rows, |g, v| {
+            f(g, v as u64);
+        }),
+        DataType::Timestamp(..) => each(
+            array.as_primitive::<TimestampNanosecondType>(),
+            ids,
+            rows,
+            |g, v| f(g, v as u64),
+        ),
+        DataType::Float64 => each(array.as_primitive::<Float64Type>(), ids, rows, |g, v| {
+            let bits = if v.is_nan() {
+                f64::NAN.to_bits()
+            } else if v == 0.0 {
+                0
+            } else {
+                v.to_bits()
+            };
+            f(g, bits);
+        }),
+        DataType::Boolean => {
+            let array = array.as_boolean();
+            for (i, &group) in ids.iter().enumerate() {
+                let row = rows.map_or(i, |r| r[i] as usize);
+                if array.is_valid(row) {
+                    f(group as usize, u64::from(array.value(row)));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Calls `f(group, bytes)` for each row of a string column with a value, in order (as `each`).
+fn each_str(array: &dyn Array, ids: &[u32], rows: Option<&[u32]>, mut f: impl FnMut(usize, &[u8])) {
+    let array = array.as_string::<i32>();
+    let nulls = array.null_count() > 0;
+    for (i, &group) in ids.iter().enumerate() {
+        let row = rows.map_or(i, |r| r[i] as usize);
+        if !nulls || array.is_valid(row) {
+            f(group as usize, array.value(row).as_bytes());
+        }
     }
 }
 
@@ -895,6 +1409,7 @@ impl Partial {
         for accumulator in &mut accumulators {
             accumulator.resize(count);
             accumulator.fold(&batch, row_keys, &groups.ids, None)?;
+            accumulator.seal();
         }
         let mut last = vec![0; count];
         let mut all = (!context.add_only).then(|| vec![Vec::new(); count]);

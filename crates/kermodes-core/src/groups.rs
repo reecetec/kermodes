@@ -20,7 +20,7 @@ use hashbrown::HashTable;
 use crate::Error;
 use crate::storage::RowKey;
 
-static HASHER: LazyLock<RandomState> = LazyLock::new(|| {
+pub(crate) static HASHER: LazyLock<RandomState> = LazyLock::new(|| {
     RandomState::with_seeds(
         0x243f_6a88_85a3_08d3,
         0x1319_8a2e_0370_7344,

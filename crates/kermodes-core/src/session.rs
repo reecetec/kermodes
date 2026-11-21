@@ -1962,7 +1962,8 @@ impl Table {
     }
 
     /// One row per value of `columns`, with each `(name, "function(column)")` aggregation:
-    /// count, sum, mean, std, min, max, first, last. `count(*)` counts rows.
+    /// count, count_distinct, sum, mean, std, min, max, first, last. `count(*)` counts rows;
+    /// integer sums and means are exact.
     pub fn agg_by(&self, columns: &[&str], aggregations: &[(&str, &str)]) -> Result<Table, Error> {
         if aggregations.is_empty() {
             return Err(Error::Unsupported(

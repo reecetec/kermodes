@@ -1,7 +1,7 @@
 //! The static path is the oracle: after every cycle, each ticking table must equal the same
 //! pipeline computed once over a static copy of its input. Float aggregates may differ in the
 //! last bits (partials merge where piece boundaries fall), so float columns are compared to a
-//! relative 1e-9; everything else must match exactly.
+//! relative 1e-9, with NaN equal to NaN; everything else must match exactly.
 
 use std::sync::Arc;
 
@@ -31,6 +31,11 @@ const AGGREGATIONS: &[(&str, &str)] = &[
     ("avg_lot", "mean(lot)"),
     ("low_lot", "min(lot)"),
     ("last_lot", "last(lot)"),
+    ("syms", "count_distinct(sym)"),
+    ("distinct_sizes", "count_distinct(size)"),
+    ("scores", "count_distinct(score)"),
+    ("flags", "count_distinct(flag)"),
+    ("lots_seen", "count_distinct(lot)"),
 ];
 
 const PIPELINES: &[(&str, Pipeline)] = &[
@@ -184,17 +189,28 @@ fn schema() -> Schema {
         Field::new("size", DataType::Int64, true),
         Field::new("flag", DataType::Boolean, true),
         Field::new("lot", DataType::Int16, true),
+        Field::new("score", DataType::Float64, true),
     ])
 }
 
-/// Ids come from a small range so keyed writes collide, within and across cycles.
+/// Ids come from a small range so keyed writes collide, within and across cycles. Scores hold NaNs
+/// of two bit patterns and zeros of both signs, which `count_distinct` must each count once.
 fn random_batch(rng: &mut Rng, rows: usize) -> RecordBatch {
+    let scores = [
+        f64::NAN,
+        f64::from_bits(0xfff8_0000_0000_0001),
+        0.0,
+        -0.0,
+        1.5,
+        -2.25,
+    ];
     let mut id = Vec::with_capacity(rows);
     let mut sym = Vec::with_capacity(rows);
     let mut price = Vec::with_capacity(rows);
     let mut size = Vec::with_capacity(rows);
     let mut flag = Vec::with_capacity(rows);
     let mut lot = Vec::with_capacity(rows);
+    let mut score = Vec::with_capacity(rows);
     for _ in 0..rows {
         id.push(Some(rng.below(12) as i64));
         sym.push((!rng.null()).then(|| ["a", "b", "c", "d"][rng.below(4) as usize]));
@@ -202,6 +218,7 @@ fn random_batch(rng: &mut Rng, rows: usize) -> RecordBatch {
         size.push((!rng.null()).then(|| rng.below(13) as i64 - 3));
         flag.push((!rng.null()).then(|| rng.below(2) == 0));
         lot.push((!rng.null()).then(|| rng.below(7) as i16 - 3));
+        score.push((!rng.null()).then(|| scores[rng.below(6) as usize]));
     }
     let columns: Vec<(&str, ArrayRef)> = vec![
         ("id", Arc::new(Int64Array::from(id))),
@@ -210,6 +227,7 @@ fn random_batch(rng: &mut Rng, rows: usize) -> RecordBatch {
         ("size", Arc::new(Int64Array::from(size))),
         ("flag", Arc::new(BooleanArray::from(flag))),
         ("lot", Arc::new(Int16Array::from(lot))),
+        ("score", Arc::new(Float64Array::from(score))),
     ];
     RecordBatch::try_from_iter(columns).unwrap()
 }
@@ -266,6 +284,14 @@ fn assert_same(got: &RecordBatch, want: &RecordBatch, context: &str) {
                 continue;
             }
             let (x, y): (f64, f64) = (a.value(row), b.value(row));
+            if x.is_nan() || y.is_nan() {
+                assert!(
+                    x.is_nan() && y.is_nan(),
+                    "{context}: `{}` row {row}: {x} vs {y}",
+                    field.name()
+                );
+                continue;
+            }
             let close = (x - y).abs() <= 1e-9 * x.abs().max(y.abs()) + 1e-12;
             assert!(close, "{context}: `{}` row {row}: {x} vs {y}", field.name());
         }

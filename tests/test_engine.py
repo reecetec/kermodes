@@ -155,6 +155,62 @@ def test_last_by_and_agg_by_match_a_plain_python_recomputation():
     ]
 
 
+def test_count_distinct_through_agg_by_ticks_with_upserts_and_deletes():
+    s = km.connect(":memory:", manual=True)
+    src = s.input_table({"id": km.int64(), **COLUMNS}, key="id")
+    per_sym = src.agg_by(
+        "sym",
+        prices="count_distinct(price)",
+        sizes="count_distinct(size)",
+        n="count(*)",
+    )
+    overall = src.agg_by(syms="count_distinct(sym)", prices="count_distinct(price)")
+
+    def rows(data: list[tuple]) -> pa.Table:
+        ids, sym, price, size = zip(*data, strict=True)
+        return pa.table(
+            {
+                "id": pa.array(ids, pa.int64()),
+                "sym": pa.array(sym, pa.string()),
+                "price": pa.array(price, pa.float64()),
+                "size": pa.array(size, pa.int64()),
+            }
+        )
+
+    def by_sym() -> list[dict]:
+        return sorted(pa.table(per_sym).to_pylist(), key=lambda r: r["sym"])
+
+    nan = float("nan")
+    # NaN is one value and -0.0 equals 0.0, as in SQL; NULL is no value.
+    src.upsert(
+        rows(
+            [
+                (0, "a", nan, 1),
+                (1, "a", nan, None),
+                (2, "a", 0.0, 1),
+                (3, "a", -0.0, 2),
+                (4, "b", None, None),
+                (5, "b", 2.5, 3),
+            ]
+        )
+    )
+    s.step()
+    assert by_sym() == [
+        {"sym": "a", "prices": 2, "sizes": 2, "n": 4},
+        {"sym": "b", "prices": 1, "sizes": 1, "n": 2},
+    ]
+    assert pa.table(overall).to_pylist() == [{"syms": 2, "prices": 3}]
+
+    src.delete(pa.table({"id": pa.array([0, 1], pa.int64())}))
+    src.upsert(rows([(2, "b", 2.5, 3)]))
+    s.step()
+    assert by_sym() == [
+        {"sym": "a", "prices": 1, "sizes": 1, "n": 1},
+        {"sym": "b", "prices": 1, "sizes": 1, "n": 3},
+    ]
+    assert pa.table(overall).to_pylist() == [{"syms": 2, "prices": 2}]
+
+
 def test_int16_columns_stay_int16_through_operators():
     s = km.connect(":memory:", manual=True)
     src = s.input_table({"sym": km.string(), "lot": "int16"})
