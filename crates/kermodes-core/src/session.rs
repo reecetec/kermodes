@@ -989,6 +989,17 @@ impl Session {
         Ok(self.add(state))
     }
 
+    /// A static table of rows the engine computed (the static executor's), as they are: their
+    /// columns may have types no input has, such as an expression's NULL.
+    pub fn computed_table(
+        &self,
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Table, Error> {
+        let state = TableState::fixed("static".into(), schema, batches).map_err(schema_error)?;
+        Ok(self.add(state))
+    }
+
     /// Runs one cycle: applies pending writes to input tables, then updates every refreshing
     /// derived table in creation order. Returns the cycle number.
     pub fn step(&self) -> u64 {
@@ -1625,21 +1636,10 @@ impl Table {
                 "update needs at least one `name = expression`".into(),
             ));
         }
-        let mut schema = self.schema.clone();
-        let mut bound = Vec::with_capacity(assignments.len());
-        for text in assignments {
-            let (assignment, next) = assign(&schema, text)?;
-            bound.push(assignment);
-            schema = next;
-        }
-        let update = Update {
-            assignments: bound,
-            columns: (0..schema.fields().len()).collect(),
-            output: schema.clone(),
-        };
+        let update = bind_update(&self.schema, assignments)?;
         self.derive(
             format!("update({})", assignments.join(", ")),
-            schema,
+            update.output.clone(),
             self.growth(),
             Operator::Update(update),
         )
@@ -1653,36 +1653,10 @@ impl Table {
                 "select needs at least one column".into(),
             ));
         }
-        let mut schema = self.schema.clone();
-        let (mut bound, mut keep) = (Vec::new(), Vec::with_capacity(columns.len()));
-        for text in columns {
-            let index = match schema.index_of(text.trim()) {
-                Ok(index) => index,
-                Err(_) => {
-                    let (assignment, next) = assign(&schema, text)?;
-                    let index = assignment.position;
-                    bound.push(assignment);
-                    schema = next;
-                    index
-                }
-            };
-            if keep.contains(&index) {
-                return Err(Error::Schema(format!(
-                    "select lists column `{}` twice",
-                    schema.field(index).name()
-                )));
-            }
-            keep.push(index);
-        }
-        let output = Arc::new(schema.project(&keep).map_err(schema_error)?);
-        let select = Update {
-            assignments: bound,
-            columns: keep,
-            output: output.clone(),
-        };
+        let select = bind_select(&self.schema, columns)?;
         self.derive(
             format!("select({})", columns.join(", ")),
-            output,
+            select.output.clone(),
             self.growth(),
             Operator::Update(select),
         )
@@ -2558,6 +2532,53 @@ fn assign(schema: &SchemaRef, text: &str) -> Result<(Assignment, SchemaRef), Err
         position,
     };
     Ok((assignment, Arc::new(Schema::new(fields))))
+}
+
+/// `update`'s assignments bound against `schema`, each seeing the ones before it.
+pub(crate) fn bind_update(schema: &SchemaRef, assignments: &[&str]) -> Result<Update, Error> {
+    let mut schema = schema.clone();
+    let mut bound = Vec::with_capacity(assignments.len());
+    for text in assignments {
+        let (assignment, next) = assign(&schema, text)?;
+        bound.push(assignment);
+        schema = next;
+    }
+    Ok(Update {
+        assignments: bound,
+        columns: (0..schema.fields().len()).collect(),
+        output: schema,
+    })
+}
+
+/// `select`'s columns bound against `schema`: names of columns, or assignments as in `update`.
+pub(crate) fn bind_select(schema: &SchemaRef, columns: &[&str]) -> Result<Update, Error> {
+    let mut schema = schema.clone();
+    let (mut bound, mut keep) = (Vec::new(), Vec::with_capacity(columns.len()));
+    for text in columns {
+        let index = match schema.index_of(text.trim()) {
+            Ok(index) => index,
+            Err(_) => {
+                let (assignment, next) = assign(&schema, text)?;
+                let index = assignment.position;
+                bound.push(assignment);
+                schema = next;
+                index
+            }
+        };
+        if keep.contains(&index) {
+            return Err(Error::Schema(format!(
+                "select lists column `{}` twice",
+                schema.field(index).name()
+            )));
+        }
+        keep.push(index);
+    }
+    let output = Arc::new(schema.project(&keep).map_err(schema_error)?);
+    Ok(Update {
+        assignments: bound,
+        columns: keep,
+        output,
+    })
 }
 
 /// Matches each batch's columns to `schema` by name and type; empty batches are dropped.

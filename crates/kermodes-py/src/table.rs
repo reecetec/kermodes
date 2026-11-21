@@ -663,9 +663,25 @@ impl Planned {
         })
     }
 
+    /// The plan's table, built now: a static plan by the static executor, on its own threads and
+    /// outside the session's graph, its result registered as a static table, so building it never
+    /// holds up a ticking table; a ticking plan by the engine's incremental operators.
     fn build(&self, plan: Plan) -> PyResult<kermodes_core::Table> {
         let plan = plan.pushed_down();
         let mut failed = None;
+        if !self.shadow.is_refreshing() {
+            let executed = kermodes_core::exec::execute(&plan, &mut |scan| {
+                self.source(scan).map_err(|e| set_aside(&mut failed, e))
+            });
+            return match (failed, executed) {
+                (Some(error), _) => Err(error),
+                (None, Ok((schema, batches))) => self
+                    .engine
+                    .computed_table(schema, batches)
+                    .map_err(engine_error),
+                (None, Err(error)) => Err(engine_error(error)),
+            };
+        }
         let built = plan.build(&mut |scan| self.rows(scan).map_err(|e| set_aside(&mut failed, e)));
         match failed {
             Some(error) => Err(error),
@@ -673,14 +689,41 @@ impl Planned {
         }
     }
 
-    /// The rows of `scan`: a table in memory, or a stored table.
+    /// A static scan's rows for the executor: a table in memory, or a stored table.
+    fn source(&self, scan: &Scan) -> PyResult<kermodes_core::exec::Source> {
+        match self.passed.get(&scan.name) {
+            Some(table) => {
+                let batches = table.snapshot().map_err(engine_error)?;
+                Ok(kermodes_core::exec::Source {
+                    schema: table.schema().clone(),
+                    parts: vec![stored::in_memory(batches)],
+                })
+            }
+            None => stored::source(self.stores()?, scan),
+        }
+    }
+
+    /// A ticking scan's rows: a table in memory, or a stored table.
     fn rows(&self, scan: &Scan) -> PyResult<kermodes_core::Table> {
         match self.passed.get(&scan.name) {
             Some(table) => match &scan.predicate {
                 Some(predicate) => table.filter(predicate).map_err(engine_error),
                 None => Ok(table.clone()),
             },
-            None => stored::rows(&self.engine, self.stores()?, scan),
+            None if scan.live => stored::live_rows(&self.engine, self.stores()?, scan),
+            None => {
+                // A static scan in a ticking plan (a static table joined to a live one): its rows
+                // now, read by the executor.
+                let mut source = Some(stored::source(self.stores()?, scan)?);
+                let (schema, batches) =
+                    kermodes_core::exec::execute(&Plan::Scan(scan.clone()), &mut |_| {
+                        Ok(source.take().expect("a plan of one scan asks once"))
+                    })
+                    .map_err(engine_error)?;
+                self.engine
+                    .computed_table(schema, batches)
+                    .map_err(engine_error)
+            }
         }
     }
 

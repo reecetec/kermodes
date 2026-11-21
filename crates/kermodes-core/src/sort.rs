@@ -28,6 +28,16 @@ pub(crate) fn sorted(
     batches: &[RecordBatch],
     keys: &[(usize, bool)],
 ) -> Result<Vec<RecordBatch>, ArrowError> {
+    gather(batches, &order(schema, batches, keys)?)
+}
+
+/// The positions of `batches`' rows (counted across them) in `sorted`'s order. Only the key
+/// columns are read, so a caller keeping some rows gathers only those (a top-N).
+pub(crate) fn order(
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+    keys: &[(usize, bool)],
+) -> Result<Vec<u32>, ArrowError> {
     let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
     if rows == 0 {
         return Ok(Vec::new());
@@ -71,7 +81,7 @@ pub(crate) fn sorted(
             sort_pairs(&order, width, pairs)
         };
     }
-    gather(batches, &order)
+    Ok(order)
 }
 
 /// One sort column as an unsigned integer per row.
@@ -313,7 +323,10 @@ pub(crate) fn partitioned_sort<K: Key>(
 }
 
 /// The rows at `order` (positions across `batches`), in pieces gathered on every core.
-fn gather(batches: &[RecordBatch], order: &[u32]) -> Result<Vec<RecordBatch>, ArrowError> {
+pub(crate) fn gather(
+    batches: &[RecordBatch],
+    order: &[u32],
+) -> Result<Vec<RecordBatch>, ArrowError> {
     let mut starts = Vec::with_capacity(batches.len());
     let mut sum = 0;
     for batch in batches {

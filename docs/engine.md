@@ -145,11 +145,10 @@ Delta { added: [(keys, rows)], removed: [(keys, last rows)], modified: [(keys, p
   holding the error; the rest of the graph keeps running. Snapshots of a failed table raise the
   error in Python.
 - Building a table takes the write lock and computes its initial state from its parent's rows
-  under it, then registers the node so it receives deltas from the next cycle. So a large static
-  build (a research query over years of history) delays every cycle of its session while it
-  runs; writes queue and nothing is lost, but live tables lag. Static plans over stored tables
-  are to run outside the graph (the streaming static executor, architecture.md §5.3), on their
-  own threads, registering only their result: a static query must never delay a ticking table.
+  under it, then registers the node so it receives deltas from the next cycle. So a large build
+  delays every cycle of its session while it runs. Static plans over stored tables therefore do
+  not build here: the static executor (`kermodes_core::exec`) runs them outside the graph and
+  registers only the result, so a static query never delays a ticking table.
 - A table lives while a handle refers to it (a Python `Table`) or a live table is computed from
   it; a static table built on another has its own rows and doesn't count. When neither holds,
   the table is released: its rows, operator state, and delta are freed, and the tables it was
@@ -163,6 +162,25 @@ Delta { added: [(keys, rows)], removed: [(keys, last rows)], modified: [(keys, p
   mimalloc and registers its collection (`mi_collect`) as the idle hook
   (`kermodes_core::set_idle_hook`); while cycles run back to back, freed memory is reused instead.
   A process's footprint then follows the tables it holds, not its high-water mark.
+
+### 4.1 Static executor
+
+- Input is a scan's `Source`: parts read independently, in the table's order (a run of a
+  Parquet file's row groups, a past date weir holds, today's rows). Parts run in parallel, each
+  decoded on the thread that runs it, and results are handed on in part order, so no result
+  depends on the thread count.
+- `where`, `update`, `select`, and `merge` stream batch by batch. `head` and `slice` stop
+  reading once they have their rows, before opening later parts. `tail` keeps its last rows.
+- `agg_by` folds each part into partial states and merges them by key hash across threads,
+  each group taking its merges in part order; memory follows the groups, not the input.
+  Groups come out in the order their keys first appear.
+- `head` or `slice` over `sort` is a top-N: each part keeps its best rows, chosen on the sort
+  columns alone, and full rows are gathered for the winners. A sort without one sorts all its
+  input, stably.
+- Joins, `last_by`, and `rolling` collect their inputs and run the engine's static operators in
+  a session of their own, so no caller's graph is held.
+- The engine's static operators are its oracle: seeded random plans over random data, split into
+  random parts, give equal schemas and rows, at one thread and many.
 
 ## 5. Operators
 

@@ -67,9 +67,7 @@ impl Where {
         let added = row_pieces(&delta.added, PIECE_ROWS);
         let threads = threads_for(added.iter().map(|(keys, _)| keys.len()).sum());
         if self.rekey {
-            let filtered = run(threads, added, |(), (_, batch)| {
-                filter_record_batch(&batch, &self.mask(&batch)?)
-            });
+            let filtered = run(threads, added, |(), (_, batch)| self.filter(&batch));
             let mut next = own.next_key();
             for batch in filtered {
                 let batch = batch?;
@@ -128,6 +126,11 @@ impl Where {
         Ok(out)
     }
 
+    /// The rows of `batch` for which the predicate is true.
+    pub fn filter(&self, batch: &RecordBatch) -> Result<RecordBatch, ArrowError> {
+        filter_record_batch(batch, &self.mask(batch)?)
+    }
+
     /// The predicate with NULL read as false.
     fn mask(&self, batch: &RecordBatch) -> Result<BooleanArray, ArrowError> {
         let value = self.predicate.evaluate(batch)?;
@@ -181,7 +184,7 @@ impl Update {
         Ok(out)
     }
 
-    fn compute(&self, batch: &RecordBatch) -> Result<RecordBatch, ArrowError> {
+    pub fn compute(&self, batch: &RecordBatch) -> Result<RecordBatch, ArrowError> {
         let rows = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
         let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
         for assignment in &self.assignments {
@@ -528,15 +531,6 @@ impl Slice {
         self.kept = now;
         Ok(out)
     }
-}
-
-/// One input column's values at `keys`, NULL where there is no key.
-pub(crate) fn pick_column(
-    input: Reader<'_>,
-    column: usize,
-    keys: &[Option<RowKey>],
-) -> Result<ArrayRef, ArrowError> {
-    Ok(input.columns_at(&[column], keys)?.remove(0))
 }
 
 pub(crate) fn take_rows(batch: &RecordBatch, rows: &[usize]) -> Result<RecordBatch, ArrowError> {

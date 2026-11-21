@@ -11,26 +11,33 @@
 //! rounding once. Float sums, means, and standard deviations depend on where piece boundaries
 //! fall, so a ticking table and a static recomputation can differ in the last bits; piece
 //! boundaries never depend on the number of cores, so results do not either.
+//!
+//! The static executor (`exec`) aggregates without engine storage (`Fold`): each part of its
+//! input folds into partial states of its own, and parts merge in their order, so the same
+//! partial states serve both paths and only float sums and means can differ from the engine's
+//! static `agg_by`, where their parts and its pieces fall differently.
 
 use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, ArrowPrimitiveType, AsArray, Float64Array, Int64Array, PrimitiveArray,
-    UInt32Array,
+    UInt32Array, new_null_array,
 };
-use arrow::compute::take;
+use arrow::compute::{concat_batches, interleave, take, take_record_batch};
 use arrow::datatypes::{
     DataType, Date32Type, Field, Float64Type, Int16Type, Int32Type, Int64Type, Schema, SchemaRef,
     TimeUnit, TimestampNanosecondType,
 };
 use arrow::error::ArrowError;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
-use arrow::row::{OwnedRow, RowConverter, Rows as EncodedRows, SortField};
+use arrow::row::{RowConverter, Rows as EncodedRows, SortField};
 use hashbrown::HashTable;
 
-use crate::groups::{HASHER, KeyKind, LocalEntry, LocalGroups, Membership, shard_of, split};
-use crate::ops::{pick_column, push_removed};
-use crate::parallel::{PARALLEL_ROWS, offsets, run, threads};
+use crate::groups::{
+    HASHER, KeyKind, KeyTable, LocalEntry, LocalGroups, Membership, shard_of, split,
+};
+use crate::ops::push_removed;
+use crate::parallel::{self, PARALLEL_ROWS, offsets, run, threads, threads_for};
 use crate::session::Reader;
 use crate::storage::{Delta, Modified, RowKey, Rows, Storage};
 use crate::{Error, type_name};
@@ -59,26 +66,23 @@ pub(crate) enum Accumulator {
     },
     /// The count, sum, and sum of squares, in double-double.
     Std { column: usize, state: Vec<Moments> },
-    /// `min` or `max`: the winning value (comparable encoding) and its row key; ties go to the
-    /// smaller key. `column` is read when folding; `source` is the input column the value is
-    /// copied from.
+    /// `min` or `max`: the winning value and its row key; ties go to the smaller key.
     Extreme {
         column: usize,
-        source: usize,
         max: bool,
-        data_type: DataType,
-        converter: RowConverter,
-        best: Vec<Option<(OwnedRow, RowKey)>>,
+        kept: Kept,
     },
-    /// `first` or `last`: the smallest or largest row key, nulls included.
+    /// `first` or `last`: the value of the smallest or largest row key, nulls included.
     Edge {
         column: usize,
-        source: usize,
         last: bool,
-        key: Vec<Option<RowKey>>,
+        kept: Kept,
     },
     /// `count_distinct`: the distinct non-null values of `column` per group.
-    CountDistinct { column: usize, values: Distinct },
+    CountDistinct {
+        column: usize,
+        values: Box<Distinct>,
+    },
 }
 
 /// One group's float sum and count, kept together so a fold touches one cache line per row.
@@ -325,7 +329,7 @@ impl Accumulator {
             "count_distinct" => (
                 Accumulator::CountDistinct {
                     column,
-                    values: Distinct::new(input_type == DataType::Utf8),
+                    values: Box::new(Distinct::new(input_type == DataType::Utf8)),
                 },
                 DataType::Int64,
             ),
@@ -365,21 +369,18 @@ impl Accumulator {
             "min" | "max" => (
                 Accumulator::Extreme {
                     column,
-                    source: column,
                     max: call.function == "max",
-                    converter: RowConverter::new(vec![SortField::new(input_type.clone())])
+                    kept: Kept::new(input_type.clone())
                         .map_err(|e| call_error(spec, e.to_string()))?,
-                    data_type: input_type.clone(),
-                    best: Vec::new(),
                 },
                 input_type,
             ),
             _ => (
                 Accumulator::Edge {
                     column,
-                    source: column,
                     last: call.function == "last",
-                    key: Vec::new(),
+                    kept: Kept::new(input_type.clone())
+                        .map_err(|e| call_error(spec, e.to_string()))?,
                 },
                 input_type,
             ),
@@ -411,34 +412,19 @@ impl Accumulator {
                 column: *column,
                 state: Vec::new(),
             },
-            Accumulator::Extreme {
-                column,
-                source,
-                max,
-                data_type,
-                ..
-            } => Accumulator::Extreme {
+            Accumulator::Extreme { column, max, kept } => Accumulator::Extreme {
                 column: *column,
-                source: *source,
                 max: *max,
-                converter: RowConverter::new(vec![SortField::new(data_type.clone())])?,
-                data_type: data_type.clone(),
-                best: Vec::new(),
+                kept: Kept::new(kept.data_type.clone())?,
             },
-            Accumulator::Edge {
-                column,
-                source,
-                last,
-                ..
-            } => Accumulator::Edge {
+            Accumulator::Edge { column, last, kept } => Accumulator::Edge {
                 column: *column,
-                source: *source,
                 last: *last,
-                key: Vec::new(),
+                kept: Kept::new(kept.data_type.clone())?,
             },
             Accumulator::CountDistinct { column, values } => Accumulator::CountDistinct {
                 column: *column,
-                values: Distinct::new(values.strings.is_some()),
+                values: Box::new(Distinct::new(values.strings.is_some())),
             },
         })
     }
@@ -484,8 +470,9 @@ impl Accumulator {
             }
             Accumulator::SumFloat { state, .. } => state.resize(len, FloatSum::default()),
             Accumulator::Std { state, .. } => state.resize(len, Moments::default()),
-            Accumulator::Extreme { best, .. } => best.resize(len, None),
-            Accumulator::Edge { key, .. } => key.resize(len, None),
+            Accumulator::Extreme { kept, .. } | Accumulator::Edge { kept, .. } => {
+                kept.best.resize(len, None)
+            }
             Accumulator::CountDistinct { values, .. } => values.resize(len),
         }
     }
@@ -496,8 +483,9 @@ impl Accumulator {
             Accumulator::SumInt { sum, n, .. } => (sum[group], n[group]) = (0, 0),
             Accumulator::SumFloat { state, .. } => state[group] = FloatSum::default(),
             Accumulator::Std { state, .. } => state[group] = Moments::default(),
-            Accumulator::Extreme { best, .. } => best[group] = None,
-            Accumulator::Edge { key, .. } => key[group] = None,
+            Accumulator::Extreme { kept, .. } | Accumulator::Edge { kept, .. } => {
+                kept.best[group] = None
+            }
             Accumulator::CountDistinct { values, .. } => values.reset(group),
         }
     }
@@ -555,49 +543,35 @@ impl Accumulator {
                     state[group].insert(x);
                 });
             }
-            Accumulator::Extreme {
-                column,
-                max,
-                converter,
-                best,
-                ..
-            } => {
-                let array = match rows {
-                    None => batch.column(*column).clone(),
-                    Some(rows) => take(
-                        batch.column(*column),
-                        &UInt32Array::from(rows.to_vec()),
-                        None,
-                    )?,
-                };
-                let encoded = converter.convert_columns(std::slice::from_ref(&array))?;
+            Accumulator::Extreme { column, max, kept } => {
+                let (array, encoded) = kept.encode(batch.column(*column), rows)?;
                 for (i, &group) in ids.iter().enumerate() {
                     if array.is_null(i) {
                         continue;
                     }
-                    let candidate = encoded.row(i);
-                    let key = keys[row_of(i)];
-                    let current = &mut best[group as usize];
-                    let better = match current {
+                    let (candidate, key) = (encoded.row(i).data(), keys[row_of(i)]);
+                    let better = match &kept.best[group as usize] {
                         None => true,
-                        Some((value, held)) => beats(*max, candidate.cmp(&value.row()), key, *held),
+                        Some((value, held)) => {
+                            beats(*max, candidate.cmp(value.as_slice()), key, *held)
+                        }
                     };
                     if better {
-                        *current = Some((candidate.owned(), key));
+                        kept.set(group as usize, candidate, key);
                     }
                 }
             }
-            Accumulator::Edge { last, key, .. } => {
+            Accumulator::Edge { column, last, kept } => {
+                let (_, encoded) = kept.encode(batch.column(*column), rows)?;
                 for (i, &group) in ids.iter().enumerate() {
                     let candidate = keys[row_of(i)];
-                    let current = &mut key[group as usize];
-                    let better = match current {
+                    let better = match &kept.best[group as usize] {
                         None => true,
-                        Some(held) if *last => candidate > *held,
-                        Some(held) => candidate < *held,
+                        Some((_, held)) if *last => candidate > *held,
+                        Some((_, held)) => candidate < *held,
                     };
                     if better {
-                        *current = Some(candidate);
+                        kept.set(group as usize, encoded.row(i).data(), candidate);
                     }
                 }
             }
@@ -670,21 +644,13 @@ impl Accumulator {
                     |group, x| state[group].remove(x),
                 );
             }
-            Accumulator::Extreme { best, .. } => {
+            Accumulator::Extreme { kept, .. } | Accumulator::Edge { kept, .. } => {
                 for (&group, &row) in ids.iter().zip(rows) {
                     let group = group as usize;
-                    if best[group]
+                    if kept.best[group]
                         .as_ref()
                         .is_some_and(|(_, key)| *key == keys[row as usize])
                     {
-                        stale[group] = true;
-                    }
-                }
-            }
-            Accumulator::Edge { key, .. } => {
-                for (&group, &row) in ids.iter().zip(rows) {
-                    let group = group as usize;
-                    if key[group] == Some(keys[row as usize]) {
                         stale[group] = true;
                     }
                 }
@@ -712,28 +678,26 @@ impl Accumulator {
             (Accumulator::Std { state, .. }, Accumulator::Std { state: theirs, .. }) => {
                 state[into].merge(&theirs[from]);
             }
-            (Accumulator::Extreme { max, best, .. }, Accumulator::Extreme { best: theirs, .. }) => {
-                if let Some((value, key)) = &theirs[from] {
-                    let better = match &best[into] {
+            (Accumulator::Extreme { max, kept, .. }, Accumulator::Extreme { kept: theirs, .. }) => {
+                if let Some((value, key)) = &theirs.best[from] {
+                    let better = match &kept.best[into] {
                         None => true,
-                        Some((held, held_key)) => {
-                            beats(*max, value.row().cmp(&held.row()), *key, *held_key)
-                        }
+                        Some((held, held_key)) => beats(*max, value.cmp(held), *key, *held_key),
                     };
                     if better {
-                        best[into] = Some((value.clone(), *key));
+                        kept.set(into, value, *key);
                     }
                 }
             }
-            (Accumulator::Edge { last, key, .. }, Accumulator::Edge { key: theirs, .. }) => {
-                if let Some(candidate) = theirs[from] {
-                    let better = match key[into] {
+            (Accumulator::Edge { last, kept, .. }, Accumulator::Edge { kept: theirs, .. }) => {
+                if let Some((value, candidate)) = &theirs.best[from] {
+                    let better = match &kept.best[into] {
                         None => true,
-                        Some(held) if *last => candidate > held,
-                        Some(held) => candidate < held,
+                        Some((_, held)) if *last => candidate > held,
+                        Some((_, held)) => candidate < held,
                     };
                     if better {
-                        key[into] = Some(candidate);
+                        kept.set(into, value, *candidate);
                     }
                 }
             }
@@ -747,7 +711,7 @@ impl Accumulator {
     }
 
     /// The output column for `groups`, in that order.
-    fn output(&self, groups: &[u32], input: Reader<'_>) -> Result<ArrayRef, ArrowError> {
+    fn output(&self, groups: &[u32]) -> Result<ArrayRef, ArrowError> {
         let at = groups.iter().map(|g| *g as usize);
         Ok(match self {
             Accumulator::Count { n, .. } => {
@@ -781,18 +745,73 @@ impl Accumulator {
             Accumulator::Std { state, .. } => {
                 Arc::new(Float64Array::from_iter(at.map(|g| state[g].std())))
             }
-            Accumulator::Extreme { source, best, .. } => {
-                let keys: Vec<_> = at.map(|g| best[g].as_ref().map(|(_, key)| *key)).collect();
-                pick_column(input, *source, &keys)?
-            }
-            Accumulator::Edge { source, key, .. } => {
-                let keys: Vec<_> = at.map(|g| key[g]).collect();
-                pick_column(input, *source, &keys)?
+            Accumulator::Extreme { kept, .. } | Accumulator::Edge { kept, .. } => {
+                kept.output(at)?
             }
             Accumulator::CountDistinct { values, .. } => Arc::new(Int64Array::from_iter_values(
                 at.map(|g| values.counts.distinct[g]),
             )),
         })
+    }
+}
+
+/// Per group, the input value a `min`, `max`, `first`, or `last` keeps, with the row key it came
+/// from (`None` before any row): in Arrow's row encoding, so a value of any type compares and
+/// copies as bytes, into a buffer reused as the value changes, and the output needs no input
+/// rows.
+pub(crate) struct Kept {
+    data_type: DataType,
+    converter: RowConverter,
+    best: Vec<Option<(Vec<u8>, RowKey)>>,
+}
+
+impl Kept {
+    fn new(data_type: DataType) -> Result<Self, ArrowError> {
+        Ok(Self {
+            converter: RowConverter::new(vec![SortField::new(data_type.clone())])?,
+            data_type,
+            best: Vec::new(),
+        })
+    }
+
+    /// The values a fold reads, every row of `column` or the selected `rows`, and their
+    /// encoding.
+    fn encode(
+        &self,
+        column: &ArrayRef,
+        rows: Option<&[u32]>,
+    ) -> Result<(ArrayRef, EncodedRows), ArrowError> {
+        let array = match rows {
+            None => column.clone(),
+            Some(rows) => take(column, &UInt32Array::from(rows.to_vec()), None)?,
+        };
+        let encoded = self
+            .converter
+            .convert_columns(std::slice::from_ref(&array))?;
+        Ok((array, encoded))
+    }
+
+    fn set(&mut self, group: usize, value: &[u8], key: RowKey) {
+        match &mut self.best[group] {
+            Some((held, at)) => {
+                held.clear();
+                held.extend_from_slice(value);
+                *at = key;
+            }
+            none => *none = Some((value.to_vec(), key)),
+        }
+    }
+
+    fn output(&self, groups: impl Iterator<Item = usize>) -> Result<ArrayRef, ArrowError> {
+        let null = self
+            .converter
+            .convert_columns(&[new_null_array(&self.data_type, 1)])?;
+        let parser = self.converter.parser();
+        let rows = groups.map(|g| match &self.best[g] {
+            Some((value, _)) => parser.parse(value),
+            None => null.row(0),
+        });
+        Ok(self.converter.convert_rows(rows)?.remove(0))
     }
 }
 
@@ -1806,7 +1825,7 @@ impl Shard {
             .map(|c| rows.column(*c).clone())
             .collect();
         for accumulator in &self.accumulators {
-            columns.push(accumulator.output(ids, input)?);
+            columns.push(accumulator.output(ids)?);
         }
         let slots = ids
             .iter()
@@ -1815,6 +1834,318 @@ impl Shard {
         let options = RecordBatchOptions::new().with_row_count(Some(ids.len()));
         let batch = RecordBatch::try_new_with_options(context.output.clone(), columns, &options)?;
         Ok((slots, batch))
+    }
+}
+
+/// `agg_by` over rows that only arrive, without engine storage (the static executor): a part
+/// folds its rows into partial states of its own (`add`, then `seal`), and parts merge in their
+/// order into `Merged`.
+pub(crate) struct Fold {
+    input: SchemaRef,
+    /// How group keys are read from input batches, and from `keys` (the group columns alone).
+    input_keys: KeyKind,
+    group_keys: KeyKind,
+    group_columns: Vec<usize>,
+    key_schema: SchemaRef,
+    accumulators: Vec<Accumulator>,
+    /// Whether an aggregation reads row keys: min, max, first, and last order rows by them.
+    positions: bool,
+    groups: KeyTable,
+    /// The group columns of each group, by id, in pieces; one batch once sealed.
+    keys: Vec<RecordBatch>,
+    /// Once sealed: `keys`' row encoding, for keys that need one, and each shard's groups.
+    encoded: Option<EncodedRows>,
+    by_shard: Vec<Vec<u32>>,
+    /// Scratch, kept for its capacity.
+    local: HashTable<LocalEntry>,
+    row_keys: Vec<RowKey>,
+}
+
+impl Fold {
+    pub fn new(
+        input: &SchemaRef,
+        group_columns: Vec<usize>,
+        specs: &[&str],
+    ) -> Result<Self, Error> {
+        let accumulators = specs
+            .iter()
+            .map(|spec| Accumulator::parse(spec, input).map(|(a, _)| a))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::with(input.clone(), group_columns, accumulators)
+            .map_err(|e| Error::Schema(e.to_string()))
+    }
+
+    fn with(
+        input: SchemaRef,
+        group_columns: Vec<usize>,
+        accumulators: Vec<Accumulator>,
+    ) -> Result<Self, ArrowError> {
+        let key_schema = Arc::new(input.project(&group_columns)?);
+        Ok(Self {
+            input_keys: KeyKind::new(&input, group_columns.clone())?,
+            group_keys: KeyKind::new(&key_schema, (0..group_columns.len()).collect())?,
+            positions: accumulators
+                .iter()
+                .any(|a| matches!(a, Accumulator::Extreme { .. } | Accumulator::Edge { .. })),
+            input,
+            group_columns,
+            key_schema,
+            accumulators,
+            groups: KeyTable::default(),
+            keys: Vec::new(),
+            encoded: None,
+            by_shard: Vec::new(),
+            local: HashTable::new(),
+            row_keys: Vec::new(),
+        })
+    }
+
+    /// The same aggregation, holding no groups: a part's partial states.
+    pub fn fresh(&self) -> Result<Self, ArrowError> {
+        let accumulators = self
+            .accumulators
+            .iter()
+            .map(Accumulator::fresh)
+            .collect::<Result<_, _>>()?;
+        Self::with(self.input.clone(), self.group_columns.clone(), accumulators)
+    }
+
+    /// Folds `batch`, whose rows' keys run from `first`.
+    pub fn add(&mut self, batch: &RecordBatch, first: RowKey) -> Result<(), ArrowError> {
+        let rows = batch.num_rows();
+        if rows == 0 {
+            return Ok(());
+        }
+        let encoded = self.input_keys.encode(batch)?;
+        let keys = self.input_keys.keys(batch, encoded.as_ref());
+        let local = LocalGroups::build(&keys, rows, &mut self.local);
+        let mut new = Vec::new();
+        let ids: Vec<u32> = (0..local.len())
+            .map(|g| {
+                let row = local.first_row[g] as usize;
+                let (id, created) = self.groups.id(&keys, row, local.hash[g]);
+                if created {
+                    new.push(row as u32);
+                }
+                id
+            })
+            .collect();
+        if !new.is_empty() && !self.group_columns.is_empty() {
+            let indices = UInt32Array::from(new);
+            let columns = self
+                .group_columns
+                .iter()
+                .map(|c| take(batch.column(*c), &indices, None))
+                .collect::<Result<Vec<_>, _>>()?;
+            self.keys
+                .push(RecordBatch::try_new(self.key_schema.clone(), columns)?);
+        }
+        let ids: Vec<u32> = local.ids.iter().map(|g| ids[*g as usize]).collect();
+        self.row_keys.clear();
+        if self.positions {
+            self.row_keys.extend(first..first + rows as RowKey);
+        }
+        for accumulator in &mut self.accumulators {
+            accumulator.resize(self.groups.len());
+            accumulator.fold(batch, &self.row_keys, &ids, None)?;
+        }
+        Ok(())
+    }
+
+    /// Readies a part's states for merging into `shards` shards, once all its rows are folded.
+    pub fn seal(&mut self, shards: usize) -> Result<(), ArrowError> {
+        let keys = if self.group_columns.is_empty() {
+            let options = RecordBatchOptions::new().with_row_count(Some(self.groups.len()));
+            RecordBatch::try_new_with_options(self.key_schema.clone(), Vec::new(), &options)?
+        } else {
+            concat_batches(&self.key_schema, &self.keys)?
+        };
+        self.encoded = self.group_keys.encode(&keys)?;
+        self.keys = vec![keys];
+        self.by_shard = vec![Vec::new(); shards];
+        for group in 0..self.groups.len() {
+            self.by_shard[shard_of(self.groups.hash(group), shards)].push(group as u32);
+        }
+        for accumulator in &mut self.accumulators {
+            accumulator.seal();
+        }
+        Ok(())
+    }
+
+    /// Merged states of the same aggregation, holding no groups, in `shards` shards.
+    pub fn merged(&self, shards: usize) -> Result<Merged, ArrowError> {
+        let shards = (0..shards)
+            .map(|_| {
+                Ok(Merging {
+                    groups: KeyTable::default(),
+                    keys: Vec::new(),
+                    accumulators: self
+                        .accumulators
+                        .iter()
+                        .map(Accumulator::fresh)
+                        .collect::<Result<_, _>>()?,
+                    first: Vec::new(),
+                })
+            })
+            .collect::<Result<_, ArrowError>>()?;
+        Ok(Merged {
+            key_schema: self.key_schema.clone(),
+            shards,
+            part_groups: Vec::new(),
+        })
+    }
+}
+
+/// Every part's groups merged, sharded by key hash so shards merge on their own threads. Each
+/// shard merges the parts in their order, so a group's states merge as they would in one table,
+/// whatever the number of shards; the output puts the groups back in the order their keys first
+/// appear in the input, whose parts' groups are numbered in that order.
+pub(crate) struct Merged {
+    key_schema: SchemaRef,
+    shards: Vec<Merging>,
+    /// Per part merged, by index: how many groups it held.
+    part_groups: Vec<usize>,
+}
+
+/// One shard of `Merged`: the groups whose key hashes to it.
+struct Merging {
+    groups: KeyTable,
+    /// The group columns of each group, by id, in pieces.
+    keys: Vec<RecordBatch>,
+    accumulators: Vec<Accumulator>,
+    /// Per group, where its key first appears: its part's index in the high 32 bits, its id
+    /// within the part in the low.
+    first: Vec<u64>,
+}
+
+impl Merged {
+    /// Merges sealed parts, given with their indices in order, after every part merged so far.
+    pub fn merge(&mut self, parts: &[(usize, Fold)]) -> Result<(), ArrowError> {
+        for (index, part) in parts {
+            debug_assert_eq!(*index, self.part_groups.len(), "parts merge in order");
+            self.part_groups.push(part.groups.len());
+        }
+        let shards: Vec<(usize, &mut Merging)> = self.shards.iter_mut().enumerate().collect();
+        run(shards.len(), shards, |(), (shard, merging)| {
+            parts
+                .iter()
+                .try_for_each(|(index, part)| merging.merge(shard, *index, part))
+        })
+        .into_iter()
+        .collect()
+    }
+
+    /// One row per group, in the order their keys first appear, with `output`'s columns (the
+    /// group columns, then each aggregation), in pieces built on every core.
+    pub fn finish(&self, output: &SchemaRef) -> Result<Vec<RecordBatch>, ArrowError> {
+        let at = self.order();
+        let shards: Vec<&Merging> = self.shards.iter().collect();
+        let columns = run(shards.len(), shards, |(), merging| {
+            merging.columns(&self.key_schema)
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+        let pieces: Vec<&[(usize, usize)]> = at.chunks(parallel::PIECE_ROWS).collect();
+        run(threads_for(at.len()), pieces, |(), piece| {
+            let picked = (0..output.fields().len())
+                .map(|column| {
+                    let arrays: Vec<&dyn Array> =
+                        columns.iter().map(|c| c[column].as_ref()).collect();
+                    interleave(&arrays, piece)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let options = RecordBatchOptions::new().with_row_count(Some(piece.len()));
+            RecordBatch::try_new_with_options(output.clone(), picked, &options)
+        })
+        .into_iter()
+        .collect()
+    }
+
+    /// Every group, as `(shard, id)`, in the order its key first appears. A group's place is
+    /// its first part's place among parts, then its id's rank among the ids of that part's
+    /// groups first seen there, counted with one bit per id of every part.
+    fn order(&self) -> Vec<(usize, usize)> {
+        let mut starts = Vec::with_capacity(self.part_groups.len());
+        let mut words = 0;
+        for groups in &self.part_groups {
+            starts.push(words);
+            words += groups.div_ceil(64);
+        }
+        let split = |first: u64| {
+            let (part, id) = (
+                (first >> 32) as usize,
+                (first & u64::from(u32::MAX)) as usize,
+            );
+            (starts[part] + id / 64, id % 64)
+        };
+        let mut seen = vec![0u64; words];
+        for merging in &self.shards {
+            for &first in &merging.first {
+                let (word, bit) = split(first);
+                seen[word] |= 1 << bit;
+            }
+        }
+        let mut before = Vec::with_capacity(words);
+        let mut total = 0;
+        for word in &seen {
+            before.push(total);
+            total += word.count_ones() as usize;
+        }
+        let mut at = vec![(0, 0); total];
+        for (shard, merging) in self.shards.iter().enumerate() {
+            for (id, &first) in merging.first.iter().enumerate() {
+                let (word, bit) = split(first);
+                let rank = (seen[word] & ((1 << bit) - 1)).count_ones() as usize;
+                at[before[word] + rank] = (shard, id);
+            }
+        }
+        at
+    }
+}
+
+impl Merging {
+    /// This shard's output columns, by group id.
+    fn columns(&self, key_schema: &SchemaRef) -> Result<Vec<ArrayRef>, ArrowError> {
+        let mut columns = concat_batches(key_schema, &self.keys)?.columns().to_vec();
+        let ids: Vec<u32> = (0..self.groups.len() as u32).collect();
+        for accumulator in &self.accumulators {
+            columns.push(accumulator.output(&ids)?);
+        }
+        Ok(columns)
+    }
+
+    /// Merges this shard's groups of the sealed part `part`, the input's `index`th.
+    fn merge(&mut self, shard: usize, index: usize, part: &Fold) -> Result<(), ArrowError> {
+        let [theirs] = part.keys.as_slice() else {
+            unreachable!("a merged part is sealed");
+        };
+        let keys = part.group_keys.keys(theirs, part.encoded.as_ref());
+        let mine = &part.by_shard[shard];
+        let mut new = Vec::new();
+        let ids: Vec<u32> = mine
+            .iter()
+            .map(|&group| {
+                let (id, created) =
+                    self.groups
+                        .id(&keys, group as usize, part.groups.hash(group as usize));
+                if created {
+                    new.push(group);
+                    self.first.push(((index as u64) << 32) | u64::from(group));
+                }
+                id
+            })
+            .collect();
+        if !new.is_empty() && theirs.num_columns() > 0 {
+            self.keys
+                .push(take_record_batch(theirs, &UInt32Array::from(new))?);
+        }
+        for (accumulator, theirs) in self.accumulators.iter_mut().zip(&part.accumulators) {
+            accumulator.resize(self.groups.len());
+            for (&from, &into) in mine.iter().zip(&ids) {
+                accumulator.merge(into as usize, theirs, from as usize)?;
+            }
+        }
+        Ok(())
     }
 }
 

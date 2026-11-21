@@ -29,7 +29,9 @@ use object_store::prefix::PrefixStore;
 use object_store::signer::{Method, Signer};
 use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt};
 use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
-use parquet::arrow::arrow_reader::{ArrowReaderOptions, RowSelection, RowSelector};
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, RowSelection, RowSelector,
+};
 use parquet::arrow::async_reader::{
     AsyncFileReader, MetadataSuffixFetch, ParquetRecordBatchStream,
 };
@@ -491,18 +493,48 @@ impl Lake {
         bounds: &[Bound],
         projection: Option<&Projection>,
     ) -> Result<Batches<'_>, Error> {
-        let reader: Box<dyn AsyncFileReader> = match at {
+        let file = self.plan_file(location, file, at, first, last, bounds, projection)?;
+        let whole = FilePart {
+            groups: file.groups.clone(),
+            selection: file.selection.clone(),
+            rows: file.rows.0,
+        };
+        self.read_part(&file, whole)
+    }
+
+    /// A part of a file `plan_file` read, a batch at a time.
+    pub(crate) fn read_part(&self, file: &FileRead, part: FilePart) -> Result<Batches<'_>, Error> {
+        Ok(Batches {
+            runtime: &self.runtime,
+            stream: file.stream(part)?,
+            row_groups: file.row_groups,
+            rows: file.rows,
+            columns: file.columns,
+        })
+    }
+
+    /// What `read` reads of a file, from its footer and page index, read once here: the parts
+    /// of it are then read from that, each by its own stream.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plan_file(
+        &self,
+        location: &str,
+        file: &str,
+        at: Option<&str>,
+        first: Date,
+        last: Date,
+        bounds: &[Bound],
+        projection: Option<&Projection>,
+    ) -> Result<FileRead, Error> {
+        let source = match at {
             Some(at) => match at.strip_prefix("file://") {
-                Some(local) => Box::new(StoreReader {
-                    store: Arc::new(LocalFileSystem::new()),
-                    path: Path::from_filesystem_path(local)
+                Some(local) => FileSource::Store(
+                    Arc::new(LocalFileSystem::new()),
+                    Path::from_filesystem_path(local)
                         .map_err(|e| Error::Io(format!("history file {at}: {e}")))?,
-                }),
+                ),
                 None if at.starts_with("https://") || at.starts_with("http://") => {
-                    Box::new(HttpReader {
-                        client: self.http.clone(),
-                        url: at.to_owned(),
-                    })
+                    FileSource::Http(self.http.clone(), at.to_owned())
                 }
                 None => {
                     return Err(Error::Corrupt(format!(
@@ -511,9 +543,8 @@ impl Lake {
                     )));
                 }
             },
-            None => Box::new(StoreReader {
-                store: self
-                    .keys
+            None => FileSource::Store(
+                self.keys
                     .as_ref()
                     .ok_or_else(|| {
                         Error::NotFound(format!(
@@ -523,116 +554,112 @@ impl Lake {
                     })?
                     .store
                     .clone(),
-                path: Path::from(format!("{location}/{file}")),
-            }),
+                Path::from(format!("{location}/{file}")),
+            ),
         };
         let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
-        self.runtime.block_on(async {
-            let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
-                .await
+        let mut footer = source.reader();
+        let reader = ArrowReaderMetadata::load_async(&mut footer, options);
+        let reader = self.runtime.block_on(reader).map_err(parquet_error)?;
+        let metadata = reader.metadata().clone();
+        let groups = metadata.row_groups();
+        let statistics = |column: &str| {
+            StatisticsConverter::try_new(column, reader.schema(), reader.parquet_schema())
+                .map_err(parquet_error)
+        };
+        let dates = statistics(DATE)?;
+        let mins = dates.row_group_mins(groups.iter()).map_err(parquet_error)?;
+        let maxes = dates
+            .row_group_maxes(groups.iter())
+            .map_err(parquet_error)?;
+        let (mins, maxes) = (as_dates(&mins)?, as_dates(&maxes)?);
+        let mut wanted: Vec<usize> = (0..groups.len())
+            .filter(|&g| {
+                mins.is_valid(g)
+                    && maxes.is_valid(g)
+                    && mins.value(g) <= last.days()
+                    && maxes.value(g) >= first.days()
+            })
+            .collect();
+        // Bounds by column, for the columns the file has.
+        let mut columns: Vec<(&str, Vec<&Bound>)> = Vec::new();
+        for bound in bounds {
+            let column = bound.column();
+            if reader.schema().column_with_name(column).is_none() {
+                continue;
+            }
+            match columns.iter_mut().find(|(c, _)| *c == column) {
+                Some((_, of)) => of.push(bound),
+                None => columns.push((column, vec![bound])),
+            }
+        }
+        for (column, bounds) in &columns {
+            let converter = statistics(column)?;
+            let mins = converter
+                .row_group_mins(groups.iter())
                 .map_err(parquet_error)?;
-            let metadata = builder.metadata().clone();
-            let groups = metadata.row_groups();
-            let statistics = |column: &str| {
-                StatisticsConverter::try_new(column, builder.schema(), builder.parquet_schema())
-                    .map_err(parquet_error)
-            };
-            let dates = statistics(DATE)?;
-            let mins = dates.row_group_mins(groups.iter()).map_err(parquet_error)?;
-            let maxes = dates
+            let maxes = converter
                 .row_group_maxes(groups.iter())
                 .map_err(parquet_error)?;
-            let (mins, maxes) = (as_dates(&mins)?, as_dates(&maxes)?);
-            let mut wanted: Vec<usize> = (0..groups.len())
-                .filter(|&g| {
-                    mins.is_valid(g)
-                        && maxes.is_valid(g)
-                        && mins.value(g) <= last.days()
-                        && maxes.value(g) >= first.days()
-                })
-                .collect();
-            // Bounds by column, for the columns the file has.
-            let mut columns: Vec<(&str, Vec<&Bound>)> = Vec::new();
-            for bound in bounds {
-                let column = bound.column();
-                if builder.schema().column_with_name(column).is_none() {
-                    continue;
-                }
-                match columns.iter_mut().find(|(c, _)| *c == column) {
-                    Some((_, of)) => of.push(bound),
-                    None => columns.push((column, vec![bound])),
-                }
-            }
+            let keep = allowed(&mins, &maxes, bounds);
+            wanted.retain(|&g| keep[g]);
+        }
+        let mut selection: Option<RowSelection> = None;
+        if let Some(page_index) = metadata.page_index()
+            && !wanted.is_empty()
+        {
             for (column, bounds) in &columns {
                 let converter = statistics(column)?;
-                let mins = converter
-                    .row_group_mins(groups.iter())
+                let pages = |maxes: bool| {
+                    if maxes {
+                        converter.data_page_maxes(page_index.as_ref(), wanted.iter())
+                    } else {
+                        converter.data_page_mins(page_index.as_ref(), wanted.iter())
+                    }
+                    .map_err(parquet_error)
+                };
+                let (mins, maxes) = (pages(false)?, pages(true)?);
+                let counts = converter
+                    .data_page_row_counts(page_index.as_ref(), groups, wanted.iter())
                     .map_err(parquet_error)?;
-                let maxes = converter
-                    .row_group_maxes(groups.iter())
-                    .map_err(parquet_error)?;
+                let Some(counts) = counts.filter(|c| c.null_count() == 0) else {
+                    continue;
+                };
                 let keep = allowed(&mins, &maxes, bounds);
-                wanted.retain(|&g| keep[g]);
+                let pages: Vec<RowSelector> = (0..counts.len())
+                    .map(|page| match keep[page] {
+                        true => RowSelector::select(counts.value(page) as usize),
+                        false => RowSelector::skip(counts.value(page) as usize),
+                    })
+                    .collect();
+                let pages = RowSelection::from(pages);
+                selection = Some(match selection {
+                    Some(selection) => selection.intersection(&pages),
+                    None => pages,
+                });
             }
-            let mut selection: Option<RowSelection> = None;
-            if let Some(page_index) = metadata.page_index()
-                && !wanted.is_empty()
-            {
-                for (column, bounds) in &columns {
-                    let converter = statistics(column)?;
-                    let pages = |maxes: bool| {
-                        if maxes {
-                            converter.data_page_maxes(page_index.as_ref(), wanted.iter())
-                        } else {
-                            converter.data_page_mins(page_index.as_ref(), wanted.iter())
-                        }
-                        .map_err(parquet_error)
-                    };
-                    let (mins, maxes) = (pages(false)?, pages(true)?);
-                    let counts = converter
-                        .data_page_row_counts(page_index.as_ref(), groups, wanted.iter())
-                        .map_err(parquet_error)?;
-                    let Some(counts) = counts.filter(|c| c.null_count() == 0) else {
-                        continue;
-                    };
-                    let keep = allowed(&mins, &maxes, bounds);
-                    let pages: Vec<RowSelector> = (0..counts.len())
-                        .map(|page| match keep[page] {
-                            true => RowSelector::select(counts.value(page) as usize),
-                            false => RowSelector::skip(counts.value(page) as usize),
-                        })
-                        .collect();
-                    let pages = RowSelection::from(pages);
-                    selection = Some(match selection {
-                        Some(selection) => selection.intersection(&pages),
-                        None => pages,
-                    });
-                }
-            }
-            let row_groups = (wanted.len(), groups.len());
-            let in_groups: u64 = wanted.iter().map(|&g| groups[g].num_rows() as u64).sum();
-            let selected = selection
-                .as_ref()
-                .map_or(in_groups, |selection| selection.row_count() as u64);
-            let mut builder = builder.with_row_groups(wanted);
-            if let Some(selection) = selection {
-                builder = builder.with_row_selection(selection);
-            }
-            let in_file = builder.schema().fields().len();
-            let mut columns = (in_file, in_file);
-            if let Some(roots) = projection.and_then(|p| roots(builder.schema(), p)) {
-                columns.0 = roots.len();
-                let mask = ProjectionMask::roots(builder.parquet_schema(), roots);
-                builder = builder.with_projection(mask);
-            }
-            let stream = builder.build().map_err(parquet_error)?;
-            Ok(Batches {
-                runtime: &self.runtime,
-                stream,
-                row_groups,
-                rows: (selected, in_groups),
-                columns,
-            })
+        }
+        let row_groups = (wanted.len(), groups.len());
+        let in_groups: u64 = wanted.iter().map(|&g| groups[g].num_rows() as u64).sum();
+        let selected = selection
+            .as_ref()
+            .map_or(in_groups, |selection| selection.row_count() as u64);
+        let in_file = reader.schema().fields().len();
+        let mut columns = (in_file, in_file);
+        let mut mask = None;
+        if let Some(roots) = projection.and_then(|p| roots(reader.schema(), p)) {
+            columns.0 = roots.len();
+            mask = Some(ProjectionMask::roots(reader.parquet_schema(), roots));
+        }
+        Ok(FileRead {
+            source,
+            reader,
+            groups: wanted,
+            selection,
+            mask,
+            row_groups,
+            rows: (selected, in_groups),
+            columns,
         })
     }
 
@@ -738,6 +765,134 @@ pub struct Batches<'a> {
     pub rows: (u64, u64),
     /// Columns read, and in the file.
     pub columns: (usize, usize),
+}
+
+/// Where a history file is read from: each part of a read opens its own reader on it.
+#[derive(Clone)]
+enum FileSource {
+    Store(Arc<dyn ObjectStore>, Path),
+    /// A URL weir vended.
+    Http(reqwest::Client, String),
+}
+
+impl FileSource {
+    fn reader(&self) -> Box<dyn AsyncFileReader> {
+        match self {
+            Self::Store(store, path) => Box::new(StoreReader {
+                store: store.clone(),
+                path: path.clone(),
+            }),
+            Self::Http(client, url) => Box::new(HttpReader {
+                client: client.clone(),
+                url: url.clone(),
+            }),
+        }
+    }
+}
+
+/// A history file's footer, read once, and what of it a read wants: its row groups, pages and
+/// columns.
+pub(crate) struct FileRead {
+    source: FileSource,
+    reader: ArrowReaderMetadata,
+    groups: Vec<usize>,
+    /// The pages wanted, over the rows of `groups` in order.
+    selection: Option<RowSelection>,
+    mask: Option<ProjectionMask>,
+    /// Row groups read, and in the file.
+    pub row_groups: (usize, usize),
+    /// Rows read (the pages bounds allow), and in the row groups read.
+    pub rows: (u64, u64),
+    /// Columns read, and in the file.
+    pub columns: (usize, usize),
+}
+
+/// Some of a file's wanted row groups, read on their own.
+pub(crate) struct FilePart {
+    groups: Vec<usize>,
+    selection: Option<RowSelection>,
+    /// Rows it reads.
+    pub rows: u64,
+}
+
+impl FileRead {
+    /// The wanted row groups in order, as parts of at least `rows` rows each (the last may have
+    /// fewer): row groups are not split, so a big one is a part alone. Parts that read no rows
+    /// (their pages all skipped) are left out.
+    pub(crate) fn parts(&self, rows: u64) -> Vec<FilePart> {
+        let all = self.reader.metadata().row_groups();
+        let mut selection = self.selection.clone();
+        let mut parts = Vec::new();
+        let mut groups = Vec::new();
+        let mut in_groups = 0;
+        for (i, &group) in self.groups.iter().enumerate() {
+            groups.push(group);
+            in_groups += all[group].num_rows() as u64;
+            if in_groups >= rows || i + 1 == self.groups.len() {
+                let selection = selection
+                    .as_mut()
+                    .map(|selection| selection.split_off(in_groups as usize));
+                let rows = selection
+                    .as_ref()
+                    .map_or(in_groups, |selection| selection.row_count() as u64);
+                if rows > 0 {
+                    parts.push(FilePart {
+                        groups: std::mem::take(&mut groups),
+                        selection,
+                        rows,
+                    });
+                }
+                groups.clear();
+                in_groups = 0;
+            }
+        }
+        parts
+    }
+
+    fn stream(
+        &self,
+        part: FilePart,
+    ) -> Result<ParquetRecordBatchStream<Box<dyn AsyncFileReader>>, Error> {
+        let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
+            self.source.reader(),
+            self.reader.clone(),
+        )
+        .with_row_groups(part.groups);
+        if let Some(selection) = part.selection {
+            builder = builder.with_row_selection(selection);
+        }
+        if let Some(mask) = &self.mask {
+            builder = builder.with_projection(mask.clone());
+        }
+        builder.build().map_err(parquet_error)
+    }
+}
+
+/// A part of a history file's rows, a batch at a time, decoded on the thread that takes them;
+/// it holds the lake, whose runtime does the reads, so it can go to any thread.
+pub(crate) struct PartBatches {
+    lake: Arc<Lake>,
+    stream: ParquetRecordBatchStream<Box<dyn AsyncFileReader>>,
+}
+
+impl PartBatches {
+    pub(crate) fn new(lake: Arc<Lake>, file: &FileRead, part: FilePart) -> Result<Self, Error> {
+        Ok(Self {
+            stream: file.stream(part)?,
+            lake,
+        })
+    }
+}
+
+impl Iterator for PartBatches {
+    type Item = Result<RecordBatch, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.lake
+            .runtime
+            .block_on(self.stream.next())
+            .map(|batch| batch.map_err(parquet_error))
+    }
 }
 
 /// Which of a column's row groups or pages, given their minimums and maximums, may hold values

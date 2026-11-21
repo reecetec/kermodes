@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 use crate::session::Table;
 use crate::{Error, SortKey, Window, agg, expr};
 
-fn names(names: &[String]) -> Vec<&str> {
+pub(crate) fn names(names: &[String]) -> Vec<&str> {
     names.iter().map(String::as_str).collect()
 }
 
@@ -119,18 +119,37 @@ impl Plan {
         &self,
         scan: &mut dyn FnMut(&Scan) -> Result<Table, Error>,
     ) -> Result<Table, Error> {
+        if let Plan::Scan(s) = self {
+            return scan(s);
+        }
+        let inputs = self
+            .inputs()
+            .into_iter()
+            .map(|input| input.build(scan))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.apply(&inputs.iter().collect::<Vec<_>>())
+    }
+
+    /// This node's operator over its inputs' tables, given in `inputs()` order. Not for a scan,
+    /// which has no operator.
+    pub(crate) fn apply(&self, inputs: &[&Table]) -> Result<Table, Error> {
+        if let Plan::Merge(_) = self {
+            return Table::merge(inputs);
+        }
+        let input = inputs[0];
         match self {
-            Plan::Scan(s) => scan(s),
-            Plan::Filter { input, predicate } => input.build(scan)?.filter(predicate),
-            Plan::Update { input, assignments } => input.build(scan)?.update(&names(assignments)),
-            Plan::Select { input, columns } => input.build(scan)?.select(&names(columns)),
+            Plan::Scan(_) | Plan::Merge(_) => {
+                unreachable!("scans have no operator; merges return above")
+            }
+            Plan::Filter { predicate, .. } => input.filter(predicate),
+            Plan::Update { assignments, .. } => input.update(&names(assignments)),
+            Plan::Select { columns, .. } => input.select(&names(columns)),
             Plan::Agg {
-                input,
                 by,
                 aggregations,
                 aliases,
+                ..
             } => {
-                let input = input.build(scan)?;
                 if let Some(alias) = aliases
                     .iter()
                     .find(|alias| input.schema().field_with_name(alias).is_ok())
@@ -142,23 +161,18 @@ impl Plan {
                 }
                 input.agg_by(&names(by), &pairs(aggregations))
             }
-            Plan::Sort { input, by } => input.build(scan)?.sort_by(by),
-            Plan::Head { input, rows } => input.build(scan)?.head(*rows),
-            Plan::Tail { input, rows } => input.build(scan)?.tail(*rows),
-            Plan::LastBy { input, by } => input.build(scan)?.last_by(&names(by)),
+            Plan::Sort { by, .. } => input.sort_by(by),
+            Plan::Head { rows, .. } => input.head(*rows),
+            Plan::Tail { rows, .. } => input.tail(*rows),
+            Plan::LastBy { by, .. } => input.last_by(&names(by)),
             Plan::Rolling {
-                input,
                 by,
                 window,
                 aggregations,
-            } => input
-                .build(scan)?
-                .rolling(&names(by), window, &pairs(aggregations)),
-            Plan::Slice { input, start, stop } => {
-                input.build(scan)?.slice(*start, stop.unwrap_or(usize::MAX))
-            }
-            Plan::Drop { input, columns } => {
-                let input = input.build(scan)?;
+                ..
+            } => input.rolling(&names(by), window, &pairs(aggregations)),
+            Plan::Slice { start, stop, .. } => input.slice(*start, stop.unwrap_or(usize::MAX)),
+            Plan::Drop { columns, .. } => {
                 let kept: Vec<String> = input
                     .schema()
                     .fields()
@@ -169,14 +183,13 @@ impl Plan {
                 input.select(&names(&kept))
             }
             Plan::Join {
-                left,
-                right,
                 on,
                 at,
                 columns,
                 bare,
+                ..
             } => {
-                let (left, right) = (left.build(scan)?, right.build(scan)?);
+                let (left, right) = (inputs[0], inputs[1]);
                 // Which unqualified names are the right table's needs both schemas.
                 let joins = columns.as_ref().map(|columns| {
                     let mut joins = columns.clone();
@@ -192,16 +205,9 @@ impl Plan {
                 });
                 let joins = joins.as_deref().map(names);
                 match at {
-                    None => left.natural_join(&right, &names(on), joins.as_deref()),
-                    Some(at) => left.as_of_join(&right, &names(on), at, joins.as_deref()),
+                    None => left.natural_join(right, &names(on), joins.as_deref()),
+                    Some(at) => left.as_of_join(right, &names(on), at, joins.as_deref()),
                 }
-            }
-            Plan::Merge(parts) => {
-                let tables = parts
-                    .iter()
-                    .map(|part| part.build(scan))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Table::merge(&tables.iter().collect::<Vec<_>>())
             }
         }
     }
@@ -268,7 +274,7 @@ impl Plan {
         }
     }
 
-    fn inputs(&self) -> Vec<&Plan> {
+    pub(crate) fn inputs(&self) -> Vec<&Plan> {
         match self {
             Plan::Scan(_) => Vec::new(),
             Plan::Filter { input, .. }

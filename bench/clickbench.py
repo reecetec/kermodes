@@ -30,6 +30,7 @@ import argparse
 import json
 import math
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -51,7 +52,10 @@ def fetch(url: str, path: Path) -> Path:
     if not path.exists():
         print(f"downloading {url}", file=sys.stderr, flush=True)
         part = path.with_suffix(".part")
-        urllib.request.urlretrieve(url, part)
+        # The dataset host refuses urllib's default User-Agent.
+        request = urllib.request.Request(url, headers={"User-Agent": "kermodes-bench"})
+        with urllib.request.urlopen(request) as response, part.open("wb") as out:
+            shutil.copyfileobj(response, out)
         part.rename(path)
     return path
 
@@ -85,7 +89,6 @@ def converted(table):
 
 
 def kermodes(files: list[Path], wanted: list[int], reload: bool) -> dict:
-    import shutil
     from datetime import timedelta
 
     import kermodes as km

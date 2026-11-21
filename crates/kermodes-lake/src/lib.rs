@@ -17,5 +17,8 @@ pub use files::{
 };
 pub use merge::{GARBAGE_GRACE, Merged, collect_garbage, merge, write_history};
 pub use plan::{Held, Incoming, Plan, plan};
-pub use read::{Explain, History, Reading, explain_history, read_history};
+pub use read::{
+    Explain, History, HistoryBatches, HistoryPart, Reading, explain_history, history_parts,
+    read_history,
+};
 pub use weir::Weir;

@@ -1,0 +1,664 @@
+//! The static executor (architecture.md §5.3, engine.md §4): a static plan over stored tables,
+//! run outside any session's update graph, on its own threads, streaming batches. A table's rows
+//! arrive as parts read in parallel, and results never depend on the number of threads: each
+//! part's output is put back in part order.
+//!
+//! Operators that keep what they must, not the data: `where`, `update`, `select`, `drop`, and
+//! merges run within each part as its batches stream through; a head or slice stops reading
+//! once it has its rows, opening no later part; a tail keeps its last rows; an aggregation folds
+//! each part into partial states merged in part order, so it holds its groups; a head or slice
+//! of a sort keeps each part's best rows. The rest collect their input: a sort, and joins,
+//! `last_by`, and `rolling`, which run the engine's own static operators on it in a session of
+//! the query's own, so no caller's graph is held.
+//!
+//! The result equals `Plan::build`'s over static tables of the same rows: same schema, rows, and
+//! order. Each node is also built over empty tables in that session, which gives its schema, and
+//! its errors and description exactly as the engine words them.
+
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::thread;
+
+use arrow::datatypes::SchemaRef;
+use arrow::error::ArrowError;
+use arrow::record_batch::RecordBatch;
+
+use crate::agg::Fold;
+use crate::groups::resolve;
+use crate::ops::Where;
+use crate::parallel::{PIECE_ROWS, offsets, threads};
+use crate::plan::{Plan, Scan, names};
+use crate::session::{bind_select, bind_update};
+use crate::sort::{gather, order, sorted};
+use crate::storage::RowKey;
+use crate::{Error, Expression, Session, Table};
+
+/// A table's rows for a plan's scan, as parts read independently and in parallel, in the
+/// table's order: part i's rows all come before part i+1's.
+pub struct Source {
+    pub schema: SchemaRef,
+    pub parts: Vec<Part>,
+}
+
+/// Reads one part: its batches in order. Opened on whichever thread runs it.
+pub type Part = Box<dyn FnOnce() -> Result<Batches, Error> + Send>;
+
+pub type Batches = Box<dyn Iterator<Item = Result<RecordBatch, Error>> + Send>;
+
+/// The plan's rows, computed outside any session's graph. `scan` gives each scan's `Source`,
+/// honoring the scan as `Plan::build`'s scan does, except that its predicate is applied here.
+pub fn execute(
+    plan: &Plan,
+    scan: &mut dyn FnMut(&Scan) -> Result<Source, Error>,
+) -> Result<(SchemaRef, Vec<RecordBatch>), Error> {
+    let mut executor = Executor {
+        session: Session::new(),
+        scan,
+    };
+    let node = executor.node(plan)?;
+    let rows = collect(node.rows.into_parts()?)?;
+    Ok((node.shape.schema().clone(), rows))
+}
+
+/// Bits of an aggregation's row key that number a row within its part; the part's index takes
+/// the rest, so keys follow scan order across parts.
+const PART_BITS: u32 = 40;
+
+/// A batch-at-a-time operator: `where`, `update`, `select`.
+type Map = Arc<dyn Fn(RecordBatch) -> Result<RecordBatch, Error> + Send + Sync>;
+
+struct Executor<'a> {
+    /// Holds the tables the plan is built from: empty ones for each node's shape, and the
+    /// collected inputs of the engine's operators.
+    session: Session,
+    scan: &'a mut dyn FnMut(&Scan) -> Result<Source, Error>,
+}
+
+/// A plan node: its table over empty inputs, and its rows.
+struct Node {
+    shape: Table,
+    rows: Rows,
+}
+
+enum Rows {
+    Parts(Vec<Part>),
+    /// A sort not yet done, so a head or slice over it keeps only its rows.
+    Sorted(Sort),
+}
+
+struct Sort {
+    input: Vec<Part>,
+    schema: SchemaRef,
+    keys: Vec<(usize, bool)>,
+    /// The sort's description, for its errors.
+    table: String,
+    /// Operators over the sorted rows that keep each row in place, run once the rows are known.
+    after: Vec<Map>,
+}
+
+impl Executor<'_> {
+    fn node(&mut self, plan: &Plan) -> Result<Node, Error> {
+        if let Plan::Scan(scan) = plan {
+            return self.scan(scan);
+        }
+        let mut inputs = plan
+            .inputs()
+            .into_iter()
+            .map(|input| self.node(input))
+            .collect::<Result<Vec<_>, _>>()?;
+        let shape = plan.apply(&inputs.iter().map(|n| &n.shape).collect::<Vec<_>>())?;
+        let rows = match plan {
+            Plan::LastBy { .. } | Plan::Rolling { .. } | Plan::Join { .. } => {
+                self.engine(plan, inputs)?
+            }
+            Plan::Merge(_) => {
+                let schema = shape.schema().clone();
+                let table = shape.description();
+                let rewrap: Map = Arc::new(move |batch: RecordBatch| {
+                    batch
+                        .with_schema(schema.clone())
+                        .map_err(|e| failed(&table, e))
+                });
+                let mut parts = Vec::new();
+                for input in inputs {
+                    parts.extend(mapped(input.rows.into_parts()?, &rewrap));
+                }
+                Rows::Parts(parts)
+            }
+            _ => {
+                let input = inputs.pop().expect("one input");
+                let schema = input.shape.schema();
+                match plan {
+                    Plan::Filter { predicate, .. } => {
+                        input.rows.then(filter(&shape, schema, predicate)?, false)?
+                    }
+                    Plan::Update { assignments, .. } => {
+                        let update = bind_update(schema, &names(assignments))?;
+                        let table = shape.description();
+                        let map: Map = Arc::new(move |batch| {
+                            update.compute(&batch).map_err(|e| failed(&table, e))
+                        });
+                        input.rows.then(map, true)?
+                    }
+                    Plan::Select { .. } | Plan::Drop { .. } => {
+                        // A drop is a select of the columns it keeps: its output's.
+                        let columns: Vec<String> = match plan {
+                            Plan::Select { columns, .. } => columns.clone(),
+                            _ => shape
+                                .schema()
+                                .fields()
+                                .iter()
+                                .map(|f| f.name().clone())
+                                .collect(),
+                        };
+                        let select = bind_select(schema, &names(&columns))?;
+                        let table = shape.description();
+                        let map: Map = Arc::new(move |batch| {
+                            select.compute(&batch).map_err(|e| failed(&table, e))
+                        });
+                        input.rows.then(map, true)?
+                    }
+                    Plan::Agg {
+                        by, aggregations, ..
+                    } => {
+                        let specs: Vec<&str> =
+                            aggregations.iter().map(|(_, spec)| spec.as_str()).collect();
+                        let fold = Fold::new(schema, resolve(schema, &names(by))?, &specs)?;
+                        let rows = aggregate(
+                            input.rows.into_parts()?,
+                            &fold,
+                            shape.schema(),
+                            &shape.description(),
+                        )?;
+                        Rows::Parts(pieces(rows))
+                    }
+                    Plan::Sort { by, .. } => {
+                        let keys = by
+                            .iter()
+                            .map(|key| Ok((resolve(schema, &[&key.column])?[0], key.descending)))
+                            .collect::<Result<Vec<_>, Error>>()?;
+                        Rows::Sorted(Sort {
+                            schema: schema.clone(),
+                            input: input.rows.into_parts()?,
+                            keys,
+                            table: shape.description(),
+                            after: Vec::new(),
+                        })
+                    }
+                    Plan::Head { rows, .. } => input.rows.slice(0, Some(*rows))?,
+                    Plan::Slice { start, stop, .. } => input.rows.slice(*start, *stop)?,
+                    Plan::Tail { rows, .. } => {
+                        Rows::Parts(pieces(tail(input.rows.into_parts()?, *rows)?))
+                    }
+                    _ => unreachable!("matched above"),
+                }
+            }
+        };
+        Ok(Node { shape, rows })
+    }
+
+    fn scan(&mut self, scan: &Scan) -> Result<Node, Error> {
+        let source = (self.scan)(scan)?;
+        let table = self.session.static_table(source.schema, Vec::new())?;
+        let rows = Rows::Parts(source.parts);
+        let Some(predicate) = &scan.predicate else {
+            return Ok(Node { shape: table, rows });
+        };
+        let shape = table.filter(predicate)?;
+        let rows = rows.then(filter(&shape, table.schema(), predicate)?, false)?;
+        Ok(Node { shape, rows })
+    }
+
+    /// The engine's static operator over its inputs' collected rows.
+    fn engine(&self, plan: &Plan, inputs: Vec<Node>) -> Result<Rows, Error> {
+        let tables = inputs
+            .into_iter()
+            .map(|input| {
+                let rows = collect(input.rows.into_parts()?)?;
+                self.session
+                    .computed_table(input.shape.schema().clone(), rows)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let table = plan.apply(&tables.iter().collect::<Vec<_>>())?;
+        Ok(Rows::Parts(pieces(table.snapshot()?)))
+    }
+}
+
+/// `where predicate` over batches of `input`'s columns, failing as `shape` would.
+fn filter(shape: &Table, input: &SchemaRef, predicate: &str) -> Result<Map, Error> {
+    let filter = Where::new(Expression::predicate(predicate, input)?, true);
+    let table = shape.description();
+    Ok(Arc::new(move |batch| {
+        filter.filter(&batch).map_err(|e| failed(&table, e))
+    }))
+}
+
+fn failed(table: &str, error: ArrowError) -> Error {
+    Error::Compute {
+        table: table.to_owned(),
+        message: error.to_string(),
+    }
+}
+
+impl Rows {
+    /// These rows with `map` applied to each batch. `keeps_rows` if it keeps every row in
+    /// place, so a sort below can still be cut short by a head above.
+    fn then(self, map: Map, keeps_rows: bool) -> Result<Rows, Error> {
+        match self {
+            Rows::Sorted(mut sort) if keeps_rows => {
+                sort.after.push(map);
+                Ok(Rows::Sorted(sort))
+            }
+            rows => Ok(Rows::Parts(mapped(rows.into_parts()?, &map))),
+        }
+    }
+
+    fn into_parts(self) -> Result<Vec<Part>, Error> {
+        match self {
+            Rows::Parts(parts) => Ok(parts),
+            Rows::Sorted(mut sort) => {
+                let input = collect(std::mem::take(&mut sort.input))?;
+                let rows =
+                    sorted(&sort.schema, &input, &sort.keys).map_err(|e| failed(&sort.table, e))?;
+                Ok(sort.then(rows))
+            }
+        }
+    }
+
+    /// The rows at positions `start..stop` (to the end if `None`).
+    fn slice(self, start: usize, stop: Option<usize>) -> Result<Rows, Error> {
+        if stop.is_some_and(|stop| stop <= start) {
+            return Ok(Rows::Parts(Vec::new()));
+        }
+        let parts = match (self, stop) {
+            (Rows::Sorted(mut sort), Some(stop)) => {
+                let input = std::mem::take(&mut sort.input);
+                let best = top(input, &sort.schema, &sort.keys, stop, &sort.table)?;
+                sort.then(best)
+            }
+            (rows, _) => rows.into_parts()?,
+        };
+        Ok(Rows::Parts(pieces(head(parts, start, stop)?)))
+    }
+}
+
+impl Sort {
+    /// `rows`, sorted, through the operators after the sort.
+    fn then(&self, rows: Vec<RecordBatch>) -> Vec<Part> {
+        self.after
+            .iter()
+            .fold(pieces(rows), |parts, map| mapped(parts, map))
+    }
+}
+
+/// Each part's batches through `map`, as they are read.
+fn mapped(parts: Vec<Part>, map: &Map) -> Vec<Part> {
+    parts
+        .into_iter()
+        .map(|part| {
+            let map = map.clone();
+            Box::new(move || {
+                let batches = part()?;
+                Ok(
+                    Box::new(batches.map(move |batch| batch.and_then(|batch| map(batch))))
+                        as Batches,
+                )
+            }) as Part
+        })
+        .collect()
+}
+
+/// Rows already computed, as parts of at most `PIECE_ROWS` rows, so the operators over them
+/// still spread over threads.
+fn pieces(batches: Vec<RecordBatch>) -> Vec<Part> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            offsets(batch.num_rows(), PIECE_ROWS).map(move |(offset, len)| batch.slice(offset, len))
+        })
+        .map(|piece| -> Part { Box::new(move || Ok(Box::new(std::iter::once(Ok(piece))))) })
+        .collect()
+}
+
+/// Every row, in order, without empty batches.
+fn collect(parts: Vec<Part>) -> Result<Vec<RecordBatch>, Error> {
+    let mut rows = Vec::new();
+    drive(
+        parts,
+        false,
+        |_, batches| {
+            batches
+                .filter(|batch| !matches!(batch, Ok(batch) if batch.num_rows() == 0))
+                .collect::<Result<Vec<_>, _>>()
+        },
+        |part| {
+            rows.extend(part);
+            Ok(true)
+        },
+    )?;
+    Ok(rows)
+}
+
+/// The rows at positions `start..stop` (to the end if `None`). With a stop, each part reads
+/// only up to `stop` rows, and parts are opened only while rows are still wanted.
+fn head(parts: Vec<Part>, start: usize, stop: Option<usize>) -> Result<Vec<RecordBatch>, Error> {
+    let Some(stop) = stop else {
+        return Ok(skip(collect(parts)?, start));
+    };
+    let (mut rows, mut held) = (Vec::new(), 0);
+    drive(
+        parts,
+        true,
+        |_, mut batches| {
+            let (mut rows, mut held) = (Vec::new(), 0);
+            while held < stop {
+                let Some(batch) = batches.next() else {
+                    break;
+                };
+                let batch = batch?;
+                let take = batch.num_rows().min(stop - held);
+                if take > 0 {
+                    rows.push(batch.slice(0, take));
+                    held += take;
+                }
+            }
+            Ok(rows)
+        },
+        |part| {
+            for batch in part {
+                let take = batch.num_rows().min(stop - held);
+                if take == 0 {
+                    break;
+                }
+                rows.push(batch.slice(0, take));
+                held += take;
+            }
+            Ok(held < stop)
+        },
+    )?;
+    Ok(skip(rows, start))
+}
+
+/// The last `n` rows. Each part keeps only its last `n`, and so do the parts so far.
+fn tail(parts: Vec<Part>, n: usize) -> Result<Vec<RecordBatch>, Error> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let mut rows = Vec::new();
+    drive(
+        parts,
+        false,
+        |_, batches| {
+            let mut rows = Vec::new();
+            for batch in batches {
+                rows.push(batch?);
+                last_batches(&mut rows, n);
+            }
+            Ok(rows)
+        },
+        |part| {
+            rows.extend(part);
+            last_batches(&mut rows, n);
+            Ok(true)
+        },
+    )?;
+    let count = count(&rows);
+    Ok(skip(rows, count.saturating_sub(n)))
+}
+
+/// Drops the leading batches that hold none of the last `n` rows.
+fn last_batches(batches: &mut Vec<RecordBatch>, n: usize) {
+    let mut rows = count(batches);
+    let unneeded = batches
+        .iter()
+        .take_while(|batch| {
+            let after = rows - batch.num_rows();
+            let unneeded = after >= n;
+            if unneeded {
+                rows = after;
+            }
+            unneeded
+        })
+        .count();
+    batches.drain(..unneeded);
+}
+
+fn count(batches: &[RecordBatch]) -> usize {
+    batches.iter().map(RecordBatch::num_rows).sum()
+}
+
+/// `batches` without their first `start` rows.
+fn skip(batches: Vec<RecordBatch>, mut start: usize) -> Vec<RecordBatch> {
+    batches
+        .into_iter()
+        .filter_map(|batch| {
+            let rows = batch.num_rows();
+            if start >= rows {
+                start -= rows;
+                return None;
+            }
+            let from = std::mem::take(&mut start);
+            Some(batch.slice(from, rows - from))
+        })
+        .collect()
+}
+
+/// The first `stop` rows of the input sorted by `keys`, ties in input order (a top-N): each
+/// part keeps its best `stop` rows, and parts merge in their order, so ties stay in input
+/// order. Choosing reads only the key columns; whole rows are gathered for the winners alone.
+fn top(
+    parts: Vec<Part>,
+    schema: &SchemaRef,
+    keys: &[(usize, bool)],
+    stop: usize,
+    table: &str,
+) -> Result<Vec<RecordBatch>, Error> {
+    // Earlier rows first: the winners so far, then the rows read since.
+    let best = |rows: Vec<RecordBatch>| -> Result<Vec<RecordBatch>, Error> {
+        let order = order(schema, &rows, keys).map_err(|e| failed(table, e))?;
+        gather(&rows, &order[..stop.min(order.len())]).map_err(|e| failed(table, e))
+    };
+    // Rows are chosen once at least as many as are kept arrive, so each row takes part in a
+    // bounded number of sorts however large `stop` is.
+    let enough = stop.saturating_add(stop.max(PIECE_ROWS));
+    let mut winners = Vec::new();
+    drive(
+        parts,
+        false,
+        |_, batches| {
+            let mut rows = Vec::new();
+            for batch in batches {
+                rows.push(batch?);
+                if count(&rows) >= enough {
+                    rows = best(rows)?;
+                }
+            }
+            // Fewer rows than are kept go to the merge as read, which sorts them anyway.
+            if count(&rows) <= stop {
+                return Ok(rows);
+            }
+            best(rows)
+        },
+        |part| {
+            winners.extend(part);
+            winners = best(std::mem::take(&mut winners))?;
+            Ok(true)
+        },
+    )?;
+    Ok(winners)
+}
+
+/// `agg_by` over the parts: each folds into partial states, and parts merge in their order, a
+/// thread's worth at a time, each thread merging the groups of one range of key hashes.
+fn aggregate(
+    parts: Vec<Part>,
+    fold: &Fold,
+    output: &SchemaRef,
+    table: &str,
+) -> Result<Vec<RecordBatch>, Error> {
+    let failed = |e| failed(table, e);
+    if parts.len() >= 1 << (RowKey::BITS - PART_BITS) {
+        return Err(Error::Unsupported(format!(
+            "an aggregation reads at most {} parts",
+            1u64 << (RowKey::BITS - PART_BITS)
+        )));
+    }
+    let shards = threads();
+    let mut merged = fold.merged(shards).map_err(failed)?;
+    let mut sealed = Vec::with_capacity(shards);
+    drive(
+        parts,
+        false,
+        |index, batches| {
+            let mut part = fold.fresh().map_err(failed)?;
+            let mut rows: RowKey = 0;
+            for batch in batches {
+                let batch = batch?;
+                let key = ((index as RowKey) << PART_BITS) | rows;
+                part.add(&batch, key).map_err(failed)?;
+                rows += batch.num_rows() as RowKey;
+                if rows >> PART_BITS != 0 {
+                    return Err(Error::Unsupported(format!(
+                        "an aggregation reads at most 2^{PART_BITS} rows of one part"
+                    )));
+                }
+            }
+            part.seal(shards).map_err(failed)?;
+            Ok((index, part))
+        },
+        |part| {
+            sealed.push(part);
+            if sealed.len() == shards {
+                merged.merge(&sealed).map_err(failed)?;
+                sealed.clear();
+            }
+            Ok(true)
+        },
+    )?;
+    merged.merge(&sealed).map_err(failed)?;
+    merged.finish(output).map_err(failed)
+}
+
+/// What the threads share while running parts.
+struct Queue<T> {
+    parts: Vec<Option<Part>>,
+    /// Each part's result, until taken.
+    done: Vec<Option<thread::Result<Result<T, Error>>>>,
+    /// The next part to open.
+    next: usize,
+    /// Parts whose results were taken.
+    taken: usize,
+    /// How many parts may be open or waiting to be taken.
+    ahead: usize,
+    stop: bool,
+}
+
+fn lock<T>(queue: &Mutex<Queue<T>>) -> MutexGuard<'_, Queue<T>> {
+    queue.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Runs `work` on each part, opened on whichever thread runs it, and hands each result to `take`
+/// on the calling thread in part order, until `take` says it needs no more: later parts are then
+/// not opened. Only a few parts per thread run ahead of the one `take` is owed, so memory
+/// follows a few parts' results however many there are. A `growing` run opens one part first
+/// and doubles how many run ahead each time `take` wants more, so a head opens only the parts
+/// it needs.
+fn drive<T: Send>(
+    parts: Vec<Part>,
+    growing: bool,
+    work: impl Fn(usize, Batches) -> Result<T, Error> + Sync,
+    mut take: impl FnMut(T) -> Result<bool, Error>,
+) -> Result<(), Error> {
+    let count = parts.len();
+    let threads = threads().min(count);
+    if threads <= 1 {
+        for (index, part) in parts.into_iter().enumerate() {
+            if !take(work(index, part()?)?)? {
+                break;
+            }
+        }
+        return Ok(());
+    }
+    let most = 2 * threads;
+    let queue = Mutex::new(Queue {
+        parts: parts.into_iter().map(Some).collect(),
+        done: (0..count).map(|_| None).collect(),
+        next: 0,
+        taken: 0,
+        ahead: if growing { 1 } else { most },
+        stop: false,
+    });
+    let changed = Condvar::new();
+    let (queue, changed, work) = (&queue, &changed, &work);
+    thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(move || {
+                while let Some((index, part)) = next_part(queue, changed) {
+                    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                        part().and_then(|batches| work(index, batches))
+                    }));
+                    lock(queue).done[index] = Some(result);
+                    changed.notify_all();
+                }
+            });
+        }
+        // However this thread leaves, the workers stop opening parts and finish.
+        let _stop = Stop { queue, changed };
+        loop {
+            let result = {
+                let mut state = lock(queue);
+                loop {
+                    if state.taken == count {
+                        return Ok(());
+                    }
+                    let at = state.taken;
+                    if let Some(result) = state.done[at].take() {
+                        break result;
+                    }
+                    state = changed.wait(state).unwrap_or_else(PoisonError::into_inner);
+                }
+            };
+            let result = result.unwrap_or_else(|payload| panic::resume_unwind(payload));
+            if !take(result?)? {
+                return Ok(());
+            }
+            let mut state = lock(queue);
+            state.taken += 1;
+            if growing {
+                state.ahead = (state.ahead * 2).min(most);
+            }
+            drop(state);
+            changed.notify_all();
+        }
+    })
+}
+
+/// The next part a worker may open, or `None` once none is left or wanted.
+fn next_part<T>(queue: &Mutex<Queue<T>>, changed: &Condvar) -> Option<(usize, Part)> {
+    let mut state = lock(queue);
+    loop {
+        if state.stop || state.next == state.parts.len() {
+            return None;
+        }
+        if state.next < state.taken + state.ahead {
+            break;
+        }
+        state = changed.wait(state).unwrap_or_else(PoisonError::into_inner);
+    }
+    let index = state.next;
+    state.next += 1;
+    let part = state.parts[index].take().expect("each part runs once");
+    Some((index, part))
+}
+
+struct Stop<'a, T> {
+    queue: &'a Mutex<Queue<T>>,
+    changed: &'a Condvar,
+}
+
+impl<T> Drop for Stop<'_, T> {
+    fn drop(&mut self) {
+        lock(self.queue).stop = true;
+        self.changed.notify_all();
+    }
+}

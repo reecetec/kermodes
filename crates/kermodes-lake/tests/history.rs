@@ -9,11 +9,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch};
-use arrow::datatypes::{DataType, Date32Type, Field, Int64Type, Schema};
+use arrow::datatypes::{DataType, Date32Type, Field, Int64Type, Schema, SchemaRef};
 use kermodes_lake::{
-    History, Lake, Merged, Reading, Weir, collect_garbage, merge, read_history, write_history,
+    History, HistoryPart, Lake, Merged, Reading, Weir, collect_garbage, column_bounds,
+    history_parts, merge, read_history, write_history,
 };
-use kermodes_weir::{Date, Error, SourceId, Store, TableName};
+use kermodes_weir::{Date, Error, HistoryCommit, SourceId, Store, TableName};
 
 struct TempDir(PathBuf);
 
@@ -606,4 +607,147 @@ fn a_keyed_tables_history_is_its_log_of_changes() {
     assert_eq!(merge(&store, &lake, &quotes, d(1)).unwrap().rows, 3);
     assert_eq!(store.date_rows(&quotes, d(1)).unwrap(), (0, 0));
     assert_eq!(log(&store), before);
+}
+
+/// Date `k`'s rows: `n` is `k` millions and the row's place in the date, `m` the place.
+fn numbered(k: u32, count: usize) -> RecordBatch {
+    let base = i64::from(k) * 1_000_000;
+    RecordBatch::try_from_iter([
+        (
+            "n",
+            Arc::new(Int64Array::from_iter_values(
+                (0..count as i64).map(|i| base + i),
+            )) as ArrayRef,
+        ),
+        (
+            "m",
+            Arc::new(Int64Array::from_iter_values(0..count as i64)) as ArrayRef,
+        ),
+    ])
+    .unwrap()
+}
+
+/// Every part run on a thread of its own, started last first, and their batches in part order.
+fn run_parts(parts: Vec<HistoryPart>) -> Vec<RecordBatch> {
+    std::thread::scope(|scope| {
+        let mut running: Vec<_> = parts
+            .into_iter()
+            .rev()
+            .map(|part| scope.spawn(move || part().unwrap().collect::<Result<Vec<_>, _>>()))
+            .collect();
+        running.reverse();
+        running
+            .into_iter()
+            .flat_map(|run| run.join().unwrap().unwrap())
+            .collect()
+    })
+}
+
+fn concat(schema: &SchemaRef, batches: &[RecordBatch]) -> RecordBatch {
+    arrow::compute::concat_batches(schema, batches).unwrap()
+}
+
+/// History read as parts, each on its own thread in any order, gives `read_history`'s rows in
+/// its order: from files of several row groups and from past dates weir holds, with bounds and
+/// columns, and through a reader holding no lake keys. A limit takes only the leading parts.
+#[test]
+fn history_read_in_parallel_parts_is_history_read_in_order() {
+    let dir = TempDir::new();
+    let root = dir.0.join("store");
+    let name = TableName::parse("md.parts").unwrap();
+    let schema = Schema::new(vec![
+        Field::new("n", DataType::Int64, true),
+        Field::new("m", DataType::Int64, true),
+    ]);
+    // Two past dates still in weir: each written today, then its directory renamed to the date.
+    for (k, count) in [(6, 3), (7, 4)] {
+        let store = Store::open(&root).unwrap();
+        let location = store.create_table(&name, &schema).unwrap().location;
+        let writer = store
+            .writer(&name, &SourceId::parse("feed").unwrap(), false)
+            .unwrap();
+        writer.write(&numbered(k, count), None).unwrap();
+        drop((writer, store));
+        let weir = root.join("weir").join(location);
+        fs::rename(weir.join(today().to_string()), weir.join(d(k).to_string())).unwrap();
+    }
+    let store = Arc::new(Store::open(&root).unwrap());
+    let entry = store.table(&name).unwrap();
+    let lake = Arc::new(Lake::open(dir.0.join("lake").to_str().unwrap()).unwrap());
+    // Two files written as a merge writes them, a row group a date: small dates would share one.
+    let with_ids = Schema::new(
+        entry
+            .schema
+            .fields()
+            .iter()
+            .zip(entry.ids.iter())
+            .map(|(field, id)| {
+                field
+                    .as_ref()
+                    .clone()
+                    .with_metadata([("PARQUET:field_id".to_string(), id.0.to_string())])
+            })
+            .collect::<Vec<_>>(),
+    );
+    for days in [
+        &[(1, 150_000), (2, 150_000), (3, 10)][..],
+        &[(4, 140_000), (5, 5)],
+    ] {
+        let dates: Vec<Date> = days.iter().map(|&(k, _)| d(k)).collect();
+        let rows = |date: Date, each: &mut dyn FnMut(RecordBatch) -> Result<(), Error>| {
+            let &(k, count) = days.iter().find(|&&(k, _)| d(k) == date).unwrap();
+            each(numbered(k, count))
+        };
+        let written = lake
+            .write(&entry.location, &with_ids, &[], &dates, rows, u64::MAX)
+            .unwrap();
+        let commit = HistoryCommit {
+            written: dates,
+            replaced: Vec::new(),
+            files: written.files,
+            dates: written.dates,
+        };
+        store.commit_history(&name, &commit).unwrap();
+    }
+
+    // `read_history` with the lake's keys is the oracle.
+    let same = |weir: &dyn Weir, parts_from: &Arc<Lake>, reading: &Reading| {
+        let (schema, parts) = history_parts(weir, parts_from, &name, reading).unwrap();
+        let count = parts.len();
+        let read = read_history(&*store, &lake, &name, reading).unwrap();
+        assert_eq!(schema, read.schema);
+        assert_eq!(
+            concat(&schema, &run_parts(parts)),
+            concat(&read.schema, &read.batches)
+        );
+        count
+    };
+    // A part a big date, or the small dates after one: three of the first file, two of the
+    // second, one each of weir's dates.
+    assert_eq!(same(&*store, &lake, &Reading::default()), 7);
+    let bounds = column_bounds("n <= 4100000");
+    let columns = ["m".to_string()];
+    let some = Reading {
+        first: Some(d(2)),
+        bounds: &bounds,
+        columns: Some(&columns),
+        ..Reading::default()
+    };
+    assert!(same(&*store, &lake, &some) < 7);
+
+    let limited = Reading {
+        limit: Some(150_001),
+        ..Reading::default()
+    };
+    let (_, parts) = history_parts(&*store, &lake, &name, &limited).unwrap();
+    assert_eq!(parts.len(), 2);
+    let rows: usize = run_parts(parts).iter().map(RecordBatch::num_rows).sum();
+    assert!(rows >= 150_001);
+
+    let vending = lake.clone();
+    store.vend_history(Arc::new(move |location, file| vending.vend(location, file)));
+    let server = kermodes_flight::serve(store.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+    let client = kermodes_flight::Client::connect(&format!("grpc://{}", server.addr())).unwrap();
+    let reader = Arc::new(Lake::reader().unwrap());
+    assert_eq!(same(&client, &reader, &Reading::default()), 7);
 }

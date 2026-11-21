@@ -386,6 +386,45 @@ impl LocalGroups {
     }
 }
 
+/// Group ids by key alone, numbered in the order keys are first seen: for rows that only arrive
+/// (the static executor's aggregation), which need no membership, slots, or reuse of ids.
+#[derive(Default)]
+pub(crate) struct KeyTable {
+    table: HashTable<u32>,
+    hashes: Vec<u64>,
+    owned: Vec<OwnedKey>,
+}
+
+impl KeyTable {
+    pub fn len(&self) -> usize {
+        self.hashes.len()
+    }
+
+    /// The engine-wide hash of group `id`'s key.
+    pub fn hash(&self, id: usize) -> u64 {
+        self.hashes[id]
+    }
+
+    /// The id of the key of `keys`' row `row`, whose engine-wide hash is `hash`, and whether the
+    /// key is new.
+    pub fn id(&mut self, keys: &Keys<'_>, row: usize, hash: u64) -> (u32, bool) {
+        let owned = &self.owned;
+        if let Some(id) = self
+            .table
+            .find(hash, |id| keys.matches(row, &owned[*id as usize]))
+        {
+            return (*id, false);
+        }
+        let id = self.hashes.len() as u32;
+        self.hashes.push(hash);
+        self.owned.push(keys.owned(row));
+        let hashes = &self.hashes;
+        self.table
+            .insert_unique(hash, id, |id| hashes[*id as usize]);
+        (id, true)
+    }
+}
+
 /// The keys of an input's rows within one group. Append-only inputs only need the newest.
 pub(crate) enum Members {
     Newest(Option<RowKey>),

@@ -45,25 +45,15 @@ impl Stores {
     }
 }
 
-/// The rows of a stored table's `scan`: all of them for which its predicate is true, with at
-/// least its columns, and at least its first `limit` rows where it has one.
-pub(crate) fn rows(
+/// The rows of a stored table's ticking `scan`: all of them for which its predicate is true,
+/// then every change, with at least its columns.
+pub(crate) fn live_rows(
     engine: &kermodes_core::Session,
     stores: &Stores,
     scan: &Scan,
 ) -> PyResult<kermodes_core::Table> {
     let entry = stores.entry(&scan.name)?;
-    let table = if !entry.key.is_empty() {
-        // A keyed table's rows are its keys' latest values; its history is its log.
-        if scan.live {
-            fed(engine, &stores.tables, &entry)?
-        } else {
-            let (_, state) = stores.tables.today(&entry, None).map_err(store_error)?;
-            engine
-                .static_table(entry.schema.clone(), state)
-                .map_err(engine_error)?
-        }
-    } else if scan.live {
+    let table = if entry.key.is_empty() {
         let last = Date::from_days(Date::of_ns(now_ns()).days() - 1);
         let history = history(engine, stores, &entry, scan, last)?;
         let today = fed(engine, &stores.tables, &entry)?;
@@ -76,30 +66,90 @@ pub(crate) fn rows(
         let today = today.select(&names).map_err(engine_error)?;
         kermodes_core::Table::merge(&[&history, &today]).map_err(engine_error)?
     } else {
-        let (day, today) = stores
-            .tables
-            .today(&entry, scan.limit)
-            .map_err(store_error)?;
-        let day = day.unwrap_or_else(|| Date::of_ns(now_ns()));
-        let history = read(stores, &entry, scan, Date::from_days(day.days() - 1))?;
-        let mut batches = history.1;
-        let enough = scan
-            .limit
-            .is_some_and(|limit| batches.iter().map(RecordBatch::num_rows).sum::<usize>() >= limit);
-        if !enough {
-            let columns = positions(&entry.schema, &history.0)?;
-            for batch in today {
-                batches.push(project(&batch, &history.0, &columns)?);
-            }
-        }
-        engine
-            .static_table(history.0, batches)
-            .map_err(engine_error)?
+        // A keyed table's rows are its keys' latest values; its history is its log.
+        fed(engine, &stores.tables, &entry)?
     };
     match &scan.predicate {
         Some(predicate) => table.filter(predicate).map_err(engine_error),
         None => Ok(table),
     }
+}
+
+/// A stored table's static `scan` for the static executor: history's parts, each decoded on
+/// whichever thread runs it, then today's rows. Today's are read first, from weir, and history up
+/// to the day before the day they were stamped on, so a day that turns between the two reads is
+/// neither missed nor read twice. A keyed table is its keys' latest rows. The executor applies
+/// the scan's predicate.
+pub(crate) fn source(stores: &Stores, scan: &Scan) -> PyResult<kermodes_core::exec::Source> {
+    let entry = stores.entry(&scan.name)?;
+    if !entry.key.is_empty() {
+        let (_, state) = stores.tables.today(&entry, None).map_err(store_error)?;
+        return Ok(kermodes_core::exec::Source {
+            schema: entry.schema.clone(),
+            parts: vec![in_memory(state)],
+        });
+    }
+    let (day, today) = stores
+        .tables
+        .today(&entry, scan.limit)
+        .map_err(store_error)?;
+    let day = day.unwrap_or_else(|| Date::of_ns(now_ns()));
+    let bounds = scan
+        .predicate
+        .as_deref()
+        .map_or_else(Vec::new, kermodes_lake::column_bounds);
+    let (dated, history) = kermodes_lake::history_parts(
+        stores.tables.weir(),
+        &stores.lake()?,
+        &entry.name,
+        &kermodes_lake::Reading {
+            last: Some(Date::from_days(day.days() - 1)),
+            bounds: &bounds,
+            columns: scan.columns.as_deref(),
+            limit: scan.limit,
+            ..kermodes_lake::Reading::default()
+        },
+    )
+    .map_err(store_error)?;
+    // History keeps each row's `Date`; readers get the table's columns.
+    let kept: Vec<usize> = (0..dated.fields().len())
+        .filter(|at| dated.field(*at).name() != kermodes_lake::DATE)
+        .collect();
+    let schema = Arc::new(dated.project(&kept).map_err(arrow_error)?);
+    let failed = |table: &TableName| {
+        let table = table.to_string();
+        move |e: &dyn std::fmt::Display| kermodes_core::Error::Source {
+            table: table.clone(),
+            message: e.to_string(),
+        }
+    };
+    let mut parts: Vec<kermodes_core::exec::Part> = Vec::with_capacity(history.len() + 1);
+    for part in history {
+        let (schema, kept, failed) = (schema.clone(), kept.clone(), failed(&entry.name));
+        parts.push(Box::new(move || {
+            let batches = part().map_err(|e| failed(&e))?;
+            let projected = batches.map(move |batch| {
+                batch
+                    .map_err(|e| failed(&e))
+                    .and_then(|batch| project(&batch, &schema, &kept).map_err(|e| failed(&e)))
+            });
+            Ok(Box::new(projected) as kermodes_core::exec::Batches)
+        }));
+    }
+    let columns = positions(&entry.schema, &schema)?;
+    let today = today
+        .iter()
+        .map(|batch| project(batch, &schema, &columns).map_err(arrow_error))
+        .collect::<PyResult<Vec<_>>>()?;
+    if !today.is_empty() {
+        parts.push(in_memory(today));
+    }
+    Ok(kermodes_core::exec::Source { schema, parts })
+}
+
+/// Batches already read, as a part.
+pub(crate) fn in_memory(batches: Vec<RecordBatch>) -> kermodes_core::exec::Part {
+    Box::new(move || Ok(Box::new(batches.into_iter().map(Ok)) as kermodes_core::exec::Batches))
 }
 
 /// What `rows(scan)` would read, and whether it ticks.
@@ -154,7 +204,8 @@ pub(crate) fn shadow(
     .map_err(engine_error)
 }
 
-/// History up to `last`, read now, as a static table without `Date`.
+/// History up to `last`, read now, as a static table without `Date`: the start of a ticking
+/// scan's rows.
 fn history(
     engine: &kermodes_core::Session,
     stores: &Stores,
@@ -162,18 +213,6 @@ fn history(
     scan: &Scan,
     last: Date,
 ) -> PyResult<kermodes_core::Table> {
-    let (schema, batches) = read(stores, entry, scan, last)?;
-    engine.static_table(schema, batches).map_err(engine_error)
-}
-
-/// History up to `last`: only the row groups and pages the scan's predicate allows, its
-/// columns, and its first rows where it has a limit; without `Date`, which history keeps.
-fn read(
-    stores: &Stores,
-    entry: &TableEntry,
-    scan: &Scan,
-    last: Date,
-) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
     let bounds = scan
         .predicate
         .as_deref()
@@ -199,9 +238,9 @@ fn read(
     let batches = history
         .batches
         .iter()
-        .map(|batch| project(batch, &schema, &kept))
+        .map(|batch| project(batch, &schema, &kept).map_err(arrow_error))
         .collect::<PyResult<Vec<_>>>()?;
-    Ok((schema, batches))
+    engine.static_table(schema, batches).map_err(engine_error)
 }
 
 /// Where each of `wanted`'s columns is in `schema`, by name.
@@ -215,10 +254,14 @@ fn positions(schema: &Schema, wanted: &Schema) -> PyResult<Vec<usize>> {
 
 /// `batch`'s columns at `columns`, as `schema`, keeping its row count when it keeps no column
 /// (`count(*)` reads none).
-fn project(batch: &RecordBatch, schema: &SchemaRef, columns: &[usize]) -> PyResult<RecordBatch> {
+fn project(
+    batch: &RecordBatch,
+    schema: &SchemaRef,
+    columns: &[usize],
+) -> Result<RecordBatch, arrow::error::ArrowError> {
     let kept = columns.iter().map(|at| batch.column(*at).clone()).collect();
     let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-    RecordBatch::try_new_with_options(schema.clone(), kept, &options).map_err(arrow_error)
+    RecordBatch::try_new_with_options(schema.clone(), kept, &options)
 }
 
 /// The stored table, ticking from weir: today's rows, then each change as it is written; a
