@@ -10,10 +10,15 @@ Use a release build of Kermodes: `uv sync` installs a faster-to-build profile.
 
 The data is ClickBench's `hits` as 100 Parquet files of about 1M rows each; `--files N` takes the
 first N. It and the queries are downloaded from a pinned ClickBench commit into
-`.kermodes/clickbench/` (ClickBench is CC BY-NC-SA, so none of it is checked in here). Both
-engines load the files into memory first, with ClickBench's conversions: byte columns as strings,
-`EventDate` (days) as a date, `EventTime` (seconds) as a timestamp. Each query runs three times;
-the best is reported.
+`.kermodes/clickbench/` (ClickBench is CC BY-NC-SA, so none of it is checked in here), with
+ClickBench's conversions: byte columns as strings, `EventDate` (days) as a date, `EventTime`
+(seconds) as a timestamp.
+
+Each engine loads the data into its own storage once, reused by later runs (`--reload` loads it
+again): Kermodes into the history of a store's `bench.hits`, a `write_history` per date, sorted
+by ClickHouse's key for the table (`CounterID, UserID, EventTime, WatchID`; its date is
+history's); DuckDB into a database file. Kermodes reads it as `hist.bench.hits`. Each query runs
+three times; the best is reported.
 
 Each engine runs in its own process. A result is right if every row of it is in DuckDB's result
 of the query without its `LIMIT` and `OFFSET`, at a position its `ORDER BY` allows: rows tied on
@@ -39,6 +44,7 @@ HITS = (
 )
 DIR = Path(__file__).resolve().parent.parent / ".kermodes" / "clickbench"
 REPEATS = 3
+SORT = ["CounterID", "UserID", "EventTime", "WatchID"]
 
 
 def fetch(url: str, path: Path) -> Path:
@@ -59,51 +65,96 @@ def hits(files: int) -> list[Path]:
     return [fetch(HITS.format(i), DIR / f"hits_{i}.parquet") for i in range(files)]
 
 
-def kermodes(files: list[Path], wanted: list[int]) -> dict:
-    import kermodes as km
+def converted(table):
+    """`hits` as ClickBench's DuckDB setup reads it (module docs)."""
     import pyarrow as pa
     import pyarrow.compute as pc
-    import pyarrow.parquet as pq
 
-    start = time.perf_counter()
-    loaded = []
-    for path in files:
-        raw = pq.read_table(path)
-        columns = []
-        for field, column in zip(raw.schema, raw.columns, strict=True):
-            if field.name == "EventDate":
-                column = pc.cast(pc.cast(column, pa.int32()), pa.date32())
-            elif field.name == "EventTime":
-                column = pc.cast(
-                    pc.multiply(column, 1_000_000_000), pa.timestamp("ns", tz="UTC")
-                )
-            elif pa.types.is_binary(field.type):
-                column = pc.cast(column, pa.utf8())
-            elif field.type == pa.int16():
-                column = pc.cast(column, pa.int32())
-            columns.append(column)
-        loaded.append(pa.Table.from_arrays(columns, names=raw.schema.names))
-    db = km.connect(":memory:", manual=True)
-    table = db.static_table(pa.concat_tables(loaded).combine_chunks())
-    load = time.perf_counter() - start
-    return run(wanted, load, lambda q: pa.table(db.sql(q, hits=table)))
+    columns = []
+    for field, column in zip(table.schema, table.columns, strict=True):
+        if field.name == "EventDate":
+            column = pc.cast(pc.cast(column, pa.int32()), pa.date32())
+        elif field.name == "EventTime":
+            column = pc.cast(
+                pc.multiply(column, 1_000_000_000), pa.timestamp("ns", tz="UTC")
+            )
+        elif pa.types.is_binary(field.type):
+            column = pc.cast(column, pa.utf8())
+        columns.append(column)
+    return pa.Table.from_arrays(columns, names=table.schema.names)
 
 
-def duckdb_engine(files: list[Path], wanted: list[int], threads: int | None) -> dict:
+def kermodes(files: list[Path], wanted: list[int], reload: bool) -> dict:
+    import shutil
+    from datetime import timedelta
+
+    import kermodes as km
+    import pyarrow as pa
+    import pyarrow.dataset as ds
+
+    store = DIR / f"store-{len(files)}"
+    loaded = store / "loaded"
+    load = None
+    if reload or not loaded.exists():
+        shutil.rmtree(store, ignore_errors=True)
+        start = time.perf_counter()
+        db = km.connect(store, manual=True)
+        data = ds.dataset([str(p) for p in files], format="parquet")
+        sample = converted(data.head(1))
+        names = {pa.utf8(): "utf8", pa.date32(): "date32"}
+        db.create_table(
+            "bench.hits",
+            {
+                f.name: "timestamp"
+                if pa.types.is_timestamp(f.type)
+                else names.get(f.type, str(f.type))
+                for f in sample.schema
+            },
+            sort=SORT,
+        )
+        days = data.to_table(columns=["EventDate"]).column(0).unique().to_pylist()
+        for day in sorted(days):
+            rows = converted(data.to_table(filter=ds.field("EventDate") == day))
+            on = (date(1970, 1, 1) + timedelta(days=day)).isoformat()
+            db.write_history("bench.hits", on, rows)
+        load = time.perf_counter() - start
+        del db
+        loaded.touch()
+    db = km.connect(store, manual=True)
+
+    def query(q: str) -> pa.Table:
+        result = pa.table(db.sql(re.sub(r"\bFROM hits\b", "FROM hist.bench.hits", q)))
+        # History adds each row's `Date`, which `hits` lacks: `SELECT *` has it first.
+        return (
+            result.drop_columns(["Date"]) if "Date" in result.column_names else result
+        )
+
+    return run(wanted, load, query)
+
+
+def duckdb_engine(
+    files: list[Path], wanted: list[int], threads: int | None, reload: bool
+) -> dict:
     import duckdb
 
-    db = duckdb.connect()
+    path = DIR / f"hits-{len(files)}.duckdb"
+    load = None
+    if reload or not path.exists():
+        path.unlink(missing_ok=True)
+        start = time.perf_counter()
+        db = duckdb.connect(path)
+        paths = ", ".join(f"'{p}'" for p in files)
+        db.execute(
+            f"""CREATE TABLE hits AS SELECT * REPLACE (make_date(EventDate) AS EventDate,
+            to_timestamp(EventTime) AS EventTime)
+            FROM read_parquet([{paths}], binary_as_string = true)"""
+        )
+        db.close()
+        load = time.perf_counter() - start
+    db = duckdb.connect(path)
     db.execute("SET TimeZone = 'UTC'")
     if threads:
         db.execute(f"SET threads = {threads}")
-    start = time.perf_counter()
-    paths = ", ".join(f"'{p}'" for p in files)
-    db.execute(
-        f"""CREATE TABLE hits AS SELECT * REPLACE (make_date(EventDate) AS EventDate,
-        to_timestamp(EventTime) AS EventTime)
-        FROM read_parquet([{paths}], binary_as_string = true)"""
-    )
-    load = time.perf_counter() - start
     return run(wanted, load, lambda q: db.sql(q).to_arrow_table())
 
 
@@ -192,14 +243,9 @@ def check(files: list[Path], wanted: list[int], ours: dict) -> dict[int, str]:
     """Whether each of Kermodes's results is one a right answer could be (module docs)."""
     import duckdb
 
-    db = duckdb.connect()
+    # The table DuckDB's worker loaded.
+    db = duckdb.connect(DIR / f"hits-{len(files)}.duckdb", read_only=True)
     db.execute("SET TimeZone = 'UTC'")
-    paths = ", ".join(f"'{p}'" for p in files)
-    db.execute(
-        f"""CREATE TABLE hits AS SELECT * REPLACE (make_date(EventDate) AS EventDate,
-        to_timestamp(EventTime) AS EventTime)
-        FROM read_parquet([{paths}], binary_as_string = true)"""
-    )
     all_queries = queries()
     verdicts = {}
     for n in wanted:
@@ -264,6 +310,11 @@ def main() -> None:
         help="default: on for up to 10 files",
     )
     parser.add_argument(
+        "--reload",
+        action="store_true",
+        help="load the data again, not as stored before",
+    )
+    parser.add_argument(
         "--worker", choices=["kermodes", "duckdb"], help=argparse.SUPPRESS
     )
     args = parser.parse_args()
@@ -275,10 +326,10 @@ def main() -> None:
         else list(range(1, len(queries()) + 1))
     )
     if args.worker == "kermodes":
-        print(json.dumps(kermodes(files, wanted)))
+        print(json.dumps(kermodes(files, wanted, args.reload)))
         return
     if args.worker == "duckdb":
-        print(json.dumps(duckdb_engine(files, wanted, args.threads)))
+        print(json.dumps(duckdb_engine(files, wanted, args.threads, args.reload)))
         return
 
     import os
@@ -300,6 +351,7 @@ def main() -> None:
         argv += ["--only", ",".join(map(str, wanted))] + (
             ["--threads", str(args.threads)] if args.threads else []
         )
+        argv += ["--reload"] if args.reload else []
         done = subprocess.run(
             argv, env=env, capture_output=True, text=True, check=False
         )
@@ -310,8 +362,12 @@ def main() -> None:
     checking = args.check if args.check is not None else args.files <= 10
     verdicts = check(files, wanted, ours) if checking else {}
 
+    def loaded(seconds: float | None) -> str:
+        return "as stored before" if seconds is None else f"{seconds:.2f} s"
+
     print(
-        f"{sum(1 for _ in files)} file(s); load: Kermodes {ours['load']:.2f} s, DuckDB {theirs['load']:.2f} s\n"
+        f"{len(files)} file(s); load: Kermodes {loaded(ours['load'])}, "
+        f"DuckDB {loaded(theirs['load'])}\n"
     )
     print("| Q | Kermodes ms | DuckDB ms | Ratio | Result |")
     print("|---|---|---|---|---|")
