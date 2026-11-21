@@ -29,6 +29,7 @@ export * from './key-handlers';
 export * from './mouse-handlers';
 export * from './errors';
 export { injectGridStyles } from './GridStyles';
+export { Spinner } from './Spinner';
 export * from './ViewportGridModel';
 export { TableViewer, type TableViewerProps } from './TableViewer';
 export { TableViewerMetricCalculator, TableViewerRenderer } from './TableViewerGrid';

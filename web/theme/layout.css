@@ -107,6 +107,15 @@
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
+/* A figure whose table has not loaded: a bar the height of its digits, as the grid's skeleton */
+.km-stat-placeholder {
+  display: inline-block;
+  width: 4.5ch;
+  height: 0.6em;
+  border-radius: 4px;
+  background: var(--secondary);
+  vertical-align: middle;
+}
 .km-stat-value[data-sign='positive'] {
   color: var(--positive);
 }
@@ -122,7 +131,7 @@
   color: var(--destructive);
 }
 
-/* A chart before its first points, or failed: said in place, as the grid says it */
+/* A chart that has loaded but has nothing to draw, or failed: said in place, as the grid says it */
 .km-chart-empty {
   position: absolute;
   inset: 0;
@@ -140,4 +149,27 @@
   font-size: 11px;
   color: var(--faint-foreground);
   text-align: center;
+}
+
+/* A chart before its first points: the grid's spinner over faint bars where the series will be */
+.km-chart-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+.km-chart-skeleton {
+  position: absolute;
+  inset: 16% 6% 14%;
+  display: flex;
+  align-items: flex-end;
+  gap: 6%;
+  opacity: 0.6;
+}
+.km-chart-skeleton > .kermodes-skeleton-bar {
+  position: static;
+  flex: 1;
+  border-radius: 3px 3px 0 0;
 }

@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from 'react';
 import Plotly from 'plotly.js-finance-dist';
 import { DataType, type Table, type Timestamp, type Vector } from 'apache-arrow';
+import { injectGridStyles, Spinner } from '@kermodes/grid';
 import { useSeries, type SeriesOptions } from './index';
 
 export type ChartProps = Omit<SeriesOptions, 'range'> & {
@@ -61,6 +62,10 @@ function values(vector: Vector): (number | string | null)[] {
 
 // Milliseconds to a timestamp's unit (Arrow's TimeUnit: second, milli, micro, nano)
 const PER_MILLISECOND = [1e-3, 1, 1e3, 1e6];
+
+// The placeholder bars' heights (percent of the chart) while it loads: varied, but fixed, so
+// nothing moves until the points arrive.
+const SKELETON_BARS = [38, 52, 46, 61, 57, 70, 64, 49, 58, 66, 54, 72];
 
 /**
  * A value of Plotly's x axis in x's own units, as the server ranges by: a time's unit since the
@@ -222,11 +227,29 @@ export function Chart({ table, x, y, where, points: budget, type = 'line', class
     };
   }, []);
 
-  const empty =
-    series.error != null ? 'This chart cannot be shown' : points == null ? 'Loading' : drawable ? null : 'No rows';
+  // Loading looks as a table's does: the same spinner over faint placeholder bars, so a chart
+  // that has not drawn yet never reads as an empty one.
+  useEffect(() => injectGridStyles(host.current?.ownerDocument), []);
+  const loading = series.error == null && points == null;
+  const empty = series.error != null ? 'This chart cannot be shown' : loading || drawable ? null : 'No rows';
   return (
     <div className={className} style={{ position: 'relative', width: '100%', height: '100%', ...style }}>
       <div ref={host} style={{ position: 'absolute', inset: 0 }} />
+      {loading && (
+        <div className="km-chart-loading" aria-busy="true" aria-label="Loading chart">
+          <div className="km-chart-skeleton" aria-hidden="true">
+            {SKELETON_BARS.map((height, at) => (
+              // Fixed placeholders that never reorder
+              // eslint-disable-next-line react/no-array-index-key
+              <span key={at} className="kermodes-skeleton-bar" style={{ height: `${height}%` }} />
+            ))}
+          </div>
+          <span className="kermodes-busy" role="status">
+            <Spinner />
+            Loading
+          </span>
+        </div>
+      )}
       {empty != null && (
         <div className="km-chart-empty">
           <span>{empty}</span>

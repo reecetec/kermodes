@@ -170,16 +170,34 @@ export function Stats({ children }: { children: ReactNode }) {
 
 /**
  * A figure: its label over its value, in the mono. With `sign`, the value is coloured by it, as
- * the grid colours numbers (a change, a P&L).
+ * the grid colours numbers (a change, a P&L). With `status`, the status of the table the value
+ * comes from (`useTable`): until it has loaded, a placeholder where the value goes, so a figure
+ * not yet known never reads as a 0 or a dash.
  */
-export function Stat({ label, value, sign }: { label: ReactNode; value: ReactNode; sign?: number }) {
+export function Stat({
+  label,
+  value,
+  sign,
+  status,
+}: {
+  label: ReactNode;
+  value: ReactNode;
+  sign?: number;
+  status?: TableStatus;
+}) {
   const tone = sign == null || sign === 0 || Number.isNaN(sign) ? undefined : sign > 0 ? 'positive' : 'negative';
   return (
     <div className="km-stat">
       <span className="km-stat-label">{label}</span>
-      <span className="km-stat-value" data-sign={tone}>
-        {value}
-      </span>
+      {status === 'loading' ? (
+        <span className="km-stat-value" aria-busy="true" aria-label="Loading">
+          <span className="km-stat-placeholder" />
+        </span>
+      ) : (
+        <span className="km-stat-value" data-sign={tone}>
+          {value}
+        </span>
+      )}
     </div>
   );
 }
