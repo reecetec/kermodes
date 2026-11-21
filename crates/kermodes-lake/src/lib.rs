@@ -15,7 +15,7 @@ pub use files::{
     Batches, DATE, Lake, OP, TARGET_FILE_BYTES, Written, dated, history_columns, with_date_column,
     with_op,
 };
-pub use merge::{GARBAGE_GRACE, Merged, collect_garbage, merge};
+pub use merge::{GARBAGE_GRACE, Merged, collect_garbage, merge, write_history};
 pub use plan::{Held, Incoming, Plan, plan};
 pub use read::{Explain, History, explain_history, read_history};
 pub use weir::Weir;

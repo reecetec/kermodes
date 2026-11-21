@@ -888,8 +888,16 @@ the only record of what history exists.
    many rows.
 
 Batch jobs (end-of-day files, vendor data, backfills, corrections) write history directly, never
-through weir: `write_history(table, date, data)` goes through the same planner, writer, and
-commit. Weir is only for live, sequenced, exactly-once ingestion.
+through weir (built): `db.write_history(table, date, data)` goes through the same planner,
+writer, and commit as a merge, and replaces the date with `data` (no rows leave it empty). Weir
+is only for live, sequenced, exactly-once ingestion.
+
+- `data` has the table's columns by name, of its types; anything else is refused before a file
+  is written.
+- The date must be past and one weir holds no rows of, by weir's clock and weir's answer however
+  the write reaches it, so a date is still served from one place: a date weir holds is merged.
+- Append tables only. A keyed table's history is its log of changes in commit order, which only
+  its writers make.
 
 ### 8.4 Reading history
 

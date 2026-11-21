@@ -925,11 +925,12 @@ impl Store {
         Date::of_ns(self.now_ns()).to_string()
     }
 
-    /// Today's date is still being written: only a past one is read whole, merged, or dropped.
+    /// Today's date is still being written: only a past one is read whole, put into history, or
+    /// dropped.
     fn past(&self, date: Date) -> Result<(), Error> {
         if date >= Date::of_ns(self.now_ns()) {
             return Err(Error::Busy(format!(
-                "{date} is still being written: only past dates are merged"
+                "{date} is still being written: only a past date goes into history"
             )));
         }
         Ok(())

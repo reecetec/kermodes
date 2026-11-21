@@ -84,6 +84,40 @@ def test_today_is_not_history_yet(tmp_path):
         s.historical_table("md.nope")
 
 
+def test_a_batch_job_writes_past_days_straight_into_history(tmp_path):
+    s = km.connect(tmp_path, manual=True)
+    s.create_table("md.ticks", COLUMNS)
+    for day, columns in DAYS.items():
+        # Columns by name, in any order.
+        given = pa.table({"px": columns["px"], "sym": columns["sym"]})
+        assert s.write_history("md.ticks", day, given)["rows"] == len(columns["px"])
+    history = s.historical_table("md.ticks")
+    assert rows(pa.table(history.table())) == expected(lambda day, sym, px: True)
+    assert "from weir" not in history.explain()
+    # Written again, a day holds the new rows in place of the old.
+    s.write_history("md.ticks", "2026-11-02", pa.table({"sym": ["z"], "px": [9.0]}))
+    assert rows(pa.table(history.where("Date = '2026-11-02'"))) == [
+        (date(2026, 11, 2), "z", 9.0)
+    ]
+    # SQL over the dates it wrote reads them as merged history: static.
+    by_sym = s.sql(
+        "SELECT sym, count(*) AS n FROM md.ticks "
+        "WHERE Date >= '2026-11-01' AND Date <= '2026-11-03' GROUP BY sym ORDER BY sym"
+    )
+    assert not by_sym.is_refreshing
+    assert pa.table(by_sym).to_pylist() == [
+        {"sym": "a", "n": 2},
+        {"sym": "b", "n": 1},
+        {"sym": "c", "n": 1},
+        {"sym": "z", "n": 1},
+    ]
+    today = datetime.now(UTC).date().isoformat()
+    with pytest.raises(km.KermodesError, match="still being written"):
+        s.write_history("md.ticks", today, pa.table({"sym": ["a"], "px": [1.0]}))
+    with pytest.raises(km.KermodesError, match="column `px` is"):
+        s.write_history("md.ticks", "2026-11-04", pa.table({"sym": ["a"], "px": [1]}))
+
+
 def test_a_stored_table_is_its_history_then_today_ticking(tmp_path):
     s = store_with_past_days(tmp_path)
     s.merge_history("md.ticks", "2026-11-01")  # 11-02 and 11-03 stay in weir, unmerged

@@ -10,7 +10,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Date32Type, Field, Int64Type, Schema};
-use kermodes_lake::{History, Lake, Merged, Weir, collect_garbage, merge, read_history};
+use kermodes_lake::{
+    History, Lake, Merged, Weir, collect_garbage, merge, read_history, write_history,
+};
 use kermodes_weir::{Date, Error, SourceId, Store, TableName};
 
 struct TempDir(PathBuf);
@@ -234,6 +236,88 @@ fn a_merge_over_flight_moves_dates_the_same() {
         merge(&client, &lake, &ticks(), today()),
         Err(Error::Busy(_))
     ));
+}
+
+/// A batch job writes a past date straight into history, not through weir: the date then
+/// holds exactly those rows, written again it holds the new ones in their place, and written
+/// with none it holds none. Its neighbours are kept as they were.
+#[test]
+fn a_batch_job_writes_a_past_date_straight_into_history() {
+    let dir = TempDir::new();
+    let store = store_with(&dir.0.join("store"), &[(d(1), &[("a", &[1, 2])])]);
+    let lake = Lake::open(dir.0.join("lake").to_str().unwrap()).unwrap();
+    merge(&store, &lake, &ticks(), d(1)).unwrap();
+
+    let written = write_history(
+        &store,
+        &lake,
+        &ticks(),
+        d(5),
+        &[batch(&[10, 11]), batch(&[12])],
+    );
+    assert_eq!(
+        written.unwrap(),
+        Merged {
+            rows: 3,
+            files: 1,
+            replaced: 1
+        }
+    );
+    assert_eq!(history(&store, &lake, d(5), d(5)), [10, 11, 12]);
+    assert_eq!(history(&store, &lake, d(1), d(5)), [1, 2, 10, 11, 12]);
+
+    write_history(&store, &lake, &ticks(), d(5), &[batch(&[13])]).unwrap();
+    assert_eq!(history(&store, &lake, d(1), d(5)), [1, 2, 13]);
+
+    write_history(&store, &lake, &ticks(), d(6), &[batch(&[14])]).unwrap();
+    assert_eq!(history(&store, &lake, d(6), d(6)), [14]);
+
+    write_history(&store, &lake, &ticks(), d(5), &[]).unwrap();
+    assert_eq!(history(&store, &lake, d(1), d(6)), [1, 2, 14]);
+    let read = read_history(&store, &lake, &ticks(), Some(d(5)), Some(d(5)), &[]).unwrap();
+    assert_eq!(rows(&read), []);
+}
+
+/// Each date is served from one place (§8): history takes no date that is not past, by the
+/// store's clock however the write reaches it, nor one weir still holds; and only rows that are
+/// the table's columns, of an append table.
+#[test]
+fn writing_history_is_refused_where_a_date_would_be_served_twice_or_the_rows_do_not_fit() {
+    let dir = TempDir::new();
+    let store = Arc::new(store_with(&dir.0.join("store"), &[(d(1), &[("a", &[1])])]));
+    let lake = Lake::open(dir.0.join("lake").to_str().unwrap()).unwrap();
+    let server = kermodes_flight::serve(store.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+    let client = kermodes_flight::Client::connect(&format!("grpc://{}", server.addr())).unwrap();
+
+    for weir in [&*store as &dyn Weir, &client] {
+        let today = write_history(weir, &lake, &ticks(), today(), &[batch(&[1])]);
+        assert!(matches!(today, Err(Error::Busy(_))), "{today:?}");
+        let held = write_history(weir, &lake, &ticks(), d(1), &[batch(&[1])]);
+        assert!(matches!(held, Err(Error::Busy(_))), "{held:?}");
+    }
+    assert_eq!(store.history(&ticks()).unwrap(), []);
+
+    let column =
+        |name: &str, values: ArrayRef| RecordBatch::try_from_iter([(name, values)]).unwrap();
+    let as_float = column("n", Arc::new(arrow::array::Float64Array::from(vec![1.0])));
+    let other = column("m", Arc::new(Int64Array::from(vec![1])));
+    let extra = RecordBatch::try_from_iter([
+        ("n", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
+        ("m", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
+    ])
+    .unwrap();
+    for rows in [as_float, other, extra] {
+        let wrong = write_history(&*store, &lake, &ticks(), d(5), &[rows]);
+        assert!(matches!(wrong, Err(Error::Schema(_))), "{wrong:?}");
+    }
+
+    let quotes = TableName::parse("md.quotes").unwrap();
+    let schema = Schema::new(vec![Field::new("n", DataType::Int64, true)]);
+    store
+        .create_keyed_table(&quotes, &schema, &["n".to_string()])
+        .unwrap();
+    let keyed = write_history(&*store, &lake, &quotes, d(5), &[batch(&[1])]);
+    assert!(matches!(keyed, Err(Error::Schema(_))), "{keyed:?}");
 }
 
 /// Each row read: its `Date` (as days) and its `n`.

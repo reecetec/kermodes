@@ -609,6 +609,34 @@ impl Session {
         Ok(moved)
     }
 
+    /// Writes `data`, every row the append table `name` has on the past `date`
+    /// (`YYYY-MM-DD`), straight into its history in place of what it held of the date, and
+    /// says what was written: `{"rows", "files", "replaced"}`. For batch jobs (end-of-day
+    /// files, vendor data, backfills, corrections); live data goes through a writer. `data` has
+    /// the table's columns, by name and type. Refused for a date weir still holds rows of: merge
+    /// that one instead.
+    fn write_history<'py>(
+        &self,
+        py: Python<'py>,
+        name: &str,
+        date: &str,
+        data: AnyRecordBatch,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let tables = self.stored()?;
+        let name = kermodes_weir::TableName::parse(name).map_err(store_error)?;
+        let date = kermodes_weir::Date::parse(date).map_err(store_error)?;
+        let (_, batches) = read_batches(data)?;
+        let lake = self.lake()?;
+        let written = py
+            .detach(|| kermodes_lake::write_history(tables.weir(), &lake, &name, date, &batches))
+            .map_err(store_error)?;
+        let out = PyDict::new(py);
+        out.set_item("rows", written.rows)?;
+        out.set_item("files", written.files)?;
+        out.set_item("replaced", written.replaced)?;
+        Ok(out)
+    }
+
     /// The stored table `name`, ticking: every row written so far, then each batch as it is
     /// written. Its rows come only from its writers. A keyed table holds each key's latest row.
     fn live_table(&self, py: Python<'_>, name: &str) -> PyResult<Table> {
