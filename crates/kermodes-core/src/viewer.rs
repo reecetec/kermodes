@@ -16,18 +16,12 @@ use arrow::error::ArrowError;
 use arrow::ipc::writer::StreamWriter;
 
 use crate::session::{Table, WeakTable};
-use crate::{Error, type_name};
+use crate::{Error, SortKey, type_name};
 
 /// Rows sent beyond the visible ones on each side, so small scrolls need no round trip.
 pub const MARGIN: usize = 100;
 /// Most rows one fetch (a copy of a selection beyond the loaded window) returns.
 pub const FETCH_LIMIT: usize = 100_000;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SortKey {
-    pub column: String,
-    pub descending: bool,
-}
 
 /// A message from the grid. A sort or filter carries the grid's number for it: `applied` then
 /// says which the rows reflect, so the grid can show the old ones as such until they do.
@@ -239,15 +233,7 @@ impl Viewer {
                 shown = Some(table.filter(&predicates.join(" AND "))?);
             }
             if !sort.is_empty() {
-                let by: Vec<String> = sort
-                    .iter()
-                    .map(|key| match key.descending {
-                        true => format!("{} desc", key.column),
-                        false => key.column.clone(),
-                    })
-                    .collect();
-                let by: Vec<&str> = by.iter().map(String::as_str).collect();
-                shown = Some(shown.as_ref().unwrap_or(&table).sort(&by)?);
+                shown = Some(shown.as_ref().unwrap_or(&table).sort_by(&sort)?);
             }
             Ok::<_, Error>(shown)
         })();

@@ -11,8 +11,8 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Float64Type, Schema, TimeUnit};
 use arrow::ipc::reader::StreamReader;
-use kermodes_core::viewer::{FETCH_LIMIT, Frame, MARGIN, Request, SortKey, Viewer};
-use kermodes_core::{Session, Table};
+use kermodes_core::viewer::{FETCH_LIMIT, Frame, MARGIN, Request, Viewer};
+use kermodes_core::{Session, SortKey, Table};
 
 fn rows(frame: &Frame) -> RecordBatch {
     let mut reader = StreamReader::try_new(frame.rows.as_slice(), None).unwrap();

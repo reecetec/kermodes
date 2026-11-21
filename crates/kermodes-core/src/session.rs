@@ -648,6 +648,39 @@ fn pair(text: &str) -> (&str, &str) {
     }
 }
 
+/// A column to sort by, and whether it sorts descending (`Table::sort_by`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SortKey {
+    pub column: String,
+    pub descending: bool,
+}
+
+impl SortKey {
+    /// `"name"`, `"name asc"`, or `"name desc"`: a trailing word `asc` or `desc` is the order,
+    /// and the rest, spaces and all, the column.
+    pub fn parse(entry: &str) -> Self {
+        let entry = entry.trim();
+        let (column, descending) = match entry.rsplit_once(char::is_whitespace) {
+            Some((name, order)) if order.eq_ignore_ascii_case("desc") => (name, true),
+            Some((name, order)) if order.eq_ignore_ascii_case("asc") => (name, false),
+            _ => (entry, false),
+        };
+        Self {
+            column: column.trim_end().to_owned(),
+            descending,
+        }
+    }
+}
+
+impl std::fmt::Display for SortKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.descending {
+            true => write!(f, "{} desc", self.column),
+            false => f.write_str(&self.column),
+        }
+    }
+}
+
 /// An input table with one row per key value: upserts replace, deletes remove.
 struct Keyed {
     /// Only a `Feed` writes it: a keyed table a store such as weir keeps.
@@ -1644,32 +1677,26 @@ impl Table {
     }
 
     /// Rows ordered by `by`, each entry `"name"` or `"name desc"` (`"name asc"` is the default),
-    /// earlier entries first. NULL sorts as the largest value; ties keep the input's order. A
-    /// static table's sort is a new table of rows in that order. A ticking table's keeps the
-    /// input's rows and their keys in that order, cycle by cycle, so reads (snapshots, rows by
-    /// position) follow it; nothing can be built on it.
+    /// earlier entries first: `sort_by` with each entry parsed (`SortKey::parse`).
     pub fn sort(&self, by: &[&str]) -> Result<Table, Error> {
-        if by.is_empty() {
+        let keys: Vec<SortKey> = by.iter().map(|entry| SortKey::parse(entry)).collect();
+        self.sort_by(&keys)
+    }
+
+    /// Rows ordered by `keys`, earlier keys first. NULL sorts as the largest value; ties keep the
+    /// input's order. A static table's sort is a new table of rows in that order. A ticking
+    /// table's keeps the input's rows and their keys in that order, cycle by cycle, so reads
+    /// (snapshots, rows by position) follow it; nothing but `slice` can be built on it.
+    pub fn sort_by(&self, keys: &[SortKey]) -> Result<Table, Error> {
+        if keys.is_empty() {
             return Err(Error::Unsupported("sort needs at least one column".into()));
         }
-        let keys = by
+        let described: Vec<String> = keys.iter().map(SortKey::to_string).collect();
+        let keys = keys
             .iter()
-            .map(|entry| {
-                let words: Vec<&str> = entry.split_whitespace().collect();
-                let (name, descending) = match words[..] {
-                    [name] => (name, false),
-                    [name, order] if order.eq_ignore_ascii_case("asc") => (name, false),
-                    [name, order] if order.eq_ignore_ascii_case("desc") => (name, true),
-                    _ => {
-                        return Err(Error::Schema(format!(
-                            "sort takes \"name\" or \"name desc\", not \"{entry}\""
-                        )));
-                    }
-                };
-                Ok((resolve(&self.schema, &[name])?[0], descending))
-            })
+            .map(|key| Ok((resolve(&self.schema, &[&key.column])?[0], key.descending)))
             .collect::<Result<Vec<_>, Error>>()?;
-        let description = format!("sort({})", by.join(", "));
+        let description = format!("sort({})", described.join(", "));
         let mut graph = self.session.write();
         let table = &graph.tables[self.id];
         if let Some(cause) = &table.failure {

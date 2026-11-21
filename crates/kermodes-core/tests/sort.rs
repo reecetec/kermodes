@@ -10,7 +10,7 @@ use arrow::array::{
 };
 use arrow::compute::{SortOptions, concat_batches, take_record_batch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use kermodes_core::{Error, Session, Table};
+use kermodes_core::{Error, Session, SortKey, Table};
 
 /// xorshift64*: small and seedable.
 struct Rng(u64);
@@ -374,13 +374,46 @@ fn nothing_is_built_on_a_ticking_sort_and_entries_are_clear() {
     assert!(message.contains("sort last"), "{message}");
     let fixed = session.static_table(schema(), vec![]).unwrap();
     assert!(fixed.sort(&["sym"]).unwrap().snapshot().unwrap().is_empty());
-    for (entry, expected) in [("sym upward", "\"name desc\""), ("prise", "price")] {
+    for (entry, expected) in [("sym upward", "`sym upward`"), ("prise", "price")] {
         let Err(error) = fixed.sort(&[entry]) else {
             panic!("{entry} should be rejected");
         };
         let error = error.to_string();
         assert!(error.contains(expected), "{entry}: {error}");
     }
+}
+
+/// A column's name may hold spaces (SQL names an unnamed result column by its expression, as in
+/// `sum((a + 1))`): sorting reads the order from a trailing word, not by splitting the name.
+#[test]
+fn a_column_named_with_spaces_sorts_by_its_whole_name() {
+    let session = Session::new();
+    let spaced = Arc::new(Schema::new(vec![Field::new(
+        "sum((a + 1))",
+        DataType::Int64,
+        true,
+    )]));
+    let values: ArrayRef = Arc::new(Int64Array::from(vec![2, 3, 1]));
+    let batch = RecordBatch::try_new(spaced.clone(), vec![values]).unwrap();
+    let fixed = session.static_table(spaced, vec![batch]).unwrap();
+    let column = |table: Table| {
+        rows(&table)
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec()
+    };
+    assert_eq!(
+        column(fixed.sort(&["sum((a + 1)) desc"]).unwrap()),
+        [3, 2, 1]
+    );
+    let key = SortKey {
+        column: "sum((a + 1))".into(),
+        descending: false,
+    };
+    assert_eq!(column(fixed.sort_by(&[key]).unwrap()), [1, 2, 3]);
 }
 
 /// 300k rows sort in parallel partitions, and two full-range columns with NULLs (65 bits each)

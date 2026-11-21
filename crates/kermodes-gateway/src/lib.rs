@@ -50,8 +50,8 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use kermodes_core::series::Series;
-use kermodes_core::viewer::{FETCH_LIMIT, Frame, Request, SortKey, Status, Viewer};
-use kermodes_core::{Session, Table, type_name};
+use kermodes_core::viewer::{FETCH_LIMIT, Frame, Request, Status, Viewer};
+use kermodes_core::{Session, SortKey, Table, type_name};
 use serde_json::{Value, json};
 use tokio::sync::{oneshot, watch};
 

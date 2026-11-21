@@ -1782,7 +1782,8 @@ fn py_frame(py: Python<'_>, frame: kermodes_core::viewer::Frame) -> PyResult<PyF
 /// {"type": "fetch", "id", "start", "count"}. A sort's or filter's `request` number is what
 /// `applied` reports back (0 if absent). `None` for other types.
 fn request(message: &Bound<'_, PyDict>) -> PyResult<Option<kermodes_core::viewer::Request>> {
-    use kermodes_core::viewer::{Request, SortKey};
+    use kermodes_core::SortKey;
+    use kermodes_core::viewer::Request;
     let item = |name: &str| -> PyResult<Bound<'_, PyAny>> {
         message
             .get_item(name)?
