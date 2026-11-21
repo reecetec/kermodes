@@ -252,17 +252,19 @@ signals = live.where("sym = 'AAPL'").agg_by("sym", n="count(*)", avg_px="mean(px
 con.publish("sig.aapl", signals, key="sym")  # in a program
 
 con.sql("SELECT season, avg(goals) FROM nhl.box_scores GROUP BY season")  # static
-con.sql("SELECT sym, count(*) FROM md.ticks GROUP BY sym", live=True)  # ticking
+con.live_sql("SELECT sym, count(*) FROM md.ticks GROUP BY sym")  # ticking
 con.sql("SELECT ... FROM book", book=my_table)  # an in-memory table, by keyword
 ```
 
-- **One name per table.** `con.table(name)`, `con.live_table(name)`, and a name in `con.sql`
-  read all of a table's rows: the lake's files and weir's tail, as one. Filters choose rows, on
-  any column; nothing requires a date.
-- **Static or ticking is chosen once, where the data is named**, and what is built from it
-  follows, as in Deephaven: anything built from a live table is live, a join of static and live
-  included. A static table is the table as it is when used: showing it again, or reading it in
-  a later cell, reads the data as it is then (one evaluation reads one consistent state). A
+- **One name per table.** `con.table(name)`, `con.live_table(name)`, and a name in `con.sql` or
+  `con.live_sql` read all of a table's rows: the lake's files and weir's tail, as one. Filters
+  choose rows, on any column; nothing requires a date.
+- **Static or ticking is chosen once, where the data is named**: `table` and `sql` static,
+  `live_table` and `live_sql` ticking. What is built from them follows, as in Deephaven:
+  anything built from a live table is live, a join of static and live included, and so is
+  `con.sql` given a live table by keyword.
+  A static table is the table as it is when used: showing it again, or reading it in a later
+  cell, reads the data as it is then (one evaluation reads one consistent state). A
   live table is all its rows, then every change: a streamed table ticks as rows arrive, a batch
   table when its next write commits, a published table as its program publishes. A research
   query never becomes a ticking table, holding memory and changing, unless it says so.
@@ -1109,8 +1111,8 @@ state at cycle time.
 ### 9.8 SQL
 
 SQL is a frontend onto the Kermodes plan, the way Deephaven's SQL compiles to its table operations.
-As built; §5.3's target makes a query static unless `live=True` (or a live table it reads)
-makes it tick, and drops the `hist.`/`live.` names and the date rule below.
+As built; §5.3's target makes a query static in `con.sql` and ticking in `con.live_sql` (or when
+a live table it is given ticks), and drops the `hist.`/`live.` names and the date rule below.
 A query ticks when any input it reads ticks, and is static otherwise; the same SQL works over live
 data, history, or both.
 
