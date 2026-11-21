@@ -15,7 +15,9 @@ use hashbrown::HashMap;
 
 use crate::slots::Slots;
 
-/// A row's identity within one table. Keys are never reused.
+/// A row's identity within one table: no two live rows share a key, and a cycle never removes
+/// and adds the same key (that is a modify). A key removed may come back in a later cycle: a
+/// slice's keys are its positions.
 pub(crate) type RowKey = u64;
 
 /// Appended batches under `SMALL_ROWS` are combined into chunks of at least `CHUNK_ROWS`. Arrow

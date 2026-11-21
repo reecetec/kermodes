@@ -1539,9 +1539,18 @@ impl Table {
         Ok(Table(table))
     }
 
+    /// The rows at positions `start..stop` in reading order (key order, or a ticking sort's), as
+    /// pandas `iloc[start:stop]`, kept current as rows come and go anywhere.
+    fn slice(&self, py: Python<'_>, start: usize, stop: usize) -> PyResult<Table> {
+        let table = py
+            .detach(|| self.0.slice(start, stop))
+            .map_err(engine_error)?;
+        Ok(Table(table))
+    }
+
     /// Rows ordered by `by`, each `"name"` or `"name desc"`, earlier entries first. NULL sorts as
     /// the largest value; ties keep the input's order. A ticking table's sort keeps its rows in
-    /// that order for reading; nothing can be built on it.
+    /// that order for reading; nothing but `slice` can be built on it.
     #[pyo3(signature = (*by))]
     fn sort(&self, py: Python<'_>, by: Vec<String>) -> PyResult<Table> {
         let by: Vec<&str> = by.iter().map(String::as_str).collect();

@@ -16,7 +16,7 @@ use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use crate::agg::{Accumulator, AggBy, Call, agg_schema, call_error};
 use crate::groups::{KeyKind, Membership, resolve};
 use crate::join::{AsOfJoin, Join, JoinShape, NaturalJoin, Tracking};
-use crate::ops::{Assignment, Edge, LastBy, Operator, Update, Where};
+use crate::ops::{Assignment, Edge, LastBy, Operator, Slice, Update, Where};
 use crate::order::Order;
 use crate::rolling::{Aggregate, Function, Input, Rolling, Span, Window};
 use crate::sort::sorted;
@@ -96,13 +96,19 @@ struct Graph {
 }
 
 impl Graph {
-    /// Adds a table; each table it is computed from gains a dependent. Nothing is built on a
-    /// ticking sort: it orders how its table is read, and tables built on it would read by key.
+    /// Adds a table; each table it is computed from gains a dependent. Nothing but `slice` is
+    /// built on a ticking sort: it orders how its table is read, and other tables built on it
+    /// would read by key; a slice keys its rows by position in that order.
     fn push(&mut self, state: TableState) -> Result<usize, Error> {
+        let positional = matches!(
+            &state.source,
+            Source::Derived { operator, .. } if matches!(**operator, Operator::Slice(_))
+        );
         if let Some(sorted) = state
             .source
             .parents()
             .find(|p| matches!(self.tables[*p].source, Source::Order { .. }))
+            .filter(|_| !positional)
         {
             return Err(Error::Unsupported(format!(
                 "`{}` is a ticking sort, which orders how its rows are read; build `{}` on the \
@@ -1770,6 +1776,19 @@ impl Table {
             self.schema.clone(),
             Growth::Changing,
             Operator::Edge(Edge::new(end, n)),
+        )
+    }
+
+    /// The rows at positions `start..stop` of the table's reading order (key order, or a
+    /// ticking sort's), as pandas `iloc[start:stop]`: fewer past the end, none when `stop` is not
+    /// past `start`. Kept current as rows come and go anywhere, including before the window.
+    pub fn slice(&self, start: usize, stop: usize) -> Result<Table, Error> {
+        // A position's row is replaced whenever rows before it come or go.
+        self.derive(
+            format!("slice({start}, {stop})"),
+            self.schema.clone(),
+            Growth::Changing,
+            Operator::Slice(Slice::new(start, stop)),
         )
     }
 

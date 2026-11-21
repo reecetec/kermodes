@@ -24,6 +24,7 @@ pub(crate) enum Operator {
     LastBy(Box<LastBy>),
     AggBy(AggBy),
     Edge(Edge),
+    Slice(Slice),
     Rolling(Box<Rolling>),
 }
 
@@ -40,6 +41,7 @@ impl Operator {
             Operator::LastBy(op) => op.process(input, delta, own),
             Operator::AggBy(op) => op.process(input, delta, own),
             Operator::Edge(op) => op.process(input, delta, own),
+            Operator::Slice(op) => op.process(input, delta, own),
             Operator::Rolling(op) => op.process(delta),
         }
     }
@@ -461,6 +463,69 @@ impl Edge {
             keys: changed,
         });
         push_removed(&mut out, own, leaving)?;
+        Ok(out)
+    }
+}
+
+/// The input's rows at positions `start..stop` of its reading order (key order, or a ticking
+/// sort's): `slice`. The output is keyed by position within the window, so it reads in the
+/// input's order even over a ticking sort, whose keys are not in its order. A position's row
+/// changes whenever rows before the window come or go, so the window is reread each cycle rather
+/// than followed key by key as `Edge` does; it costs a selection of the window's keys.
+pub(crate) struct Slice {
+    start: usize,
+    count: usize,
+    /// The input key at each output position, as published.
+    kept: Vec<RowKey>,
+}
+
+impl Slice {
+    pub fn new(start: usize, stop: usize) -> Self {
+        Self {
+            start,
+            count: stop.saturating_sub(start),
+            kept: Vec::new(),
+        }
+    }
+
+    fn process(
+        &mut self,
+        input: Reader<'_>,
+        delta: &Delta,
+        own: &Storage,
+    ) -> Result<Delta, ArrowError> {
+        if self.count == 0 {
+            return Ok(Delta::default());
+        }
+        let now = input.keys_at(self.start, self.count)?;
+        let modified: HashSet<RowKey> = delta
+            .modified
+            .iter()
+            .flat_map(|m| m.keys.iter().copied())
+            .collect();
+        // A position held before and after is a modify, whether it holds another row now or its
+        // row was modified: keys are positions, so it is never removed and re-added in a cycle.
+        let (mut changed, mut sources) = (Vec::new(), Vec::new());
+        for (position, (was, is)) in self.kept.iter().zip(&now).enumerate() {
+            if was != is || modified.contains(is) {
+                changed.push(position as RowKey);
+                sources.push(*is);
+            }
+        }
+        let shared = self.kept.len().min(now.len());
+        let mut out = Delta::default();
+        out.added.push(Rows {
+            batch: input.gather(&now[shared..])?,
+            keys: (shared as RowKey..now.len() as RowKey).collect(),
+        });
+        out.modified.push(Modified {
+            previous: own.gather(&changed)?,
+            current: input.gather(&sources)?,
+            keys: changed,
+        });
+        let leaving = (shared as RowKey..self.kept.len() as RowKey).collect();
+        push_removed(&mut out, own, leaving)?;
+        self.kept = now;
         Ok(out)
     }
 }

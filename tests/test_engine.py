@@ -264,6 +264,31 @@ def test_head_and_tail_follow_the_ends_of_a_ticking_table():
     assert pa.table(last)["sym"].to_pylist() == ["c", "d"]
 
 
+def test_slice_follows_positions_as_rows_come_and_go_before_it():
+    s = km.connect(":memory:", manual=True)
+    book = s.input_table(COLUMNS, key="sym")
+    middle = book.slice(1, 3)
+    cheapest = book.sort("price").slice(0, 2)
+    past_end, empty = book.slice(5, 9), book.slice(2, 1)
+    book.upsert(ticks(["b", "c", "d"], [2.0, 3.0, 1.0], [1, 2, 3]))
+    s.step()
+    assert pa.table(middle)["sym"].to_pylist() == ["c", "d"]
+    assert pa.table(cheapest)["sym"].to_pylist() == ["d", "b"]
+    # Keys keep arrival order, so `a` lands last; `c` changes in place.
+    book.upsert(ticks(["a", "c"], [0.5, 9.0], [4, 5]))
+    s.step()
+    assert pa.table(middle).to_pylist() == [
+        {"sym": "c", "price": 9.0, "size": 5},
+        {"sym": "d", "price": 1.0, "size": 3},
+    ]
+    assert pa.table(cheapest)["sym"].to_pylist() == ["a", "d"]
+    book.delete(pa.table({"sym": ["a", "b"]}))
+    s.step()
+    assert pa.table(middle)["sym"].to_pylist() == ["d"]
+    assert pa.table(cheapest)["sym"].to_pylist() == ["d", "c"]
+    assert len(past_end) == 0 and len(empty) == 0
+
+
 def test_sort_orders_rows_with_nulls_last_and_ticking_sorts_order_reads():
     s = km.connect(":memory:", manual=True)
     fixed = s.static_table(

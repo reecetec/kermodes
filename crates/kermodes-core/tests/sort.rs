@@ -464,3 +464,93 @@ fn large_and_wide_sorts_match_the_reference() {
         );
     }
 }
+
+/// Windows inside, straddling, and past the end, and empty ones (`stop` at or before `start`).
+const SLICES: &[(usize, usize)] = &[
+    (0, 5),
+    (3, 11),
+    (8, 9),
+    (12, 40),
+    (0, 1_000),
+    (500, 510),
+    (6, 6),
+    (9, 2),
+];
+
+/// `slice` follows positions in the input's reading order: rows coming, changing, and going
+/// before the window shift rows into and out of it. Over unsorted inputs (key order) and ticking
+/// sorts, each window must read exactly as the same window of the static recomputation.
+#[test]
+fn ticking_slice_reads_like_the_static_slice_of_its_rows() {
+    let keyed_schema = schema();
+    for seed in 1..=40 {
+        let mut rng = Rng(seed);
+        let session = Session::new();
+        let keyed = session
+            .keyed_input_table(&keyed_schema, &["sym", "size"])
+            .unwrap();
+        let appended = session.input_table(&schema()).unwrap();
+        let grouped = appended
+            .agg_by(
+                &["sym", "flag"],
+                &[("price", "max(price)"), ("size", "sum(size)")],
+            )
+            .unwrap();
+        let inputs = [&keyed, &appended, &grouped];
+        // Per input: its slices, then its sort by each order with that sort's slices.
+        let slices = |table: &Table| -> Vec<Table> {
+            SLICES
+                .iter()
+                .map(|(start, stop)| table.slice(*start, *stop).unwrap())
+                .collect()
+        };
+        let ticking: Vec<(Vec<Table>, Vec<Vec<Table>>)> = inputs
+            .iter()
+            .map(|table| {
+                let sorted = ORDERS
+                    .iter()
+                    .map(|keys| slices(&sort_by(table, keys)))
+                    .collect();
+                (slices(table), sorted)
+            })
+            .collect();
+        for cycle in 0..12 {
+            for _ in 0..rng.below(4) {
+                let rows = rng.below(30) as usize;
+                let batch = random_batch(&mut rng, rows);
+                match rng.below(3) {
+                    0 => keyed.delete(&[batch.project(&[0, 2]).unwrap()]).unwrap(),
+                    _ => keyed.upsert(std::slice::from_ref(&batch)).unwrap(),
+                }
+                appended.append(&[batch]).unwrap();
+            }
+            session.step();
+            for (input, (plain, sorted)) in inputs.iter().zip(&ticking) {
+                let fixed = session
+                    .static_table(input.schema().clone(), input.snapshot().unwrap())
+                    .unwrap();
+                let check = |got: &[Table], table: &Table, order: &str| {
+                    let all = rows(table);
+                    for ((start, stop), got) in SLICES.iter().zip(got) {
+                        let context = format!(
+                            "seed {seed}, cycle {cycle}, {} {order} slice({start}, {stop})",
+                            input.description()
+                        );
+                        let from = (*start).min(all.num_rows());
+                        let to = (*stop).clamp(from, all.num_rows());
+                        assert_eq!(rows(got), all.slice(from, to - from), "{context}");
+                        assert_eq!(
+                            rows(got),
+                            rows(&table.slice(*start, *stop).unwrap()),
+                            "{context}: static slice"
+                        );
+                    }
+                };
+                check(plain, &fixed, "unsorted");
+                for (got, keys) in sorted.iter().zip(ORDERS) {
+                    check(got, &sort_by(&fixed, keys), &format!("by {keys:?}"));
+                }
+            }
+        }
+    }
+}
