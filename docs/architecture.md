@@ -72,7 +72,7 @@ Non-goals (for now)
 |---|---|---|
 | Feedhandler | Logger / Kafka ingester | Ingester (connector) |
 | Tickerplant + tplog | Data Import Server (DIS) | **weir** |
-| RDB | Worker reading intraday | Engine worker; `con.table(...).live()` reads weir's tail and the lake as one |
+| RDB | Worker reading intraday | Engine worker; `con.live_table(...)` reads the lake and weir's tail as one, ticking |
 | RTE / CEP, chained TP | Persistent query | Engine deployment publishing derived live tables back to weir |
 | `.u.end` end-of-day writedown | Merge + validate | Daily merge job |
 | HDB (splayed, date-partitioned, mmap) | Historical (DH format / Parquet) | Parquet + Kermodes catalog; the same `con.table(...)` |
@@ -243,34 +243,44 @@ The target; §8.4 and §9.8 describe what runs today (`db.live_table`, `db.histo
 ```python
 con = km.connect()  # $KERMODES_URL, else kermodes dev; or a directory, or ":memory:"
 
-ticks = con.table("md.ticks")  # a reference: nothing is read
-ticks  # in a notebook: its first rows, and its row count where the catalog knows it
-aapl = ticks.where("sym = 'AAPL' and ts >= '2026-11-01'").select("ts", "px")  # still a plan
-aapl.collect()  # static: the rows now
-aapl.live()  # the rows now, then every change after: ticking
+ticks = con.table("md.ticks")  # static: the table as it is when used
+ticks  # in a notebook: its first rows
+ticks.where("sym = 'AAPL'").agg_by("sym", n="count(*)", avg_px="mean(px)")  # shown as a result
 
-con.sql("SELECT season, avg(goals) FROM nhl.box_scores GROUP BY season")  # a plan, the same kind
-con.sql("SELECT sym, count(*) FROM md.ticks GROUP BY sym").live()
+live = con.live_table("md.ticks")  # ticking: all its rows, then every change
+signals = live.where("sym = 'AAPL'").agg_by("sym", n="count(*)", avg_px="mean(px)")  # ticks
+con.publish("sig.aapl", signals, key="sym")  # in a program
+
+con.sql("SELECT season, avg(goals) FROM nhl.box_scores GROUP BY season")  # static
+con.sql("SELECT sym, count(*) FROM md.ticks GROUP BY sym", live=True)  # ticking
 con.sql("SELECT ... FROM book", book=my_table)  # an in-memory table, by keyword
 ```
 
-- **One reference per table.** `con.table(name)` and a name in `con.sql` read all of a table's
-  rows: the lake's files and weir's tail, as one. Filters choose rows, on any column; nothing
-  requires a date.
-- **Plans are lazy.** Operators on a stored table, and SQL, build one plan, so filters and the
-  columns used reach the files (§8.4) whichever API wrote them. A plan mixes stored tables with
-  in-memory ones (input tables, results). Showing a plan in a notebook runs a cheap preview (its
-  first rows, the columns shown, a `LIMIT`); nothing else reads until asked.
-- **Static unless asked to tick.** `collect()` gives the rows now, through the static executor;
-  `live()` gives the same rows now and then every change, through the ticking engine. A streamed
-  table ticks as rows arrive, a batch table when its next write commits, a published table as
-  its program publishes: one meaning whatever the source. A research query never becomes a
-  ticking table, holding memory and changing, unless it says so.
+- **One name per table.** `con.table(name)`, `con.live_table(name)`, and a name in `con.sql`
+  read all of a table's rows: the lake's files and weir's tail, as one. Filters choose rows, on
+  any column; nothing requires a date.
+- **Static or ticking is chosen once, where the data is named**, and what is built from it
+  follows, as in Deephaven: anything built from a live table is live, a join of static and live
+  included. A static table is the table as it is when used: showing it again, or reading it in
+  a later cell, reads the data as it is then (one evaluation reads one consistent state). A
+  live table is all its rows, then every change: a streamed table ticks as rows arrive, a batch
+  table when its next write commits, a published table as its program publishes. A research
+  query never becomes a ticking table, holding memory and changing, unless it says so.
+- **Every result is a table**: shown, passed on, joined, published. Underneath, operators on
+  stored tables and SQL build one plan, run when something needs its data (a notebook shows a
+  preview: its first rows and only the columns shown; `pa.table(t)`, `len(t)`, iteration, or a
+  ticking table built on it reads all of it), so filters and the columns used reach the files
+  (§8.4) whichever API wrote them, and `live_table("md.ticks").where("sym = 'AAPL'")` reads only
+  `AAPL`'s rows of history. Operators check columns and types when called, against the schema
+  the catalog knows, so mistakes show at once; only the work waits. `t.explain()` shows the plan
+  and what it will read.
+- **Two engines, one plan.** A static table runs on the static executor; a live table on the
+  ticking engine. Users choose static or ticking, never an engine.
 - **Programs publish tables, and published tables are tables**: a feature view or a strategy's
   signals is `con.table("features.momentum")`, with history, readable by SQL and by other
-  programs, live or not.
-- **Replay** runs the same program over history: every `live()` plan and program follows a
-  replay clock instead of the wall clock (§9.4).
+  programs, static or live.
+- **Replay** runs the same program over history: its live tables follow a replay clock instead
+  of the wall clock (§9.4).
 
 ### 5.4 Schema evolution
 
@@ -946,8 +956,9 @@ is only for live, sequenced, exactly-once ingestion.
 ### 8.4 Reading history
 
 The engine reads history itself, on its static operator path (§9.1). This section describes the
-API as built; §5.3 is the target that replaces `historical_table`, `live_table`, `table`, and the
-`Date` column readers filter by.
+API as built; §5.3 is the target, which replaces `historical_table` and `db.table`, makes
+`live_table` all of a table's rows rather than today's, and drops the `Date` column readers
+filter by.
 
 - `db.historical_table(...)` is static. Date predicates in its `where` are pushed down: the
   catalog returns only files whose date range overlaps them, the reader skips row groups by their
@@ -1098,8 +1109,8 @@ state at cycle time.
 ### 9.8 SQL
 
 SQL is a frontend onto the Kermodes plan, the way Deephaven's SQL compiles to its table operations.
-As built; §5.3's target makes a query static unless `.live()` asks it to tick, and drops the
-`hist.`/`live.` names and the date rule below.
+As built; §5.3's target makes a query static unless `live=True` (or a live table it reads)
+makes it tick, and drops the `hist.`/`live.` names and the date rule below.
 A query ticks when any input it reads ticks, and is static otherwise; the same SQL works over live
 data, history, or both.
 
