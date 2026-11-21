@@ -141,6 +141,11 @@ rewrite expressions, dropping table qualifiers, without matching every expressio
 `ahash` (already compiled in through arrow-array) hashes group keys; using it directly adds no
 crate to the build.
 
+`regex` (already compiled in through arrow-string, with the same features) runs
+`regexp_replace`: arrow-rs has regex match kernels but none that replaces. Its syntax follows
+RE2's, which DuckDB uses, so DuckDB's patterns mean the same here, except that `\d`, `\w`, and
+`\s` also match non-ASCII digits, letters, and spaces.
+
 `rusqlite` (with SQLite bundled) holds the local catalog: a synchronous, in-process database is
 what an embedded store (`km.connect(path)`) and `kermodes dev` need, with no runtime to start. The
 cluster's catalog is Postgres, shared by every weir, through the rust-postgres family: weir's

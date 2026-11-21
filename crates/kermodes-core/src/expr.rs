@@ -4,20 +4,25 @@ use std::sync::{Arc, LazyLock};
 
 use arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Datum, Float64Array, Int16Array, Int32Array,
-    Int64Array, NullArray, Scalar, StringArray, UInt32Array,
+    Int64Array, NullArray, Scalar, StringArray, UInt32Array, new_null_array,
 };
 use arrow::compute::kernels::comparison::{ilike, like, nilike, nlike};
+use arrow::compute::kernels::zip::zip;
 use arrow::compute::kernels::{cmp, numeric};
 use arrow::compute::{and_kleene, cast, is_not_null, is_null, not, nullif, or_kleene, take};
 use arrow::datatypes::{DataType, Schema};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
-use sqlparser::ast::{BinaryOperator, Expr as Ast, Spanned, UnaryOperator, Value as Literal};
+use sqlparser::ast::{
+    BinaryOperator, CaseWhen, Expr as Ast, InTarget, Spanned, UnaryOperator, Value as Literal,
+};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::{Span, Token};
 
 use crate::{Error, type_name};
+
+mod functions;
 
 static DIALECT: GenericDialect = GenericDialect {};
 static NO_COLUMNS: LazyLock<RecordBatch> =
@@ -192,11 +197,25 @@ impl Binder<'_> {
                     case_insensitive: matches!(ast, Ast::ILike { .. }),
                     negated: *negated,
                 };
-                let text = self.string(expr)?;
-                let pattern = self.string(pattern)?;
+                let text = self.string(expr, "LIKE")?;
+                let pattern = self.string(pattern, "LIKE")?;
                 let node = Node::Like(pattern_match, Box::new(text), Box::new(pattern));
                 Ok((self.fold(ast, node)?, DataType::Boolean))
             }
+            Ast::Function(function) => self.function(ast, function),
+            Ast::Extract { field, expr, .. } => self.extract(ast, field, expr),
+            Ast::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => self.case(ast, operand.as_deref(), conditions, else_result.as_deref()),
+            Ast::In {
+                expr,
+                target: InTarget::List(list),
+                negated,
+                global: false,
+            } => self.in_list(ast, expr, list, *negated),
             other => Err(self.error(
                 ast.span(),
                 format!("`{other}` is not supported in expressions yet"),
@@ -321,8 +340,7 @@ impl Binder<'_> {
         Ok((self.fold(ast, node)?, data_type))
     }
 
-    /// Brings both operands to one type: numbers widen, NULL takes the other side's type, and
-    /// a string literal compared with a date or timestamp is read as one.
+    /// Brings both operands to one type, as `common_type` chooses it.
     fn unify(
         &self,
         ast: &Ast,
@@ -330,37 +348,119 @@ impl Binder<'_> {
         (l, lt): (Node, DataType),
         (r, rt): (Node, DataType),
     ) -> Result<(Node, Node, DataType), Error> {
-        if lt == rt {
-            return Ok((l, r, lt));
+        let literals = (matches!(l, Node::Literal(_)), matches!(r, Node::Literal(_)));
+        let Some(to) = common_type((&lt, literals.0), (&rt, literals.1)) else {
+            return Err(self.error(
+                ast.span(),
+                format!(
+                    "cannot apply `{op}` to {} and {}",
+                    type_name(&lt),
+                    type_name(&rt)
+                ),
+            ));
+        };
+        let l = self.coerce(ast, l, &lt, &to)?;
+        let r = self.coerce(ast, r, &rt, &to)?;
+        Ok((l, r, to))
+    }
+
+    /// Binds operands that must share a type (the values `IN` compares, the results of a
+    /// `CASE`) and brings them to it, as `common_type` chooses it pairwise. A string literal
+    /// reads as a date or timestamp only while every operand before it was a literal too.
+    fn unify_all<'a>(
+        &self,
+        what: &str,
+        operands: impl IntoIterator<Item = &'a Ast>,
+    ) -> Result<(Vec<Node>, DataType), Error> {
+        let mut bound = Vec::new();
+        let mut to = DataType::Null;
+        let mut all_literals = true;
+        for ast in operands {
+            let (node, data_type) = self.bind(ast)?;
+            let literal = matches!(node, Node::Literal(_));
+            to = common_type((&to, all_literals), (&data_type, literal)).ok_or_else(|| {
+                self.error(
+                    ast.span(),
+                    format!(
+                        "{what} cannot mix {} with `{ast}`, which is {}",
+                        type_name(&to),
+                        type_name(&data_type)
+                    ),
+                )
+            })?;
+            all_literals &= literal;
+            bound.push((ast, node, data_type));
         }
-        if lt == DataType::Null {
-            return Ok((self.cast(ast, l, &rt)?, r, rt));
+        let nodes = bound
+            .into_iter()
+            .map(|(ast, node, data_type)| self.coerce(ast, node, &data_type, &to))
+            .collect::<Result<_, _>>()?;
+        Ok((nodes, to))
+    }
+
+    /// `CASE [operand] WHEN ... THEN ... [ELSE ...] END`. As in DuckDB, `CASE x WHEN v` tests
+    /// `x = v`, so a NULL `x` matches no branch, and a branch whose condition is NULL is not taken.
+    fn case(
+        &self,
+        ast: &Ast,
+        operand: Option<&Ast>,
+        conditions: &[CaseWhen],
+        otherwise: Option<&Ast>,
+    ) -> Result<(Node, DataType), Error> {
+        let (operand, whens) = match operand {
+            Some(operand) => {
+                let values =
+                    std::iter::once(operand).chain(conditions.iter().map(|c| &c.condition));
+                let (nodes, _) = self.unify_all("`CASE` and its `WHEN` values", values)?;
+                let mut nodes = nodes.into_iter();
+                (nodes.next().map(Box::new), nodes.collect())
+            }
+            None => {
+                let whens = conditions
+                    .iter()
+                    .map(|c| {
+                        let (node, data_type) = self.bind(&c.condition)?;
+                        self.boolean(&c.condition, node, data_type)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                (None, whens)
+            }
+        };
+        let results = conditions.iter().map(|c| &c.result).chain(otherwise);
+        let (mut thens, data_type) = self.unify_all("`CASE` results", results)?;
+        if data_type == DataType::Null {
+            return Ok((Node::Literal(Arc::new(NullArray::new(1))), DataType::Null));
         }
-        if rt == DataType::Null {
-            return Ok((l, self.cast(ast, r, &lt)?, lt));
-        }
-        if is_numeric(&lt) && is_numeric(&rt) {
-            let wide = if numeric_rank(&lt) >= numeric_rank(&rt) {
-                lt
-            } else {
-                rt
-            };
-            return Ok((self.cast(ast, l, &wide)?, self.cast(ast, r, &wide)?, wide));
-        }
-        if lt == DataType::Utf8 && is_temporal(&rt) && matches!(l, Node::Literal(_)) {
-            return Ok((self.cast(ast, l, &rt)?, r, rt));
-        }
-        if rt == DataType::Utf8 && is_temporal(&lt) && matches!(r, Node::Literal(_)) {
-            return Ok((l, self.cast(ast, r, &lt)?, lt));
-        }
-        Err(self.error(
-            ast.span(),
-            format!(
-                "cannot apply `{op}` to {} and {}",
-                type_name(&lt),
-                type_name(&rt)
-            ),
-        ))
+        let otherwise = if otherwise.is_some() {
+            thens.pop()
+        } else {
+            None
+        };
+        let otherwise = otherwise.unwrap_or_else(|| Node::Literal(new_null_array(&data_type, 1)));
+        let node = Node::Case {
+            operand,
+            branches: whens.into_iter().zip(thens).collect(),
+            otherwise: Box::new(otherwise),
+        };
+        Ok((self.fold(ast, node)?, data_type))
+    }
+
+    /// `x [NOT] IN (v1, v2, ...)`, which is `x = v1 OR x = v2 ...` in three-valued logic: NULL when
+    /// nothing matches and `x` or a value is NULL.
+    fn in_list(
+        &self,
+        ast: &Ast,
+        expr: &Ast,
+        list: &[Ast],
+        negated: bool,
+    ) -> Result<(Node, DataType), Error> {
+        let (nodes, _) = self.unify_all("`IN`", std::iter::once(expr).chain(list))?;
+        let mut nodes = nodes.into_iter();
+        let Some(value) = nodes.next() else {
+            unreachable!("`IN` binds its left operand first");
+        };
+        let node = Node::In(Box::new(value), nodes.collect(), negated);
+        Ok((self.fold(ast, node)?, DataType::Boolean))
     }
 
     fn cast(&self, ast: &Ast, node: Node, to: &DataType) -> Result<Node, Error> {
@@ -370,15 +470,25 @@ impl Binder<'_> {
         self.fold(ast, Node::Cast(Box::new(node), to.clone()))
     }
 
-    /// A `LIKE` operand: a string, or NULL read as one.
-    fn string(&self, ast: &Ast) -> Result<Node, Error> {
+    fn coerce(&self, ast: &Ast, node: Node, from: &DataType, to: &DataType) -> Result<Node, Error> {
+        if from == to {
+            return Ok(node);
+        }
+        self.cast(ast, node, to)
+    }
+
+    /// A string operand of `what`, or NULL read as one.
+    fn string(&self, ast: &Ast, what: &str) -> Result<Node, Error> {
         let (node, data_type) = self.bind(ast)?;
         match data_type {
             DataType::Utf8 => Ok(node),
             DataType::Null => self.cast(ast, node, &DataType::Utf8),
             other => Err(self.error(
                 ast.span(),
-                format!("`LIKE` needs strings, but `{ast}` is {}", type_name(&other)),
+                format!(
+                    "`{what}` needs strings, but `{ast}` is {}",
+                    type_name(&other)
+                ),
             )),
         }
     }
@@ -428,6 +538,22 @@ enum Node {
     Arithmetic(Arithmetic, Box<Node>, Box<Node>),
     /// Text, then pattern (`%` any run, `_` one character).
     Like(PatternMatch, Box<Node>, Box<Node>),
+    /// `length` or `strlen` of a string.
+    Length(Box<Node>, functions::Count),
+    /// `regexp_replace` of a string, its pattern compiled when binding.
+    RegexpReplace(Box<Node>, Box<functions::Replace>),
+    /// `date_part` or `extract`.
+    DatePart(Box<Node>, functions::Field),
+    DateTrunc(Box<Node>, functions::Unit),
+    /// The operand a simple `CASE` compares each `WHEN` value with, the (`WHEN`, `THEN`) pairs
+    /// in order, and the `ELSE` result (NULL when the query has none).
+    Case {
+        operand: Option<Box<Node>>,
+        branches: Vec<(Node, Node)>,
+        otherwise: Box<Node>,
+    },
+    /// The value, the list it is looked up in, and `true` for `NOT IN`.
+    In(Box<Node>, Vec<Node>, bool),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -465,6 +591,21 @@ impl Node {
             | Node::Compare(_, l, r)
             | Node::Arithmetic(_, l, r)
             | Node::Like(_, l, r) => vec![l, r],
+            Node::Length(n, _)
+            | Node::RegexpReplace(n, _)
+            | Node::DatePart(n, _)
+            | Node::DateTrunc(n, _) => vec![n],
+            Node::Case {
+                operand,
+                branches,
+                otherwise,
+            } => operand
+                .as_deref()
+                .into_iter()
+                .chain(branches.iter().flat_map(|(when, then)| [when, then]))
+                .chain([&**otherwise])
+                .collect(),
+            Node::In(value, list, _) => std::iter::once(&**value).chain(list).collect(),
         }
     }
 
@@ -526,11 +667,70 @@ impl Node {
                     Arithmetic::Rem => numeric::rem(a, b),
                 })
             }
+            Node::Length(node, count) => node.eval(batch)?.map(|a| functions::length(a, *count)),
+            Node::RegexpReplace(node, replace) => node.eval(batch)?.map(|a| replace.apply(a)),
+            Node::DatePart(node, field) => node.eval(batch)?.map(|a| functions::extract(a, *field)),
+            Node::DateTrunc(node, unit) => node.eval(batch)?.map(|a| functions::truncate(a, *unit)),
+            Node::Case {
+                operand,
+                branches,
+                otherwise,
+            } => {
+                let operand = operand.as_ref().map(|o| o.eval(batch)).transpose()?;
+                let mut result = otherwise.eval(batch)?;
+                // Later branches first, each then overwritten where an earlier one matches: the
+                // first branch whose condition holds wins. A NULL condition picks the later side.
+                for (when, then) in branches.iter().rev() {
+                    let mut mask = when.eval(batch)?;
+                    if let Some(operand) = &operand {
+                        mask = equal(operand.clone(), mask)?;
+                    }
+                    result = match mask {
+                        Value::Scalar(mask) => {
+                            let mask = mask.as_boolean();
+                            if mask.is_valid(0) && mask.value(0) {
+                                then.eval(batch)?
+                            } else {
+                                result
+                            }
+                        }
+                        Value::Array(mask) => {
+                            let then = then.eval(batch)?;
+                            let chosen = zip(
+                                mask.as_boolean(),
+                                then.datum().as_ref(),
+                                result.datum().as_ref(),
+                            )?;
+                            Value::Array(chosen)
+                        }
+                    };
+                }
+                Ok(result)
+            }
+            Node::In(value, list, negated) => {
+                let value = value.eval(batch)?;
+                let mut found: Option<Value> = None;
+                for item in list {
+                    let matched = equal(value.clone(), item.eval(batch)?)?;
+                    found = Some(match found {
+                        Some(found) => boolean(found, matched, or_kleene)?,
+                        None => matched,
+                    });
+                }
+                let found = found
+                    .unwrap_or_else(|| Value::Scalar(Arc::new(BooleanArray::from(vec![false]))));
+                if *negated {
+                    found.map(|a| Ok(Arc::new(not(a.as_boolean())?) as ArrayRef))
+                } else {
+                    Ok(found)
+                }
+            }
         }
     }
 }
 
 /// A column of values, or one value standing for every row.
+#[derive(Clone)]
 enum Value {
     Array(ArrayRef),
     /// A one-row array.
@@ -585,6 +785,40 @@ fn binary(
     } else {
         Value::Array(out)
     })
+}
+
+fn equal(l: Value, r: Value) -> Result<Value, ArrowError> {
+    binary(l, r, |a, b| Ok(Arc::new(cmp::eq(a, b)?) as ArrayRef))
+}
+
+/// The type two operands are brought to: numbers widen, NULL takes the other side's type, and a
+/// string literal meeting a date or timestamp is read as one. Each side says whether it is a
+/// literal.
+fn common_type(
+    (a, a_literal): (&DataType, bool),
+    (b, b_literal): (&DataType, bool),
+) -> Option<DataType> {
+    if a == b || *b == DataType::Null {
+        return Some(a.clone());
+    }
+    if *a == DataType::Null {
+        return Some(b.clone());
+    }
+    if is_numeric(a) && is_numeric(b) {
+        let wide = if numeric_rank(a) >= numeric_rank(b) {
+            a
+        } else {
+            b
+        };
+        return Some(wide.clone());
+    }
+    if *a == DataType::Utf8 && a_literal && is_temporal(b) {
+        return Some(b.clone());
+    }
+    if *b == DataType::Utf8 && b_literal && is_temporal(a) {
+        return Some(a.clone());
+    }
+    None
 }
 
 fn boolean(

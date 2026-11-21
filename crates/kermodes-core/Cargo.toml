@@ -11,4 +11,6 @@ ahash = { version = "0.8", default-features = false }
 # timestamp columns; without it that cast works only where another crate enables it (pyo3 does).
 arrow = { workspace = true, features = ["ipc", "chrono-tz"] }
 hashbrown = { version = "0.17", default-features = false }
+# regexp_replace's patterns (docs/architecture.md §4.1), with the features arrow-string compiles.
+regex = { version = "1.13", default-features = false, features = ["std", "unicode", "perf"] }
 sqlparser.workspace = true

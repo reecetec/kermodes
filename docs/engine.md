@@ -198,14 +198,33 @@ Grouping keys:
   mismatch → the cast that would work).
 - Compile to a tree of arrow-rs kernel calls evaluated per chunk: arithmetic (`arrow::compute`
   numeric kernels), comparison (`cmp`), boolean with SQL three-valued logic (`and_kleene`,
-  `or_kleene`), `CASE` via `zip`, `CAST` via `cast`, `IN` via comparison chains or a hash set for
-  long lists, `IS [NOT] NULL` from validity, `[NOT] LIKE` / `ILIKE` via the `like` kernels
+  `or_kleene`), `IS [NOT] NULL` from validity, `[NOT] LIKE` / `ILIKE` via the `like` kernels
   (`%`, `_`; no `ESCAPE`).
+- `CASE WHEN c THEN a ... [ELSE e] END` and `CASE x WHEN v THEN a ... END` via `zip`: the first
+  branch whose condition is true wins (NULL is not true; `CASE x WHEN v` is `x = v`), a missing
+  `ELSE` is NULL, and the results share one type (numbers widen int16 < int32 < int64 <
+  float64, NULL fits any). Every branch is evaluated over the whole chunk, so one that fails
+  (overflow) fails the table even on rows another branch takes.
+- `x [NOT] IN (v1, v2, ...)` as `x = v1 OR x = v2 ...` in three-valued logic: NULL when nothing
+  matches and `x` or a value is NULL.
 - Literals become scalars, never broadcast arrays. Constant subtrees fold at compile time.
 - Integer division by zero yields null; overflow on checked arithmetic fails the table.
-- M0 functions: `abs`, `round`, `floor`, `ceil`, `sqrt`, `ln`, `exp`, `power`, `least`,
-  `greatest`, `coalesce`, `lower`, `upper`, `length`, `substring`, `now()`, `today()`,
-  `date_trunc`.
+- Functions (names case-insensitive), with DuckDB's semantics; NULL in gives NULL out:
+  - `length(s)`: Unicode code points, int64. `strlen(s)`: UTF-8 bytes, int64.
+  - `regexp_replace(s, pattern, replacement[, 'g'])`: replaces the first match, or every match
+    with `'g'` (the only option). `\1`..`\9` in the replacement are capture groups and `\\` a
+    backslash. Pattern and replacement are string literals, compiled once when binding; RE2
+    syntax and defaults (the `regex` crate): `.` does not match a newline, as in DuckDB.
+  - `extract(part FROM t)` / `date_part('part', t)` for a date32 or timestamp (UTC): `year`,
+    `month`, `day`, `hour`, `minute`, `second` (whole), `dow` (0 = Sunday), `doy`, as int64;
+    `epoch` (seconds since 1970, fractional) as float64. Dates have no `hour`, `minute`, or
+    `second`. DuckDB's spellings of each part are accepted (`years`, `mins`, `dayofweek`, ...).
+  - `date_trunc('unit', t)`: `second`, `minute`, `hour`, `day`, `week` (from Monday), `month`,
+    `quarter`, `year`. A timestamp stays a timestamp and a date32 stays a date32 (DuckDB returns
+    a timestamp for a date; the value is the same instant).
+- Still to come: `CAST` via `cast`, a hash set for long `IN` lists, and the M0 functions `abs`,
+  `round`, `floor`, `ceil`, `sqrt`, `ln`, `exp`, `power`, `least`, `greatest`, `coalesce`,
+  `lower`, `upper`, `substring`, `now()`, `today()`.
 - Later: the binder records which input columns an expression reads, so `where` and `update`
   skip modified rows whose changed columns the expression doesn't read.
 
