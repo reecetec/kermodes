@@ -144,8 +144,12 @@ Delta { added: [(keys, rows)], removed: [(keys, last rows)], modified: [(keys, p
 - Failure: if an operator errors, its table and everything downstream of it enter a failed state
   holding the error; the rest of the graph keeps running. Snapshots of a failed table raise the
   error in Python.
-- Building a table on a refreshing parent takes the read lock, computes the initial state from a
-  snapshot, and registers the node so it receives deltas from the next cycle.
+- Building a table takes the write lock and computes its initial state from its parent's rows
+  under it, then registers the node so it receives deltas from the next cycle. So a large static
+  build (a research query over years of history) delays every cycle of its session while it
+  runs; writes queue and nothing is lost, but live tables lag. Static plans over stored tables
+  are to run outside the graph (the streaming static executor, architecture.md §5.3), on their
+  own threads, registering only their result: a static query must never delay a ticking table.
 - A table lives while a handle refers to it (a Python `Table`) or a live table is computed from
   it; a static table built on another has its own rows and doesn't count. When neither holds,
   the table is released: its rows, operator state, and delta are freed, and the tables it was

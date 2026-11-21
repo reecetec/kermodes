@@ -17,7 +17,6 @@
 
 use arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
 use arrow::buffer::NullBuffer;
-use arrow::compute::interleave_record_batch;
 use arrow::datatypes::{
     DataType, Date32Type, Float64Type, Int16Type, Int32Type, Int64Type, TimeUnit,
     TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
@@ -26,6 +25,7 @@ use arrow::datatypes::{
 use arrow::ipc::writer::StreamWriter;
 
 use crate::session::{Table, WeakTable};
+use crate::storage::interleave_rows;
 use crate::viewer::{Frame, Status};
 use crate::{Error, type_name};
 
@@ -169,7 +169,7 @@ impl Series {
             RecordBatch::new_empty(schema.into())
         } else {
             let batches: Vec<&RecordBatch> = batches.iter().collect();
-            interleave_record_batch(&batches, &picked).map_err(|e| failed(e.to_string()))?
+            interleave_rows(&batches, &picked).map_err(|e| failed(e.to_string()))?
         };
         let mut rows = Vec::new();
         (|| {

@@ -100,6 +100,22 @@ fn dense_location(
     Ok((chunk, (key - starts[chunk]) as usize))
 }
 
+/// The rows `indices` picks from `batches` (`(batch, row)` each), in that order, as
+/// `interleave_record_batch`; a table without columns keeps its row count (`count(*)` reads no
+/// column, and an Arrow batch without columns needs its count said).
+pub(crate) fn interleave_rows(
+    batches: &[&RecordBatch],
+    indices: &[(usize, usize)],
+) -> Result<RecordBatch, ArrowError> {
+    match batches.first() {
+        Some(first) if first.num_columns() == 0 => {
+            let options = RecordBatchOptions::new().with_row_count(Some(indices.len()));
+            RecordBatch::try_new_with_options(first.schema(), Vec::new(), &options)
+        }
+        _ => interleave_record_batch(batches, indices),
+    }
+}
+
 /// Combines the dense chunks from `from` on into one.
 fn combine(
     chunks: &mut Vec<RecordBatch>,
@@ -178,7 +194,7 @@ impl Storage {
                     .collect::<Result<Vec<_>, _>>()?;
                 let (touched, indices) = touched(&locations);
                 let chunks: Vec<&RecordBatch> = touched.iter().map(|at| &chunks[*at]).collect();
-                interleave_record_batch(&chunks, &indices)
+                interleave_rows(&chunks, &indices)
             }
             Index::Sparse {
                 slot_of, columns, ..

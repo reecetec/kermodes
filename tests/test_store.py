@@ -21,21 +21,21 @@ def test_stored_tables_tick_and_survive_the_process(tmp_path):
     w = s.writer("md.ticks", source="feed")
     assert w.write(rows([1, 2])) and w.last_seq == 1
     live = s.live_table("md.ticks")
+    # A live table starts when first used; a manual session loads it at its next step.
+    assert len(live) == 0
     assert w.write(rows([3]))
     # A resend of a sequence number already written changes nothing.
     assert not w.write(rows([99]), seq=1)
     s.step()
     assert pa.table(live)["n"].to_pylist() == [1, 2, 3]
     assert live.is_refreshing and s.tables == ["md.ticks"]
-    with pytest.raises(km.KermodesError, match="rows arrive|does not accept"):
+    with pytest.raises(km.KermodesError, match="written to input tables"):
         live.append(rows([4]))
 
     del s, w, live
     gc.collect()
     s = km.connect(tmp_path, manual=True)
-    reopened = s.live_table("md.ticks")
-    s.step()
-    assert pa.table(reopened)["n"].to_pylist() == [1, 2, 3]
+    assert pa.table(s.table("md.ticks"))["n"].to_pylist() == [1, 2, 3]
     w = s.writer("md.ticks", source="feed")
     assert w.last_seq == 2
 
@@ -55,9 +55,7 @@ def test_writes_sent_without_waiting_land_in_order_locally_and_remotely(tmp_path
         assert w.last_seq == 300
         # A resend among writes in flight is dropped.
         assert not w.write(rows([-1]), seq=300, wait=False).wait()
-    live = owner.live_table("md.ticks")
-    owner.step()
-    assert pa.table(live)["n"].to_pylist() == list(range(600))
+    assert pa.table(owner.table("md.ticks"))["n"].to_pylist() == list(range(600))
 
 
 def test_a_remote_writer_rides_out_a_server_restart(tmp_path):
@@ -73,9 +71,7 @@ def test_a_remote_writer_rides_out_a_server_restart(tmp_path):
     _server = owner.serve_store(port=port)
     w.flush()
     assert all(pending.wait() for pending in sent)
-    live = owner.live_table("md.ticks")
-    owner.step()
-    assert pa.table(live)["n"].to_pylist() == list(range(1_200))
+    assert pa.table(owner.table("md.ticks"))["n"].to_pylist() == list(range(1_200))
 
 
 def test_a_store_has_one_owner_and_clear_errors(tmp_path):
@@ -128,13 +124,11 @@ def test_a_killed_writer_loses_nothing_it_acknowledged(tmp_path):
         child.kill()  # SIGKILL: no clean shutdown, possibly mid-write
         child.wait()
         s = km.connect(tmp_path, manual=True)
-        table = s.live_table("md.ticks")
-        s.step()
-        n = pa.table(table)["n"].to_pylist()
+        n = pa.table(s.table("md.ticks"))["n"].to_pylist()
         batches = n[::100]
         # Every batch from 1 up, whole, once each; at least everything acknowledged.
         assert batches == list(range(1, len(batches) + 1))
         assert len(n) == 100 * len(batches)
         assert len(batches) >= acknowledged
-        del s, table
+        del s
         gc.collect()

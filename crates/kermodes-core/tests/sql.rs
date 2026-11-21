@@ -12,7 +12,8 @@ use arrow::array::{
 use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
-use kermodes_core::sql::{Plan, Scan, parse};
+use kermodes_core::plan::Scan;
+use kermodes_core::sql::parse;
 use kermodes_core::{Error, Session, Table};
 
 /// The plan of `sql` as `EXPLAIN` prints it, its scans not described.
@@ -54,14 +55,14 @@ fn a_query_binds_to_the_operators_the_python_api_has() {
         (
             // Only the first table's conditions go with a scan: a join keeps all its rows. The
             // join adds only the right table's columns the query reads, as `r.c`.
-            "SELECT o.sym, o.px, r.sector FROM live.md.odds o \
+            "SELECT o.sym, o.px, r.sector FROM md.odds o \
              LEFT JOIN ref.syms r ON o.sym = r.sym \
              WHERE o.px > 1 AND r.sector = 'tech'",
             "select sym, px, sector\n\
              update sector = \"r.sector\"\n\
              where \"r.sector\" = 'tech'\n\
              natural_join on sym adding r.sector=sector\n\
-             scan live.md.odds where px > 1\n\
+             scan md.odds where px > 1\n\
              scan ref.syms",
         ),
         (
@@ -71,14 +72,14 @@ fn a_query_binds_to_the_operators_the_python_api_has() {
         (
             // A sorted result's rows by position are a slice: a ticking sort is read in order
             "WITH up AS (SELECT * FROM t WHERE px > 0) \
-             SELECT sym FROM up UNION ALL SELECT sym FROM hist.md.s ORDER BY sym DESC LIMIT 5",
+             SELECT sym FROM up UNION ALL SELECT sym FROM md.s ORDER BY sym DESC LIMIT 5",
             "slice 0..5\n\
              sort sym desc\n\
              merge\n\
              select sym\n\
              scan t where px > 0\n\
              select sym\n\
-             scan hist.md.s",
+             scan md.s",
         ),
         (
             // Expressions grouped by are computed first; a result column that is one reads it
@@ -196,33 +197,18 @@ fn group_by_a_name_that_is_a_column_and_an_alias_is_refused() {
 }
 
 /// Each scan names the columns the query may read of its table, so a store reads only those:
-/// every column it names bare (which table holds it is the tables' to say) or by that table's
-/// name, join keys included; all of them after `*`.
+/// every column the plan reads of it, join keys included, and names that may be no column of
+/// it (a bare name in a join, whichever table holds it); all of them after `*`.
 #[test]
 fn a_scan_names_the_columns_the_query_reads() {
-    fn scans(plan: &Plan, out: &mut Vec<Scan>) {
-        match plan {
-            Plan::Scan(scan) => out.push(scan.clone()),
-            Plan::Filter { input, .. }
-            | Plan::Update { input, .. }
-            | Plan::Select { input, .. }
-            | Plan::Agg { input, .. }
-            | Plan::Sort { input, .. }
-            | Plan::Head { input, .. }
-            | Plan::Slice { input, .. }
-            | Plan::Drop { input, .. } => scans(input, out),
-            Plan::Join { left, right, .. } => {
-                scans(left, out);
-                scans(right, out);
-            }
-            Plan::Merge(parts) => parts.iter().for_each(|p| scans(p, out)),
-        }
-    }
     let columns = |sql: &str| {
-        let mut out = Vec::new();
-        scans(&parse(sql).unwrap().plan, &mut out);
-        out.into_iter()
-            .map(|scan| (scan.name, scan.columns))
+        parse(sql)
+            .unwrap()
+            .plan
+            .pushed_down()
+            .scans()
+            .into_iter()
+            .map(|scan| (scan.name.clone(), scan.columns.clone()))
             .collect::<Vec<_>>()
     };
     let names = |names: &[&str]| Some(names.iter().map(|n| n.to_string()).collect::<Vec<_>>());

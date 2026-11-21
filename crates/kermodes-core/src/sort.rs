@@ -11,13 +11,14 @@
 
 use ahash::RandomState;
 use arrow::array::{Array, ArrayRef, AsArray};
-use arrow::compute::{cast, interleave_record_batch};
+use arrow::compute::cast;
 use arrow::datatypes::{DataType, Float64Type, Int64Type, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use hashbrown::HashMap;
 
 use crate::parallel::{PIECE_ROWS, run, threads_for};
+use crate::storage::interleave_rows;
 
 /// `batches` (rows in key order) ordered by `keys`, each a column and whether it sorts
 /// descending; earlier keys first. NULL sorts as the largest value (last ascending, first
@@ -330,7 +331,7 @@ fn gather(batches: &[RecordBatch], order: &[u32]) -> Result<Vec<RecordBatch>, Ar
                 (batch, row - starts[batch])
             })
             .collect();
-        interleave_record_batch(&sources, &at)
+        interleave_rows(&sources, &at)
     })
     .into_iter()
     .collect()

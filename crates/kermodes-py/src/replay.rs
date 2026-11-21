@@ -72,19 +72,16 @@ impl Replay {
         let (first, last) = (self.first.days(), self.last.days());
         let chunks: Chunks = Box::new((first..=last).map(move |days| {
             let date = Date::from_days(days);
-            let history = kermodes_lake::read_history(
-                tables.weir(),
-                &lake,
-                &name,
-                Some(date),
-                Some(date),
-                &[],
-                None,
-            )
-            .map_err(|e| kermodes_core::Error::Compute {
-                table: failed.clone(),
-                message: format!("cannot read {date}: {e}"),
-            })?;
+            let day = kermodes_lake::Reading {
+                first: Some(date),
+                last: Some(date),
+                ..kermodes_lake::Reading::default()
+            };
+            let history = kermodes_lake::read_history(tables.weir(), Some(&lake), &name, &day)
+                .map_err(|e| kermodes_core::Error::Compute {
+                    table: failed.clone(),
+                    message: format!("cannot read {date}: {e}"),
+                })?;
             // History dates its rows; the replayed table, as a live one, does not.
             let columns: Vec<usize> = (0..history.schema.fields().len())
                 .filter(|at| history.schema.field(*at).name() != kermodes_lake::DATE)
@@ -110,7 +107,7 @@ impl Replay {
         };
         self.lock()
             .add(&description, &schema, ts, kind, chunks)
-            .map(Table)
+            .map(Table::built)
             .map_err(engine_error)
     }
 

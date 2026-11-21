@@ -10,7 +10,7 @@ use arrow::array::{
 };
 use arrow::compute::{SortColumn, concat_batches, lexsort_to_indices, take_record_batch};
 use arrow::datatypes::{DataType, Field, Float64Type, Int64Type, Schema, TimeUnit};
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use kermodes_core::{Error, Session, Table};
 
 /// Rows sorted by every column: tables are compared as sets of rows.
@@ -516,4 +516,35 @@ fn std_of_values_with_a_large_offset_matches_its_recomputation() {
             }
         }
     }
+}
+
+/// `count(*)` reads no column of its table, so a stored table's scan gives it rows without any:
+/// they are still counted, static and ticking.
+#[test]
+fn count_of_a_table_without_columns_counts_its_rows() {
+    let session = Session::new();
+    let schema = Arc::new(Schema::empty());
+    let rows = |n| {
+        let options = RecordBatchOptions::new().with_row_count(Some(n));
+        RecordBatch::try_new_with_options(schema.clone(), Vec::new(), &options).unwrap()
+    };
+    let fixed = session
+        .static_table(schema.clone(), vec![rows(3), rows(2)])
+        .unwrap();
+    let counted = fixed.agg_by(&[], &[("n", "count(*)")]).unwrap();
+    let count = |table: &Table| {
+        contents(table)
+            .column(0)
+            .as_primitive::<Int64Type>()
+            .value(0)
+    };
+    assert_eq!(count(&counted), 5);
+
+    let ticking = session.input_table(&schema).unwrap();
+    let counted = ticking.agg_by(&[], &[("n", "count(*)")]).unwrap();
+    ticking.append(&[rows(4)]).unwrap();
+    session.step();
+    ticking.append(&[rows(1)]).unwrap();
+    session.step();
+    assert_eq!(count(&counted), 5);
 }

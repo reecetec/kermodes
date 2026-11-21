@@ -1,5 +1,6 @@
 //! Scalar expressions in SQL syntax, bound to a schema and evaluated with Arrow kernels.
 
+use std::ops::ControlFlow;
 use std::sync::{Arc, LazyLock};
 
 use arrow::array::{
@@ -15,6 +16,7 @@ use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use sqlparser::ast::{
     BinaryOperator, CaseWhen, Expr as Ast, InTarget, Spanned, UnaryOperator, Value as Literal,
+    visit_expressions,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::{Parser, ParserError};
@@ -95,6 +97,34 @@ impl Expression {
     pub fn evaluate(&self, batch: &RecordBatch) -> Result<ArrayRef, ArrowError> {
         self.node.eval(batch)?.into_array(batch.num_rows())
     }
+}
+
+/// Every name the expression `text` may read as a column: each identifier in it. It may list
+/// names that are no column, never miss one that is; `None` if `text` does not parse.
+pub(crate) fn reads(text: &str) -> Option<Vec<String>> {
+    let mut parser = parser(text).ok()?;
+    let ast = parser.parse_expr().ok()?;
+    Some(identifiers(&ast))
+}
+
+/// The name `name = expression` assigns, and the names it reads, as `reads` says them.
+pub(crate) fn assignment_reads(text: &str) -> Option<(String, Vec<String>)> {
+    let mut parser = parser(text).ok()?;
+    let name = parser.parse_identifier().ok()?;
+    parser.expect_token(&Token::Eq).ok()?;
+    let ast = parser.parse_expr().ok()?;
+    Some((name.value, identifiers(&ast)))
+}
+
+fn identifiers(ast: &Ast) -> Vec<String> {
+    let mut names = Vec::new();
+    let _ = visit_expressions(ast, |expr| {
+        if let Ast::Identifier(ident) = expr {
+            names.push(ident.value.clone());
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    names
 }
 
 fn parser(text: &str) -> Result<Parser<'static>, Error> {

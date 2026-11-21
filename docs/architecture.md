@@ -199,8 +199,8 @@ reason in this section.
   share the schema history. Changes are planned operations (§5.4).
 - Partitions are internal. A streamed table's rows are grouped by the UTC day they arrived
   (§7.3, §8.1), so weir can hand a closed day to the lake at a fixed wall-clock moment; a batch
-  table's files are laid out by size and its sort key. Readers never see or name either (target;
-  today stored tables still carry a `Date` column, §8.4).
+  table's files are laid out by size and its sort key. Readers never see or name either: `Date`
+  stays inside the files (§8.4).
 - Each row's arrival time is the system column `_ingest_ts` (UTC, nanoseconds): left out of `*`
   and of previews, selectable and filterable by name, for point-in-time queries ("what was known
   at 10:31") and replay (target).
@@ -237,18 +237,19 @@ How a table is written is a property of the table, not of its readers (target):
 
 ### 5.3 Access API
 
-The target; §8.4 and §9.8 describe what runs today (`db.live_table`, `db.historical_table`,
-`db.table`, `hist.`/`live.` names), which this replaces.
-
 ```python
 con = km.connect()  # $KERMODES_URL, else kermodes dev; or a directory, or ":memory:"
 
 ticks = con.table("md.ticks")  # static: the table as it is when used
 ticks  # in a notebook: its first rows
-ticks.where("sym = 'AAPL'").agg_by("sym", n="count(*)", avg_px="mean(px)")  # shown as a result
+ticks.where("sym = 'AAPL'").agg_by(
+    "sym", n="count(*)", avg_px="mean(px)"
+)  # shown as a result
 
 live = con.live_table("md.ticks")  # ticking: all its rows, then every change
-signals = live.where("sym = 'AAPL'").agg_by("sym", n="count(*)", avg_px="mean(px)")  # ticks
+signals = live.where("sym = 'AAPL'").agg_by(
+    "sym", n="count(*)", avg_px="mean(px)"
+)  # ticks
 con.publish("sig.aapl", signals, key="sym")  # in a program
 
 con.sql("SELECT season, avg(goals) FROM nhl.box_scores GROUP BY season")  # static
@@ -955,36 +956,33 @@ is only for live, sequenced, exactly-once ingestion.
 - Append tables only. A keyed table's history is its log of changes in commit order, which only
   its writers make.
 
-### 8.4 Reading history
+### 8.4 Reading a stored table
 
-The engine reads history itself, on its static operator path (§9.1). This section describes the
-API as built; §5.3 is the target, which replaces `historical_table` and `db.table`, makes
-`live_table` all of a table's rows rather than today's, and drops the `Date` column readers
-filter by.
+The engine reads history itself, on its static operator path (§9.1). A plan's scan of a stored
+table (§5.3) reads all of its rows: the lake's files and the past dates weir holds unmerged (so
+history has no gap), and today's rows from weir. `Date` stays in the files, as weir's handoff
+unit, and out of what readers get.
 
-- `db.historical_table(...)` is static. Date predicates in its `where` are pushed down: the
-  catalog returns only files whose date range overlaps them, the reader skips row groups by their
-  statistics (a packed small date costs its own row groups, not its pack). The predicate's other
-  top-level `and`-ed comparisons of a column with a value (`sym = 'AAPL'`, `px > 10`) skip row
-  groups and pages by their statistics and the page index; on a sorted table (§8.1) a symbol is
-  a narrow run of pages in each row group. The engine still applies the whole predicate. A SQL
-  query reads only the columns it names of each table (all after `*`), matched by column ID so
-  renamed columns read under their new names; a file written before columns had IDs is read
-  whole. `EXPLAIN` shows files, row groups, rows, and columns considered and read. A date sealed
-  but not yet merged is read from weir, so history has no gap.
-- `db.live_table(...)` is today's rows at subscription, then every row written after, across
-  midnight too: nothing leaves at midnight, and memory grows with the run's uptime. A run that
-  restarts starts from today again, so a program needing earlier rows reads them from history
-  (`db.table`), not from having stayed up. Later, if wanted: an opt-in daily restart of a
-  deployment, or rows leaving in place at midnight.
-- `db.table(name).where(predicate)` is a stored table across its history and today. An append
-  table's predicate must say which dates (`Date >= '2026-11-01' && ...`): dates before today are
-  read once from history (files and row groups by date; unmerged dates from weir), and if the
-  dates reach today, today on ticks from weir, each row dated by its arrival (the ingest time
-  each batch carries to its readers), across midnight too. Which day is today is fixed when
-  `where` runs, so nothing is read twice or missed; a later merge of a day changes nothing a
-  running engine sees. A keyed table is its latest state, ticking. `explain(predicate)` says what
-  history it reads.
+- What reaches the files: a scan's predicate is the filters right over it; its top-level
+  `and`-ed comparisons of a column with a value (`sym = 'AAPL'`, `px > 10`) skip row groups and
+  pages by their statistics and the page index, and on a sorted table (§8.1) a symbol is a
+  narrow run of pages in each row group. The engine still applies the whole predicate. A scan
+  reads only the columns the plan uses of it (all after `*`), matched by column ID so renamed
+  columns read under their new names; a file written before columns had IDs is read whole. A
+  head or slice over a scan, through operators that keep rows in place, reads only the first
+  rows it needs, in date order: a notebook's preview of a large table reads one row group.
+  `explain()` shows files, row groups, rows, and columns considered and read.
+- Static: today's rows are read first, from weir, and history up to the day before the day they
+  were stamped on, so a day that turns between the two reads is neither missed nor read twice.
+  A keyed table is its keys' latest rows, folded from today's log as weir folds a checkpoint.
+- Ticking: history up to yesterday is read once, static; today ticks from weir, across midnight
+  too: nothing leaves at midnight, and memory grows with the run's uptime. A run that restarts
+  reads history again. A keyed table is its latest state, ticking. A live table starts when
+  first used: a session that runs its own cycles waits for the cycle that loads it; a manual
+  session's loads at its next `step`.
+- A process reads the lake only when the table has files in it: a table never merged needs no
+  `KERMODES_LAKE`. In the cluster, runs and the UI get the lake's location and keys, as merge
+  Jobs do.
 - Later: a date replaced while an engine runs reaches it on restart only; catalog notifications
   could swap it as a remove-then-add delta. Workers may cache fetched files on local NVMe.
 
@@ -1105,48 +1103,45 @@ state at cycle time.
 - Each worker has an engine memory budget (§10.5) enforced by an accounting allocator over Arrow
   buffers; an operator that would exceed it fails the query with an error instead of the pod
   being OOM-killed.
-- Large static aggregations and joins process one `Date` partition at a time where the query
-  allows. Spilling to local disk is a later addition.
+- Large static aggregations and joins stream history a batch at a time where the query allows
+  (engine.md). Spilling to local disk is a later addition.
 
 ### 9.8 SQL
 
-SQL is a frontend onto the Kermodes plan, the way Deephaven's SQL compiles to its table operations.
-As built; §5.3's target makes a query static in `con.sql` and ticking in `con.live_sql` (or when
-a live table it is given ticks), and drops the `hist.`/`live.` names and the date rule below.
-A query ticks when any input it reads ticks, and is static otherwise; the same SQL works over live
-data, history, or both.
+SQL is a frontend onto the Kermodes plan (§5.3), the way Deephaven's SQL compiles to its table
+operations: `con.sql` and `con.live_sql` build the same plan as the table API's operators, so a
+query reads only what it needs of the files. `con.sql` reads stored tables as they are when the
+result is used, `con.live_sql` reads them ticking; a query also ticks when a table passed to it
+does.
 
 ```python
-edges = db.sql("""
+edges = con.live_sql("""
     SELECT o.game_id, o.book, o.price, f.pts_avg
-    FROM live.sports.odds o
-    ASOF JOIN live.sports.form f
+    FROM sports.odds o
+    ASOF JOIN sports.form f
       MATCH_CONDITION (o.ts >= f.ts)
       ON o.player_id = f.player_id
-""")  # reads today's live data: ticking
+""")  # all their rows, then every change: ticking
 
-monthly = db.sql("""
+monthly = con.sql("""
     SELECT book, avg(price) AS avg_price, count(*) AS n
     FROM sports.odds
-    WHERE Date >= '2026-10-01' AND Date <= '2026-10-31'
+    WHERE ts >= '2026-10-01' AND ts < '2026-11-01'
     GROUP BY book
-""")  # merged dates only: static
+""")  # the rows as they are now: static
 
-print(db.explain("SELECT ..."))  # the plan, without reading anything
+print(monthly.explain())  # the plan, without reading anything
 ```
 
 Table resolution
 
-- `ns.table` resolves to `db.table` (history ∪ live). An append table's `WHERE` must say which
-  dates; they are pruned against the catalog: if no unmerged date survives, the plan reads only
-  Parquet and is static; if only today's date survives, it reads only weir. A keyed table is its
-  latest state.
-- `live.ns.table` and `hist.ns.table` pin one side explicitly.
+- `ns.table` is the stored table, all its rows (§8.4); a keyed table is its keys' latest rows.
+  Nothing requires a date: filters on any column reach the files.
 - Later, maybe: `FOR SYSTEM_TIME AS OF '<timestamp>'`, reading history at a catalog snapshot.
   Not built: history keeps no replaced files (§8.2), so its correctness rests on each commit, not
   on time travel.
 - Tables in Python are passed by keyword and read under that name:
-  `db.sql("SELECT ... FROM board", board=board)`. Keywords, not the caller's variables, so a query
+  `con.sql("SELECT ... FROM board", board=board)`. Keywords, not the caller's variables, so a query
   reads only what it is given.
 
 Supported subset, mapped to operators
@@ -1163,30 +1158,29 @@ Supported subset, mapped to operators
 | `UNION ALL` | `merge` |
 | CTEs (`WITH`), subqueries in `FROM` | inlined into the plan |
 
-- `WHERE` conditions on the first table read alone go with its read, so a stored table reads only
-  the dates, files, and row groups they allow; the rest filter the joined rows.
+- `WHERE` conditions on the first table read alone go with its scan, so a stored table reads
+  only the files, row groups, and pages they allow; the rest filter the joined rows.
 - A join adds only the right table's columns the query reads: `r.price` is a column of its own,
   so it never collides with the left's `price`, and an unqualified name comes from the right only
   when the left lacks it. `SELECT *` adds every right column, and a name both sides have is an
   error naming it.
 - Aggregates are `count`, `sum`, `avg`, `min`, `max`, `first`, `last`, `stddev`, over a column or
   an expression; expressions over aggregates (`sum(px * qty) / sum(qty)`) are computed after
-  grouping. An aggregate without `AS` is named after its function, as in Postgres.
+  grouping. An aggregate without `AS` is named as DuckDB names it (`count_star()`, `sum(px)`).
 - `INNER JOIN` is refused: matching many rows to many needs a join operator the engine does not
   have; `LEFT JOIN` covers a right side with one row per key. `DISTINCT ON (key) ... ORDER BY ts`
   is refused too: `last_by` keeps each key's last row written, which is its latest by `ts` only
   when rows arrive in time order.
-- Anything else (full outer joins, non-equi joins, `OFFSET`, correlated subqueries, recursive
-  CTEs) is rejected at bind time with an error naming the construct and the closest supported
-  form.
-- `ORDER BY` / `LIMIT` on ticking inputs are maintained incrementally, as in Deephaven; on static
-  inputs they run once. `LIMIT` after a ticking `ORDER BY` is refused, as `head` after a ticking
-  `sort` is.
-- `db.explain(query)` prints the Kermodes plan with pruning decisions (dates, files, row groups)
-  and whether each operator runs on the static or incremental path; `db.sql` refuses `EXPLAIN`
-  and points to it.
-- SQL works everywhere a plan does: sessions (`db.sql`), deployments (a deployment may be one SQL
-  file in the project), feature views, the web console, and ranger.
+- Anything else (full outer joins, non-equi joins, correlated subqueries, recursive CTEs) is
+  rejected at bind time with an error naming the construct and the closest supported form.
+- `ORDER BY` / `LIMIT` / `OFFSET` on ticking inputs are maintained incrementally, as in
+  Deephaven: `LIMIT` and `OFFSET` after a ticking `ORDER BY` are a `slice` of the sorted rows,
+  the one operator a ticking sort allows over it. On static inputs they run once.
+- A query's table `explain()`s itself: the plan with what each scan reads (files, row groups,
+  rows, columns) and whether each operator runs on the static or incremental path; `con.sql`
+  refuses `EXPLAIN` and points to it.
+- SQL works everywhere a plan does: sessions (`con.sql`), deployments (a deployment may be one
+  SQL file in the project), feature views, the web console, and ranger.
 
 ## 10. Control plane
 
@@ -1240,7 +1234,7 @@ Humans (CLI, SDK, UI) and agents use the same calls.
 - Executors: Kubernetes Job per task (arbitrary image) or a warm Python worker pool (low latency).
 - Each run records the deployed artifact (commit SHA) it ran.
 - Run state is published to weir as live tables: `sys.job_runs`, `sys.task_runs`, `sys.task_logs`.
-  Observability is `db.live_table("sys", "job_runs")`.
+  Observability is `con.live_table("sys.job_runs")`.
 
 ```python
 @km.job(schedule="0 6 * * *", retries=3, backoff="exp", timeout="30m")
@@ -1578,9 +1572,8 @@ def form(games):
 ```
 
 - Offline: `km.training_set(labels, features=[...], ts=...)` evaluates the view over
-  `db.historical_table` on the engine's static path and performs a point-in-time-correct as-of
-  join, one `Date` partition at a time.
-- Online: the same view runs incrementally on `db.live_table`; online state is
+  `con.table` on the engine's static path and performs a point-in-time-correct as-of join.
+- Online: the same view runs incrementally on `con.live_table`; online state is
   `last_by(entity)` in engine memory. No separate online store.
 - Served-feature logging: deployments publish the exact features and predictions they served back
   to weir as live tables. These merge into history and become training data that matches serving.
@@ -1647,7 +1640,7 @@ namespaces).
 
 - `km.connect(target)`: a server's URL (the cluster's weir, or a running `kermodes dev`), a store
   directory opened in this process, or `":memory:"` for no store; the engine runs in this process
-  either way, from the same Rust crate. `db.sql(...)` and the table API build the same plans
+  either way, from the same Rust crate. `con.sql(...)` and the table API build the same plans
   (§9.3, §9.8).
 - Tables convert to pyarrow, pandas, and polars without copying where possible (Arrow PyCapsule
   interface).
@@ -1819,7 +1812,7 @@ proven parts.
   Past a memory budget (512 MiB) the grid says the table is too large to sort or filter there,
   rather than risk the server. Keyed tables (each key's latest row, which a position does not
   name) and published tables (which live in the session) are viewed as before. Whole tables are
-  for programs and notebooks: `km.connect().live_table()` and `db.table()` give every row.
+  for programs and notebooks: `con.table()` and `con.live_table()` give every row.
 - Transport: in notebooks, the widget's comm (a small JSON header plus Arrow IPC buffers); in
   the web UI, the same frames over WebSocket, later Barrage-style deltas over Flight (§9.6).
   What answers the grid (windows, quick filters, sorting, fetches) is the engine's
@@ -2185,8 +2178,8 @@ Verified against maturin 1.16, PyO3 0.30, and uv.
 | Milestone | Deliverable | Toy example |
 |---|---|---|
 | M0 | Engine library: row sets, update graph, static + incremental operators, expressions; PyO3 module; notebook widget; oracle tests; benchmarks ([engine.md](engine.md)) | Random-walk ticker → rolling mean/vol, live in Jupyter |
-| M1 | weir (DoPut, segments, seq dedup, epochs, snapshot + tail); `db.live_table`; WebSocket connector; `kermodes dev`; Helm chart (weir + engine) | Synthetic ticker over WebSocket → weir → engine, on a laptop and in the cluster |
-| M2 | Parquet writer and pruned reader, catalog, merge job, `db.historical_table`, `db.table`, replay clock; SQL frontend with `EXPLAIN`; column IDs and compatible schema changes | Same SQL query over last month (static) and today (ticking); ticker merged nightly, replayed as a backtest |
+| M1 | weir (DoPut, segments, seq dedup, epochs, snapshot + tail); live tables; WebSocket connector; `kermodes dev`; Helm chart (weir + engine) | Synthetic ticker over WebSocket → weir → engine, on a laptop and in the cluster |
+| M2 | Parquet writer and pruned reader, catalog, merge job, `con.table`/`con.live_table` over history and today as one, replay clock; SQL frontend with `explain()`; column IDs and compatible schema changes | Same SQL query static and ticking over all of a table's rows; ticker merged nightly, replayed as a backtest |
 | M3 | Projects and the pipeline: `kermodes init` / `run` / `dev` / `test` / `plan`, manifest discovery, environments, git sync from any host, rollouts (`auto` / `manual` / `on_start`; `rolling` / `recreate`) on weir source leases, a drain-aware controller on Kubernetes Deployments, scheduler and `sys.*` tables | Toy ticker project: merging to `main` rolls it out with no gap in its output, and draining its node moves it with none either |
 | M4 | Multi-user: OIDC, RBAC, gateway, worker classes, `--live` local runs on prod's inputs, PR previews in shadow; ranger MCP; web UI v1 with monitoring v1 (§16.7) | Two users with their own sessions; a developer runs a deployment locally on prod's live inputs; an agent opens a PR that previews in shadow; the UI shows each worker's CPU, memory, and table space |
 | M5 | den: register sklearn LinearRegression → ONNX → `predict`; torch MLP; aliases, shadow mode | Live prediction; swap champion without restart |

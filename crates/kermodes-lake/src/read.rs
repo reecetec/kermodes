@@ -65,47 +65,67 @@ impl fmt::Display for Explain {
     }
 }
 
-/// `name`'s history from `first` to `last` (all of it where `None`), reading from files only
-/// the row groups and pages `bounds` allow, and only the table's `columns` (all where `None`;
-/// `Date`, and a keyed table's `Op`, always). Rows outside the bounds may still be read: the
-/// caller applies its predicate. A name the table lacks reads nothing.
+/// What of a table's history to read: the dates `first` to `last` (all where `None`), from
+/// files only the row groups and pages `bounds` allow, only the table's `columns` (all where
+/// `None`; `Date`, and a keyed table's `Op`, always), and only its first `limit` rows in date
+/// order (all where `None`). Rows outside the bounds may still be read: the caller applies its
+/// predicate. A column name the table lacks reads nothing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Reading<'a> {
+    pub first: Option<Date>,
+    pub last: Option<Date>,
+    pub bounds: &'a [Bound],
+    pub columns: Option<&'a [String]>,
+    pub limit: Option<usize>,
+}
+
+/// `name`'s history, as `reading` says: at least `limit` rows where there are that many, each
+/// file and row group read only while they are still needed. `lake` may be `None` for a table
+/// whose history is all still in weir; a file to read without one is `NotFound`.
 pub fn read_history(
     weir: &dyn Weir,
-    lake: &Lake,
+    lake: Option<&Lake>,
     name: &TableName,
-    first: Option<Date>,
-    last: Option<Date>,
-    bounds: &[Bound],
-    columns: Option<&[String]>,
+    reading: &Reading<'_>,
 ) -> Result<History, Error> {
-    history(weir, lake, name, first, last, bounds, columns, true)
+    history(weir, lake, name, reading, true)
 }
 
-/// What `read_history` would touch, from the catalog and the files' footers and page indexes
-/// alone.
+/// What `read_history` would touch without a limit, from the catalog and the files' footers
+/// and page indexes alone.
 pub fn explain_history(
     weir: &dyn Weir,
-    lake: &Lake,
+    lake: Option<&Lake>,
     name: &TableName,
-    first: Option<Date>,
-    last: Option<Date>,
-    bounds: &[Bound],
-    columns: Option<&[String]>,
+    reading: &Reading<'_>,
 ) -> Result<Explain, Error> {
-    history(weir, lake, name, first, last, bounds, columns, false).map(|history| history.explain)
+    let reading = Reading {
+        limit: None,
+        ..*reading
+    };
+    history(weir, lake, name, &reading, false).map(|history| history.explain)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Where a part of history is: a file of the lake, or a past date weir holds.
+enum Part<'a> {
+    File(&'a kermodes_weir::HistoryFile),
+    Weir(Date),
+}
+
 fn history(
     weir: &dyn Weir,
-    lake: &Lake,
+    lake: Option<&Lake>,
     name: &TableName,
-    first: Option<Date>,
-    last: Option<Date>,
-    bounds: &[Bound],
-    columns: Option<&[String]>,
+    reading: &Reading<'_>,
     rows: bool,
 ) -> Result<History, Error> {
+    let Reading {
+        first,
+        last,
+        bounds,
+        columns,
+        limit,
+    } = *reading;
     let entry = weir.entry(name)?;
     let full = with_date_column(&history_columns(&entry)?);
     let system = full.fields().len() - entry.ids.len();
@@ -147,58 +167,77 @@ fn history(
         ..Explain::default()
     };
     explain.files.1 = held.iter().map(|h| &h.file).collect::<BTreeSet<_>>().len();
-    // Each part of the result, by the date it starts at.
-    let mut parts: Vec<(Date, Vec<RecordBatch>)> = Vec::new();
+    let mut batches = Vec::new();
     if first <= last {
-        for file in weir.history_files(name, first, last)? {
-            // A file's footer is read here; its row groups only as the batches are taken.
-            let mut batches = lake.read(
-                &entry.location,
-                &file.name,
-                first,
-                last,
-                bounds,
-                projection.as_ref(),
-            )?;
-            let read = if rows {
-                batches
-                    .by_ref()
-                    .map(|batch| {
-                        batch.and_then(|batch| as_current(&entry, batch, wanted.as_deref()))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?
-            } else {
-                Vec::new()
-            };
-            explain.files.0 += 1;
-            explain.row_groups.0 += batches.row_groups.0;
-            explain.row_groups.1 += batches.row_groups.1;
-            explain.rows.0 += batches.rows.0;
-            explain.rows.1 += batches.rows.1;
-            parts.push((file.first.max(first), read));
-        }
+        let files = weir.history_files(name, first, last)?;
         let merged: BTreeSet<Date> = held.iter().map(|h| h.date).collect();
+        // Each part, by the date it starts at: read in date order, so a limit keeps the first.
+        let mut parts: Vec<(Date, Part<'_>)> = files
+            .iter()
+            .map(|file| (file.first.max(first), Part::File(file)))
+            .collect();
         for date in weir.past_dates(name)? {
             // A date merged and not yet dropped is history's to give.
-            if !in_range(date) || merged.contains(&date) {
-                continue;
+            if in_range(date) && !merged.contains(&date) {
+                parts.push((date, Part::Weir(date)));
             }
-            let mut read = Vec::new();
-            if rows {
-                weir.read_date(name, date, &mut |batch, stamp| {
-                    let whole = dated(&full, date, &with_op(&entry, batch, stamp.change)?)?;
-                    read.push(whole.project(&positions).map_err(arrow_error)?);
-                    Ok(())
-                })?;
+        }
+        parts.sort_by_key(|(date, _)| *date);
+        let mut taken = 0;
+        for (_, part) in parts {
+            if limit.is_some_and(|limit| taken >= limit) {
+                break;
             }
-            explain.weir_dates += 1;
-            parts.push((date, read));
+            match part {
+                Part::File(file) => {
+                    let lake = lake.ok_or_else(|| {
+                        Error::NotFound(format!(
+                            "{name}'s history files: no lake to read them from"
+                        ))
+                    })?;
+                    // A file's footer is read here; its row groups only as the batches are taken.
+                    let mut read = lake.read(
+                        &entry.location,
+                        &file.name,
+                        first,
+                        last,
+                        bounds,
+                        projection.as_ref(),
+                    )?;
+                    if rows {
+                        for batch in read.by_ref() {
+                            let batch = as_current(&entry, batch?, wanted.as_deref())?;
+                            taken += batch.num_rows();
+                            batches.push(batch);
+                            if limit.is_some_and(|limit| taken >= limit) {
+                                break;
+                            }
+                        }
+                    }
+                    explain.files.0 += 1;
+                    explain.row_groups.0 += read.row_groups.0;
+                    explain.row_groups.1 += read.row_groups.1;
+                    explain.rows.0 += read.rows.0;
+                    explain.rows.1 += read.rows.1;
+                }
+                Part::Weir(date) => {
+                    if rows {
+                        weir.read_date(name, date, &mut |batch, stamp| {
+                            let whole = dated(&full, date, &with_op(&entry, batch, stamp.change)?)?;
+                            let batch = whole.project(&positions).map_err(arrow_error)?;
+                            taken += batch.num_rows();
+                            batches.push(batch);
+                            Ok(())
+                        })?;
+                    }
+                    explain.weir_dates += 1;
+                }
+            }
         }
     }
-    parts.sort_by_key(|(date, _)| *date);
     Ok(History {
         schema,
-        batches: parts.into_iter().flat_map(|(_, batches)| batches).collect(),
+        batches,
         explain,
     })
 }

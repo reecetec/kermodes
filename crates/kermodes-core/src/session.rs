@@ -8,7 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use arrow::array::{ArrayRef, new_null_array};
-use arrow::compute::{interleave, interleave_record_batch};
+use arrow::compute::interleave;
 use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
@@ -20,7 +20,7 @@ use crate::ops::{Assignment, Edge, LastBy, Operator, Slice, Update, Where};
 use crate::order::Order;
 use crate::rolling::{Aggregate, Function, Input, Rolling, Span, Window};
 use crate::sort::sorted;
-use crate::storage::{Delta, End, Modified, RowKey, Rows, Storage};
+use crate::storage::{Delta, End, Modified, RowKey, Rows, Storage, interleave_rows};
 use crate::types::check_types;
 use crate::{Error, Expression, type_name};
 
@@ -464,7 +464,7 @@ impl<'a> Reader<'a> {
                     return Ok(batches[only].clone());
                 }
                 let batches: Vec<&RecordBatch> = batches.iter().collect();
-                interleave_record_batch(&batches, &at)
+                interleave_rows(&batches, &at)
             }
             Place::Ordered { input, .. } => input.gather(keys),
         }
@@ -1198,6 +1198,12 @@ impl Session {
         self.clock().is_some()
     }
 
+    /// Whether writes wait for a cycle to take them. A cycle takes them all and applies them
+    /// under the graph's lock, so a read after this says `false` sees every write queued before.
+    pub fn has_queued_writes(&self) -> bool {
+        !self.pending().is_empty()
+    }
+
     fn clock(&self) -> MutexGuard<'_, Option<Clock>> {
         self.inner
             .clock
@@ -1493,13 +1499,13 @@ impl Keyed {
         if !added_keys.is_empty() {
             delta.added.push(Rows {
                 keys: added_keys,
-                batch: interleave_record_batch(&batches, &added_at)?,
+                batch: interleave_rows(&batches, &added_at)?,
             });
         }
         if !modified_keys.is_empty() {
             delta.modified.push(Modified {
                 previous: storage.gather(&modified_keys)?,
-                current: interleave_record_batch(&batches, &modified_at)?,
+                current: interleave_rows(&batches, &modified_at)?,
                 keys: modified_keys,
             });
         }
@@ -1799,7 +1805,7 @@ impl Table {
     pub fn rolling(
         &self,
         by: &[&str],
-        window: Window<'_>,
+        window: &Window,
         aggregations: &[(&str, &str)],
     ) -> Result<Table, Error> {
         if self.growth() != Growth::AppendOnly {
@@ -1814,7 +1820,7 @@ impl Table {
                 "rolling needs at least one aggregation".into(),
             ));
         }
-        let span = match window {
+        let span = match *window {
             Window::Rows(0) => {
                 return Err(Error::Unsupported(
                     "a rolling window needs at least one row".into(),
@@ -1826,8 +1832,8 @@ impl Table {
                     "a rolling time window needs a positive span".into(),
                 ));
             }
-            Window::Time { at, span } => {
-                let at = resolve(&self.schema, &[at])?[0];
+            Window::Time { ref at, span } => {
+                let at = resolve(&self.schema, &[at.as_str()])?[0];
                 let data_type = self.schema.field(at).data_type();
                 if !matches!(
                     data_type,

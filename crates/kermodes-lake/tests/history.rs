@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Date32Type, Field, Int64Type, Schema};
 use kermodes_lake::{
-    History, Lake, Merged, Weir, collect_garbage, merge, read_history, write_history,
+    History, Lake, Merged, Reading, Weir, collect_garbage, merge, read_history, write_history,
 };
 use kermodes_weir::{Date, Error, SourceId, Store, TableName};
 
@@ -183,7 +183,7 @@ fn a_merge_cut_short_after_its_commit_finishes_by_dropping() {
     let store = store_with(&root, &[(d(1), &[("a", &[1, 2])])]);
     assert_eq!(store.date_rows(&ticks(), d(1)).unwrap().0, 2);
     // In both places: a read takes it from history alone.
-    let read = read_history(&store, &lake, &ticks(), None, None, &[], None).unwrap();
+    let read = read_history(&store, Some(&lake), &ticks(), &Reading::default()).unwrap();
     assert_eq!((rows(&read).len(), read.explain.weir_dates), (2, 0));
 
     assert_eq!(
@@ -277,8 +277,48 @@ fn a_batch_job_writes_a_past_date_straight_into_history() {
 
     write_history(&store, &lake, &ticks(), d(5), &[]).unwrap();
     assert_eq!(history(&store, &lake, d(1), d(6)), [1, 2, 14]);
-    let read = read_history(&store, &lake, &ticks(), Some(d(5)), Some(d(5)), &[], None).unwrap();
+    let day = Reading {
+        first: Some(d(5)),
+        last: Some(d(5)),
+        ..Reading::default()
+    };
+    let read = read_history(&store, Some(&lake), &ticks(), &day).unwrap();
     assert_eq!(rows(&read), []);
+}
+
+/// A read that needs only a table's first rows (a notebook's preview) stops once it has them,
+/// in date order across the lake's files and weir's past dates.
+#[test]
+fn a_limited_read_takes_the_first_rows_in_date_order() {
+    let dir = TempDir::new();
+    let days: [Day; 4] = [
+        (d(1), &[("a", &[1, 2])]),
+        (d(2), &[("a", &[3, 4])]),
+        (d(3), &[("a", &[5, 6])]),
+        (d(4), &[("a", &[7, 8])]),
+    ];
+    let store = store_with(&dir.0.join("store"), &days);
+    let lake = Lake::open(dir.0.join("lake").to_str().unwrap()).unwrap();
+    merge(&store, &lake, &ticks(), d(1)).unwrap();
+    merge(&store, &lake, &ticks(), d(2)).unwrap();
+
+    let limited = |limit| {
+        let first = Reading {
+            limit: Some(limit),
+            ..Reading::default()
+        };
+        read_history(&store, Some(&lake), &ticks(), &first).unwrap()
+    };
+    let values =
+        |history: &History| -> Vec<i64> { rows(history).into_iter().map(|(_, n)| n).collect() };
+    // Whole batches: at least the rows asked for, and no part after the one that gave them.
+    let three = limited(3);
+    assert_eq!(values(&three), [1, 2, 3, 4]);
+    assert_eq!(three.explain.weir_dates, 0);
+    let five = limited(5);
+    assert_eq!(values(&five), [1, 2, 3, 4, 5, 6]);
+    assert_eq!(five.explain.weir_dates, 1);
+    assert_eq!(values(&limited(100)), [1, 2, 3, 4, 5, 6, 7, 8]);
 }
 
 /// Each date is served from one place (§8): history takes no date that is not past, by the
@@ -369,7 +409,11 @@ fn a_read_of_some_columns_reads_only_those() {
     store.create_table(&wide, &renamed).unwrap();
 
     let columns = ["z".to_string(), "a".to_string(), "nowhere".to_string()];
-    let read = read_history(&store, &lake, &wide, None, None, &[], Some(&columns)).unwrap();
+    let some = Reading {
+        columns: Some(&columns),
+        ..Reading::default()
+    };
+    let read = read_history(&store, Some(&lake), &wide, &some).unwrap();
     let names: Vec<&str> = read
         .schema
         .fields()
@@ -388,7 +432,7 @@ fn a_read_of_some_columns_reads_only_those() {
     assert_eq!(got, [(1, 100), (2, 200), (3, 300)]);
     assert_eq!(read.explain.columns, (3, 4));
     assert_eq!(read.explain.weir_dates, 1);
-    let all = read_history(&store, &lake, &wide, None, None, &[], None).unwrap();
+    let all = read_history(&store, Some(&lake), &wide, &Reading::default()).unwrap();
     assert_eq!(all.explain.columns, (4, 4));
 }
 
@@ -430,8 +474,14 @@ fn history_reads_only_the_dates_asked_for() {
 
     let (one, two, three) = (d(1).days(), d(2).days(), d(3).days());
     for weir in [&*store as &dyn Weir, &client] {
-        let read =
-            |first, last| read_history(weir, &lake, &ticks(), first, last, &[], None).unwrap();
+        let read = |first, last| {
+            let dates = Reading {
+                first,
+                last,
+                ..Reading::default()
+            };
+            read_history(weir, Some(&lake), &ticks(), &dates).unwrap()
+        };
 
         let all = read(None, None);
         let mut expected: Vec<(i32, i64)> = [1, 2, 3, 4, 5].map(|n| (one, n)).to_vec();
@@ -507,8 +557,12 @@ fn a_keyed_tables_history_is_its_log_of_changes() {
     let store = Store::open(&dir.0).unwrap();
     let lake = Lake::open(dir.0.join("lake").to_str().unwrap()).unwrap();
     let log = |store: &Store| -> Vec<(String, i64)> {
-        let history =
-            read_history(store, &lake, &quotes, Some(d(1)), Some(d(1)), &[], None).unwrap();
+        let day = Reading {
+            first: Some(d(1)),
+            last: Some(d(1)),
+            ..Reading::default()
+        };
+        let history = read_history(store, Some(&lake), &quotes, &day).unwrap();
         let mut log = Vec::new();
         for batch in &history.batches {
             let ops = batch.column(1).as_string::<i32>();

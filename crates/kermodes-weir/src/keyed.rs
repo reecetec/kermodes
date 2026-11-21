@@ -15,7 +15,8 @@ use crate::{Change, Error};
 /// than the state costs about this much memory, not the day's size.
 const COMPACT_BYTES: usize = 64 << 20;
 
-pub(crate) struct Fold {
+/// A keyed table's state folded from its changes: each key's latest row.
+pub struct Fold {
     schema: SchemaRef,
     key: Vec<usize>,
     rows: RowConverter,
@@ -27,7 +28,7 @@ pub(crate) struct Fold {
 }
 
 impl Fold {
-    pub(crate) fn new(schema: &SchemaRef, key: &[String]) -> Result<Self, Error> {
+    pub fn new(schema: &SchemaRef, key: &[String]) -> Result<Self, Error> {
         Self::compacting_at(schema, key, COMPACT_BYTES)
     }
 
@@ -58,7 +59,7 @@ impl Fold {
     /// Applies one batch: upserts set each of its keys' latest row, deletes remove their keys,
     /// and a checkpoint is the whole state from here (rows after it in upserts), replacing every
     /// key before it.
-    pub(crate) fn apply(&mut self, batch: RecordBatch, change: Change) -> Result<(), Error> {
+    pub fn apply(&mut self, batch: RecordBatch, change: Change) -> Result<(), Error> {
         let keys = self.keys(&batch)?;
         if change == Change::Checkpoint {
             self.batches.clear();
@@ -94,7 +95,7 @@ impl Fold {
     }
 
     /// Every key's latest row, in key order.
-    pub(crate) fn state(&self) -> Result<RecordBatch, Error> {
+    pub fn state(&self) -> Result<RecordBatch, Error> {
         let mut latest: Vec<(&OwnedRow, &(usize, usize))> = self.latest.iter().collect();
         latest.sort_unstable_by(|a, b| a.0.cmp(b.0));
         let indices: Vec<(usize, usize)> = latest.iter().map(|(_, at)| **at).collect();

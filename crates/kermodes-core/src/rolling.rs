@@ -26,13 +26,13 @@ const CHUNK_ROWS: usize = 16 * PIECE_ROWS;
 
 /// Which of its group's rows a row's window holds: the row itself and rows before it in key
 /// order.
-#[derive(Clone, Copy, Debug)]
-pub enum Window<'a> {
+#[derive(Clone, Debug, PartialEq)]
+pub enum Window {
     /// The row and up to `n - 1` rows before it.
     Rows(usize),
     /// The rows whose `at` lies in `(t - span, t]`, `t` being the row's own; `span` is in
     /// `at`'s units (nanoseconds for timestamps, days for dates).
-    Time { at: &'a str, span: i64 },
+    Time { at: String, span: i64 },
 }
 
 /// A window resolved against the input's columns.

@@ -203,17 +203,25 @@ pub(crate) struct Call {
     pub column: Option<usize>,
 }
 
+/// `function(argument)`'s function and argument, as written; `None` if it is not that shape.
+fn split_call(spec: &str) -> Option<(&str, &str)> {
+    let (name, rest) = spec.trim().split_once('(')?;
+    Some((name.trim(), rest.strip_suffix(')')?.trim()))
+}
+
+/// The column the aggregation `spec` reads, `None` for `count(*)` or a spec that is not
+/// `function(column)`.
+pub(crate) fn reads(spec: &str) -> Option<&str> {
+    split_call(spec)
+        .map(|(_, argument)| argument)
+        .filter(|argument| *argument != "*")
+}
+
 impl Call {
     pub fn parse(spec: &str, schema: &Schema) -> Result<Self, Error> {
         let error = |message: String| call_error(spec, message);
-        let text = spec.trim();
-        let (name, rest) = text
-            .split_once('(')
-            .ok_or_else(|| error("expected `function(column)`".into()))?;
-        let argument = rest
-            .strip_suffix(')')
-            .ok_or_else(|| error("expected `function(column)`".into()))?
-            .trim();
+        let (name, argument) =
+            split_call(spec).ok_or_else(|| error("expected `function(column)`".into()))?;
         let function = match name.trim().to_ascii_lowercase().as_str() {
             "count" => "count",
             "count_distinct" => "count_distinct",

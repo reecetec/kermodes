@@ -30,77 +30,8 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use crate::session::Table;
+use crate::plan::{Plan, Scan};
 use crate::{Error, SortKey};
-
-/// A table a query reads, by the name it is written with (`ns.table`, `live.ns.table`,
-/// `hist.ns.table`, or a name the caller supplies), the conditions on it alone, and the columns
-/// the query may read of it (all where `None`): a store reads only the dates, files, and
-/// columns they allow. A caller's scan gives the rows that satisfy them, with at least those
-/// columns; a name among them the table lacks is no column of it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Scan {
-    pub name: String,
-    pub predicate: Option<String>,
-    pub columns: Option<Vec<String>>,
-}
-
-/// A query as the engine's operators, each input built before the operator over it.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Plan {
-    Scan(Scan),
-    Filter {
-        input: Box<Plan>,
-        predicate: String,
-    },
-    Update {
-        input: Box<Plan>,
-        assignments: Vec<String>,
-    },
-    Select {
-        input: Box<Plan>,
-        columns: Vec<String>,
-    },
-    /// `agg_by`. `aliases`: names `GROUP BY` took as the aliases of other expressions, which
-    /// must not be columns of the input: SQL groups by the column of that name instead.
-    Agg {
-        input: Box<Plan>,
-        by: Vec<String>,
-        aggregations: Vec<(String, String)>,
-        aliases: Vec<String>,
-    },
-    Sort {
-        input: Box<Plan>,
-        by: Vec<SortKey>,
-    },
-    Head {
-        input: Box<Plan>,
-        rows: usize,
-    },
-    /// The rows at positions `start` up to `stop` (to the end if `None`), in the input's order.
-    Slice {
-        input: Box<Plan>,
-        start: usize,
-        stop: Option<usize>,
-    },
-    /// Every column but these: those `ORDER BY` read and the result does not show.
-    Drop {
-        input: Box<Plan>,
-        columns: Vec<String>,
-    },
-    /// A `LEFT JOIN` (`at` empty, `natural_join`) or `ASOF JOIN` (`as_of_join`). It adds the
-    /// right table's `columns` (`r.c=c`: its `c` as a column `r.c`, all of them if `None`), and
-    /// the `bare` names the left table lacks and the right has.
-    Join {
-        left: Box<Plan>,
-        right: Box<Plan>,
-        on: Vec<String>,
-        at: Option<String>,
-        columns: Option<Vec<String>>,
-        bare: Vec<String>,
-    },
-    Merge(Vec<Plan>),
-}
 
 /// A parsed statement: its plan, and whether it was `EXPLAIN`ed.
 #[derive(Debug, Clone, PartialEq)]
@@ -134,200 +65,6 @@ pub fn parse(sql: &str) -> Result<Parsed, Error> {
 fn unsupported(what: &str) -> Error {
     Error::Unsupported(format!("SQL: {what}"))
 }
-
-fn names(names: &[String]) -> Vec<&str> {
-    names.iter().map(String::as_str).collect()
-}
-
-impl Plan {
-    /// The plan's table, each scan's rows from `scan`.
-    pub fn build(
-        &self,
-        scan: &mut dyn FnMut(&Scan) -> Result<Table, Error>,
-    ) -> Result<Table, Error> {
-        match self {
-            Plan::Scan(s) => scan(s),
-            Plan::Filter { input, predicate } => input.build(scan)?.filter(predicate),
-            Plan::Update { input, assignments } => input.build(scan)?.update(&names(assignments)),
-            Plan::Select { input, columns } => input.build(scan)?.select(&names(columns)),
-            Plan::Agg {
-                input,
-                by,
-                aggregations,
-                aliases,
-            } => {
-                let input = input.build(scan)?;
-                if let Some(alias) = aliases
-                    .iter()
-                    .find(|alias| input.schema().field_with_name(alias).is_ok())
-                {
-                    return Err(unsupported(&format!(
-                        "GROUP BY {alias}: {alias} is both a column of the table and an alias in \
-                         SELECT, and SQL groups by the column; name the alias apart"
-                    )));
-                }
-                let aggregations: Vec<(&str, &str)> = aggregations
-                    .iter()
-                    .map(|(name, spec)| (name.as_str(), spec.as_str()))
-                    .collect();
-                input.agg_by(&names(by), &aggregations)
-            }
-            Plan::Sort { input, by } => input.build(scan)?.sort_by(by),
-            Plan::Head { input, rows } => input.build(scan)?.head(*rows),
-            Plan::Slice { input, start, stop } => {
-                input.build(scan)?.slice(*start, stop.unwrap_or(usize::MAX))
-            }
-            Plan::Drop { input, columns } => {
-                let input = input.build(scan)?;
-                let kept: Vec<String> = input
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|f| f.name().clone())
-                    .filter(|name| !columns.contains(name))
-                    .collect();
-                input.select(&names(&kept))
-            }
-            Plan::Join {
-                left,
-                right,
-                on,
-                at,
-                columns,
-                bare,
-            } => {
-                let (left, right) = (left.build(scan)?, right.build(scan)?);
-                // Which unqualified names are the right table's needs both schemas.
-                let joins = columns.as_ref().map(|columns| {
-                    let mut joins = columns.clone();
-                    joins.extend(
-                        bare.iter()
-                            .filter(|name| {
-                                right.schema().field_with_name(name).is_ok()
-                                    && left.schema().field_with_name(name).is_err()
-                            })
-                            .cloned(),
-                    );
-                    joins
-                });
-                let joins = joins.as_deref().map(names);
-                match at {
-                    None => left.natural_join(&right, &names(on), joins.as_deref()),
-                    Some(at) => left.as_of_join(&right, &names(on), at, joins.as_deref()),
-                }
-            }
-            Plan::Merge(parts) => {
-                let tables = parts
-                    .iter()
-                    .map(|part| part.build(scan))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Table::merge(&tables.iter().collect::<Vec<_>>())
-            }
-        }
-    }
-
-    /// The plan as a tree of operators, each marked static or ticking, its scans described by
-    /// `scan` (what a store would read, and whether it ticks), without building anything.
-    pub fn explain(&self, scan: &mut Describe<'_>) -> Result<String, Error> {
-        let mut lines = Vec::new();
-        self.explain_into(scan, 0, &mut lines)?;
-        Ok(lines.join("\n"))
-    }
-
-    /// Writes this node and its inputs at `depth`; whether it ticks.
-    fn explain_into(
-        &self,
-        scan: &mut Describe<'_>,
-        depth: usize,
-        lines: &mut Vec<String>,
-    ) -> Result<bool, Error> {
-        let mut below = Vec::new();
-        let mut ticks = false;
-        for input in self.inputs() {
-            ticks |= input.explain_into(scan, depth + 1, &mut below)?;
-        }
-        let what = match self {
-            Plan::Scan(s) => {
-                let (described, scan_ticks) = scan(s)?;
-                ticks = scan_ticks;
-                let mut what = format!("scan {}", s.name);
-                if let Some(predicate) = &s.predicate {
-                    write!(what, " where {predicate}").ok();
-                }
-                if !described.is_empty() {
-                    write!(what, ": {described}").ok();
-                }
-                what
-            }
-            other => other.operator(),
-        };
-        let path = if ticks { "ticking" } else { "static " };
-        lines.push(format!("{path}  {}{what}", "  ".repeat(depth)));
-        lines.extend(below);
-        Ok(ticks)
-    }
-
-    fn inputs(&self) -> Vec<&Plan> {
-        match self {
-            Plan::Scan(_) => Vec::new(),
-            Plan::Filter { input, .. }
-            | Plan::Update { input, .. }
-            | Plan::Select { input, .. }
-            | Plan::Agg { input, .. }
-            | Plan::Sort { input, .. }
-            | Plan::Head { input, .. }
-            | Plan::Slice { input, .. }
-            | Plan::Drop { input, .. } => vec![input],
-            Plan::Join { left, right, .. } => vec![left, right],
-            Plan::Merge(parts) => parts.iter().collect(),
-        }
-    }
-
-    /// This node's operator, as the Python API writes it.
-    fn operator(&self) -> String {
-        match self {
-            Plan::Scan(s) => format!("scan {}", s.name),
-            Plan::Filter { predicate, .. } => format!("where {predicate}"),
-            Plan::Update { assignments, .. } => format!("update {}", assignments.join(", ")),
-            Plan::Select { columns, .. } => format!("select {}", columns.join(", ")),
-            Plan::Agg {
-                by, aggregations, ..
-            } => {
-                let aggregations: Vec<String> = aggregations
-                    .iter()
-                    .map(|(name, spec)| format!("{name}={spec}"))
-                    .collect();
-                format!("agg_by [{}]: {}", by.join(", "), aggregations.join(", "))
-            }
-            Plan::Sort { by, .. } => {
-                let by: Vec<String> = by.iter().map(SortKey::to_string).collect();
-                format!("sort {}", by.join(", "))
-            }
-            Plan::Head { rows, .. } => format!("head {rows}"),
-            Plan::Slice { start, stop, .. } => match stop {
-                Some(stop) => format!("slice {start}..{stop}"),
-                None => format!("slice {start}.."),
-            },
-            Plan::Drop { columns, .. } => format!("drop {}", columns.join(", ")),
-            Plan::Join {
-                on, at, columns, ..
-            } => {
-                let mut what = match at {
-                    None => format!("natural_join on {}", on.join(", ")),
-                    Some(at) => format!("as_of_join on {} at {at}", on.join(", ")),
-                };
-                if let Some(columns) = columns.as_ref().filter(|c| !c.is_empty()) {
-                    write!(what, " adding {}", columns.join(", ")).ok();
-                }
-                what
-            }
-            Plan::Merge(_) => "merge".to_owned(),
-        }
-    }
-}
-
-/// What `Plan::explain` asks of each scan: what a store would read for it, and whether it ticks.
-pub type Describe<'a> = dyn FnMut(&Scan) -> Result<(String, bool), Error> + 'a;
 
 /// Binds queries, the `WITH` names in scope.
 #[derive(Default, Clone)]
@@ -817,14 +554,16 @@ impl Binder {
                 );
                 let plan = match parts.as_slice() {
                     [one] if self.ctes.contains_key(*one) => self.ctes[*one].clone(),
-                    [_] | [_, _] | ["live" | "hist", _, _] => Plan::Scan(Scan {
+                    [_] | [_, _] => Plan::Scan(Scan {
                         name: parts.join("."),
                         predicate: None,
                         columns: None,
+                        limit: None,
+                        live: false,
                     }),
                     _ => {
                         return Err(unsupported(&format!(
-                            "the table name {name}: ns.table, live.ns.table, or hist.ns.table"
+                            "the table name {name}: ns.table, or a table passed by name"
                         )));
                     }
                 };
@@ -929,66 +668,6 @@ impl Binder {
             let mut all: Vec<String> = scan.predicate.take().into_iter().collect();
             all.extend(pushed.iter().map(|c| text(c, &rights)));
             scan.predicate = and(&all);
-        }
-        // What each table's scan reads: every column after `*`; otherwise each column the query
-        // names bare (which table holds it is the table's to say) or by that table's name.
-        if !every {
-            let mut named: HashMap<String, BTreeSet<String>> = HashMap::new();
-            let (mut joined, mut all_bare): (Vec<&Expr>, _) = (Vec::new(), bare.clone());
-            for (join, _, _) in &joins {
-                let (constraint, condition) = match &join.join_operator {
-                    JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => (c, None),
-                    JoinOperator::AsOf {
-                        match_condition,
-                        constraint,
-                    } => (constraint, Some(match_condition)),
-                    _ => continue,
-                };
-                joined.extend(condition);
-                match constraint {
-                    JoinConstraint::On(expr) => joined.push(expr),
-                    JoinConstraint::Using(names) => {
-                        all_bare.extend(names.iter().map(|n| n.to_string()));
-                    }
-                    _ => {}
-                }
-            }
-            for expr in expressions(select, order).into_iter().chain(joined) {
-                let _ = visit_expressions(expr, |e| {
-                    match e {
-                        Expr::Identifier(ident) => {
-                            all_bare.insert(ident.value.clone());
-                        }
-                        Expr::CompoundIdentifier(parts) => {
-                            if let [.., table, column] = parts.as_slice() {
-                                named
-                                    .entry(table.value.clone())
-                                    .or_default()
-                                    .insert(column.value.clone());
-                            }
-                        }
-                        _ => {}
-                    }
-                    ControlFlow::<()>::Continue(())
-                });
-            }
-            let columns = |known: &str| {
-                let mut columns = all_bare.clone();
-                columns.extend(named.get(known).into_iter().flatten().cloned());
-                Some(columns.into_iter().collect::<Vec<_>>())
-            };
-            if let Plan::Scan(scan) = &mut plan
-                && scan.columns.is_none()
-            {
-                scan.columns = columns(&first);
-            }
-            for (_, right, name) in &mut joins {
-                if let Plan::Scan(scan) = right
-                    && scan.columns.is_none()
-                {
-                    scan.columns = columns(name);
-                }
-            }
         }
         for (join, right, name) in joins {
             let (on, at) = match &join.join_operator {

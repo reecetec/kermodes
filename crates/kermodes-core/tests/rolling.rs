@@ -73,7 +73,7 @@ fn rows(table: &Table) -> RecordBatch {
 }
 
 /// Each row's expected aggregates, from its window recomputed over every earlier row.
-fn reference(input: &RecordBatch, window: Window<'_>) -> Vec<[Option<f64>; 7]> {
+fn reference(input: &RecordBatch, window: &Window) -> Vec<[Option<f64>; 7]> {
     let sym = input.column(0).as_string::<i32>();
     let ts = input.column(1).as_primitive::<Int64Type>();
     let price = input.column(2).as_primitive::<Float64Type>();
@@ -84,7 +84,7 @@ fn reference(input: &RecordBatch, window: Window<'_>) -> Vec<[Option<f64>; 7]> {
             let same = |other: usize| {
                 get(sym, other).map(|o| sym.value(o)) == get(sym, row).map(|r| sym.value(r))
             };
-            let members: Vec<usize> = match window {
+            let members: Vec<usize> = match *window {
                 Window::Rows(n) => {
                     let group: Vec<usize> = (0..=row).filter(|o| same(*o)).collect();
                     group[group.len().saturating_sub(n)..].to_vec()
@@ -157,11 +157,14 @@ fn rolling_matches_windows_recomputed_from_scratch() {
         let windows = [
             Window::Rows(1),
             Window::Rows(3),
-            Window::Time { at: "ts", span: 40 },
+            Window::Time {
+                at: "ts".into(),
+                span: 40,
+            },
         ];
         let rolled: Vec<Table> = windows
             .iter()
-            .map(|w| input.rolling(&["sym"], *w, AGGREGATIONS).unwrap())
+            .map(|w| input.rolling(&["sym"], w, AGGREGATIONS).unwrap())
             .collect();
         let mut clock = 0;
         for cycle in 0..20 {
@@ -171,7 +174,7 @@ fn rolling_matches_windows_recomputed_from_scratch() {
             session.step();
             let all = rows(&input);
             for (window, table) in windows.iter().zip(&rolled) {
-                let (got, want) = (results(&rows(table)), reference(&all, *window));
+                let (got, want) = (results(&rows(table)), reference(&all, window));
                 assert_eq!(got.len(), want.len());
                 for (row, (g, w)) in got.iter().zip(&want).enumerate() {
                     for (column, (g, w)) in g.iter().zip(w).enumerate() {
@@ -205,7 +208,7 @@ fn rolling_needs_rows_in_order() {
     .unwrap();
     for table in [&keyed, &merged, &merged.update(&["x = size + 1"]).unwrap()] {
         let Err(Error::Unsupported(message)) =
-            table.rolling(&["sym"], Window::Rows(2), AGGREGATIONS)
+            table.rolling(&["sym"], &Window::Rows(2), AGGREGATIONS)
         else {
             panic!("rolling over `{}` should be rejected", table.description());
         };
@@ -216,7 +219,10 @@ fn rolling_needs_rows_in_order() {
     let windowed = input
         .rolling(
             &["sym"],
-            Window::Time { at: "ts", span: 5 },
+            &Window::Time {
+                at: "ts".into(),
+                span: 5,
+            },
             &[("n", "count(*)")],
         )
         .unwrap();
@@ -238,7 +244,7 @@ fn rolling_needs_rows_in_order() {
     assert!(error.contains("went backwards"), "{error}");
 
     for (spec, message) in [("first(price)", "not `first`"), ("min(sym)", "number")] {
-        let Err(error) = input.rolling(&[], Window::Rows(2), &[("x", spec)]) else {
+        let Err(error) = input.rolling(&[], &Window::Rows(2), &[("x", spec)]) else {
             panic!("{spec} should be rejected");
         };
         assert!(error.to_string().contains(message), "{spec}: {error}");
@@ -252,7 +258,7 @@ fn rolling_std_stays_accurate_as_values_move_away() {
     let session = Session::new();
     let input = session.input_table(&schema()).unwrap();
     let rolled = input
-        .rolling(&[], Window::Rows(3), &[("vol", "std(price)")])
+        .rolling(&[], &Window::Rows(3), &[("vol", "std(price)")])
         .unwrap();
     let prices: Vec<f64> = std::iter::once(0.0)
         .chain((1..50).map(|k| 1e8 + 0.1 * k as f64))
@@ -315,13 +321,13 @@ fn parallel_rolling_matches_cycle_by_cycle_rolling() {
     let windows = [
         Window::Rows(50),
         Window::Time {
-            at: "ts",
+            at: "ts".into(),
             span: 300,
         },
     ];
     let rolled: Vec<Table> = windows
         .iter()
-        .map(|w| ticking.rolling(&["sym"], *w, AGGREGATIONS).unwrap())
+        .map(|w| ticking.rolling(&["sym"], w, AGGREGATIONS).unwrap())
         .collect();
     for batch in &batches {
         ticking.append(std::slice::from_ref(batch)).unwrap();
@@ -330,7 +336,7 @@ fn parallel_rolling_matches_cycle_by_cycle_rolling() {
     let all = concat_batches(&Arc::new(schema()), &batches).unwrap();
     let fixed = session.static_table(Arc::new(schema()), vec![all]).unwrap();
     for (window, table) in windows.iter().zip(&rolled) {
-        let at_once = fixed.rolling(&["sym"], *window, AGGREGATIONS).unwrap();
+        let at_once = fixed.rolling(&["sym"], window, AGGREGATIONS).unwrap();
         assert_eq!(rows(table), rows(&at_once), "{window:?}");
     }
 }

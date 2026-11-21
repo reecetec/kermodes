@@ -17,7 +17,7 @@ ClickBench's conversions: byte columns as strings, `EventDate` (days) as a date,
 Each engine loads the data into its own storage once, reused by later runs (`--reload` loads it
 again): Kermodes into the history of a store's `bench.hits`, a `write_history` per date, sorted
 by ClickHouse's key for the table (`CounterID, UserID, EventTime, WatchID`; its date is
-history's); DuckDB into a database file. Kermodes reads it as `hist.bench.hits`. Each query runs
+history's); DuckDB into a database file. Kermodes reads it as `bench.hits`. Each query runs
 three times; the best is reported.
 
 Each engine runs in its own process. A result is right if every row of it is in DuckDB's result
@@ -123,11 +123,7 @@ def kermodes(files: list[Path], wanted: list[int], reload: bool) -> dict:
     db = km.connect(store, manual=True)
 
     def query(q: str) -> pa.Table:
-        result = pa.table(db.sql(re.sub(r"\bFROM hits\b", "FROM hist.bench.hits", q)))
-        # History adds each row's `Date`, which `hits` lacks: `SELECT *` has it first.
-        return (
-            result.drop_columns(["Date"]) if "Date" in result.column_names else result
-        )
+        return pa.table(db.sql(re.sub(r"\bFROM hits\b", "FROM bench.hits", q)))
 
     return run(wanted, load, query)
 

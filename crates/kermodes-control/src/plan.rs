@@ -93,6 +93,18 @@ pub fn merges_due(
     due
 }
 
+/// The environment a process reaching the lake needs: `KERMODES_LAKE` and the S3 endpoint; the
+/// keys come from the lake's Secret (`envFrom`).
+fn lake_env(lake: &Lake) -> Value {
+    json!([
+        {"name": "PYTHONDONTWRITEBYTECODE", "value": "1"},
+        {"name": "KERMODES_LAKE", "value": lake.url},
+        {"name": "AWS_ENDPOINT", "value": lake.endpoint},
+        {"name": "AWS_ALLOW_HTTP", "value": lake.endpoint.starts_with("http://").to_string()},
+        {"name": "AWS_REGION", "value": "us-east-1"},
+    ])
+}
+
 /// The Job that merges `date` of `table` from weir into the lake: `kermodes merge`, against weir
 /// over Flight, writing to the lake's bucket with that bucket's credentials alone.
 pub fn merge_job(
@@ -107,13 +119,7 @@ pub fn merge_job(
         "name": "merge",
         "image": image,
         "args": ["merge", table, date.to_string(), "--server", weir],
-        "env": [
-            {"name": "PYTHONDONTWRITEBYTECODE", "value": "1"},
-            {"name": "KERMODES_LAKE", "value": lake.url},
-            {"name": "AWS_ENDPOINT", "value": lake.endpoint},
-            {"name": "AWS_ALLOW_HTTP", "value": lake.endpoint.starts_with("http://").to_string()},
-            {"name": "AWS_REGION", "value": "us-east-1"},
-        ],
+        "env": lake_env(lake),
         "envFrom": [{"secretRef": {"name": lake.secret}}],
         // A merge streams the date through: a 1.5 GB day took 6 s and little memory.
         "resources": {
@@ -190,6 +196,8 @@ pub struct Target {
     /// runs it on the platform's Python alone.
     pub environment: Option<String>,
     pub pull_secrets: Vec<String>,
+    /// The lake: a run's stored tables are all their rows, merged history included (§5.3).
+    pub lake: Option<Lake>,
 }
 
 /// What to do with a resource when its project's mainline is at `synced`.
@@ -305,6 +313,10 @@ pub fn deployment(target: &Target, resource: &Resource, name: &str, stopped: boo
         ],
         "securityContext": container_security(),
     });
+    if let Some(lake) = &target.lake {
+        run["env"] = lake_env(lake);
+        run["envFrom"] = json!([{"secretRef": {"name": lake.secret}}]);
+    }
     let mut init = vec![snapshot(target)];
     on_environment(target, &mut init, &mut run);
     let mut spec = pod(target, init, vec![run], "Always");
@@ -1160,6 +1172,7 @@ mod tests {
             app_builds: "http://kermodes-control:8732/builds".into(),
             environment: None,
             pull_secrets: vec!["pull".into()],
+            lake: None,
         }
     }
 
@@ -1847,6 +1860,47 @@ mod tests {
             environment_key(&hashed, "registry/kermodes:0.4.1"),
             environment_key(&hashed, "registry/kermodes:0.4.2")
         );
+    }
+
+    /// A run's stored tables are all their rows (§5.3): with a lake, its run reaches it as a
+    /// merge Job does; without one, it has no lake keys at all.
+    #[test]
+    fn a_run_reaches_the_lake_when_there_is_one() {
+        let ticks = resource("ticks", Update::Auto, Rollout::Rolling);
+        let lake = Lake {
+            url: "s3://kermodes-lake".into(),
+            endpoint: "http://minio:9000".into(),
+            secret: "kermodes-lake".into(),
+        };
+        let on = Target {
+            lake: Some(lake),
+            ..target("a")
+        };
+        let pod = deployment(&on, &ticks, "ticker-ticks", false)
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap();
+        let run = &pod.containers[0];
+        let env: BTreeMap<String, String> = run
+            .env
+            .clone()
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.name, e.value.unwrap_or_default()))
+            .collect();
+        assert_eq!(env["KERMODES_LAKE"], "s3://kermodes-lake");
+        let secret = run.env_from.clone().unwrap()[0].secret_ref.clone().unwrap();
+        assert_eq!(secret.name, "kermodes-lake");
+
+        let without = deployment(&target("a"), &ticks, "ticker-ticks", false)
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap();
+        assert!(without.containers[0].env_from.is_none());
     }
 
     #[test]

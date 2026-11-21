@@ -23,6 +23,7 @@ use std::fmt;
 use std::path::Path;
 
 pub use catalog::{Garbage, HistoryCommit, HistoryDate, HistoryFile, TableEntry};
+pub use keyed::Fold;
 pub use names::{Date, SourceId, TableName};
 pub use partition::Stamp;
 pub use pending::{Answer, IN_FLIGHT_BYTES, InFlight, Pending};

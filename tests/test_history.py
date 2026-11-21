@@ -29,18 +29,19 @@ def store_with_past_days(path):
     return km.connect(path, manual=True)
 
 
-def rows(table: pa.Table) -> list[tuple]:
-    return sorted(zip(*(table[c].to_pylist() for c in ["Date", "sym", "px"])))
+def rows(table) -> list[tuple]:
+    t = pa.table(table)
+    return sorted(zip(t["sym"].to_pylist(), t["px"].to_pylist(), strict=True))
 
 
 def expected(keep) -> list[tuple]:
-    """The oracle: every day's rows as `(Date, sym, px)`, those `keep` keeps."""
-    every = [
-        (date.fromisoformat(day), sym, px)
+    """The oracle: every day's rows as `(sym, px)`, those `keep(day, sym, px)` keeps."""
+    return sorted(
+        (sym, px)
         for day, c in DAYS.items()
-        for sym, px in zip(c["sym"], c["px"])
-    ]
-    return sorted(row for row in every if keep(*row))
+        for sym, px in zip(c["sym"], c["px"], strict=True)
+        if keep(date.fromisoformat(day), sym, px)
+    )
 
 
 def test_past_days_merge_into_history_and_read_back_like_pyarrow(tmp_path):
@@ -54,24 +55,19 @@ def test_past_days_merge_into_history_and_read_back_like_pyarrow(tmp_path):
     assert s.merge_history("md.ticks", "2026-11-02")["replaced"] == 1
     # Again: nothing left in weir to move.
     assert s.merge_history("md.ticks", "2026-11-01")["rows"] == 0
-    history = s.historical_table("md.ticks")
+    ticks = s.table("md.ticks")
 
-    second = history.where("Date = '2026-11-02' and px > 1")
-    assert rows(pa.table(second)) == expected(
-        lambda day, sym, px: day == date(2026, 11, 2) and px > 1
-    )
-    # 2026-11-03 is not merged yet: it comes from weir, so history has no gap.
-    assert rows(pa.table(history.table())) == expected(lambda day, sym, px: px > 0)
-    assert rows(pa.table(history.where("sym = 'a'"))) == expected(
-        lambda day, sym, px: sym == "a"
-    )
+    # One table: the merged file, and 2026-11-03 from weir, so history has no gap.
+    assert pa.table(ticks).column_names == ["sym", "px"]
+    assert rows(ticks) == expected(lambda *_: True)
+    assert rows(ticks.where("sym = 'a'")) == expected(lambda day, sym, px: sym == "a")
 
-    # Read only from the catalog and the files' footers.
-    assert history.explain("Date = '2026-11-02'").startswith(
-        "md.ticks 2026-11-02 to 2026-11-02: 1 of 1 files, 1 of 2 row groups, "
-    )
-    whole = history.explain()
-    assert "2 of 2 row groups" in whole and "1 date from weir" in whole
+    # A filter reaches the files: the 11-01 row group's prices rule it out.
+    high = ticks.where("px > 3.5")
+    assert rows(high) == expected(lambda day, sym, px: px > 3.5)
+    plan = high.explain()
+    assert "scan md.ticks where px > 3.5" in plan
+    assert "1 of 1 files, 1 of 2 row groups" in plan and "1 date from weir" in plan
 
 
 def test_today_is_not_history_yet(tmp_path):
@@ -81,7 +77,7 @@ def test_today_is_not_history_yet(tmp_path):
     with pytest.raises(km.KermodesError, match="still being written"):
         s.merge_history("md.ticks", today)
     with pytest.raises(km.KermodesError, match="no table"):
-        s.historical_table("md.nope")
+        s.table("md.nope")
 
 
 def test_a_batch_job_writes_past_days_straight_into_history(tmp_path):
@@ -91,19 +87,16 @@ def test_a_batch_job_writes_past_days_straight_into_history(tmp_path):
         # Columns by name, in any order.
         given = pa.table({"px": columns["px"], "sym": columns["sym"]})
         assert s.write_history("md.ticks", day, given)["rows"] == len(columns["px"])
-    history = s.historical_table("md.ticks")
-    assert rows(pa.table(history.table())) == expected(lambda day, sym, px: True)
-    assert "from weir" not in history.explain()
-    # Written again, a day holds the new rows in place of the old.
+    ticks = s.table("md.ticks")
+    assert rows(ticks) == expected(lambda *_: True)
+    assert "not merged yet" not in ticks.explain()
+    # Written again, a day holds the new rows in place of the old; a static table reads the
+    # data as it is when used.
     s.write_history("md.ticks", "2026-11-02", pa.table({"sym": ["z"], "px": [9.0]}))
-    assert rows(pa.table(history.where("Date = '2026-11-02'"))) == [
-        (date(2026, 11, 2), "z", 9.0)
-    ]
-    # SQL over the dates it wrote reads them as merged history: static.
-    by_sym = s.sql(
-        "SELECT sym, count(*) AS n FROM md.ticks "
-        "WHERE Date >= '2026-11-01' AND Date <= '2026-11-03' GROUP BY sym ORDER BY sym"
+    assert rows(ticks) == sorted(
+        expected(lambda day, *_: day != date(2026, 11, 2)) + [("z", 9.0)]
     )
+    by_sym = s.sql("SELECT sym, count(*) AS n FROM md.ticks GROUP BY sym ORDER BY sym")
     assert not by_sym.is_refreshing
     assert pa.table(by_sym).to_pylist() == [
         {"sym": "a", "n": 2},
@@ -118,25 +111,28 @@ def test_a_batch_job_writes_past_days_straight_into_history(tmp_path):
         s.write_history("md.ticks", "2026-11-04", pa.table({"sym": ["a"], "px": [1]}))
 
 
-def test_a_stored_table_is_its_history_then_today_ticking(tmp_path):
+def test_a_stored_table_is_its_history_and_today_static_or_ticking(tmp_path):
     s = store_with_past_days(tmp_path)
     s.merge_history("md.ticks", "2026-11-01")  # 11-02 and 11-03 stay in weir, unmerged
     w = s.writer("md.ticks", source="feed")
     w.write(pa.table({"sym": ["d", "e"], "px": [7.0, 0.1]}))
-    today = datetime.now(UTC).date()
-    ticks = s.table("md.ticks")
-    rich = ticks.where("Date >= '2026-11-02' and px > 1")
+    want = expected(lambda day, sym, px: px > 1)
+
+    rich = s.live_table("md.ticks").where("px > 1")
+    # A live table starts when first used: history at once, today's rows at a manual
+    # session's next step.
+    assert rows(rich) == want
     s.step()
-    want = expected(lambda day, sym, px: day >= date(2026, 11, 2) and px > 1)
-    assert rows(pa.table(rich)) == sorted(want + [(today, "d", 7.0)])
-    # Today ticks.
+    assert rows(rich) == sorted(want + [("d", 7.0)])
     w.write(pa.table({"sym": ["f"], "px": [8.0]}))
     s.step()
-    assert rows(pa.table(rich)) == sorted(want + [(today, "d", 7.0), (today, "f", 8.0)])
-    # A range that ends before today reads history alone.
-    past = ticks.where("Date <= '2026-11-02' and Date >= '2026-11-01'")
-    assert rows(pa.table(past)) == expected(lambda day, *_: day <= date(2026, 11, 2))
-    plan = ticks.explain("Date >= '2026-11-02'")
-    assert "2026-11-02 to" in plan and "ticking from weir" in plan
-    with pytest.raises(ValueError, match="say which dates"):
-        ticks.where("px > 1")
+    assert rows(rich) == sorted(want + [("d", 7.0), ("f", 8.0)])
+    plan = rich.explain()
+    assert "ticking  scan md.ticks where px > 1" in plan and "then ticking" in plan
+
+    # Static: the same rows as they are when used, no step needed.
+    static = s.table("md.ticks").where("px > 1")
+    assert not static.is_refreshing
+    assert rows(static) == sorted(want + [("d", 7.0), ("f", 8.0)])
+    w.write(pa.table({"sym": ["g"], "px": [9.0]}))
+    assert rows(static) == sorted(want + [("d", 7.0), ("f", 8.0), ("g", 9.0)])

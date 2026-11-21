@@ -28,6 +28,8 @@ def test_keyed_tables_hold_each_keys_latest_row(tmp_path):
     w = s.writer("md.quotes", source="feed")
     assert w.upsert(quotes([("a", 1.0), ("b", 2.0)]))
     live = s.live_table("md.quotes")
+    # A live table starts when first used; a manual session loads it at its next step.
+    assert len(live) == 0
     w.upsert(quotes([("a", 10.0), ("c", 3.0)]))
     # A delete needs only the key.
     w.delete(pa.table({"sym": ["b"]}))
@@ -38,9 +40,7 @@ def test_keyed_tables_hold_each_keys_latest_row(tmp_path):
 
     del s, w, live
     s = km.connect(tmp_path, manual=True)
-    reopened = s.live_table("md.quotes")
-    s.step()
-    assert as_dict(reopened) == {"a": 10.0, "c": 3.0}
+    assert as_dict(s.table("md.quotes")) == {"a": 10.0, "c": 3.0}
 
 
 def until_equal(s, reader, table) -> None:

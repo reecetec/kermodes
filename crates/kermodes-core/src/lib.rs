@@ -10,6 +10,7 @@ mod join;
 mod ops;
 mod order;
 mod parallel;
+pub mod plan;
 pub mod replay;
 mod rolling;
 pub mod series;

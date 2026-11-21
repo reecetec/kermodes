@@ -2,25 +2,26 @@
 
 mod publish;
 mod replay;
-mod sql;
 mod stored;
+mod table;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use arrow::array::{Array, ArrayIterator, ArrayRef, AsArray, RecordBatch, StructArray};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit, TimestampNanosecondType};
+use arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
+use arrow::datatypes::{DataType, Schema, TimeUnit, TimestampNanosecondType};
 use arrow::error::ArrowError;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyCapsule, PyDict};
+use pyo3::types::{PyBytes, PyDict};
 use pyo3_arrow::error::PyArrowError;
-use pyo3_arrow::ffi::to_stream_pycapsule;
 use pyo3_arrow::input::AnyRecordBatch;
+use stored::Stores;
+use table::Table;
 
 /// mimalloc for every allocation the engine makes. It keeps freed memory for reuse only briefly
 /// and returns what stays idle to the OS, where the system allocators keep large freed blocks
@@ -88,8 +89,8 @@ impl Key {
 pub struct Session {
     engine: kermodes_core::Session,
     tables: Option<Tables>,
-    /// Where history's files are, opened on first use (`Session::lake`).
-    lake: OnceLock<Arc<kermodes_lake::Lake>>,
+    /// Where history's files are, opened on first use (`Stores::lake`).
+    lake: Arc<OnceLock<Arc<kermodes_lake::Lake>>>,
 }
 
 /// Where a session's stored tables are: a store this process owns, or a server's.
@@ -229,12 +230,6 @@ impl Tables {
                 Fed::Log(entry) => kermodes_lake::with_op(entry, batch.clone(), stamp.change)
                     .map_err(|e| e.to_string())
                     .and_then(|logged| rows.append(&[logged]).map_err(|e| e.to_string())),
-                Fed::Dated(schema) => {
-                    let date = kermodes_weir::Date::of_ns(stamp.ingest_ns);
-                    kermodes_lake::dated(schema, date, batch)
-                        .map_err(|e| e.to_string())
-                        .and_then(|dated| rows.append(&[dated]).map_err(|e| e.to_string()))
-                }
             };
             fed.unwrap_or_else(|e| {
                 rows.fail(e);
@@ -272,6 +267,102 @@ impl Tables {
         }
     }
 
+    /// Today's rows of the stored table `entry` as they stand now, read once: an append
+    /// table's rows committed today (at least the first `limit`, where `Some`), or a keyed
+    /// table's latest row per key; and the day weir stamped them on, if any came. Read before
+    /// history, which then ends the day before, so a day that turns between the two reads is
+    /// neither missed nor read twice.
+    fn today(
+        &self,
+        entry: &kermodes_weir::TableEntry,
+        limit: Option<usize>,
+    ) -> Result<(Option<kermodes_weir::Date>, Vec<RecordBatch>), kermodes_weir::Error> {
+        struct Read {
+            fold: Option<kermodes_weir::Fold>,
+            batches: Vec<RecordBatch>,
+            rows: usize,
+            day: Option<kermodes_weir::Date>,
+            done: bool,
+            failed: Option<kermodes_weir::Error>,
+        }
+        let fold = (!entry.key.is_empty())
+            .then(|| kermodes_weir::Fold::new(&entry.schema, &entry.key))
+            .transpose()?;
+        let read = Arc::new(Mutex::new(Read {
+            fold,
+            batches: Vec::new(),
+            rows: 0,
+            day: None,
+            done: false,
+            failed: None,
+        }));
+        // Told when the replay of today is over: caught up, enough rows, or failed.
+        let (over, replayed) = std::sync::mpsc::channel::<Result<(), String>>();
+        let taking = (read.clone(), over.clone());
+        let subscriber: kermodes_weir::Subscriber = Box::new(move |batch, stamp, _| {
+            let (read, over) = &taking;
+            let mut read = read.lock().unwrap_or_else(|e| e.into_inner());
+            if read.done {
+                return false;
+            }
+            read.day
+                .get_or_insert(kermodes_weir::Date::of_ns(stamp.ingest_ns));
+            let applied = match read.fold.as_mut() {
+                Some(fold) => fold.apply(batch.clone(), stamp.change),
+                None => {
+                    read.rows += batch.num_rows();
+                    read.batches.push(batch.clone());
+                    Ok(())
+                }
+            };
+            let enough = limit.is_some_and(|limit| read.rows >= limit);
+            if let Err(e) = applied {
+                read.failed = Some(e);
+            }
+            if enough || read.failed.is_some() {
+                read.done = true;
+                let _ = over.send(Ok(()));
+                return false;
+            }
+            true
+        });
+        let name = &entry.name;
+        match self {
+            // The replay is done when it returns.
+            Tables::Local(store) => {
+                store.subscribe(name, subscriber, Box::new(|_| {}))?;
+            }
+            Tables::Remote(client) => {
+                let lost = over.clone();
+                client.subscribe(
+                    name,
+                    subscriber,
+                    Box::new(move || {
+                        let _ = over.send(Ok(()));
+                    }),
+                    Box::new(move |reason| {
+                        let _ = lost.send(Err(reason));
+                    }),
+                    !entry.key.is_empty(),
+                )?;
+                replayed
+                    .recv()
+                    .unwrap_or(Ok(()))
+                    .map_err(kermodes_weir::Error::Io)?;
+            }
+        }
+        let mut read = read.lock().unwrap_or_else(|e| e.into_inner());
+        read.done = true;
+        if let Some(failed) = read.failed.take() {
+            return Err(failed);
+        }
+        let rows = match read.fold.take() {
+            Some(fold) => vec![fold.state()?],
+            None => std::mem::take(&mut read.batches),
+        };
+        Ok((read.day, rows))
+    }
+
     fn writer(
         &self,
         name: &kermodes_weir::TableName,
@@ -288,13 +379,11 @@ impl Tables {
 }
 
 /// How a fed table takes a stored table's changes: as the table they make (`live_table`; a
-/// keyed table's latest row per key), as their log, each row with its kind as history keeps it
-/// (`changes`), or as an append table's rows with the `Date` they arrived on, as history has
-/// them (`table`; the schema is history's, `Date` first).
+/// keyed table's latest row per key), or as their log, each row with its kind as history keeps
+/// it (`changes`).
 enum Fed {
     State { keyed: bool },
     Log(kermodes_weir::TableEntry),
-    Dated(arrow::datatypes::SchemaRef),
 }
 
 enum SourceWriter {
@@ -357,7 +446,7 @@ impl Session {
         Ok(Self {
             engine: kermodes_core::Session::new(),
             tables,
-            lake: OnceLock::new(),
+            lake: Arc::new(OnceLock::new()),
         })
     }
 
@@ -380,7 +469,7 @@ impl Session {
                 self.engine.keyed_input_table(&schema, &names)
             }
         });
-        Ok(Table(table.map_err(engine_error)?))
+        Ok(Table::built(table.map_err(engine_error)?))
     }
 
     /// A table that never changes, from any Arrow table or record batch.
@@ -389,7 +478,7 @@ impl Session {
         let table = py
             .detach(|| self.engine.static_table(schema, batches))
             .map_err(engine_error)?;
-        Ok(Table(table))
+        Ok(Table::built(table))
     }
 
     /// Runs one cycle and returns its number.
@@ -528,22 +617,22 @@ impl Session {
         Ok(Writer(writer))
     }
 
-    /// The stored table `name` across its history and today, a `StoredTable`: nothing is read
-    /// until `where` says which dates.
-    fn table(&self, py: Python<'_>, name: &str) -> PyResult<stored::StoredTable> {
-        py.detach(|| self.stored_table(name))
+    /// The stored table `name`, static: all its rows, the lake's files and weir's tail as one, as
+    /// they are each time the table is used. Nothing is read until then, and only what its
+    /// operators need: their filters and columns reach the files.
+    fn table(&self, py: Python<'_>, name: &str) -> PyResult<Table> {
+        table::stored_table(py, &self.engine, self.stores()?, name, false)
     }
 
-    /// The stored table `name`'s history (architecture.md §8), a `HistoricalTable`: nothing is
-    /// read until it is used, so `where` can read only the dates it asks for.
-    fn historical_table(&self, py: Python<'_>, name: &str) -> PyResult<HistoricalTable> {
-        py.detach(|| self.historical(name))
+    /// The stored table `name`, ticking: all its rows, then every change as it is written. Its
+    /// operators' filters and columns reach the files, as `table`'s do.
+    fn live_table(&self, py: Python<'_>, name: &str) -> PyResult<Table> {
+        table::stored_table(py, &self.engine, self.stores()?, name, true)
     }
 
-    /// The result of the SQL `query` (architecture.md §9.8), a `Table` that ticks when a table
-    /// it reads ticks. Its tables are stored tables by name (`ns.table` across history and
-    /// today, its `WHERE` saying which dates; `live.ns.table`; `hist.ns.table`), and tables
-    /// passed by keyword, under that name: `db.sql("SELECT ... FROM board", board=board)`.
+    /// The SQL `query`'s table (architecture.md §9.8), static: its names are stored tables
+    /// (`ns.table`, all their rows), or tables passed by keyword under that name, as in
+    /// `con.sql("SELECT ... FROM board", board=board)`. It ticks only if a table passed ticks.
     #[pyo3(signature = (query, **tables))]
     fn sql(
         &self,
@@ -551,19 +640,19 @@ impl Session {
         query: &str,
         tables: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Table> {
-        sql::query(self, py, query, tables).map(Table)
+        table::sql(py, &self.engine, self.stores().ok(), query, tables, false)
     }
 
-    /// How `sql(query)` would run, without reading anything: the engine's operators, each
-    /// static or ticking, and what each stored table read would read of history.
+    /// The SQL `query`'s table, ticking: as `sql`, its stored tables read as `live_table` reads
+    /// them.
     #[pyo3(signature = (query, **tables))]
-    fn explain(
+    fn live_sql(
         &self,
         py: Python<'_>,
         query: &str,
         tables: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<String> {
-        sql::explain(self, py, query, tables)
+    ) -> PyResult<Table> {
+        table::sql(py, &self.engine, self.stores().ok(), query, tables, true)
     }
 
     /// A replay of the stored tables' past dates `first` to `last` (`YYYY-MM-DD`, before
@@ -637,12 +726,6 @@ impl Session {
         Ok(out)
     }
 
-    /// The stored table `name`, ticking: every row written so far, then each batch as it is
-    /// written. Its rows come only from its writers. A keyed table holds each key's latest row.
-    fn live_table(&self, py: Python<'_>, name: &str) -> PyResult<Table> {
-        py.detach(|| self.live(name)).map(Table)
-    }
-
     /// The stored keyed table `name`'s changes as they happen, ticking: its state as of its
     /// latest checkpoint (`checkpoint` rows), then each upsert and delete. `Op` says which, as
     /// in the table's history.
@@ -666,7 +749,7 @@ impl Session {
                 .map_err(store_error)?;
             Ok(table)
         })?;
-        Ok(Table(table))
+        Ok(Table::built(table))
     }
 
     /// Publishes `table` as the keyed stored table `name` (created if needed), one row per value
@@ -687,12 +770,13 @@ impl Session {
         if key.is_empty() {
             return Err(PyValueError::new_err("publish needs key columns"));
         }
+        let table = table.table(py)?;
         py.detach(|| {
             tables
-                .create_table(&name, table.0.schema(), &key, &[])
+                .create_table(&name, table.schema(), &key, &[])
                 .map_err(store_error)?;
             let writer = tables.writer(&name, &source, false).map_err(store_error)?;
-            publish::publish(&table.0, writer, &key).map_err(engine_error)
+            publish::publish(&table, writer, &key).map_err(engine_error)
         })
     }
 
@@ -769,38 +853,6 @@ impl Session {
 }
 
 impl Session {
-    fn stored_table(&self, name: &str) -> PyResult<stored::StoredTable> {
-        let tables = self.stored()?.clone();
-        let name = kermodes_weir::TableName::parse(name).map_err(store_error)?;
-        let entry = tables.entry(&name).map_err(store_error)?;
-        Ok(stored::StoredTable {
-            engine: self.engine.clone(),
-            tables,
-            lake: self.lake().map_err(|e| e.to_string()),
-            entry,
-        })
-    }
-
-    fn historical(&self, name: &str) -> PyResult<HistoricalTable> {
-        let tables = self.stored()?.clone();
-        let name = kermodes_weir::TableName::parse(name).map_err(store_error)?;
-        tables.entry(&name).map_err(store_error)?;
-        Ok(HistoricalTable {
-            engine: self.engine.clone(),
-            tables,
-            lake: self.lake()?,
-            name,
-        })
-    }
-
-    fn live(&self, name: &str) -> PyResult<kermodes_core::Table> {
-        match open_live(&self.engine, self.stored()?, name) {
-            Ok(table) => Ok(table),
-            Err(OpenError::Store(e)) => Err(store_error(e)),
-            Err(OpenError::Engine(e)) => Err(engine_error(e)),
-        }
-    }
-
     fn stored(&self) -> PyResult<&Tables> {
         self.tables.as_ref().ok_or_else(|| {
             KermodesError::new_err(
@@ -810,126 +862,16 @@ impl Session {
         })
     }
 
-    /// The lake, history's files: at `KERMODES_LAKE` (`s3://bucket/prefix` in the cluster), or
-    /// in `lake` beside a store this process owns.
+    fn stores(&self) -> PyResult<Stores> {
+        Ok(Stores {
+            tables: self.stored()?.clone(),
+            lake: self.lake.clone(),
+        })
+    }
+
+    /// The lake, history's files (`Stores::lake`).
     fn lake(&self) -> PyResult<Arc<kermodes_lake::Lake>> {
-        if let Some(lake) = self.lake.get() {
-            return Ok(lake.clone());
-        }
-        let url = match (std::env::var("KERMODES_LAKE").ok(), self.stored()?) {
-            (Some(url), _) => url,
-            (None, Tables::Local(store)) => store.root().join("lake").display().to_string(),
-            (None, Tables::Remote(_)) => {
-                return Err(KermodesError::new_err(
-                    "history is in the lake in object storage: set KERMODES_LAKE to where \
-                     (s3://bucket/prefix)",
-                ));
-            }
-        };
-        let lake = Arc::new(kermodes_lake::Lake::open(&url).map_err(store_error)?);
-        Ok(self.lake.get_or_init(|| lake).clone())
-    }
-}
-
-/// A stored table's history (`Session.historical_table`): nothing is read until it is used.
-#[pyclass(module = "kermodes", name = "HistoricalTable", frozen)]
-pub struct HistoricalTable {
-    engine: kermodes_core::Session,
-    tables: Tables,
-    lake: Arc<kermodes_lake::Lake>,
-    name: kermodes_weir::TableName,
-}
-
-#[pymethods]
-impl HistoricalTable {
-    /// Rows for which `predicate` is true. Its `and`-ed comparisons of `Date` with a date
-    /// (`Date = '2026-11-12'`, `Date >= '2026-11-01'`) choose the dates read: only their files,
-    /// and in those only their row groups; its comparisons of other columns with values
-    /// (`sym = 'AAPL'`) skip the row groups and pages whose statistics rule them out.
-    #[pyo3(name = "where")]
-    fn where_(&self, py: Python<'_>, predicate: &str) -> PyResult<Table> {
-        py.detach(|| self.rows(Some(predicate), None)).map(Table)
-    }
-
-    /// All of it.
-    fn table(&self, py: Python<'_>) -> PyResult<Table> {
-        py.detach(|| self.rows(None, None)).map(Table)
-    }
-
-    /// What `where(predicate)`, or `table()` without one, would read: files, row groups, rows,
-    /// columns, and bytes, from the catalog and the files' footers and page indexes alone.
-    #[pyo3(signature = (predicate=None))]
-    fn explain(&self, py: Python<'_>, predicate: Option<&str>) -> PyResult<String> {
-        py.detach(|| self.describe(predicate, None))
-    }
-}
-
-impl HistoricalTable {
-    /// The rows for which `predicate` is true, all of them without one: only the dates, files,
-    /// row groups, and pages its bounds allow are read, and only `columns` (all if `None`).
-    pub(crate) fn rows(
-        &self,
-        predicate: Option<&str>,
-        columns: Option<&[String]>,
-    ) -> PyResult<kermodes_core::Table> {
-        let Some(predicate) = predicate else {
-            return self.read(None, None, &[], columns);
-        };
-        let (first, last) = kermodes_lake::date_bounds(predicate);
-        let bounds = kermodes_lake::column_bounds(predicate);
-        self.read(first, last, &bounds, columns)?
-            .filter(predicate)
-            .map_err(engine_error)
-    }
-
-    /// What `rows(predicate, columns)` would read.
-    pub(crate) fn describe(
-        &self,
-        predicate: Option<&str>,
-        columns: Option<&[String]>,
-    ) -> PyResult<String> {
-        let (first, last) = predicate.map_or((None, None), kermodes_lake::date_bounds);
-        let bounds = predicate.map_or_else(Vec::new, kermodes_lake::column_bounds);
-        let explain = kermodes_lake::explain_history(
-            self.tables.weir(),
-            &self.lake,
-            &self.name,
-            first,
-            last,
-            &bounds,
-            columns,
-        )
-        .map_err(store_error)?;
-        let bound =
-            |date: Option<kermodes_weir::Date>| date.map_or("…".into(), |d| d.to_string());
-        Ok(format!(
-            "{} {} to {}: {explain}",
-            self.name,
-            bound(first),
-            bound(last)
-        ))
-    }
-
-    fn read(
-        &self,
-        first: Option<kermodes_weir::Date>,
-        last: Option<kermodes_weir::Date>,
-        bounds: &[kermodes_lake::Bound],
-        columns: Option<&[String]>,
-    ) -> PyResult<kermodes_core::Table> {
-        let history = kermodes_lake::read_history(
-            self.tables.weir(),
-            &self.lake,
-            &self.name,
-            first,
-            last,
-            bounds,
-            columns,
-        )
-        .map_err(store_error)?;
-        self.engine
-            .static_table(history.schema, history.batches)
-            .map_err(engine_error)
+        self.stores()?.lake()
     }
 }
 
@@ -1375,16 +1317,18 @@ impl Server {
     }
 
     /// Shows `table` in the web UI as `name`, replacing any table of that name.
-    fn publish(&self, py: Python<'_>, name: &str, table: PyRef<'_, Table>) {
-        let table = &table.0;
-        py.detach(|| self.lock().publish(name, table));
+    fn publish(&self, py: Python<'_>, name: &str, table: PyRef<'_, Table>) -> PyResult<()> {
+        let table = table.table(py)?;
+        py.detach(|| self.lock().publish(name, &table));
+        Ok(())
     }
 
     /// Serves `table` as the view `name` for a page of the app's own (the Deployments tab),
     /// without listing it among the published tables.
-    fn publish_view(&self, py: Python<'_>, name: &str, table: PyRef<'_, Table>) {
-        let table = &table.0;
-        py.detach(|| self.lock().publish_view(name, table));
+    fn publish_view(&self, py: Python<'_>, name: &str, table: PyRef<'_, Table>) -> PyResult<()> {
+        let table = table.table(py)?;
+        py.detach(|| self.lock().publish_view(name, &table));
+        Ok(())
     }
 
     /// Removes `name` from the web UI; whether it was published.
@@ -1443,323 +1387,6 @@ fn parse_period(text: &str) -> PyResult<Duration> {
              not {text:?}"
         ))
     })
-}
-
-/// A rolling time span: a period for timestamps, or a number in the `at` column's units.
-#[derive(FromPyObject)]
-enum Span {
-    Period(String),
-    Units(i64),
-}
-
-/// A table: static, or ticking with the session's cycles. It lives while Python refers to it or
-/// a live table is computed from it; weak references (the notebook view's) don't count.
-///
-/// Every method that reaches the session releases the interpreter first. A cycle can free rows
-/// that Python owns (inputs are imported without copying), which takes the interpreter while
-/// the cycle holds the session; waiting for the session while holding the interpreter would
-/// deadlock.
-#[pyclass(module = "kermodes", name = "Table", frozen, weakref)]
-pub struct Table(kermodes_core::Table);
-
-#[pymethods]
-impl Table {
-    /// Column names and type names.
-    #[getter]
-    fn columns(&self) -> Vec<(String, String)> {
-        self.0
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| (f.name().clone(), kermodes_core::type_name(f.data_type())))
-            .collect()
-    }
-
-    #[getter]
-    fn is_refreshing(&self, py: Python<'_>) -> bool {
-        py.detach(|| self.0.is_refreshing())
-    }
-
-    /// Queues rows for the next cycle, from any Arrow table or record batch.
-    fn append(&self, py: Python<'_>, data: AnyRecordBatch) -> PyResult<()> {
-        let (_, batches) = read_batches(data)?;
-        py.detach(|| self.0.append(&batches)).map_err(engine_error)
-    }
-
-    /// Queues rows that replace the row with the same key, or add one. Keyed tables only.
-    fn upsert(&self, py: Python<'_>, data: AnyRecordBatch) -> PyResult<()> {
-        let (_, batches) = read_batches(data)?;
-        py.detach(|| self.0.upsert(&batches)).map_err(engine_error)
-    }
-
-    /// Queues removal of the rows with these keys; `data` holds only the key columns.
-    fn delete(&self, py: Python<'_>, data: AnyRecordBatch) -> PyResult<()> {
-        let (_, batches) = read_batches(data)?;
-        py.detach(|| self.0.delete(&batches)).map_err(engine_error)
-    }
-
-    /// Rows for which `predicate` is true; NULL counts as false.
-    #[pyo3(name = "where")]
-    fn where_(&self, py: Python<'_>, predicate: &str) -> PyResult<Table> {
-        let table = py
-            .detach(|| self.0.filter(predicate))
-            .map_err(engine_error)?;
-        Ok(Table(table))
-    }
-
-    /// Only the listed columns, in that order: each an existing column's name or
-    /// `name = expression`, as in `update`.
-    #[pyo3(signature = (*columns))]
-    fn select(&self, py: Python<'_>, columns: Vec<String>) -> PyResult<Table> {
-        let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
-        let table = py
-            .detach(|| self.0.select(&columns))
-            .map_err(engine_error)?;
-        Ok(Table(table))
-    }
-
-    /// Adds or replaces columns, each given as `name = expression`.
-    #[pyo3(signature = (*assignments))]
-    fn update(&self, py: Python<'_>, assignments: Vec<String>) -> PyResult<Table> {
-        let assignments: Vec<&str> = assignments.iter().map(String::as_str).collect();
-        let table = py
-            .detach(|| self.0.update(&assignments))
-            .map_err(engine_error)?;
-        Ok(Table(table))
-    }
-
-    /// The last row, in arrival order, for each value of `columns`.
-    #[pyo3(signature = (*columns))]
-    fn last_by(&self, py: Python<'_>, columns: Vec<String>) -> PyResult<Table> {
-        let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
-        let table = py
-            .detach(|| self.0.last_by(&columns))
-            .map_err(engine_error)?;
-        Ok(Table(table))
-    }
-
-    /// The first `n` rows in key order (arrival order for appended rows), kept current.
-    fn head(&self, py: Python<'_>, n: usize) -> PyResult<Table> {
-        let table = py.detach(|| self.0.head(n)).map_err(engine_error)?;
-        Ok(Table(table))
-    }
-
-    /// The last `n` rows in key order (the newest, for appended rows), kept current.
-    fn tail(&self, py: Python<'_>, n: usize) -> PyResult<Table> {
-        let table = py.detach(|| self.0.tail(n)).map_err(engine_error)?;
-        Ok(Table(table))
-    }
-
-    /// The rows at positions `start..stop` in reading order (key order, or a ticking sort's), as
-    /// pandas `iloc[start:stop]`, kept current as rows come and go anywhere.
-    fn slice(&self, py: Python<'_>, start: usize, stop: usize) -> PyResult<Table> {
-        let table = py
-            .detach(|| self.0.slice(start, stop))
-            .map_err(engine_error)?;
-        Ok(Table(table))
-    }
-
-    /// Rows ordered by `by`, each `"name"` or `"name desc"`, earlier entries first. NULL sorts as
-    /// the largest value; ties keep the input's order. A ticking table's sort keeps its rows in
-    /// that order for reading; nothing but `slice` can be built on it.
-    #[pyo3(signature = (*by))]
-    fn sort(&self, py: Python<'_>, by: Vec<String>) -> PyResult<Table> {
-        let by: Vec<&str> = by.iter().map(String::as_str).collect();
-        let table = py.detach(|| self.0.sort(&by)).map_err(engine_error)?;
-        Ok(Table(table))
-    }
-
-    /// Each row with columns from the `right` row whose `on` columns hold the same values, or
-    /// NULLs; a key with more than one right row fails the table. `on` and `joins` entries are
-    /// `"name"` or `"left=right"` (`"new=old"` for `joins`); `joins` defaults to every right
-    /// column not in `on`.
-    #[pyo3(signature = (right, on, joins=None))]
-    fn natural_join(
-        &self,
-        py: Python<'_>,
-        right: &Table,
-        on: Key,
-        joins: Option<Vec<String>>,
-    ) -> PyResult<Table> {
-        let on = on.names();
-        let on: Vec<&str> = on.iter().map(String::as_str).collect();
-        let joins: Option<Vec<&str>> = joins
-            .as_ref()
-            .map(|j| j.iter().map(String::as_str).collect());
-        let table = py
-            .detach(|| self.0.natural_join(&right.0, &on, joins.as_deref()))
-            .map_err(engine_error)?;
-        Ok(Table(table))
-    }
-
-    /// Each row with columns from the `right` row whose `on` columns match and whose `at` time
-    /// is the latest not after this row's (the last to arrive among equal times), or NULLs.
-    /// `right` must only gain rows. `at` is `"name"` or `"left=right"`; `joins` defaults to
-    /// every right column not in `on` or `at`.
-    #[pyo3(signature = (right, on, at, joins=None))]
-    fn as_of_join(
-        &self,
-        py: Python<'_>,
-        right: &Table,
-        on: Key,
-        at: &str,
-        joins: Option<Vec<String>>,
-    ) -> PyResult<Table> {
-        let on = on.names();
-        let on: Vec<&str> = on.iter().map(String::as_str).collect();
-        let joins: Option<Vec<&str>> = joins
-            .as_ref()
-            .map(|j| j.iter().map(String::as_str).collect());
-        let table = py
-            .detach(|| self.0.as_of_join(&right.0, &on, at, joins.as_deref()))
-            .map_err(engine_error)?;
-        Ok(Table(table))
-    }
-
-    /// One row per value of `columns`, with each `name="function(column)"` aggregation.
-    #[pyo3(signature = (*columns, **aggregations))]
-    fn agg_by(
-        &self,
-        py: Python<'_>,
-        columns: Vec<String>,
-        aggregations: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<Table> {
-        let mut specs: Vec<(String, String)> = Vec::new();
-        for (name, spec) in aggregations.into_iter().flat_map(|d| d.iter()) {
-            specs.push((name.extract()?, spec.extract()?));
-        }
-        let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
-        let specs: Vec<(&str, &str)> = specs
-            .iter()
-            .map(|(n, s)| (n.as_str(), s.as_str()))
-            .collect();
-        let table = py
-            .detach(|| self.0.agg_by(&columns, &specs))
-            .map_err(engine_error)?;
-        Ok(Table(table))
-    }
-
-    /// Each row with aggregates over a backward window of its group's rows (`by`; one group
-    /// without): the row and the `rows - 1` before it, or the rows whose `at` lies within
-    /// `time` before its own (`time` a period such as `"5m"` for timestamps, or a number in
-    /// `at`'s units). Each `name="function(column)"`: count, sum, mean, std, min, or max. The
-    /// table must only append rows.
-    #[pyo3(signature = (*by, rows=None, time=None, at=None, **aggregations))]
-    fn rolling(
-        &self,
-        py: Python<'_>,
-        by: Vec<String>,
-        rows: Option<usize>,
-        time: Option<Span>,
-        at: Option<String>,
-        aggregations: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<Table> {
-        let window = match (rows, time, &at) {
-            (Some(n), None, None) => kermodes_core::Window::Rows(n),
-            (None, Some(time), Some(at)) => kermodes_core::Window::Time {
-                at,
-                span: match time {
-                    Span::Period(text) => i64::try_from(parse_period(&text)?.as_nanos())
-                        .map_err(|_| PyValueError::new_err("rolling time span is too long"))?,
-                    Span::Units(units) => units,
-                },
-            },
-            _ => {
-                return Err(PyValueError::new_err(
-                    "rolling takes rows=n, or time= with at= naming the time column",
-                ));
-            }
-        };
-        let mut specs: Vec<(String, String)> = Vec::new();
-        for (name, spec) in aggregations.into_iter().flat_map(|d| d.iter()) {
-            specs.push((name.extract()?, spec.extract()?));
-        }
-        let by: Vec<&str> = by.iter().map(String::as_str).collect();
-        let specs: Vec<(&str, &str)> = specs
-            .iter()
-            .map(|(n, s)| (n.as_str(), s.as_str()))
-            .collect();
-        let table = py
-            .detach(|| self.0.rolling(&by, window, &specs))
-            .map_err(engine_error)?;
-        Ok(Table(table))
-    }
-
-    fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
-        py.detach(|| self.0.num_rows()).map_err(engine_error)
-    }
-
-    /// Exports a snapshot of the current rows through the Arrow PyCapsule interface.
-    #[pyo3(signature = (requested_schema=None))]
-    fn __arrow_c_stream__<'py>(
-        &self,
-        py: Python<'py>,
-        requested_schema: Option<Bound<'py, PyCapsule>>,
-    ) -> PyResult<Bound<'py, PyCapsule>> {
-        let batches = py.detach(|| self.0.snapshot()).map_err(engine_error)?;
-        let schema = self.0.schema();
-        let field = Field::new_struct("", schema.fields().clone(), false)
-            .with_metadata(schema.metadata().clone());
-        let arrays = batches
-            .into_iter()
-            .map(|batch| Ok(Arc::new(StructArray::from(batch)) as ArrayRef));
-        let reader = Box::new(ArrayIterator::new(arrays, Arc::new(field)));
-        Ok(to_stream_pycapsule(py, reader, requested_schema)?)
-    }
-
-    /// The cycle that last changed this table; live notebook views poll it.
-    #[getter]
-    fn _changed(&self, py: Python<'_>) -> u64 {
-        py.detach(|| self.0.changed())
-    }
-
-    /// Notebook display: the table viewer, ticking with the table (see `kermodes._live`).
-    fn _ipython_display_(slf: &Bound<'_, Self>) -> PyResult<()> {
-        slf.py()
-            .import("kermodes._live")?
-            .call_method1("show", (slf,))?;
-        Ok(())
-    }
-
-    /// The table as text, for a terminal and for an agent reading cell outputs: whether it
-    /// ticks, its row count, how it was built, its columns with their types, and its first rows;
-    /// or its error.
-    fn __repr__(&self, py: Python<'_>) -> String {
-        let (head, status, description) = py.detach(|| {
-            let status =
-                kermodes_core::viewer::Status::new(self.0.is_loading(), self.0.is_refreshing())
-                    .as_str();
-            (
-                self.0.rows_at(0, PREVIEW_ROWS),
-                status,
-                self.0.description(),
-            )
-        });
-        match head {
-            Ok(window) => {
-                let header = format!(
-                    "kermodes.Table · {status} · {}\n{description}",
-                    row_count(window.total)
-                );
-                preview_text(&window.rows, window.total, &header)
-                    .unwrap_or_else(|e| format!("{header}\n(its rows cannot be shown: {e})"))
-            }
-            Err(error) => format!("kermodes.Table · failed\n{description}\n{error}"),
-        }
-    }
-}
-
-/// Every row of every table, which need the same column names and types in the same order. Rows
-/// keep their table's order and tables follow one another; nothing is copied. Ticks if any table
-/// does.
-#[pyfunction]
-#[pyo3(signature = (*tables))]
-fn merge(py: Python<'_>, tables: Vec<PyRef<'_, Table>>) -> PyResult<Table> {
-    let tables: Vec<&kermodes_core::Table> = tables.iter().map(|t| &t.0).collect();
-    let table = py
-        .detach(|| kermodes_core::Table::merge(&tables))
-        .map_err(engine_error)?;
-    Ok(Table(table))
 }
 
 /// One open grid's server side (`kermodes_core::viewer`): `kermodes.notebook` carries its messages over
@@ -1848,11 +1475,11 @@ fn request(message: &Bound<'_, PyDict>) -> PyResult<Option<kermodes_core::viewer
 #[pymethods]
 impl Viewer {
     #[new]
-    fn new(py: Python<'_>, table: PyRef<'_, Table>) -> Self {
-        let table = &table.0;
-        Self(Mutex::new(
-            py.detach(|| kermodes_core::viewer::Viewer::new(table)),
-        ))
+    fn new(py: Python<'_>, table: PyRef<'_, Table>) -> PyResult<Self> {
+        let table = table.table(py)?;
+        Ok(Self(Mutex::new(
+            py.detach(|| kermodes_core::viewer::Viewer::new(&table)),
+        )))
     }
 
     /// Handles a grid message; returns the frame to send back, if any.
@@ -1925,9 +1552,8 @@ impl Viewer {
 mod _native {
     #[pymodule_export]
     use super::{
-        HistoricalTable, Ingest, IngestStats, Pending, Server, Session, StoreServer, Table, Ticker,
-        Viewer, Writer, control, merge, publish::Publication, replay::Replay, serve_replica,
-        stored::StoredTable, ticker,
+        Ingest, IngestStats, Pending, Server, Session, StoreServer, Table, Ticker, Viewer, Writer,
+        control, publish::Publication, replay::Replay, serve_replica, table::merge, ticker,
     };
 
     use pyo3::prelude::*;
