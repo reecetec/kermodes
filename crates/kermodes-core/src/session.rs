@@ -257,6 +257,9 @@ struct TableState {
     /// A fed table not yet given what its store held when it subscribed (`Feed::ready`): its
     /// writes wait, so it loads in one cycle rather than in pieces.
     loading: bool,
+    /// Ready (`Feed::ready`) with what its store held queued for the next cycle: still loading
+    /// to anyone looking, until that cycle applies it, so no view sees it current but empty.
+    catching_up: bool,
     /// Merge lanes its row keys take (`Lanes`): 1, unless its keys are a merge's or kept from
     /// one.
     lanes: RowKey,
@@ -910,6 +913,7 @@ impl Feed {
         let (ready, waiting): (Vec<_>, Vec<_>) = held.drain(..).partition(|(id, _)| *id == self.id);
         *held = waiting;
         drop(held);
+        graph.tables[self.id].catching_up = !ready.is_empty();
         session.pending().splice(0..0, ready);
         drop(graph);
         session.inner.arrived.notify_all();
@@ -1046,6 +1050,11 @@ impl Session {
     /// derived table in creation order. Returns the cycle number.
     pub fn step(&self) -> u64 {
         let mut graph = self.write();
+        // The cycle applies every write a ready table had held (they lead `pending`), and no
+        // one sees its rows until it ends, under this lock.
+        for table in &mut graph.tables {
+            table.catching_up = false;
+        }
         // Taken under the graph's lock, as `Feed::ready` moves held writes: no cycle runs a
         // table's later writes before its held ones.
         let pending = std::mem::take(&mut *self.pending());
@@ -1380,6 +1389,7 @@ impl TableState {
             },
             listeners: Vec::new(),
             loading: false,
+            catching_up: false,
             lanes: 1,
         }
     }
@@ -1609,13 +1619,14 @@ impl Table {
     }
 
     /// Whether it, or a table it is computed from, is a fed table still loading what its store
-    /// held (`Feed::ready`): its rows are not all there yet.
+    /// held (`Feed::ready`), or holding it for the cycle that applies it: its rows are not all
+    /// there yet.
     pub fn is_loading(&self) -> bool {
         let graph = self.session.read();
         let mut tables = vec![self.id];
         while let Some(id) = tables.pop() {
             let table = &graph.tables[id];
-            if table.loading {
+            if table.loading || table.catching_up {
                 return true;
             }
             tables.extend(table.source.parents());

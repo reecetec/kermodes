@@ -228,22 +228,24 @@ export function Chart({ table, x, y, where, points: budget, type = 'line', class
   }, []);
 
   // Loading and reconnecting look as a table's do: the same spinner in a pill, over faint
-  // placeholder bars before any points, or over the last points dimmed, so a chart that is not
-  // current never reads as an empty or a failed one.
+  // placeholder bars before any points, or over the points so far dimmed. A table still catching
+  // up with its store is loading even once points arrive, so its first, partial frames (none,
+  // for a table opened as weir replays its day) never read as empty or final.
   useEffect(() => injectGridStyles(host.current?.ownerDocument), []);
   const failed = series.status === 'failed';
-  const busy = failed ? null : series.status === 'reconnecting' ? 'Reconnecting' : points == null ? 'Loading' : null;
+  const busy =
+    series.status === 'reconnecting' ? 'Reconnecting' : series.status === 'loading' ? 'Loading' : null;
   const empty = failed ? 'This chart cannot be shown' : busy != null || drawable ? null : 'No rows';
   return (
     <div className={className} style={{ position: 'relative', width: '100%', height: '100%', ...style }}>
       <div ref={host} style={{ position: 'absolute', inset: 0 }} />
       {busy != null && (
         <div
-          className={points == null ? 'km-chart-loading' : 'km-chart-loading km-chart-dim'}
+          className={drawable ? 'km-chart-loading km-chart-dim' : 'km-chart-loading'}
           aria-busy="true"
           aria-label={busy}
         >
-          {points == null && (
+          {!drawable && (
             <div className="km-chart-skeleton" aria-hidden="true">
               {SKELETON_BARS.map((height, at) => (
                 // Fixed placeholders that never reorder

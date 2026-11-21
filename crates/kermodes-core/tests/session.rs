@@ -443,6 +443,10 @@ fn a_fed_table_loads_whole_once_ready() {
     );
 
     feed.ready();
+    assert!(
+        fed.is_loading() && downstream.is_loading() && sizes(&downstream).is_empty(),
+        "ready, but its rows wait for the next cycle: never current and empty meanwhile"
+    );
     let cycle = session.step();
     assert!(!fed.is_loading() && !downstream.is_loading());
     assert_eq!(sizes(&downstream), [1, 2]);
@@ -450,6 +454,13 @@ fn a_fed_table_loads_whole_once_ready() {
     feed.append(&[rows(&["c"], &[3])]).unwrap();
     session.step();
     assert_eq!(sizes(&downstream), [1, 2, 3]);
+
+    let (empty, feed) = session.fed_table(&schema(), "live md.trades").unwrap();
+    feed.ready();
+    assert!(
+        !empty.is_loading(),
+        "a store that held nothing: current at once"
+    );
 
     let (lost, feed) = session.fed_table(&schema(), "live md.quotes").unwrap();
     feed.fail("the store closed the stream".into());
