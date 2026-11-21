@@ -306,6 +306,11 @@ workloads) and comparison scripts under `bench/`, all reading the same seeded da
   per cycle, plus a notebook-style static burst every 50 cycles) for `--minutes`, memory every
   30 s. Memory that keeps growing while data does not is allocator fragmentation; run it on
   Linux (glibc) as well as macOS.
+- `clickbench.py`: ClickBench's 43 queries over its `hits` table, in Kermodes and DuckDB: which
+  run, each one's time, and whether Kermodes's results are right, DuckDB's being the oracle (rows
+  tied on the `ORDER BY` may come in any order). `--files N` takes the first N of its 100 files
+  of about 1M rows. Data and queries are downloaded from a pinned ClickBench commit (CC BY-NC-SA,
+  so not checked in).
 
 Python comparisons need a release build of Kermodes (`maturin develop --release`); `uv sync` builds
 a faster-to-compile profile. Numbers go in commit messages with the machine; nothing is checked in
@@ -320,6 +325,7 @@ Targets (release build, on the development laptop):
 | Keyed order book (`kermodes-bench book`): 1M orders over 100 symbols, 100k upserts and deletes per cycle, through `agg_by(sym)` (`count`, `sum`, `mean`, `std`); the same in Deephaven (`bench/deephaven_book.py`) | Cycle time ≤ Deephaven's |
 | Static `agg_by` over 100M rows, 10k `int64` groups, `sum`/`mean`/`std` of a `float64` | Within 2× of Polars `group_by` on the same data |
 | `import kermodes; km.connect(":memory:")` | < 100 ms |
+| ClickBench (`clickbench.py --files 100`): 43 queries over 100M rows, each engine's data loaded | Every result right; geometric mean within 1.5× of DuckDB, no query beyond 3× |
 
 ## 11. Code layout for M0
 
