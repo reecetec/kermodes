@@ -43,6 +43,7 @@ jobs:
       # The toolchain rust-toolchain.toml names.
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
 
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
@@ -50,10 +51,12 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      # Dependencies (arrow's kernels above all) optimised: the engine's oracle tests run in half
-      # the time.
+      # nextest runs every test in its own process, all at once, rather than one test binary
+      # after another; doctests are cargo's alone.
       - name: Run Rust tests
-        run: cargo test --workspace --locked --config 'profile.dev.package."*".opt-level=3'
+        run: |
+          cargo nextest run --workspace --locked --no-fail-fast
+          cargo test --workspace --locked --doc
 
       - name: Check for a second arrow-rs major
         run: |

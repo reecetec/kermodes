@@ -31,9 +31,15 @@ kermodes-lake = { path = "crates/kermodes-lake" }
 kermodes-weir = { path = "crates/kermodes-weir" }
 
 # Line tables are enough for backtraces; full debug info makes compiles, links, and target/ far
-# larger. CI optimises dependencies for its test run (ci.yaml); locally they stay quick to build.
+# larger.
 [profile.dev]
 debug = "line-tables-only"
+
+# Dependencies (arrow's and parquet's kernels above all) optimised in every dev and test build:
+# compiled once and cached, they make the engine's randomized oracle tests about four times
+# faster, while the workspace's own crates stay quick to rebuild.
+[profile.dev.package."*"]
+opt-level = 3
 
 # Editable Python builds (uv sync): optimised enough to use the engine, fast to rebuild.
 [profile.dev-py]
