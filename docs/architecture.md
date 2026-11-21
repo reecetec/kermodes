@@ -278,9 +278,12 @@ con.sql("SELECT ... FROM book", book=my_table)  # an in-memory table, by keyword
   preview: its first rows and only the columns shown; `pa.table(t)`, `len(t)`, iteration, or a
   ticking table built on it reads all of it), so filters and the columns used reach the files
   (§8.4) whichever API wrote them, and `live_table("md.ticks").where("sym = 'AAPL'")` reads only
-  `AAPL`'s rows of history. Operators check columns and types when called, against the schema
-  the catalog knows, so mistakes show at once; only the work waits. `t.explain()` shows the plan
-  and what it will read.
+  `AAPL`'s rows of history and, as weir delivers each batch, takes only `AAPL`'s: an append
+  table's rows never change, so its filter and columns apply as rows arrive and the live table
+  holds the rows that pass, once. (A keyed table's filter ticks, since an upsert can move a key
+  out of it.) Operators check columns and types when called, against the schema the catalog
+  knows, so mistakes show at once; only the work waits. `t.explain()` shows the plan and what it
+  will read.
 - **Two engines, one plan.** A static table runs on the static executor; a live table on the
   ticking engine. Users choose static or ticking, never an engine.
 - **Programs publish tables, and published tables are tables**: a feature view or a strategy's

@@ -227,6 +227,14 @@ impl Tables {
                     }
                     .map_err(|e| e.to_string())
                 }
+                Fed::Rows(door) => door
+                    .admit(batch)
+                    .map_err(|e| e.to_string())
+                    .and_then(|kept| match kept {
+                        Some(kept) => rows.append(&[kept]).map_err(|e| e.to_string()),
+                        // Nothing admitted: the table goes on following.
+                        None => Ok(true),
+                    }),
                 Fed::Log(entry) => kermodes_lake::with_op(entry, batch.clone(), stamp.change)
                     .map_err(|e| e.to_string())
                     .and_then(|logged| rows.append(&[logged]).map_err(|e| e.to_string())),
@@ -379,10 +387,11 @@ impl Tables {
 }
 
 /// How a fed table takes a stored table's changes: as the table they make (`live_table`; a
-/// keyed table's latest row per key), or as their log, each row with its kind as history keeps
-/// it (`changes`).
+/// keyed table's latest row per key), as an append table's rows admitted at the door (`Door`),
+/// or as their log, each row with its kind as history keeps it (`changes`).
 enum Fed {
     State { keyed: bool },
+    Rows(stored::Door),
     Log(kermodes_weir::TableEntry),
 }
 

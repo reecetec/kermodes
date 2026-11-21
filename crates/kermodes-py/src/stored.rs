@@ -4,9 +4,10 @@
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arrow::array::{RecordBatch, RecordBatchOptions, UInt64Array};
-use arrow::compute::take;
+use arrow::array::{Array, AsArray, RecordBatch, RecordBatchOptions, UInt64Array};
+use arrow::compute::{filter_record_batch, prep_null_mask_filter, take};
 use arrow::datatypes::{Schema, SchemaRef};
+use arrow::error::ArrowError;
 use kermodes_core::plan::Scan;
 use kermodes_weir::{Date, TableEntry, TableName};
 use pyo3::prelude::*;
@@ -54,25 +55,80 @@ pub(crate) fn live_rows(
     scan: &Scan,
 ) -> PyResult<kermodes_core::Table> {
     let entry = stores.entry(&scan.name)?;
-    let table = if entry.key.is_empty() {
-        let last = Date::from_days(Date::of_ns(now_ns()).days() - 1);
-        let history = history(engine, stores, &entry, scan, last)?;
-        let today = fed(engine, &stores.tables, &entry)?;
-        let names: Vec<&str> = history
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().as_str())
-            .collect();
-        let today = today.select(&names).map_err(engine_error)?;
-        kermodes_core::Table::merge(&[&history, &today]).map_err(engine_error)?
-    } else {
-        // A keyed table's rows are its keys' latest values; its history is its log.
-        fed(engine, &stores.tables, &entry)?
-    };
-    match &scan.predicate {
-        Some(predicate) => table.filter(predicate).map_err(engine_error),
-        None => Ok(table),
+    if !entry.key.is_empty() {
+        // A keyed table's rows are its keys' latest values, and an upsert can move a key out
+        // of the predicate, which only a ticking `where` turns into the key's removal.
+        let table = fed(engine, &stores.tables, &entry)?;
+        return match &scan.predicate {
+            Some(predicate) => table.filter(predicate).map_err(engine_error),
+            None => Ok(table),
+        };
+    }
+    let last = Date::from_days(Date::of_ns(now_ns()).days() - 1);
+    let (schema, history) = history_batches(stores, &entry, scan, last)?;
+    let door = Door::new(&entry, schema.clone(), scan.predicate.as_deref())?;
+    let mut kept = Vec::new();
+    for batch in history {
+        if let Some(batch) = door.keep(batch).map_err(arrow_error)? {
+            kept.push(batch);
+        }
+    }
+    let today = fed_rows(engine, &stores.tables, &entry, door)?;
+    if kept.is_empty() {
+        return Ok(today);
+    }
+    let history = engine.static_table(schema, kept).map_err(engine_error)?;
+    kermodes_core::Table::merge(&[&history, &today]).map_err(engine_error)
+}
+
+/// What of a stored append table's rows a live table takes: its scan's columns, and the rows its
+/// predicate keeps, applied to each batch as it arrives (history's, then weir's), so rows the
+/// predicate drops never enter the engine and no `where` keeps a copy of the rows it passes. An
+/// append table's rows never change once written, so filtering them on arrival is the same as
+/// filtering the table.
+pub(crate) struct Door {
+    /// The scan's columns, by position in the stored table's
+    columns: Vec<usize>,
+    schema: SchemaRef,
+    /// Bound to `schema`
+    predicate: Option<kermodes_core::Expression>,
+}
+
+impl Door {
+    fn new(entry: &TableEntry, schema: SchemaRef, predicate: Option<&str>) -> PyResult<Self> {
+        let predicate = predicate
+            .map(|text| kermodes_core::Expression::predicate(text, &schema))
+            .transpose()
+            .map_err(engine_error)?;
+        Ok(Self {
+            columns: positions(&entry.schema, &schema)?,
+            schema,
+            predicate,
+        })
+    }
+
+    /// A batch weir delivers, in the stored table's columns: the rows the live table takes, or
+    /// `None` when it takes none.
+    pub(crate) fn admit(&self, batch: &RecordBatch) -> Result<Option<RecordBatch>, ArrowError> {
+        self.keep(project(batch, &self.schema, &self.columns)?)
+    }
+
+    /// A batch already in the scan's columns: the rows the predicate keeps (NULL as false).
+    fn keep(&self, batch: RecordBatch) -> Result<Option<RecordBatch>, ArrowError> {
+        let kept = match &self.predicate {
+            None => batch,
+            Some(predicate) => {
+                let mask = predicate.evaluate(&batch)?;
+                let mask = mask.as_boolean();
+                // NULL counts as false; the kernel that says so wants a mask with NULLs.
+                if mask.null_count() > 0 {
+                    filter_record_batch(&batch, &prep_null_mask_filter(mask))?
+                } else {
+                    filter_record_batch(&batch, mask)?
+                }
+            }
+        };
+        Ok((kept.num_rows() > 0).then_some(kept))
     }
 }
 
@@ -255,15 +311,14 @@ pub(crate) fn shadow(
     .map_err(engine_error)
 }
 
-/// History up to `last`, read now, as a static table without `Date`: the start of a ticking
-/// scan's rows.
-fn history(
-    engine: &kermodes_core::Session,
+/// History up to `last`, read now, without `Date`: the start of a ticking scan's rows, in the
+/// scan's columns (all the predicate reads among them).
+fn history_batches(
     stores: &Stores,
     entry: &TableEntry,
     scan: &Scan,
     last: Date,
-) -> PyResult<kermodes_core::Table> {
+) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
     let bounds = scan
         .predicate
         .as_deref()
@@ -291,7 +346,7 @@ fn history(
         .iter()
         .map(|batch| project(batch, &schema, &kept).map_err(arrow_error))
         .collect::<PyResult<Vec<_>>>()?;
-    engine.static_table(schema, batches).map_err(engine_error)
+    Ok((schema, batches))
 }
 
 /// Where each of `wanted`'s columns is in `schema`, by name.
@@ -315,29 +370,36 @@ fn project(
     RecordBatch::try_new_with_options(schema.clone(), kept, &options)
 }
 
-/// The stored table, ticking from weir: today's rows, then each change as it is written; a
-/// keyed table's latest row per key.
+/// The keyed stored table, ticking from weir: each key's latest row, then each change as it is
+/// written.
 fn fed(
     engine: &kermodes_core::Session,
     tables: &Tables,
     entry: &TableEntry,
 ) -> PyResult<kermodes_core::Table> {
-    let description = format!("live {}", entry.name);
     let key: Vec<&str> = entry.key.iter().map(String::as_str).collect();
-    let (table, feed) = if key.is_empty() {
-        engine.fed_table(&entry.schema, &description)
-    } else {
-        engine.fed_keyed_table(&entry.schema, &key, &description)
-    }
-    .map_err(engine_error)?;
+    let (table, feed) = engine
+        .fed_keyed_table(&entry.schema, &key, &format!("live {}", entry.name))
+        .map_err(engine_error)?;
     tables
-        .feed(
-            &entry.name,
-            feed,
-            Fed::State {
-                keyed: !key.is_empty(),
-            },
-        )
+        .feed(&entry.name, feed, Fed::State { keyed: true })
+        .map_err(store_error)?;
+    Ok(table)
+}
+
+/// The append stored table, ticking from weir: today's rows the door admits, then each batch
+/// written, admitted as it arrives.
+fn fed_rows(
+    engine: &kermodes_core::Session,
+    tables: &Tables,
+    entry: &TableEntry,
+    door: Door,
+) -> PyResult<kermodes_core::Table> {
+    let (table, feed) = engine
+        .fed_table(&door.schema, &format!("live {}", entry.name))
+        .map_err(engine_error)?;
+    tables
+        .feed(&entry.name, feed, Fed::Rows(door))
         .map_err(store_error)?;
     Ok(table)
 }
