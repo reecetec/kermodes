@@ -1770,7 +1770,8 @@ namespaces).
   retries, backing off, until weir is back and the table opens afresh. A `kermodes run` started
   while weir is away waits for it too, so a program that lost weir restarts once rather than
   crash-looping.
-- Deployments, the home page wherever a controller runs (the Kermodes brand opens it), as
+- Deployments, the first tab and the page at `/` wherever a controller runs (Catalog and Tables
+  are at `/catalog` and `/tables`; elsewhere `/` shows Tables), as
   Deephaven's query monitor lists persistent queries: `kermodes ui` serves `sys.deployments`'
   newest row per deployment as the view `deployments`, which the app opens for this tab and does
   not list among Tables. One dense table: name, project, kind, status as a filled cell coloured

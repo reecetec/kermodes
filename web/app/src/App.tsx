@@ -17,7 +17,6 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip';
-import { Logo } from '@/components/Logo';
 import { cn } from '@/lib/utils';
 import { TABLE_MIME, TablesWorkspace, type WorkspaceHandle } from '@/tables/Workspace';
 
@@ -32,6 +31,33 @@ const PAGE_LABEL: Record<Page, string> = {
   catalog: 'Catalog',
   tables: 'Tables',
 };
+
+/** Each page's address, so a page can be linked, reloaded, and reached with Back */
+const PAGE_PATH: Record<Page, string> = {
+  deployments: '/',
+  catalog: '/catalog',
+  tables: '/tables',
+};
+
+function pageAt(path: string): Page {
+  const trimmed = path.replace(/\/+$/, '') || '/';
+  return (Object.keys(PAGE_PATH) as Page[]).find(page => PAGE_PATH[page] === trimmed) ?? 'deployments';
+}
+
+/** The page the address names, and a way to go to another that adds it to the history */
+function useRoute(): [Page, (page: Page) => void] {
+  const [route, setRoute] = useState(() => pageAt(location.pathname));
+  useEffect(() => {
+    const moved = () => setRoute(pageAt(location.pathname));
+    window.addEventListener('popstate', moved);
+    return () => window.removeEventListener('popstate', moved);
+  }, []);
+  const go = useCallback((page: Page) => {
+    if (location.pathname !== PAGE_PATH[page]) history.pushState(null, '', PAGE_PATH[page]);
+    setRoute(page);
+  }, []);
+  return [route, go];
+}
 
 /** Re-render when the connection's status, tables, or last error change */
 function useConnection(connection: KermodesConnection): void {
@@ -152,7 +178,6 @@ function TopBar({
   page,
   onPage,
   pages,
-  home,
 }: {
   connection: KermodesConnection;
   themeName: ThemeName;
@@ -160,26 +185,10 @@ function TopBar({
   page: Page;
   onPage: (page: Page) => void;
   pages: readonly Page[];
-  /** The home page the brand opens: Deployments wherever a controller runs, else Tables */
-  home: Page;
 }) {
   const apps = useApps();
   return (
     <header className="flex h-12 shrink-0 items-center gap-3 border-b bg-sidebar px-4">
-      <button
-        type="button"
-        onClick={() => onPage(home)}
-        aria-current={page === home ? 'page' : undefined}
-        title={PAGE_LABEL[home]}
-        className={cn(
-          '-ml-2 flex h-8 items-center gap-2 rounded-md px-2 hover:bg-accent',
-          // Deployments has no tab of its own: the brand is its tab. Tables has one, which shows it.
-          page === home && !pages.includes(home) && 'bg-secondary'
-        )}
-      >
-        <Logo className="size-6" />
-        <span className="text-[15px] font-semibold tracking-tight">Kermodes</span>
-      </button>
       <nav className="flex items-center gap-1">
         {pages.map(name => (
           <Button
@@ -316,14 +325,20 @@ export default function App({ connection }: { connection: KermodesConnection }) 
   const workspace = useRef<WorkspaceHandle>(null);
   // The canvas draws with the tokens in effect on <html>; recomputed when the theme flips
   const theme = useMemo(() => gridThemeOf(document.documentElement), [themeName]);
-  // Deployments is the home page wherever a controller reports them, Tables elsewhere; it shows
-  // until someone picks a tab, and the brand goes back to it.
+  // Deployments is the first page wherever a controller reports them; elsewhere its address
+  // shows Tables.
   const hasDeployments = connection.pages.includes(DEPLOYMENTS_VIEW);
   const hasCatalog = useHasCatalog();
-  const pages: Page[] = [...(hasCatalog ? (['catalog'] as const) : []), 'tables'];
-  const home: Page = hasDeployments ? 'deployments' : 'tables';
-  const [picked, setPicked] = useState<Page | null>(null);
-  const page: Page = picked ?? home;
+  const pages: Page[] = [
+    ...(hasDeployments ? (['deployments'] as const) : []),
+    ...(hasCatalog ? (['catalog'] as const) : []),
+    'tables',
+  ];
+  const [route, go] = useRoute();
+  const page: Page = route === 'deployments' && !hasDeployments ? 'tables' : route;
+  useEffect(() => {
+    document.title = `${PAGE_LABEL[page]} · Kermodes`;
+  }, [page]);
 
   const openTable = useCallback((table: string) => workspace.current?.open(table), []);
 
@@ -335,16 +350,15 @@ export default function App({ connection }: { connection: KermodesConnection }) 
           themeName={themeName}
           onToggleTheme={toggleTheme}
           page={page}
-          onPage={setPicked}
+          onPage={go}
           pages={pages}
-          home={home}
         />
         {page === 'deployments' && <DeploymentsPage connection={connection} />}
         {page === 'catalog' && (
           <CatalogPage
             onOpen={table => {
               openTable(table);
-              setPicked('tables');
+              go('tables');
             }}
           />
         )}
