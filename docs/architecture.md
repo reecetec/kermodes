@@ -17,11 +17,11 @@ Columbia's Great Bear Rainforest. pandas, then Polars, then Kermodes: `import ke
 
 ## 1. Thesis
 
-**A table is a timeline.** Every `namespace.table` has one schema and is reachable as:
-
-- `db.live_table(ns, t)` — intraday, append-only, ticking.
-- `db.historical_table(ns, t)` — merged days in the lake, static.
-- `db.table(ns, t)` — both, routed by `Date`.
+**A table is a table.** Every `namespace.table` has one schema and one name, whether its rows
+are streamed through weir, synced by a batch job, or published by a program. A query reads a
+consistent snapshot of it, or follows it as it changes (§5.3). Where its rows physically sit,
+weir's tail or the lake's files, is the system's business: readers never split a table into a
+live and a historical part, and never name a storage partition.
 
 Everything else is a declarative object built on tables: feature views, models, jobs,
 ingesters, deployments. The same expression that builds a training set from history runs
@@ -72,16 +72,18 @@ Non-goals (for now)
 |---|---|---|
 | Feedhandler | Logger / Kafka ingester | Ingester (connector) |
 | Tickerplant + tplog | Data Import Server (DIS) | **weir** |
-| RDB | Worker reading intraday | Engine worker, `db.live_table` |
+| RDB | Worker reading intraday | Engine worker; `con.table(...).live()` reads weir's tail and the lake as one |
 | RTE / CEP, chained TP | Persistent query | Engine deployment publishing derived live tables back to weir |
 | `.u.end` end-of-day writedown | Merge + validate | Daily merge job |
-| HDB (splayed, date-partitioned, mmap) | Historical (DH format / Parquet) | Parquet + Kermodes catalog, `db.historical_table` |
-| Gateway | Query routing | `db.table` + query router |
+| HDB (splayed, date-partitioned, mmap) | Historical (DH format / Parquet) | Parquet + Kermodes catalog; the same `con.table(...)` |
+| Gateway | Query routing | None needed: one table, one name (§5.3) |
 | q scripts on disk | Git-integrated persistent query scripts | Project repositories + deployment pipeline (§11) |
 
 Lessons taken from kdb+: keep the ingest hop dumb (append, log, publish — no queries); historical
-speed comes from layout (sort by key within date, enumerated keys, parted attribute) more than
-from file format.
+speed comes from layout (sort by key, enumerated keys, parted attribute) more than from file
+format. Not taken: the RDB/HDB split as the user's model. Recent data in a log and old data in
+columnar files is the right physical design; making users hold, filter by date, and stitch two
+tables for one dataset is not, and assumes every dataset is a daily stream.
 
 ## 4. Components
 
@@ -195,13 +197,18 @@ reason in this section.
   nothing derives a path from a name.
 - Schemas are Arrow schemas with stable column IDs, versioned in the catalog. Live and historical
   share the schema history. Changes are planned operations (§5.4).
-- Column partition: `Date` (UTC, string `YYYY-MM-DD`), assigned from **ingest time**, not event
-  time. This makes a day's partition closable at a fixed wall-clock moment. Late events land in the
-  partition of the day they arrived.
+- Partitions are internal. A streamed table's rows are grouped by the UTC day they arrived
+  (§7.3, §8.1), so weir can hand a closed day to the lake at a fixed wall-clock moment; a batch
+  table's files are laid out by size and its sort key. Readers never see or name either (target;
+  today stored tables still carry a `Date` column, §8.4).
+- Each row's arrival time is the system column `_ingest_ts` (UTC, nanoseconds): left out of `*`
+  and of previews, selectable and filterable by name, for point-in-time queries ("what was known
+  at 10:31") and replay (target).
 - Internal partition: one per ingest source (`source_id`). Each internal partition has exactly one
   writer.
-- Event time is an optional designated column per table (`ts_column`), used by as-of joins,
-  windows, and replay.
+- Event time is the user's own columns (`ts`, `game_date`); a table may designate one
+  (`ts_column`) for as-of joins, windows, and replay. An optional sort key (`sort=["sym", "ts"]`)
+  orders rows within files so filters on it skip most pages.
 
 ### 5.2 Table kinds
 
@@ -218,20 +225,52 @@ mutable data (upserts, CDC, order books from a feed) goes to keyed tables; weir 
 as written and never mutates a row, so a keyed table's history is its log of changes.
 `changes(name)` is that log for today, ticking: the latest checkpoint, then each change after it.
 
+How a table is written is a property of the table, not of its readers (target):
+
+- **Streamed** through weir by sources holding leases, exactly once (§6, §7): ticks, quotes,
+  CDC, a program's published output. Rows reach the lake at the daily handoff (§8.3).
+- **Batch**, straight to the lake in one catalog commit each: a daily sync of NHL box scores, a
+  vendor file, a backfill, a correction. A batch write says what it means, never which day:
+  append rows; upsert or delete by key (a keyed table: a corrected game replaces its rows); or
+  replace the rows where a predicate holds (`season = 2025`). `write_history(table, date, data)`
+  (§8.3) is the step this replaces.
+
 ### 5.3 Access API
 
-```python
-db = km.connect()  # $KERMODES_URL, else kermodes dev; or a directory, or ":memory:"
+The target; §8.4 and §9.8 describe what runs today (`db.live_table`, `db.historical_table`,
+`db.table`, `hist.`/`live.` names), which this replaces.
 
-odds = db.live_table("sports.odds")  # unmerged intraday partitions, ticking
-hist = db.historical_table("sports.odds")  # merged dates, static
-full = db.table("sports.odds")  # historical ∪ live, disjoint by Date
+```python
+con = km.connect()  # $KERMODES_URL, else kermodes dev; or a directory, or ":memory:"
+
+ticks = con.table("md.ticks")  # a reference: nothing is read
+ticks  # in a notebook: its first rows, and its row count where the catalog knows it
+aapl = ticks.where("sym = 'AAPL' and ts >= '2026-11-01'").select("ts", "px")  # still a plan
+aapl.collect()  # static: the rows now
+aapl.live()  # the rows now, then every change after: ticking
+
+con.sql("SELECT season, avg(goals) FROM nhl.box_scores GROUP BY season")  # a plan, the same kind
+con.sql("SELECT sym, count(*) FROM md.ticks GROUP BY sym").live()
+con.sql("SELECT ... FROM book", book=my_table)  # an in-memory table, by keyword
 ```
 
-`db.live_table` contains every intraday partition not yet merged; callers usually filter
-`.where("Date = today()")`. `db.table` partitions dates by catalog state: dates committed to the
-lake come from history, the rest from weir. When a merge commits, the date moves from live to
-historical at a cycle boundary; the rows are identical, so downstream sees no change.
+- **One reference per table.** `con.table(name)` and a name in `con.sql` read all of a table's
+  rows: the lake's files and weir's tail, as one. Filters choose rows, on any column; nothing
+  requires a date.
+- **Plans are lazy.** Operators on a stored table, and SQL, build one plan, so filters and the
+  columns used reach the files (§8.4) whichever API wrote them. A plan mixes stored tables with
+  in-memory ones (input tables, results). Showing a plan in a notebook runs a cheap preview (its
+  first rows, the columns shown, a `LIMIT`); nothing else reads until asked.
+- **Static unless asked to tick.** `collect()` gives the rows now, through the static executor;
+  `live()` gives the same rows now and then every change, through the ticking engine. A streamed
+  table ticks as rows arrive, a batch table when its next write commits, a published table as
+  its program publishes: one meaning whatever the source. A research query never becomes a
+  ticking table, holding memory and changing, unless it says so.
+- **Programs publish tables, and published tables are tables**: a feature view or a strategy's
+  signals is `con.table("features.momentum")`, with history, readable by SQL and by other
+  programs, live or not.
+- **Replay** runs the same program over history: every `live()` plan and program follows a
+  replay clock instead of the wall clock (§9.4).
 
 ### 5.4 Schema evolution
 
@@ -906,7 +945,9 @@ is only for live, sequenced, exactly-once ingestion.
 
 ### 8.4 Reading history
 
-The engine reads history itself, on its static operator path (§9.1).
+The engine reads history itself, on its static operator path (§9.1). This section describes the
+API as built; §5.3 is the target that replaces `historical_table`, `live_table`, `table`, and the
+`Date` column readers filter by.
 
 - `db.historical_table(...)` is static. Date predicates in its `where` are pushed down: the
   catalog returns only files whose date range overlaps them, the reader skips row groups by their
@@ -1057,6 +1098,8 @@ state at cycle time.
 ### 9.8 SQL
 
 SQL is a frontend onto the Kermodes plan, the way Deephaven's SQL compiles to its table operations.
+As built; §5.3's target makes a query static unless `.live()` asks it to tick, and drops the
+`hist.`/`live.` names and the date rule below.
 A query ticks when any input it reads ticks, and is static otherwise; the same SQL works over live
 data, history, or both.
 
