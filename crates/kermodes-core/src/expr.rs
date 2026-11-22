@@ -116,6 +116,76 @@ pub(crate) fn assignment_reads(text: &str) -> Option<(String, Vec<String>)> {
     Some((name.value, identifiers(&ast)))
 }
 
+/// An assignment `name = column ± integer` or `name = integer ± column`: the value is
+/// `constant + column`, or `constant - column` when `negated`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Affine {
+    pub name: String,
+    pub column: String,
+    pub constant: i64,
+    pub negated: bool,
+}
+
+/// `text` as an `Affine` assignment, if it is one; `None` for anything else.
+pub(crate) fn affine(text: &str) -> Option<Affine> {
+    let mut parser = parser(text).ok()?;
+    let name = parser.parse_identifier().ok()?;
+    parser.expect_token(&Token::Eq).ok()?;
+    let ast = parser.parse_expr().ok()?;
+    expect_end(text, &parser).ok()?;
+    let Ast::BinaryOp { left, op, right } = unnested(&ast) else {
+        return None;
+    };
+    let (column, constant, negated) = match (op, identifier_of(left), integer_of(right)) {
+        (BinaryOperator::Plus, Some(column), Some(c)) => (column, c, false),
+        (BinaryOperator::Minus, Some(column), Some(c)) => (column, c.checked_neg()?, false),
+        _ => match (op, integer_of(left), identifier_of(right)) {
+            (BinaryOperator::Plus, Some(c), Some(column)) => (column, c, false),
+            (BinaryOperator::Minus, Some(c), Some(column)) => (column, c, true),
+            _ => return None,
+        },
+    };
+    Some(Affine {
+        name: name.value,
+        column,
+        constant,
+        negated,
+    })
+}
+
+fn unnested(ast: &Ast) -> &Ast {
+    match ast {
+        Ast::Nested(inner) => unnested(inner),
+        other => other,
+    }
+}
+
+fn identifier_of(ast: &Ast) -> Option<String> {
+    match unnested(ast) {
+        Ast::Identifier(ident) => Some(ident.value.clone()),
+        _ => None,
+    }
+}
+
+/// An integer literal, signed or not.
+fn integer_of(ast: &Ast) -> Option<i64> {
+    match unnested(ast) {
+        Ast::Value(value) => match &value.value {
+            Literal::Number(digits, _) => digits.parse().ok(),
+            _ => None,
+        },
+        Ast::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => integer_of(expr)?.checked_neg(),
+        Ast::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => integer_of(expr),
+        _ => None,
+    }
+}
+
 fn identifiers(ast: &Ast) -> Vec<String> {
     let mut names = Vec::new();
     let _ = visit_expressions(ast, |expr| {

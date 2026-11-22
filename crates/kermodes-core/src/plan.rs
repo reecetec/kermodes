@@ -6,6 +6,9 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
+use arrow::datatypes::DataType;
+
+use crate::expr::Affine;
 use crate::session::Table;
 use crate::{Error, SortKey, Window, agg, expr};
 
@@ -321,6 +324,176 @@ impl Plan {
         self.push_limits();
         self.require(None);
         self
+    }
+
+    /// The plan with each `sum` of an integer column plus or minus an integer constant, computed
+    /// by an `update` right before an aggregation for `sum` alone, taken from that column's
+    /// `sum` and `count`: `sum(x + c)` is `sum(x) + c * count(x)` (NULLs skipped by both), so an
+    /// aggregation of many such sums reads the column once into two states instead of a column
+    /// and a sum per constant. Both engines run the plan this gives, so they agree; the one
+    /// difference from the plan as written is where an integer overflow can occur. `scan` gives
+    /// each scan's table, of which only the schema is read (an empty one is enough). A rewrite
+    /// is made only where its result has the plan's columns, in order, of the same types.
+    pub fn rewritten(
+        mut self,
+        scan: &mut dyn FnMut(&Scan) -> Result<Table, Error>,
+    ) -> Result<Plan, Error> {
+        for input in self.inputs_mut() {
+            let taken = std::mem::replace(input, Plan::Merge(Vec::new()));
+            *input = taken.rewritten(scan)?;
+        }
+        let Some(folded) = self.folded_sums(scan)? else {
+            return Ok(self);
+        };
+        let same = folded.build(scan)?.schema() == self.build(scan)?.schema();
+        Ok(if same { folded } else { self })
+    }
+
+    /// This aggregation with its sums of `x ± c` folded (`rewritten`), if it has any.
+    fn folded_sums(
+        &self,
+        scan: &mut dyn FnMut(&Scan) -> Result<Table, Error>,
+    ) -> Result<Option<Plan>, Error> {
+        let Plan::Agg {
+            input,
+            by,
+            aggregations,
+            aliases,
+        } = self
+        else {
+            return Ok(None);
+        };
+        let Plan::Update {
+            input: inner,
+            assignments,
+        } = input.as_ref()
+        else {
+            return Ok(None);
+        };
+        let schema = inner.build(scan)?.schema().clone();
+        let assigned: Vec<Option<(String, Vec<String>)>> = assignments
+            .iter()
+            .map(|text| expr::assignment_reads(text))
+            .collect();
+        let sum_alone = |name: &str| {
+            !by.iter().any(|key| key == name)
+                && aggregations.iter().all(|(_, spec)| {
+                    agg::reads(spec) != Some(name) || agg::function(spec).as_deref() == Some("sum")
+                })
+        };
+        let mut folded: Vec<(usize, Affine)> = Vec::new();
+        for (at, text) in assignments.iter().enumerate() {
+            let Some(affine) = expr::affine(text) else {
+                continue;
+            };
+            let integer = schema.field_with_name(&affine.column).is_ok_and(|field| {
+                matches!(
+                    field.data_type(),
+                    DataType::Int16 | DataType::Int32 | DataType::Int64
+                )
+            });
+            // The column as the update's input has it, the result read nowhere else (an
+            // assignment that does not parse may read anything), and both plain names.
+            let untouched = assigned
+                .iter()
+                .flatten()
+                .all(|(name, _)| *name != affine.column);
+            let unread = assigned.iter().enumerate().all(|(other, parsed)| {
+                other == at
+                    || parsed.as_ref().is_some_and(|(name, reads)| {
+                        *name != affine.name && !reads.contains(&affine.name)
+                    })
+            });
+            let plain = [&affine.name, &affine.column]
+                .iter()
+                .all(|name| !name.contains(['"', '=', '(', ')']));
+            if integer && untouched && unread && plain && sum_alone(&affine.name) {
+                folded.push((at, affine));
+            }
+        }
+        if folded.is_empty() {
+            return Ok(None);
+        }
+        let affine_of = |name: &str| folded.iter().map(|(_, a)| a).find(|a| a.name == name);
+        let mut taken: BTreeSet<String> = schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .chain(by.iter().cloned())
+            .chain(aggregations.iter().map(|(name, _)| name.clone()))
+            .collect();
+        let mut kept: Vec<(String, String)> = Vec::new();
+        let mut sums: Vec<(String, &Affine)> = Vec::new();
+        for (name, spec) in aggregations {
+            match agg::reads(spec).and_then(affine_of) {
+                Some(affine) if agg::function(spec).as_deref() == Some("sum") => {
+                    sums.push((name.clone(), affine));
+                }
+                _ => kept.push((name.clone(), spec.clone())),
+            }
+        }
+        // Each folded sum's `sum(x)` and `count(x)`, one of each per column, shared with an
+        // aggregation the plan already has.
+        let mut helper = |spec: String, kept: &mut Vec<(String, String)>| {
+            if let Some((name, _)) = kept.iter().find(|(_, s)| *s == spec) {
+                return name.clone();
+            }
+            let name = (0..)
+                .map(|n| format!("__r{n}"))
+                .find(|name| !taken.contains(name))
+                .expect("a free name");
+            taken.insert(name.clone());
+            kept.push((name.clone(), spec));
+            name
+        };
+        let quoted = |name: &str| format!("\"{name}\"");
+        let mut after = Vec::new();
+        for (name, affine) in sums {
+            let sum = quoted(&helper(format!("sum({})", affine.column), &mut kept));
+            let count = quoted(&helper(format!("count({})", affine.column), &mut kept));
+            let c = affine.constant;
+            after.push(if affine.negated {
+                format!("{} = {c} * {count} - {sum}", quoted(&name))
+            } else if c < 0 {
+                format!("{} = {sum} - {} * {count}", quoted(&name), c.unsigned_abs())
+            } else {
+                format!("{} = {sum} + {c} * {count}", quoted(&name))
+            });
+        }
+        let remaining: Vec<String> = assignments
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| !folded.iter().any(|(f, _)| f == at))
+            .map(|(_, text)| text.clone())
+            .collect();
+        let below = if remaining.is_empty() {
+            inner.as_ref().clone()
+        } else {
+            Plan::Update {
+                input: inner.clone(),
+                assignments: remaining,
+            }
+        };
+        let mut plan = Plan::Agg {
+            input: Box::new(below),
+            by: by.clone(),
+            aggregations: kept,
+            aliases: aliases.clone(),
+        };
+        if !after.is_empty() {
+            plan = Plan::Update {
+                input: Box::new(plan),
+                assignments: after,
+            };
+        }
+        Ok(Some(Plan::Select {
+            input: Box::new(plan),
+            columns: by
+                .iter()
+                .chain(aggregations.iter().map(|(name, _)| name))
+                .cloned()
+                .collect(),
+        }))
     }
 
     fn push_filters(&mut self) {

@@ -165,6 +165,12 @@ Delta { added: [(keys, rows)], removed: [(keys, last rows)], modified: [(keys, p
   (`kermodes_core::set_idle_hook`); while cycles run back to back, freed memory is reused instead.
   A process's footprint then follows the tables it holds, not its high-water mark.
 
+Before either engine runs a plan, `Plan::rewritten` takes a `sum` of an integer column plus or
+minus a constant, computed just for that sum, from the column's `sum` and `count`
+(`sum(x + c) = sum(x) + c * count(x)`), so many such sums read the column once. Both engines run
+the rewritten plan; the one difference from the plan as written is where an integer overflow can
+occur. SQL computes an expression that several aggregates read once.
+
 ### 4.1 Static executor
 
 - Input is a scan's `Source`: parts read independently, in the table's order (a run of a

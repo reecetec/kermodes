@@ -186,6 +186,12 @@ pub(crate) fn reads(spec: &str) -> Option<&str> {
         .filter(|argument| *argument != "*")
 }
 
+/// The function the aggregation `spec` calls, lowercased; `None` if it is not
+/// `function(argument)`.
+pub(crate) fn function(spec: &str) -> Option<String> {
+    split_call(spec).map(|(name, _)| name.to_ascii_lowercase())
+}
+
 impl Call {
     pub fn parse(spec: &str, schema: &Schema) -> Result<Self, Error> {
         let error = |message: String| call_error(spec, message);

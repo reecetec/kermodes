@@ -667,7 +667,7 @@ impl Planned {
     /// outside the session's graph, its result registered as a static table, so building it never
     /// holds up a ticking table; a ticking plan by the engine's incremental operators.
     fn build(&self, plan: Plan) -> PyResult<kermodes_core::Table> {
-        let plan = plan.pushed_down();
+        let plan = self.rewritten(plan)?.pushed_down();
         let mut failed = None;
         if !self.shadow.is_refreshing() {
             let executed = kermodes_core::exec::execute(&plan, &mut |scan| {
@@ -728,8 +728,26 @@ impl Planned {
         }
     }
 
+    /// `plan` rewritten for both engines alike (`Plan::rewritten`), from its scans' types.
+    fn rewritten(&self, plan: Plan) -> PyResult<Plan> {
+        let mut failed = None;
+        let rewritten = plan.rewritten(&mut |scan| {
+            let empty = match self.passed.get(&scan.name) {
+                Some(table) => empty_like(&self.engine, table),
+                None => self
+                    .stores()
+                    .and_then(|stores| stored::shadow(&self.engine, stores, scan)),
+            };
+            empty.map_err(|e| set_aside(&mut failed, e))
+        });
+        match failed {
+            Some(error) => Err(error),
+            None => rewritten.map_err(engine_error),
+        }
+    }
+
     fn explain(&self) -> PyResult<String> {
-        let plan = self.plan.clone().pushed_down();
+        let plan = self.rewritten(self.plan.clone())?.pushed_down();
         let mut failed = None;
         let explained = plan.explain(&mut |scan| {
             let described = match self.passed.get(&scan.name) {

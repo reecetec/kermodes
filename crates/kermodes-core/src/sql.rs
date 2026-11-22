@@ -1010,11 +1010,18 @@ impl Aggregates<'_> {
             }
             [FunctionArg::Unnamed(FunctionArgExpr::Expr(arg))] => match name(arg, self.rights) {
                 Some(column) => column,
+                // An expression computed once however many aggregates read it.
                 None => {
-                    let column = format!("__e{}", self.before.len());
-                    self.before
-                        .push(format!("{column} = {}", text(arg, self.rights)));
-                    column
+                    let computed = text(arg, self.rights);
+                    let already = self.before.iter().find_map(|assignment| {
+                        let (column, expression) = assignment.split_once(" = ")?;
+                        (expression == computed).then(|| column.to_owned())
+                    });
+                    already.unwrap_or_else(|| {
+                        let column = format!("__e{}", self.before.len());
+                        self.before.push(format!("{column} = {computed}"));
+                        column
+                    })
                 }
             },
             _ => {
