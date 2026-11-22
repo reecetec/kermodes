@@ -698,6 +698,7 @@ impl Planned {
                     schema: table.schema().clone(),
                     parts: vec![stored::in_memory(batches)],
                     reread: None,
+                    stats: None,
                 })
             }
             None => stored::source(self.stores()?, scan),

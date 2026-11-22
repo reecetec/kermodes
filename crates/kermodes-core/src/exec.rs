@@ -25,13 +25,18 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
-use arrow::array::{AsArray, RecordBatchOptions, UInt64Array};
-use arrow::compute::{concat_batches, take_record_batch};
+use arrow::array::{
+    Array, ArrayRef, AsArray, Int64Array, RecordBatchOptions, UInt64Array, new_null_array,
+};
+use arrow::compute::kernels::cmp;
+use arrow::compute::{
+    SortOptions, cast, concat, concat_batches, sort_to_indices, take, take_record_batch,
+};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, UInt64Type};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 
-use crate::agg::Fold;
+use crate::agg::{self, Fold};
 use crate::expr::reads;
 use crate::groups::resolve;
 use crate::ops::Where;
@@ -44,11 +49,39 @@ use crate::{Error, Expression, Session, Table};
 
 /// A table's rows for a plan's scan, as parts read independently and in parallel, in the
 /// table's order: part i's rows all come before part i+1's. A source that can read its parts
-/// again by column and row says how (`reread`); one that cannot leaves it `None`.
+/// again by column and row says how (`reread`); one that knows what parts hold without reading
+/// them, from statistics, says so (`stats`); each leaves what it cannot `None`.
 pub struct Source {
     pub schema: SchemaRef,
     pub parts: Vec<Part>,
     pub reread: Option<Reread>,
+    pub stats: Option<Stats>,
+}
+
+/// What part `part` of a source holds of its columns at `columns` (positions in its schema),
+/// from statistics that hold exactly; `None` where the part has none. Called on any thread.
+pub type Stats = Arc<dyn Fn(usize, &[usize]) -> Result<Option<PartStats>, Error> + Send + Sync>;
+
+/// A part's rows as its statistics give them.
+#[derive(Debug, Clone)]
+pub struct PartStats {
+    /// Its rows: exactly when `whole`, else at most.
+    pub rows: u64,
+    /// Whether the statistics are of exactly the rows the part reads, not of more (whole row
+    /// groups whose pages a predicate skipped): `rows` and the columns' extremes are then the
+    /// part's own, where otherwise they only bound them.
+    pub whole: bool,
+    /// Per column asked, its extremes and NULLs; `None` where not known.
+    pub columns: Vec<Option<ColumnStats>>,
+}
+
+/// A column's least and greatest non-NULL values, as one-row arrays of its type (NULL where it
+/// holds only NULLs), and its NULLs.
+#[derive(Debug, Clone)]
+pub struct ColumnStats {
+    pub min: ArrayRef,
+    pub max: ArrayRef,
+    pub nulls: u64,
 }
 
 /// Reads one part: its batches in order. Opened on whichever thread runs it.
@@ -124,6 +157,7 @@ struct Scanned {
     schema: SchemaRef,
     parts: Vec<Part>,
     reread: Reread,
+    stats: Option<Stats>,
     predicate: Option<String>,
     /// The scan's description, for its errors.
     table: String,
@@ -199,21 +233,39 @@ impl Executor<'_> {
                         let map: Map = Arc::new(move |batch| {
                             select.compute(&batch).map_err(|e| failed(&table, e))
                         });
-                        input.rows.then(map, true)?
+                        // Columns by name alone, of a scan read again: still the scan's, read
+                        // again and known by statistics through the selection.
+                        let plain: Option<Vec<usize>> = columns
+                            .iter()
+                            .map(|name| schema.index_of(name).ok())
+                            .collect();
+                        match (input.rows, plain) {
+                            (Rows::Scanned(scanned), Some(at)) if scanned.keeps(&at) => {
+                                Rows::Scanned(scanned.selected(at, shape.schema().clone(), map))
+                            }
+                            (rows, _) => rows.then(map, true)?,
+                        }
                     }
                     Plan::Agg {
                         by, aggregations, ..
                     } => {
-                        let specs: Vec<&str> =
-                            aggregations.iter().map(|(_, spec)| spec.as_str()).collect();
-                        let fold = Fold::new(schema, resolve(schema, &names(by))?, &specs)?;
-                        let rows = aggregate(
-                            input.rows.into_parts()?,
-                            &fold,
-                            shape.schema(),
-                            &shape.description(),
-                        )?;
-                        Rows::Parts(pieces(rows))
+                        if by.is_empty()
+                            && let Rows::Scanned(scanned) = &input.rows
+                            && let Some(batch) = scanned.summarized(aggregations, shape.schema())?
+                        {
+                            Rows::Parts(pieces(vec![batch]))
+                        } else {
+                            let specs: Vec<&str> =
+                                aggregations.iter().map(|(_, spec)| spec.as_str()).collect();
+                            let fold = Fold::new(schema, resolve(schema, &names(by))?, &specs)?;
+                            let rows = aggregate(
+                                input.rows.into_parts()?,
+                                &fold,
+                                shape.schema(),
+                                &shape.description(),
+                            )?;
+                            Rows::Parts(pieces(rows))
+                        }
                     }
                     Plan::Sort { by, .. } => {
                         let keys = by
@@ -254,6 +306,7 @@ impl Executor<'_> {
                 schema: source.schema,
                 parts: source.parts,
                 reread,
+                stats: source.stats,
                 predicate: predicate.clone(),
                 table: shape.description(),
             }),
@@ -335,13 +388,17 @@ impl Rows {
                 let best = match *input {
                     Rows::Scanned(scanned) => match scanned.narrow(&keys) {
                         Some(narrow) => scanned.top(&narrow, &sort.keys, stop, &sort.table)?,
-                        None => top(
-                            scanned.into_parts()?,
-                            &sort.schema,
-                            &sort.keys,
-                            stop,
-                            &sort.table,
-                        )?,
+                        None => {
+                            let skip = scanned.skipping(&sort.keys);
+                            top(
+                                scanned.into_parts()?,
+                                &sort.schema,
+                                &sort.keys,
+                                stop,
+                                &sort.table,
+                                skip,
+                            )?
+                        }
                     },
                     input => top(
                         input.into_parts()?,
@@ -349,6 +406,7 @@ impl Rows {
                         &sort.keys,
                         stop,
                         &sort.table,
+                        None,
                     )?,
                 };
                 sort.then(best)
@@ -360,6 +418,198 @@ impl Rows {
 }
 
 impl Scanned {
+    /// An aggregation without keys of only `count(*)`, `min`, and `max` over the scan, which has
+    /// no predicate, from what the source's statistics say of each part, reading only the parts
+    /// they say nothing of, and of those only the columns asked. `None` where it does not apply:
+    /// another aggregation, a column of a type whose extremes the engine orders otherwise than
+    /// statistics do (floats: Parquet leaves NaN out), or no rows, which the engine answers.
+    fn summarized(
+        &self,
+        aggregations: &[(String, String)],
+        output: &SchemaRef,
+    ) -> Result<Option<RecordBatch>, Error> {
+        enum Wanted {
+            Count,
+            Min(usize),
+            Max(usize),
+        }
+        let Some(stats) = &self.stats else {
+            return Ok(None);
+        };
+        if self.predicate.is_some() {
+            return Ok(None);
+        }
+        let column = |name: &str| {
+            self.schema.index_of(name).ok().filter(|&at| {
+                matches!(
+                    self.schema.field(at).data_type(),
+                    DataType::Int16
+                        | DataType::Int32
+                        | DataType::Int64
+                        | DataType::Date32
+                        | DataType::Timestamp(_, _)
+                        | DataType::Utf8
+                )
+            })
+        };
+        let mut wanted = Vec::with_capacity(aggregations.len());
+        let mut columns = BTreeSet::new();
+        for (_, spec) in aggregations {
+            let want = match (agg::function(spec).as_deref(), agg::reads(spec)) {
+                (Some("count"), None) => Wanted::Count,
+                (Some("min"), Some(name)) => match column(name) {
+                    Some(at) => Wanted::Min(at),
+                    None => return Ok(None),
+                },
+                (Some("max"), Some(name)) => match column(name) {
+                    Some(at) => Wanted::Max(at),
+                    None => return Ok(None),
+                },
+                _ => return Ok(None),
+            };
+            if let Wanted::Min(at) | Wanted::Max(at) = want {
+                columns.insert(at);
+            }
+            wanted.push(want);
+        }
+        let columns: Vec<usize> = columns.into_iter().collect();
+        let failed = |e| failed(&self.table, e);
+        let mut rows = 0u64;
+        let (mut mins, mut maxes) = (
+            vec![Vec::new(); columns.len()],
+            vec![Vec::new(); columns.len()],
+        );
+        for part in 0..self.parts.len() {
+            if let Some(known) = stats(part, &columns)?
+                && known.whole
+                && known.columns.iter().all(Option::is_some)
+            {
+                rows += known.rows;
+                for (at, column) in known.columns.into_iter().flatten().enumerate() {
+                    mins[at].push(column.min);
+                    maxes[at].push(column.max);
+                }
+                continue;
+            }
+            // Read: the columns asked, or the first alone for its rows.
+            let read = if columns.is_empty() {
+                vec![0]
+            } else {
+                columns.clone()
+            };
+            for batch in (self.reread)(part, &read, None)? {
+                let batch = batch?;
+                rows += batch.num_rows() as u64;
+                for at in 0..columns.len() {
+                    let (min, max) = extremes(batch.column(at)).map_err(failed)?;
+                    mins[at].push(min);
+                    maxes[at].push(max);
+                }
+            }
+        }
+        if rows == 0 {
+            return Ok(None);
+        }
+        let mut out = Vec::with_capacity(wanted.len());
+        for (want, field) in wanted.iter().zip(output.fields()) {
+            let array: ArrayRef = match want {
+                Wanted::Count => Arc::new(Int64Array::from(vec![rows as i64])),
+                Wanted::Min(at) | Wanted::Max(at) => {
+                    let at = columns.binary_search(at).expect("asked");
+                    let max = matches!(want, Wanted::Max(_));
+                    let of = if max { &maxes[at] } else { &mins[at] };
+                    let all = concat(&of.iter().map(AsRef::as_ref).collect::<Vec<_>>())
+                        .map_err(failed)?;
+                    let (least, greatest) = extremes(&all).map_err(failed)?;
+                    if max { greatest } else { least }
+                }
+            };
+            out.push(cast(&array, field.data_type()).map_err(failed)?);
+        }
+        RecordBatch::try_new(output.clone(), out)
+            .map(Some)
+            .map_err(failed)
+    }
+
+    /// The skipping of parts a top-N by `keys` over the scan can do, where its source has
+    /// statistics.
+    fn skipping(&self, keys: &[(usize, bool)]) -> Option<Skip> {
+        let (&(column, descending), stats) = (keys.first()?, self.stats.clone()?);
+        Some(Skip {
+            stats,
+            column,
+            descending,
+        })
+    }
+
+    /// Whether a selection of the columns at `at` keeps every column the predicate reads.
+    fn keeps(&self, at: &[usize]) -> bool {
+        let Some(predicate) = &self.predicate else {
+            return true;
+        };
+        reads(predicate).is_some_and(|names| {
+            names
+                .iter()
+                .filter_map(|name| self.schema.index_of(name).ok())
+                .all(|column| at.contains(&column))
+        })
+    }
+
+    /// The scan's columns at `at`, as `schema`: its parts through `map`, and its reads again
+    /// and statistics asked by position in the selection, answered by position in the scan.
+    fn selected(self, at: Vec<usize>, schema: SchemaRef, map: Map) -> Scanned {
+        let at: Arc<[usize]> = at.into();
+        let reread: Reread = {
+            let (at, read, table) = (at.clone(), self.reread, self.table.clone());
+            Arc::new(move |part, columns, rows| {
+                // The scan reads its columns in its order: ask in that order, then put back.
+                let mut asked: Vec<(usize, usize)> = columns
+                    .iter()
+                    .enumerate()
+                    .map(|(place, &column)| (at[column], place))
+                    .collect();
+                asked.sort_unstable();
+                let mut from = vec![0; asked.len()];
+                for (got, &(_, place)) in asked.iter().enumerate() {
+                    from[place] = got;
+                }
+                let ascending: Vec<usize> = asked.iter().map(|&(column, _)| column).collect();
+                let table = table.clone();
+                let batches = read(part, &ascending, rows)?;
+                Ok(Box::new(batches.map(move |batch| {
+                    let batch = batch?;
+                    let fields: Vec<_> = from
+                        .iter()
+                        .map(|&got| batch.schema().field(got).clone())
+                        .collect();
+                    let columns = from.iter().map(|&got| batch.column(got).clone()).collect();
+                    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+                    RecordBatch::try_new_with_options(
+                        Arc::new(Schema::new(fields)),
+                        columns,
+                        &options,
+                    )
+                    .map_err(|e| failed(&table, e))
+                })) as Batches)
+            })
+        };
+        let stats = self.stats.map(|stats| {
+            let at = at.clone();
+            Arc::new(move |part: usize, columns: &[usize]| {
+                let columns: Vec<usize> = columns.iter().map(|&column| at[column]).collect();
+                stats(part, &columns)
+            }) as Stats
+        });
+        Scanned {
+            schema,
+            parts: mapped(self.parts, &map),
+            reread,
+            stats,
+            predicate: self.predicate,
+            table: self.table,
+        }
+    }
+
     /// The scan's rows, through its predicate: read narrowly first where the predicate reads
     /// fewer than half the columns, since reading again costs each part a second read, which
     /// pays only where most of the columns are left for the rows kept.
@@ -453,6 +703,7 @@ impl Scanned {
         stop: usize,
         table: &str,
     ) -> Result<Vec<RecordBatch>, Error> {
+        let skip = self.skipping(keys);
         let keys: Vec<(usize, bool)> = keys
             .iter()
             .map(|&(at, descending)| {
@@ -466,6 +717,7 @@ impl Scanned {
             &keys,
             stop,
             table,
+            skip,
         )?;
         let positions: Vec<u64> = winners
             .iter()
@@ -773,15 +1025,72 @@ fn skip(batches: Vec<RecordBatch>, mut start: usize) -> Vec<RecordBatch> {
         .collect()
 }
 
+/// A column's least and greatest non-NULL values, as one-row arrays (NULL where it has none).
+fn extremes(array: &ArrayRef) -> Result<(ArrayRef, ArrayRef), ArrowError> {
+    let first = |descending| -> Result<ArrayRef, ArrowError> {
+        let options = SortOptions {
+            descending,
+            nulls_first: false,
+        };
+        let at = sort_to_indices(array, Some(options), Some(1))?;
+        if at.is_empty() {
+            return Ok(new_null_array(array.data_type(), 1));
+        }
+        take(array, &at, None)
+    };
+    Ok((first(false)?, first(true)?))
+}
+
+/// Which parts of a top-N's scan to leave unread: those whose statistics show every row worse
+/// on the first sort key than the `stop`th best row so far, which then beats them all.
+struct Skip {
+    stats: Stats,
+    /// The first sort key's position in the scan.
+    column: usize,
+    descending: bool,
+}
+
+impl Skip {
+    /// Whether part `part` holds no row better than `cutoff`, the `stop`th best row's first key.
+    /// Equal keys are kept: later keys, or input order, may still put them ahead. NULL sorts as
+    /// the largest value: last ascending, so never ahead of a value; first descending.
+    fn skips(&self, part: usize, cutoff: &ArrayRef) -> Result<bool, Error> {
+        if cutoff.is_null(0) {
+            return Ok(false);
+        }
+        let Some(known) = (self.stats)(part, &[self.column])? else {
+            return Ok(false);
+        };
+        let Some(Some(column)) = known.columns.first() else {
+            return Ok(false);
+        };
+        let worse = if self.descending {
+            if column.nulls > 0 || column.max.is_null(0) {
+                return Ok(false);
+            }
+            cmp::lt(&column.max, cutoff)
+        } else {
+            if column.min.is_null(0) {
+                return Ok(true);
+            }
+            cmp::gt(&column.min, cutoff)
+        };
+        // Statistics of another type than the key's skip nothing.
+        Ok(worse.is_ok_and(|worse| worse.value(0)))
+    }
+}
+
 /// The first `stop` rows of the input sorted by `keys`, ties in input order (a top-N): each
 /// part keeps its best `stop` rows, and parts merge in their order, so ties stay in input
 /// order. Choosing reads only the key columns; whole rows are gathered for the winners alone.
+/// With `skip`, once `stop` winners are known, a part that cannot beat the last is not read.
 fn top(
     parts: Vec<Part>,
     schema: &SchemaRef,
     keys: &[(usize, bool)],
     stop: usize,
     table: &str,
+    skip: Option<Skip>,
 ) -> Result<Vec<RecordBatch>, Error> {
     // Earlier rows first: the winners so far, then the rows read since.
     let best = |rows: Vec<RecordBatch>| -> Result<Vec<RecordBatch>, Error> {
@@ -791,6 +1100,32 @@ fn top(
     // Rows are chosen once at least as many as are kept arrive, so each row takes part in a
     // bounded number of sorts however large `stop` is.
     let enough = stop.saturating_add(stop.max(PIECE_ROWS));
+    // The `stop`th best row's first key, once `stop` rows are known: what a part must beat.
+    let cutoff: Arc<Mutex<Option<ArrayRef>>> = Arc::default();
+    // Checked as a part opens, before it reads anything.
+    let skipping = skip.is_some();
+    let parts = match skip.map(Arc::new) {
+        None => parts,
+        Some(skip) => parts
+            .into_iter()
+            .enumerate()
+            .map(|(index, part)| {
+                let (skip, cutoff) = (skip.clone(), cutoff.clone());
+                Box::new(move || {
+                    let cut = cutoff
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .clone();
+                    if let Some(cut) = cut
+                        && skip.skips(index, &cut)?
+                    {
+                        return Ok(Box::new(std::iter::empty()) as Batches);
+                    }
+                    part()
+                }) as Part
+            })
+            .collect(),
+    };
     let mut winners = Vec::new();
     drive(
         parts,
@@ -812,10 +1147,26 @@ fn top(
         |part| {
             winners.extend(part);
             winners = best(std::mem::take(&mut winners))?;
+            if skipping && count(&winners) >= stop {
+                let last = row_of(&winners, stop - 1)
+                    .map(|(batch, row)| batch.column(keys[0].0).slice(row, 1));
+                *cutoff.lock().unwrap_or_else(PoisonError::into_inner) = last;
+            }
             Ok(true)
         },
     )?;
     Ok(winners)
+}
+
+/// The batch holding row `row` of `batches`, and its place in it.
+fn row_of(batches: &[RecordBatch], mut row: usize) -> Option<(&RecordBatch, usize)> {
+    for batch in batches {
+        if row < batch.num_rows() {
+            return Some((batch, row));
+        }
+        row -= batch.num_rows();
+    }
+    None
 }
 
 /// `agg_by` over the parts: each folds into partial states on the thread that reads it, and

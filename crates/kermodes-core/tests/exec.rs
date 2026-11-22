@@ -12,12 +12,14 @@ use std::sync::{Arc, Mutex, Weak};
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int16Array, Int64Array, RecordBatch, StringArray,
-    TimestampNanosecondArray, UInt64Array,
+    TimestampNanosecondArray, UInt64Array, new_empty_array, new_null_array,
 };
-use arrow::compute::{concat_batches, take_record_batch};
+use arrow::compute::{
+    SortOptions, concat, concat_batches, sort_to_indices, take, take_record_batch,
+};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
-use kermodes_core::exec::{Batches, Part, Reread, Source, execute};
+use kermodes_core::exec::{Batches, ColumnStats, Part, PartStats, Reread, Source, Stats, execute};
 use kermodes_core::plan::{Plan, Scan};
 use kermodes_core::{Error, Session, SortKey, Window};
 
@@ -138,14 +140,63 @@ fn source(parts: &[Vec<RecordBatch>]) -> Source {
             })
             .collect(),
         reread: None,
+        stats: None,
     }
+}
+
+/// Exact statistics of each of `parts`, as a source of them would give: rows, and each column's
+/// least and greatest non-NULL values and NULLs.
+fn stats_of(parts: &[Vec<RecordBatch>]) -> Stats {
+    let held = Arc::new(parts.to_vec());
+    Arc::new(move |part, columns| {
+        let batches = &held[part];
+        let rows = batches.iter().map(|batch| batch.num_rows() as u64).sum();
+        let columns = columns
+            .iter()
+            .map(|&at| {
+                let data_type = schema().field(at).data_type().clone();
+                let arrays: Vec<&dyn Array> = batches
+                    .iter()
+                    .map(|batch| batch.column(at).as_ref())
+                    .collect();
+                let all = if arrays.is_empty() {
+                    new_empty_array(&data_type)
+                } else {
+                    concat(&arrays).unwrap()
+                };
+                let first = |descending| -> ArrayRef {
+                    let options = SortOptions {
+                        descending,
+                        nulls_first: false,
+                    };
+                    let at = sort_to_indices(&all, Some(options), Some(1)).unwrap();
+                    if at.is_empty() {
+                        new_null_array(&data_type, 1)
+                    } else {
+                        take(&all, &at, None).unwrap()
+                    }
+                };
+                Some(ColumnStats {
+                    min: first(false),
+                    max: first(true),
+                    nulls: all.null_count() as u64,
+                })
+            })
+            .collect();
+        Ok(Some(PartStats {
+            rows,
+            whole: true,
+            columns,
+        }))
+    })
 }
 
 /// Each read of a source read again: its part, its columns, and how many rows it asked for
 /// (all where `None`).
 type Reads = Arc<Mutex<Vec<(usize, Vec<usize>, Option<usize>)>>>;
 
-/// `parts` as a source that reads them again by column and row, logging each read.
+/// `parts` as a source that reads them again by column and row, logging each read, and knows
+/// each part's statistics.
 fn rereadable(parts: &[Vec<RecordBatch>], reads: &Reads) -> Source {
     let held = Arc::new(parts.to_vec());
     let count = held.len();
@@ -182,6 +233,7 @@ fn rereadable(parts: &[Vec<RecordBatch>], reads: &Reads) -> Source {
             })
             .collect(),
         reread: Some(reread),
+        stats: Some(stats_of(parts)),
     }
 }
 
@@ -834,6 +886,7 @@ fn counted(parts: usize, batches: usize, rows: usize, counts: &Counts) -> Source
             })
             .collect(),
         reread: None,
+        stats: None,
     }
 }
 
@@ -877,6 +930,7 @@ fn an_aggregation_holds_no_batch_it_has_folded() {
             })
             .collect(),
         reread: None,
+        stats: None,
     };
     let plan = Plan::Agg {
         input: Box::new(scan().plan),
@@ -909,6 +963,109 @@ fn an_aggregation_holds_no_batch_it_has_folded() {
     assert!(
         alive <= threads.min(parts),
         "{alive} batches alive at once on {threads} threads"
+    );
+}
+
+/// An aggregation without keys of `count(*)`, `min`, and `max` takes parts' statistics where a
+/// source has them, reading none of those parts, and gives the engine's result.
+#[test]
+fn a_summary_reads_no_part_its_statistics_answer() {
+    let (mut rng, mut clock) = (Rng(11), 0);
+    let parts: Vec<Vec<RecordBatch>> = (0..6)
+        .map(|_| {
+            (0..2)
+                .map(|_| random_batch(&mut rng, 300, &mut clock))
+                .collect()
+        })
+        .collect();
+    // Parts 0 to 4 are known only by their statistics: reading them fails.
+    let source = || {
+        let mut source = rereadable(&parts, &Reads::default());
+        let read = source.reread.clone().unwrap();
+        source.reread = Some(Arc::new(move |part, columns, rows| {
+            if part < 5 {
+                return Err(Error::Unsupported(format!("part {part} read")));
+            }
+            read(part, columns, rows)
+        }));
+        let stats = stats_of(&parts);
+        source.stats = Some(Arc::new(move |part, columns| {
+            if part < 5 {
+                stats(part, columns)
+            } else {
+                Ok(None)
+            }
+        }));
+        source
+    };
+    for aggregations in [
+        vec!["count(*)", "min(k)", "max(t)", "min(s)", "max(s)", "max(m)"],
+        vec!["count(*)"],
+    ] {
+        let plan = Plan::Agg {
+            input: Box::new(scan().plan.pushed_down()),
+            by: Vec::new(),
+            aggregations: aggregations
+                .iter()
+                .enumerate()
+                .map(|(i, spec)| (format!("a{i}"), spec.to_string()))
+                .collect(),
+            aliases: Vec::new(),
+        };
+        assert_eq!(
+            executed_from(&plan, source),
+            built(&plan, &parts),
+            "{aggregations:?}"
+        );
+    }
+}
+
+/// A top-N over a scan whose source has statistics leaves unread the parts that cannot beat its
+/// `stop`th best row so far, and gives the engine's rows.
+#[test]
+fn a_top_n_reads_no_part_its_statistics_rule_out() {
+    let (mut rng, mut clock) = (Rng(13), 0);
+    // Times only grow from part to part: once the first part is read, the ten earliest times
+    // are known, and no later part holds an earlier one.
+    let parts: Vec<Vec<RecordBatch>> = (0..40)
+        .map(|_| {
+            (0..2)
+                .map(|_| random_batch(&mut rng, 100, &mut clock))
+                .collect()
+        })
+        .collect();
+    let reads = Reads::default();
+    let plan = Plan::Head {
+        input: Box::new(Plan::Sort {
+            input: Box::new(scan().plan),
+            by: vec![SortKey {
+                column: "t".into(),
+                descending: false,
+            }],
+        }),
+        rows: 10,
+    };
+    assert_eq!(
+        executed_from(&plan, || rereadable(&parts, &reads)),
+        built(&plan, &parts)
+    );
+    let read: std::collections::BTreeSet<usize> = reads
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, _, rows)| rows.is_none())
+        .map(|(part, _, _)| *part)
+        .collect();
+    // Parts opened before the first part's winners were known may be read: two per thread.
+    let threads = std::env::var("KERMODES_THREADS")
+        .ok()
+        .and_then(|threads| threads.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
+    assert!(
+        read.len() <= 2 * threads + 1,
+        "{} of {} parts read on {threads} threads",
+        read.len(),
+        parts.len()
     );
 }
 

@@ -12,12 +12,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{
     Array, ArrayRef, AsArray, Date32Array, Float64Array, Int64Array, RecordBatch,
-    RecordBatchOptions, Scalar, StringArray,
+    RecordBatchOptions, Scalar, StringArray, new_null_array,
 };
 use arrow::compute::kernels::cmp::{gt_eq, lt_eq};
 use arrow::compute::{
-    SortColumn, and_kleene, concat_batches, filter_record_batch, lexsort_to_indices,
-    prep_null_mask_filter, take_record_batch,
+    SortColumn, SortOptions, and_kleene, concat_batches, filter_record_batch, lexsort_to_indices,
+    prep_null_mask_filter, sort_to_indices, take, take_record_batch,
 };
 use arrow::datatypes::{DataType, Date32Type, Field, Schema, SchemaRef};
 use bytes::Bytes;
@@ -42,7 +42,9 @@ use parquet::arrow::async_writer::AsyncArrowWriter;
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::errors::ParquetError;
-use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
+use parquet::file::metadata::{
+    PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
+};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use tokio::runtime::Runtime;
 
@@ -909,6 +911,68 @@ pub(crate) struct FilePart {
 }
 
 impl FileRead {
+    /// What `part`'s row groups' statistics say of the table's columns `wanted` (each by its ID,
+    /// with its type now; `None` for a column history keeps itself): per column, its least and
+    /// greatest non-NULL values and its NULLs, where the file holds the column under that ID
+    /// with that type and every row group's statistics of it are marked exact (Parquet may
+    /// shorten a string's); `None` for a column they cannot say.
+    pub(crate) fn stats(
+        &self,
+        part: &FilePart,
+        wanted: &[Option<(ColumnId, &Field)>],
+    ) -> crate::read::PartStats {
+        let metadata = self.reader.metadata();
+        let schema = self.reader.schema();
+        let groups: Vec<&RowGroupMetaData> = part
+            .groups
+            .iter()
+            .map(|&group| metadata.row_group(group))
+            .collect();
+        let column = |(id, field): (ColumnId, &Field)| -> Option<crate::read::ColumnStats> {
+            let held = schema.fields().iter().find(|held| {
+                held.metadata()
+                    .get(PARQUET_FIELD_ID_META_KEY)
+                    .and_then(|held| held.parse().ok())
+                    .map(ColumnId)
+                    == Some(id)
+            })?;
+            if held.data_type() != field.data_type() {
+                return None;
+            }
+            let converter =
+                StatisticsConverter::try_new(held.name(), schema, self.reader.parquet_schema())
+                    .ok()?;
+            let at = converter.parquet_column_index()?;
+            let nulls = converter
+                .row_group_null_counts(groups.iter().copied())
+                .ok()?;
+            let mins = converter.row_group_mins(groups.iter().copied()).ok()?;
+            let maxes = converter.row_group_maxes(groups.iter().copied()).ok()?;
+            for (i, group) in groups.iter().enumerate() {
+                let stats = group.column(at).statistics()?;
+                let all_null = nulls.is_valid(i) && nulls.value(i) == group.num_rows() as u64;
+                // A row group of NULLs alone has no extremes, and needs none.
+                let exact = mins.is_valid(i)
+                    && maxes.is_valid(i)
+                    && stats.min_is_exact()
+                    && stats.max_is_exact();
+                if !(exact || all_null) || nulls.is_null(i) {
+                    return None;
+                }
+            }
+            Some(crate::read::ColumnStats {
+                min: first(&mins, false).ok()?,
+                max: first(&maxes, true).ok()?,
+                nulls: nulls.values().iter().sum(),
+            })
+        };
+        crate::read::PartStats {
+            rows: part.rows,
+            whole: part.selection.is_none(),
+            columns: wanted.iter().map(|w| w.and_then(column)).collect(),
+        }
+    }
+
     /// The wanted row groups in order, as parts of at least `rows` rows each (the last may have
     /// fewer): row groups are not split, so a big one is a part alone. Parts that read no rows
     /// (their pages all skipped) are left out.
@@ -1008,6 +1072,20 @@ impl FileRead {
         }
         builder.build().map_err(parquet_error)
     }
+}
+
+/// The least (or, `greatest`, the greatest) non-NULL value of `array`, as a one-row array:
+/// NULL where it has none.
+fn first(array: &ArrayRef, greatest: bool) -> Result<ArrayRef, arrow::error::ArrowError> {
+    let options = SortOptions {
+        descending: greatest,
+        nulls_first: false,
+    };
+    let at = sort_to_indices(array, Some(options), Some(1))?;
+    if at.is_empty() {
+        return Ok(new_null_array(array.data_type(), 1));
+    }
+    take(array, &at, None)
 }
 
 /// A part of a history file's rows, a batch at a time, decoded on the thread that takes them;

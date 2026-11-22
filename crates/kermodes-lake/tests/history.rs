@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use arrow::array::{ArrayRef, AsArray, Int64Array, RecordBatch, UInt64Array};
-use arrow::compute::take_record_batch;
+use arrow::array::{Array, ArrayRef, AsArray, Int64Array, RecordBatch, StringArray, UInt64Array};
+use arrow::compute::{SortOptions, sort_to_indices, take, take_record_batch};
 use arrow::datatypes::{DataType, Date32Type, Field, Int64Type, Schema, SchemaRef};
 use bytes::Bytes;
 use kermodes_lake::{
@@ -810,6 +810,125 @@ fn history_read_in_parallel_parts_is_history_read_in_order() {
     let client = kermodes_flight::Client::connect(&format!("grpc://{}", server.addr())).unwrap();
     let reader = Arc::new(Lake::reader().unwrap());
     assert_eq!(same(&client, &reader, &Reading::default()), 7);
+}
+
+/// A column's least and greatest non-NULL values, as one-row arrays, read from its rows.
+fn extremes_of(column: &ArrayRef) -> (ArrayRef, ArrayRef) {
+    let first = |descending| {
+        let options = SortOptions {
+            descending,
+            nulls_first: false,
+        };
+        let at = sort_to_indices(column, Some(options), Some(1)).unwrap();
+        take(column, &at, None).unwrap()
+    };
+    (first(false), first(true))
+}
+
+/// A part's statistics are what reading it gives: its rows, and each column's extremes and
+/// NULLs, a string column with NULLs among them. A past date weir holds has none.
+#[test]
+fn a_parts_statistics_are_its_rows() {
+    let dir = TempDir::new();
+    let root = dir.0.join("store");
+    let name = TableName::parse("md.stats").unwrap();
+    let schema = Schema::new(vec![
+        Field::new("n", DataType::Int64, true),
+        Field::new("s", DataType::Utf8, true),
+    ]);
+    let rows = |k: u32, count: usize| {
+        let base = i64::from(k) * 1_000_000;
+        RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(Int64Array::from_iter_values(
+                    (0..count as i64).map(|i| base + (i * 7919) % count as i64),
+                )),
+                Arc::new(StringArray::from_iter((0..count).map(|i| {
+                    (i % 5 != 0).then(|| format!("{k}-{:05}", (i * 31) % count))
+                }))),
+            ],
+        )
+        .unwrap()
+    };
+    // A past date still in weir.
+    let store = Store::open(&root).unwrap();
+    let location = store.create_table(&name, &schema).unwrap().location;
+    let writer = store
+        .writer(&name, &SourceId::parse("feed").unwrap(), false)
+        .unwrap();
+    writer.write(&rows(9, 50), None).unwrap();
+    drop((writer, store));
+    let weir = root.join("weir").join(location);
+    fs::rename(weir.join(today().to_string()), weir.join(d(9).to_string())).unwrap();
+    let store = Arc::new(Store::open(&root).unwrap());
+    let entry = store.table(&name).unwrap();
+    let lake = Arc::new(Lake::open(dir.0.join("lake").to_str().unwrap()).unwrap());
+    let with_ids = Schema::new(
+        entry
+            .schema
+            .fields()
+            .iter()
+            .zip(entry.ids.iter())
+            .map(|(field, id)| {
+                field
+                    .as_ref()
+                    .clone()
+                    .with_metadata([("PARQUET:field_id".to_string(), id.0.to_string())])
+            })
+            .collect::<Vec<_>>(),
+    );
+    let days = [(1, 150_000), (2, 120_000), (3, 40)];
+    let dates: Vec<Date> = days.iter().map(|&(k, _)| d(k)).collect();
+    let written = lake
+        .write(
+            &entry.location,
+            &with_ids,
+            &[],
+            &dates,
+            |date, each| {
+                let &(k, count) = days.iter().find(|&&(k, _)| d(k) == date).unwrap();
+                each(rows(k, count))
+            },
+            u64::MAX,
+        )
+        .unwrap();
+    let commit = HistoryCommit {
+        written: dates,
+        replaced: Vec::new(),
+        files: written.files,
+        dates: written.dates,
+    };
+    store.commit_history(&name, &commit).unwrap();
+
+    let parts = history_parts(&*store, &lake, &entry, &Reading::default()).unwrap();
+    let n = parts.schema.index_of("n").unwrap();
+    let s = parts.schema.index_of("s").unwrap();
+    let mut files = 0;
+    for part in 0..parts.len() {
+        let read = parts.read(part, &[n, s], None).unwrap();
+        let read = read.collect::<Result<Vec<_>, _>>().unwrap();
+        let Some(stats) = parts.stats(part, &[n, s]).unwrap() else {
+            // Only weir's date has no statistics.
+            assert_eq!(read.iter().map(RecordBatch::num_rows).sum::<usize>(), 50);
+            continue;
+        };
+        files += 1;
+        let read = arrow::compute::concat_batches(&read[0].schema(), &read).unwrap();
+        assert!(stats.whole);
+        assert_eq!(stats.rows, read.num_rows() as u64, "part {part}");
+        for (at, column) in stats.columns.iter().enumerate() {
+            let column = column.as_ref().expect("exact statistics");
+            let (min, max) = extremes_of(read.column(at));
+            assert_eq!(
+                (&column.min, &column.max),
+                (&min, &max),
+                "part {part}, column {at}"
+            );
+            assert_eq!(column.nulls, read.column(at).null_count() as u64);
+        }
+    }
+    assert!(files > 1, "parts of more than one file part: {files}");
 }
 
 /// Byte ranges asked of a file server, by the file's path.

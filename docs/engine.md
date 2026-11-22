@@ -186,7 +186,13 @@ occur. SQL computes an expression that several aggregates read once.
   Groups come out in the order their keys first appear.
 - `head` or `slice` over `sort` is a top-N: each part keeps its best rows, chosen on the sort
   columns alone, and full rows are gathered for the winners. A sort without one sorts all its
-  input, stably.
+  input, stably. Over a source with statistics, once it holds its rows, a part whose first sort
+  key cannot beat the last of them (strictly: ties may still win) is not opened.
+- A source may know what its parts hold from statistics (`Stats`: a history file's row groups,
+  where Parquet marks them exact, matched by column ID and type). An aggregation without keys
+  of only `count(*)`, `min`, and `max` of integer, date, time, or string columns, over a scan
+  without a predicate, takes them from there and reads only the parts they say nothing of
+  (today's rows, a past date weir holds). Floats are read: Parquet leaves NaN out of extremes.
 - Late materialization. A source may read a part again, only some of its columns and only some
   of its rows by position (`Reread`; a stored table's history by Parquet row selection within
   the row groups planned, today's rows by index), the part's rows the same however it is read.

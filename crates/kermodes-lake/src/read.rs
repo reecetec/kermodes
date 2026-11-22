@@ -6,9 +6,9 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::array::{RecordBatch, RecordBatchOptions, UInt64Array};
+use arrow::array::{ArrayRef, RecordBatch, RecordBatchOptions, UInt64Array};
 use arrow::compute::{concat_batches, take};
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Field, SchemaRef};
 use kermodes_weir::{ColumnId, Date, Error, TableEntry, TableName};
 
 use crate::bounds::Bound;
@@ -139,6 +139,27 @@ pub fn history_parts(
     })
 }
 
+/// What a part's statistics say of its rows (`HistoryParts::stats`).
+#[derive(Debug, Clone)]
+pub struct PartStats {
+    /// Its rows: exactly when `whole`, else at most.
+    pub rows: u64,
+    /// Whether the statistics are of exactly the rows the part reads: none of its row groups'
+    /// pages skipped. Otherwise they only bound them.
+    pub whole: bool,
+    /// Per column asked, its extremes and NULLs; `None` where not known.
+    pub columns: Vec<Option<ColumnStats>>,
+}
+
+/// A column's least and greatest non-NULL values, as one-row arrays of its type (NULL where it
+/// holds only NULLs), and its NULLs.
+#[derive(Debug, Clone)]
+pub struct ColumnStats {
+    pub min: ArrayRef,
+    pub max: ArrayRef,
+    pub nulls: u64,
+}
+
 /// A table's history as parts, `read_history`'s rows in its order: all of part i's rows come
 /// before part i+1's. A part reads the same rows in the same order whichever of its columns
 /// are read, so a reader can choose rows by some columns, then read the others for the rows it
@@ -160,6 +181,27 @@ impl HistoryParts {
 
     pub fn is_empty(&self) -> bool {
         self.pieces.is_empty()
+    }
+
+    /// What part `part`'s Parquet statistics say of `schema`'s columns at `columns`, without
+    /// reading its rows (`FileRead::stats`); `None` for a past date weir holds, which has none.
+    pub fn stats(&self, part: usize, columns: &[usize]) -> Result<Option<PartStats>, Error> {
+        let piece = self
+            .pieces
+            .get(part)
+            .ok_or_else(|| Error::NotFound(format!("part {part} of {}", self.pieces.len())))?;
+        let Piece::File(file, whole) = piece else {
+            return Ok(None);
+        };
+        let system = self.schema.fields().len() - self.ids.len();
+        let wanted: Vec<Option<(ColumnId, &Field)>> = columns
+            .iter()
+            .map(|&at| {
+                let id = self.ids.get(at.checked_sub(system)?)?;
+                Some((*id, self.schema.field(at)))
+            })
+            .collect();
+        Ok(Some(file.stats(whole, &wanted)))
     }
 
     /// Part `part`'s rows, a batch at a time, decoded on whichever thread takes them: only

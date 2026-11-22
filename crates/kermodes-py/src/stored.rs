@@ -146,6 +146,7 @@ pub(crate) fn source(stores: &Stores, scan: &Scan) -> PyResult<kermodes_core::ex
             schema: entry.schema.clone(),
             parts: vec![in_memory(state)],
             reread: None,
+            stats: None,
         });
     }
     let (day, today) = stores
@@ -181,15 +182,20 @@ pub(crate) fn source(stores: &Stores, scan: &Scan) -> PyResult<kermodes_core::ex
         .map(|batch| project(batch, &schema, &columns).map_err(arrow_error))
         .collect::<PyResult<Vec<_>>>()?;
     let count = history.len() + usize::from(!today.is_empty());
+    let history = Arc::new(history);
+    let table: Arc<str> = entry.name.to_string().into();
+    let failed = {
+        let table = table.clone();
+        move |e: &dyn std::fmt::Display| kermodes_core::Error::Source {
+            table: table.to_string(),
+            message: e.to_string(),
+        }
+    };
     let reread: kermodes_core::exec::Reread = {
-        let (history, schema) = (Arc::new(history), schema.clone());
-        let table: Arc<str> = entry.name.to_string().into();
+        let (history, schema, kept, failed) =
+            (history.clone(), schema.clone(), kept.clone(), failed.clone());
         Arc::new(move |part, columns, rows| {
-            let table = table.clone();
-            let failed = move |e: &dyn std::fmt::Display| kermodes_core::Error::Source {
-                table: table.to_string(),
-                message: e.to_string(),
-            };
+            let failed = failed.clone();
             if part == history.len() {
                 return rows_at(&today, &schema, columns, rows).map_err(|e| failed(&e));
             }
@@ -200,6 +206,29 @@ pub(crate) fn source(stores: &Stores, scan: &Scan) -> PyResult<kermodes_core::ex
             ))
         })
     };
+    // History's parts know their files' statistics; today's rows have none.
+    let stats: kermodes_core::exec::Stats = Arc::new(move |part, columns| {
+        if part >= history.len() {
+            return Ok(None);
+        }
+        let columns: Vec<usize> = columns.iter().map(|&at| kept[at]).collect();
+        let known = history.stats(part, &columns).map_err(|e| failed(&e))?;
+        Ok(known.map(|known| kermodes_core::exec::PartStats {
+            rows: known.rows,
+            whole: known.whole,
+            columns: known
+                .columns
+                .into_iter()
+                .map(|column| {
+                    column.map(|c| kermodes_core::exec::ColumnStats {
+                        min: c.min,
+                        max: c.max,
+                        nulls: c.nulls,
+                    })
+                })
+                .collect(),
+        }))
+    });
     let all: Arc<[usize]> = (0..schema.fields().len()).collect();
     let parts = (0..count)
         .map(|part| {
@@ -211,6 +240,7 @@ pub(crate) fn source(stores: &Stores, scan: &Scan) -> PyResult<kermodes_core::ex
         schema,
         parts,
         reread: Some(reread),
+        stats: Some(stats),
     })
 }
 
