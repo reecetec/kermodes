@@ -192,8 +192,12 @@ pub(crate) fn source(stores: &Stores, scan: &Scan) -> PyResult<kermodes_core::ex
         }
     };
     let reread: kermodes_core::exec::Reread = {
-        let (history, schema, kept, failed) =
-            (history.clone(), schema.clone(), kept.clone(), failed.clone());
+        let (history, schema, kept, failed) = (
+            history.clone(),
+            schema.clone(),
+            kept.clone(),
+            failed.clone(),
+        );
         Arc::new(move |part, columns, rows| {
             let failed = failed.clone();
             if part == history.len() {
