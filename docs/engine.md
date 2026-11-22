@@ -173,8 +173,10 @@ Delta { added: [(keys, rows)], removed: [(keys, last rows)], modified: [(keys, p
   depends on the thread count.
 - `where`, `update`, `select`, and `merge` stream batch by batch. `head` and `slice` stop
   reading once they have their rows, before opening later parts. `tail` keeps its last rows.
-- `agg_by` folds each part into partial states and merges them by key hash across threads,
-  each group taking its merges in part order; memory follows the groups, not the input.
+- `agg_by` folds each part into partial states, and one thread per key-hash shard merges each
+  part's groups of its shard as the part arrives, in part order; memory follows the groups, not
+  the input. A part whose keys prove nearly unique (more groups than half its first 64k rows)
+  stops combining its own groups and leaves that to the merge, which looks each up anyway.
   Groups come out in the order their keys first appear.
 - `head` or `slice` over `sort` is a top-N: each part keeps its best rows, chosen on the sort
   columns alone, and full rows are gathered for the winners. A sort without one sorts all its

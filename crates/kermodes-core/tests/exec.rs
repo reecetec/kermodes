@@ -911,3 +911,54 @@ fn an_aggregation_holds_no_batch_it_has_folded() {
         "{alive} batches alive at once on {threads} threads"
     );
 }
+
+/// Parts large enough, with keys close enough to unique, that each part stops deduplicating its
+/// groups across batches (after 64k rows): later batches repeat keys of earlier ones, of other
+/// batches passed through, and of other parts, and the merge still gives the engine's groups, in
+/// the engine's order, with the engine's states.
+#[test]
+fn aggregates_nearly_unique_keys_as_the_engine_does() {
+    let (parts, batches, rows) = (3, 20, 5_000);
+    let mut rng = Rng(7);
+    let mut clock = 0;
+    let mut at = 0i64;
+    let parts: Vec<Vec<RecordBatch>> = (0..parts)
+        .map(|_| {
+            (0..batches)
+                .map(|_| {
+                    let batch = random_batch(&mut rng, rows, &mut clock);
+                    // 60k keys over 100k rows a part: more groups than half its rows.
+                    let keys: Int64Array = (at..at + rows as i64)
+                        .map(|row| Some(row * 7_919 % 60_000))
+                        .collect();
+                    at += rows as i64;
+                    let mut columns = batch.columns().to_vec();
+                    columns[0] = Arc::new(keys);
+                    RecordBatch::try_new(schema(), columns).unwrap()
+                })
+                .collect()
+        })
+        .collect();
+    for by in [vec!["k"], vec!["k", "s"]] {
+        let plan = Plan::Agg {
+            input: Box::new(scan().plan),
+            by: by.iter().map(|c| c.to_string()).collect(),
+            aggregations: [
+                "count(*)",
+                "sum(n)",
+                "std(x)",
+                "min(s)",
+                "max(t)",
+                "first(x)",
+                "last(s)",
+                "count_distinct(m)",
+            ]
+            .iter()
+            .enumerate()
+            .map(|(i, spec)| (format!("a{i}"), spec.to_string()))
+            .collect(),
+            aliases: Vec::new(),
+        };
+        assert_eq!(executed(&plan, &parts), built(&plan, &parts), "by {by:?}");
+    }
+}

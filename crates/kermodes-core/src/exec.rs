@@ -818,8 +818,9 @@ fn top(
     Ok(winners)
 }
 
-/// `agg_by` over the parts: each folds into partial states, and parts merge in their order, a
-/// thread's worth at a time, each thread merging the groups of one range of key hashes.
+/// `agg_by` over the parts: each folds into partial states on the thread that reads it, and
+/// each sealed part goes, in part order, to every shard's merger, which merges the groups of one
+/// range of key hashes on a thread of its own while later parts fold.
 fn aggregate(
     parts: Vec<Part>,
     fold: &Fold,
@@ -835,37 +836,34 @@ fn aggregate(
     }
     let shards = threads();
     let mut merged = fold.merged(shards).map_err(failed)?;
-    let mut sealed = Vec::with_capacity(shards);
-    drive(
-        parts,
-        false,
-        |index, batches| {
-            let mut part = fold.fresh().map_err(failed)?;
-            let mut rows: RowKey = 0;
-            for batch in batches {
-                let batch = batch?;
-                let key = ((index as RowKey) << PART_BITS) | rows;
-                part.add(&batch, key).map_err(failed)?;
-                rows += batch.num_rows() as RowKey;
-                if rows >> PART_BITS != 0 {
-                    return Err(Error::Unsupported(format!(
-                        "an aggregation reads at most 2^{PART_BITS} rows of one part"
-                    )));
-                }
-            }
-            part.seal(shards).map_err(failed)?;
-            Ok((index, part))
+    merged.merge_from(
+        |give| {
+            drive(
+                parts,
+                false,
+                |index, batches| {
+                    let mut part = fold.fresh().map_err(failed)?;
+                    let mut rows: RowKey = 0;
+                    for batch in batches {
+                        let batch = batch?;
+                        let key = ((index as RowKey) << PART_BITS) | rows;
+                        part.add(&batch, key).map_err(failed)?;
+                        rows += batch.num_rows() as RowKey;
+                        if rows >> PART_BITS != 0 {
+                            return Err(Error::Unsupported(format!(
+                                "an aggregation reads at most 2^{PART_BITS} rows of one part"
+                            )));
+                        }
+                    }
+                    part.seal(shards).map_err(failed)?;
+                    Ok(part)
+                },
+                // A shard that failed stops the reading; its error comes back from the merge.
+                |part| Ok(give(part)),
+            )
         },
-        |part| {
-            sealed.push(part);
-            if sealed.len() == shards {
-                merged.merge(&sealed).map_err(failed)?;
-                sealed.clear();
-            }
-            Ok(true)
-        },
+        failed,
     )?;
-    merged.merge(&sealed).map_err(failed)?;
     merged.finish(output).map_err(failed)
 }
 

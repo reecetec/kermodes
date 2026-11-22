@@ -89,25 +89,51 @@ pub(crate) enum KeyKind {
     None,
     /// One integer, date, or timestamp column, read as `i64`.
     Int(usize),
+    /// Two of those: packed into two words with no row encoding (a symbol id and a minute, an
+    /// order id and a client), as the pair's columns of the same types encode on both sides of a
+    /// join.
+    IntPair(usize, usize),
     /// One string column.
     Str(usize),
     /// Anything else: Arrow's row encoding of the key columns.
     Rows(Grouper),
 }
 
+/// Whether a column of `data_type` is read as an `i64` key.
+fn int_like(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Date32
+            | DataType::Timestamp(TimeUnit::Nanosecond, _)
+    )
+}
+
+/// An integer, date, or timestamp column's values, read as `i64`.
+fn ints(array: &ArrayRef) -> Ints<'_> {
+    let values = match array.data_type() {
+        DataType::Int16 => IntValues::I16(array.as_primitive::<Int16Type>().values()),
+        DataType::Int32 => IntValues::I32(array.as_primitive::<Int32Type>().values()),
+        DataType::Date32 => IntValues::I32(array.as_primitive::<Date32Type>().values()),
+        DataType::Int64 => IntValues::I64(array.as_primitive::<Int64Type>().values()),
+        _ => IntValues::I64(array.as_primitive::<TimestampNanosecondType>().values()),
+    };
+    Ints {
+        values,
+        nulls: array.nulls(),
+    }
+}
+
 impl KeyKind {
     pub fn new(schema: &Schema, columns: Vec<usize>) -> Result<Self, ArrowError> {
+        let type_of = |column: usize| schema.field(column).data_type();
         Ok(match columns.as_slice() {
             [] => KeyKind::None,
-            [column] => match schema.field(*column).data_type() {
-                DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::Date32
-                | DataType::Timestamp(TimeUnit::Nanosecond, _) => KeyKind::Int(*column),
-                DataType::Utf8 => KeyKind::Str(*column),
-                _ => KeyKind::Rows(Grouper::by_position(schema, columns)?),
-            },
+            [column] if int_like(type_of(*column)) => KeyKind::Int(*column),
+            [column] if type_of(*column) == &DataType::Utf8 => KeyKind::Str(*column),
+            [a, b] if int_like(type_of(*a)) && int_like(type_of(*b)) => KeyKind::IntPair(*a, *b),
             _ => KeyKind::Rows(Grouper::by_position(schema, columns)?),
         })
     }
@@ -124,20 +150,8 @@ impl KeyKind {
     pub fn keys<'a>(&self, batch: &'a RecordBatch, encoded: Option<&'a Rows>) -> Keys<'a> {
         match self {
             KeyKind::None => Keys::None,
-            KeyKind::Int(column) => {
-                let array = batch.column(*column);
-                let values = match array.data_type() {
-                    DataType::Int16 => IntValues::I16(array.as_primitive::<Int16Type>().values()),
-                    DataType::Int32 => IntValues::I32(array.as_primitive::<Int32Type>().values()),
-                    DataType::Date32 => IntValues::I32(array.as_primitive::<Date32Type>().values()),
-                    DataType::Int64 => IntValues::I64(array.as_primitive::<Int64Type>().values()),
-                    _ => IntValues::I64(array.as_primitive::<TimestampNanosecondType>().values()),
-                };
-                Keys::Int(Ints {
-                    values,
-                    nulls: array.nulls(),
-                })
-            }
+            KeyKind::Int(column) => Keys::Int(ints(batch.column(*column))),
+            KeyKind::IntPair(a, b) => Keys::IntPair(ints(batch.column(*a)), ints(batch.column(*b))),
             KeyKind::Str(column) => Keys::Str(batch.column(*column).as_string::<i32>()),
             KeyKind::Rows(_) => Keys::Rows(encoded.expect("row-encoded keys are encoded first")),
         }
@@ -148,6 +162,7 @@ impl KeyKind {
 pub(crate) enum Keys<'a> {
     None,
     Int(Ints<'a>),
+    IntPair(Ints<'a>, Ints<'a>),
     Str(&'a StringArray),
     Rows(&'a Rows),
 }
@@ -184,6 +199,9 @@ pub(crate) enum OwnedKey {
     All,
     Null,
     Int(i64),
+    /// A key that packs exactly (`Packed::exact`): a pair of integers, or a string or row
+    /// encoding of at most 16 bytes, kept inline rather than allocated.
+    Packed(Packed),
     Str(Box<str>),
     Bytes(Box<[u8]>),
 }
@@ -199,6 +217,15 @@ impl Keys<'_> {
                 lo: ints.get(row) as u64,
                 ..Packed::default()
             },
+            // A NULL reads as 0 and sets its bit in the tag, which stays within exact tags.
+            Keys::IntPair(a, b) => {
+                let (a_null, b_null) = (a.is_null(row), b.is_null(row));
+                Packed {
+                    lo: if a_null { 0 } else { a.get(row) as u64 },
+                    hi: if b_null { 0 } else { b.get(row) as u64 },
+                    tag: u32::from(a_null) | u32::from(b_null) << 1,
+                }
+            }
             Keys::Str(array) if array.is_null(row) => Packed::NULL,
             Keys::Str(array) => Packed::bytes(array.value(row).as_bytes()),
             Keys::Rows(rows) => Packed::bytes(rows.row(row).data()),
@@ -212,7 +239,9 @@ impl Keys<'_> {
             return match self {
                 Keys::Str(array) => HASHER.hash_one(array.value(row).as_bytes()),
                 Keys::Rows(rows) => HASHER.hash_one(rows.row(row).data()),
-                Keys::None | Keys::Int(_) => unreachable!("fixed-width keys pack exactly"),
+                Keys::None | Keys::Int(_) | Keys::IntPair(..) => {
+                    unreachable!("fixed-width keys pack exactly")
+                }
             };
         }
         HASHER.hash_one((packed.lo, packed.hi, packed.tag))
@@ -228,7 +257,9 @@ impl Keys<'_> {
             || match self {
                 Keys::Str(array) => array.value(a) == array.value(b),
                 Keys::Rows(rows) => rows.row(a) == rows.row(b),
-                Keys::None | Keys::Int(_) => unreachable!("fixed-width keys pack exactly"),
+                Keys::None | Keys::Int(_) | Keys::IntPair(..) => {
+                    unreachable!("fixed-width keys pack exactly")
+                }
             }
     }
 
@@ -239,6 +270,12 @@ impl Keys<'_> {
             (Keys::Str(array), OwnedKey::Null) => array.is_null(row),
             (Keys::Int(ints), OwnedKey::Int(value)) => {
                 !ints.is_null(row) && ints.get(row) == *value
+            }
+            (Keys::IntPair(..) | Keys::Rows(_), OwnedKey::Packed(packed)) => {
+                self.pack(row) == *packed
+            }
+            (Keys::Str(array), OwnedKey::Packed(packed)) => {
+                array.is_valid(row) && self.pack(row) == *packed
             }
             (Keys::Str(array), OwnedKey::Str(text)) => {
                 array.is_valid(row) && array.value(row) == text.as_ref()
@@ -253,9 +290,16 @@ impl Keys<'_> {
             Keys::None => OwnedKey::All,
             Keys::Int(ints) if ints.is_null(row) => OwnedKey::Null,
             Keys::Int(ints) => OwnedKey::Int(ints.get(row)),
+            Keys::IntPair(..) => OwnedKey::Packed(self.pack(row)),
             Keys::Str(array) if array.is_null(row) => OwnedKey::Null,
-            Keys::Str(array) => OwnedKey::Str(array.value(row).into()),
-            Keys::Rows(rows) => OwnedKey::Bytes(rows.row(row).data().into()),
+            Keys::Str(array) => match self.pack(row) {
+                packed if packed.exact() => OwnedKey::Packed(packed),
+                _ => OwnedKey::Str(array.value(row).into()),
+            },
+            Keys::Rows(rows) => match self.pack(row) {
+                packed if packed.exact() => OwnedKey::Packed(packed),
+                _ => OwnedKey::Bytes(rows.row(row).data().into()),
+            },
         }
     }
 
@@ -439,6 +483,15 @@ impl KeyTable {
         self.table
             .insert_unique(hash, id, |id| hashes[*id as usize]);
         (id, true)
+    }
+
+    /// Appends a group by its key's hash alone, without looking the key up: for a part that
+    /// stopped deduplicating across its batches (`Fold`), whose duplicates the merge combines.
+    /// `id` is not called after this: the appended groups hold no key to match.
+    pub fn push(&mut self, hash: u64) -> u32 {
+        let id = self.hashes.len() as u32;
+        self.hashes.push(hash);
+        id
     }
 }
 

@@ -19,7 +19,8 @@
 //! every earlier one, in the order the cycle's modified rows (their new values), then its added
 //! rows, first hold their keys.
 
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::thread;
 
 use arrow::array::{
     Array, ArrayRef, ArrowPrimitiveType, AsArray, Float64Array, Int64Array, PrimitiveArray,
@@ -2085,7 +2086,17 @@ pub(crate) struct Fold {
     /// Scratch, kept for its capacity.
     local: HashTable<LocalEntry>,
     row_keys: Vec<RowKey>,
+    /// Rows folded so far, and whether the part has stopped deduplicating across batches
+    /// (`DEDUP_CHECK_ROWS`).
+    folded: usize,
+    passing: bool,
 }
+
+/// After this many rows, a part whose groups number more than half its rows stops looking each
+/// batch's groups up in its own table and appends them as they are: the merge looks every group
+/// up again anyway, and with keys this close to unique (order IDs, a user and a minute) the
+/// part's lookups would almost all add a group, costing a second hash table for nothing.
+const DEDUP_CHECK_ROWS: usize = 1 << 16;
 
 impl Fold {
     pub fn new(
@@ -2123,6 +2134,8 @@ impl Fold {
             by_shard: Vec::new(),
             local: HashTable::new(),
             row_keys: Vec::new(),
+            folded: 0,
+            passing: false,
         })
     }
 
@@ -2146,16 +2159,25 @@ impl Fold {
         let keys = self.input_keys.keys(batch, encoded.as_ref());
         let local = LocalGroups::build(&keys, rows, &mut self.local);
         let mut new = Vec::new();
-        let ids: Vec<u32> = (0..local.len())
-            .map(|g| {
-                let row = local.first_row[g] as usize;
-                let (id, created) = self.groups.id(&keys, row, local.hash[g]);
-                if created {
-                    new.push(row as u32);
-                }
-                id
-            })
-            .collect();
+        let ids: Vec<u32> = if self.passing {
+            new.extend_from_slice(&local.first_row);
+            local
+                .hash
+                .iter()
+                .map(|&hash| self.groups.push(hash))
+                .collect()
+        } else {
+            (0..local.len())
+                .map(|g| {
+                    let row = local.first_row[g] as usize;
+                    let (id, created) = self.groups.id(&keys, row, local.hash[g]);
+                    if created {
+                        new.push(row as u32);
+                    }
+                    id
+                })
+                .collect()
+        };
         if !new.is_empty() && !self.group_columns.is_empty() {
             let indices = UInt32Array::from(new);
             let columns = self
@@ -2180,6 +2202,10 @@ impl Fold {
         for accumulator in &mut self.accumulators {
             accumulator.resize(self.groups.len());
             accumulator.fold(batch, &self.row_keys, &ids, None)?;
+        }
+        self.folded += rows;
+        if !self.passing && self.folded >= DEDUP_CHECK_ROWS && 2 * self.groups.len() > self.folded {
+            self.passing = true;
         }
         Ok(())
     }
@@ -2253,24 +2279,59 @@ struct Merging {
 }
 
 impl Merged {
-    /// Merges sealed parts, given with their indices in order, after every part merged so far.
-    pub fn merge(&mut self, parts: &[(usize, Fold)]) -> Result<(), ArrowError> {
-        let mut starts = Vec::with_capacity(parts.len());
-        for (index, part) in parts {
-            debug_assert_eq!(*index, self.parts, "parts merge in order");
-            self.parts += 1;
-            starts.push(self.places);
-            self.places += part.groups.len() as u64;
-        }
-        let shards: Vec<(usize, &mut Merging)> = self.shards.iter_mut().enumerate().collect();
-        run(shards.len(), shards, |(), (shard, merging)| {
-            parts
-                .iter()
-                .zip(&starts)
-                .try_for_each(|((_, part), start)| merging.merge(shard, *start, part))
+    /// Merges the sealed parts `feed` hands to the function it is given, in part order, as they
+    /// come. Each shard merges on a thread of its own for the whole run, fed through a short
+    /// queue, so it merges one part while later parts fold and no shard waits for the others.
+    /// The function returns false once a shard has failed; `feed` should then stop, and the
+    /// shard's error, as `failed` makes it, is returned (after any of `feed`'s own).
+    pub fn merge_from<E>(
+        &mut self,
+        feed: impl FnOnce(&mut dyn FnMut(Fold) -> bool) -> Result<(), E>,
+        failed: impl Fn(ArrowError) -> E,
+    ) -> Result<(), E> {
+        let Self {
+            shards,
+            parts,
+            places,
+            ..
+        } = self;
+        thread::scope(|scope| {
+            let mut senders = Vec::with_capacity(shards.len());
+            let mut mergers = Vec::with_capacity(shards.len());
+            for (shard, merging) in shards.iter_mut().enumerate() {
+                // Two parts queued: enough to keep a shard busy, few enough that unmerged
+                // parts do not pile up when merging is the slower side.
+                let (sender, queued) = mpsc::sync_channel::<(u64, Arc<Fold>)>(2);
+                senders.push(sender);
+                mergers.push(scope.spawn(move || {
+                    queued
+                        .into_iter()
+                        .try_for_each(|(start, part)| merging.merge(shard, start, &part))
+                }));
+            }
+            let mut give = |part: Fold| {
+                let start = *places;
+                *parts += 1;
+                *places += part.groups.len() as u64;
+                let part = Arc::new(part);
+                senders
+                    .iter()
+                    .all(|sender| sender.send((start, part.clone())).is_ok())
+            };
+            let fed = feed(&mut give);
+            drop(senders);
+            let mut merged = Ok(());
+            for merger in mergers {
+                let result = merger
+                    .join()
+                    .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+                if merged.is_ok() {
+                    merged = result;
+                }
+            }
+            fed?;
+            merged.map_err(failed)
         })
-        .into_iter()
-        .collect()
     }
 
     /// One row per group, in the order their keys first appear, with `output`'s columns (the
