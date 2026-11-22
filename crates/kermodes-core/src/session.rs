@@ -8,7 +8,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use arrow::array::{ArrayRef, new_null_array};
-use arrow::compute::interleave;
+use arrow::compute::{concat_batches, interleave};
 use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
@@ -20,7 +20,9 @@ use crate::ops::{Assignment, Edge, LastBy, Operator, Slice, Update, Where};
 use crate::order::Order;
 use crate::rolling::{Aggregate, Function, Input, Rolling, Span, Window};
 use crate::sort::sorted;
-use crate::storage::{Delta, End, Modified, RowKey, Rows, Storage, interleave_rows};
+use crate::storage::{
+    CHUNK_ROWS, Delta, End, Modified, RowKey, Rows, SMALL_ROWS, Storage, interleave_rows,
+};
 use crate::types::check_types;
 use crate::{Error, Expression, type_name};
 
@@ -54,6 +56,11 @@ struct Inner {
     /// Writes of tables still loading (`Feed::ready`), in arrival order: apart from `pending`,
     /// so the clock sleeps while they wait.
     held: Mutex<Vec<(usize, Write)>>,
+    /// Small appends of loading tables not yet in `held`, gathered per table into chunks as
+    /// storage combines them: a store replays a day's writes as written (an ingester's ~14
+    /// rows each), and holding each alone until the table is ready costs ~2 KB a batch, more
+    /// than the rows. Taken only under `held`'s lock.
+    gathering: Mutex<Vec<Gathering>>,
     /// Signalled when writes are queued or the clock is told to stop.
     arrived: Condvar,
     /// The background clock started by `Session::start`, if running.
@@ -64,6 +71,21 @@ struct Inner {
     /// The last finished cycle, signalled through `cycled` (see `Session::wait_cycle`).
     finished: Mutex<u64>,
     cycled: Condvar,
+}
+
+/// A loading table's run of small appends, the last of its held writes: combined into one
+/// chunk once it holds `CHUNK_ROWS`, or when anything else is held or applied after it.
+struct Gathering {
+    table: usize,
+    batches: Vec<RecordBatch>,
+    rows: usize,
+}
+
+/// A run's batches as one. They were conformed to the table's schema when written, so they
+/// share it, which is all concatenation checks.
+fn combine(run: Gathering) -> RecordBatch {
+    let schema = run.batches[0].schema();
+    concat_batches(&schema, &run.batches).expect("a table's held appends share its schema")
 }
 
 /// A thread running a cycle whenever writes are pending. It holds the session only while it
@@ -910,6 +932,7 @@ impl Feed {
         let mut graph = session.write();
         graph.tables[self.id].loading = false;
         let mut held = session.held();
+        session.gather_out(&mut held, |table| table == self.id);
         let (ready, waiting): (Vec<_>, Vec<_>) = held.drain(..).partition(|(id, _)| *id == self.id);
         *held = waiting;
         drop(held);
@@ -1063,13 +1086,14 @@ impl Session {
         // A loading table's writes wait until it is ready, so it loads whole; once it is, those
         // still held (a write that raced `Feed::ready`) go first.
         let mut held = self.held();
+        self.gather_out(&mut held, |id| !graph.tables[id].loading);
         let (ready, waiting): (Vec<_>, Vec<_>) = held
             .drain(..)
             .partition(|(id, _)| !graph.tables[*id].loading);
         *held = waiting;
         for (id, write) in ready.into_iter().chain(pending) {
             if graph.tables[id].loading && !matches!(write, Write::Fail(_)) {
-                held.push((id, write));
+                self.hold(&mut held, id, vec![write]);
             } else {
                 writes[id].push(write);
             }
@@ -1317,6 +1341,57 @@ impl Session {
             .pending
             .lock()
             .expect("kermodes write queue poisoned by an earlier panic")
+    }
+
+    fn gathering(&self) -> MutexGuard<'_, Vec<Gathering>> {
+        self.inner
+            .gathering
+            .lock()
+            .expect("kermodes write queue poisoned by an earlier panic")
+    }
+
+    /// Holds `writes` of the loading table `table` (under `held`'s lock), gathering its small
+    /// appends into chunks; anything else is held after the run before it.
+    fn hold(&self, held: &mut Vec<(usize, Write)>, table: usize, writes: Vec<Write>) {
+        for write in writes {
+            match write {
+                Write::Append(batch) if batch.num_rows() < SMALL_ROWS => {
+                    let mut gathering = self.gathering();
+                    let at = match gathering.iter().position(|run| run.table == table) {
+                        Some(at) => at,
+                        None => {
+                            gathering.push(Gathering {
+                                table,
+                                batches: Vec::new(),
+                                rows: 0,
+                            });
+                            gathering.len() - 1
+                        }
+                    };
+                    let run = &mut gathering[at];
+                    run.rows += batch.num_rows();
+                    run.batches.push(batch);
+                    if run.rows >= CHUNK_ROWS {
+                        held.push((table, Write::Append(combine(gathering.swap_remove(at)))));
+                    }
+                }
+                write => {
+                    self.gather_out(held, |of| of == table);
+                    held.push((table, write));
+                }
+            }
+        }
+    }
+
+    /// Ends the runs of the tables `which` picks, each held as one chunk after its writes.
+    fn gather_out(&self, held: &mut Vec<(usize, Write)>, which: impl Fn(usize) -> bool) {
+        let mut gathering = self.gathering();
+        let (done, open): (Vec<_>, Vec<_>) = gathering.drain(..).partition(|run| which(run.table));
+        *gathering = open;
+        held.extend(
+            done.into_iter()
+                .map(|run| (run.table, Write::Append(combine(run)))),
+        );
     }
 
     fn held(&self) -> MutexGuard<'_, Vec<(usize, Write)>> {
@@ -2535,10 +2610,13 @@ impl Target {
     /// Queues `writes` for the next cycle, or, while the table loads, holds them; a lost source
     /// (`Write::Fail`) never waits.
     fn queue(&self, writes: impl Iterator<Item = Write>) {
-        let (now, later): (Vec<_>, Vec<_>) = writes
-            .map(|write| (self.id, write))
-            .partition(|(_, write)| !self.hold || matches!(write, Write::Fail(_)));
-        self.session.held().extend(later);
+        let (now, later): (Vec<_>, Vec<Write>) =
+            writes.partition(|write| !self.hold || matches!(write, Write::Fail(_)));
+        if !later.is_empty() {
+            let mut held = self.session.held();
+            self.session.hold(&mut held, self.id, later);
+        }
+        let now: Vec<_> = now.into_iter().map(|write| (self.id, write)).collect();
         if !now.is_empty() {
             self.session.pending().extend(now);
             self.session.inner.arrived.notify_all();

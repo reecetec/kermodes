@@ -25,8 +25,8 @@ pub(crate) type RowKey = u64;
 /// ~10 rows each) would otherwise hold about 3x its data, and every lookup would walk hundreds of
 /// thousands of chunks. From 4,096 rows that cost is under 1%, and a copy would only raise the
 /// peak, so larger batches are kept as given. Each row is copied at most once.
-const SMALL_ROWS: usize = 4_096;
-const CHUNK_ROWS: usize = 1 << 16;
+pub(crate) const SMALL_ROWS: usize = 4_096;
+pub(crate) const CHUNK_ROWS: usize = 1 << 16;
 
 enum Index {
     /// Keys `0..len`, in chunk order: append-only tables.

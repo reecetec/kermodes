@@ -7,16 +7,22 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow::array::{RecordBatch, RecordBatchOptions, UInt64Array};
-use arrow::compute::take;
+use arrow::compute::{concat_batches, take};
 use arrow::datatypes::SchemaRef;
 use kermodes_weir::{ColumnId, Date, Error, TableEntry, TableName};
 
 use crate::bounds::Bound;
 use crate::files::{
     AsCurrent, FilePart, FileRead, Lake, PartBatches, Projection, dated, history_columns,
-    projected, with_date_column, with_op,
+    projected, with_date_column, with_op, within,
 };
 use crate::weir::Weir;
+
+/// A weir date's batches are its writes as written: an ingester's are ~14 rows each, and Arrow
+/// costs about 1 KB a batch, more than such rows. Those under `SMALL_ROWS` are combined into
+/// chunks of `CHUNK_ROWS` as they are read, as a table's storage combines them.
+const SMALL_ROWS: usize = 4_096;
+const CHUNK_ROWS: usize = 1 << 16;
 
 /// Dates of a table's history, read.
 pub struct History {
@@ -431,13 +437,30 @@ fn plan(
                 Source::Weir(date) => {
                     let mut batches = Vec::new();
                     if rows {
+                        let (mut small, mut gathered) = (Vec::new(), 0);
                         weir.read_date(name, date, &mut |batch, stamp| {
                             let whole = dated(&full, date, &with_op(entry, batch, stamp.change)?)?;
                             let batch = whole.project(&positions).map_err(arrow_error)?;
+                            // No statistics to prune by: the bounds choose rows as they come.
+                            let Some(batch) = within(batch, bounds)? else {
+                                return Ok(());
+                            };
                             covered += batch.num_rows() as u64;
-                            batches.push(batch);
+                            if batch.num_rows() >= SMALL_ROWS {
+                                gather(&mut batches, &mut small)?;
+                                gathered = 0;
+                                batches.push(batch);
+                            } else {
+                                gathered += batch.num_rows();
+                                small.push(batch);
+                                if gathered >= CHUNK_ROWS {
+                                    gather(&mut batches, &mut small)?;
+                                    gathered = 0;
+                                }
+                            }
                             Ok(())
                         })?;
+                        gather(&mut batches, &mut small)?;
                     }
                     pieces.push(Piece::Weir(batches));
                     explain.weir_dates += 1;
@@ -452,6 +475,15 @@ fn plan(
         ids: kept.ids,
         pieces,
     })
+}
+
+/// `small`, if any, as one batch after `batches`.
+fn gather(batches: &mut Vec<RecordBatch>, small: &mut Vec<RecordBatch>) -> Result<(), Error> {
+    if let Some(first) = small.first() {
+        batches.push(concat_batches(&first.schema(), small.iter()).map_err(arrow_error)?);
+        small.clear();
+    }
+    Ok(())
 }
 
 fn arrow_error(e: arrow::error::ArrowError) -> Error {

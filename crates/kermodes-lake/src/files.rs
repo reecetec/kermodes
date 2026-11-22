@@ -15,7 +15,10 @@ use arrow::array::{
     RecordBatchOptions, Scalar, StringArray,
 };
 use arrow::compute::kernels::cmp::{gt_eq, lt_eq};
-use arrow::compute::{SortColumn, concat_batches, lexsort_to_indices, take_record_batch};
+use arrow::compute::{
+    SortColumn, and_kleene, concat_batches, filter_record_batch, lexsort_to_indices,
+    prep_null_mask_filter, take_record_batch,
+};
 use arrow::datatypes::{DataType, Date32Type, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -1037,6 +1040,49 @@ impl Iterator for PartBatches {
             .runtime
             .block_on(self.stream.next())
             .map(|batch| batch.map_err(parquet_error))
+    }
+}
+
+/// The rows of `batch` within every one of `bounds` on its columns, or `None` for none. Bounds
+/// come from a predicate's top-level `and` terms, so a row outside one, or NULL there, fails the
+/// predicate: dropping it is exact. A bound on a column the batch lacks, or with a literal not of
+/// the column's type, drops nothing.
+pub(crate) fn within(batch: RecordBatch, bounds: &[Bound]) -> Result<Option<RecordBatch>, Error> {
+    let mut keep: Option<arrow::array::BooleanArray> = None;
+    for bound in bounds {
+        let Ok(at) = batch.schema().index_of(bound.column()) else {
+            continue;
+        };
+        let column = batch.column(at);
+        let (Bound::Low(_, literal) | Bound::High(_, literal)) = bound;
+        let Some(value) = literal_as(literal, column.data_type()) else {
+            continue;
+        };
+        let value = Scalar::new(value);
+        let within = match bound {
+            Bound::Low(..) => gt_eq(column, &value),
+            Bound::High(..) => lt_eq(column, &value),
+        }
+        .map_err(|e| Error::Arrow(e.to_string()))?;
+        keep = Some(match keep {
+            None => within,
+            Some(keep) => and_kleene(&keep, &within).map_err(|e| Error::Arrow(e.to_string()))?,
+        });
+    }
+    let Some(keep) = keep else {
+        return Ok(Some(batch));
+    };
+    let keep = if keep.null_count() > 0 {
+        prep_null_mask_filter(&keep)
+    } else {
+        keep
+    };
+    match keep.true_count() {
+        0 => Ok(None),
+        all if all == batch.num_rows() => Ok(Some(batch)),
+        _ => filter_record_batch(&batch, &keep)
+            .map(Some)
+            .map_err(|e| Error::Arrow(e.to_string())),
     }
 }
 

@@ -973,7 +973,10 @@ unit, and out of what readers get.
 - What reaches the files: a scan's predicate is the filters right over it; its top-level
   `and`-ed comparisons of a column with a value (`sym = 'AAPL'`, `px > 10`) skip row groups and
   pages by their statistics and the page index, and on a sorted table (§8.1) a symbol is a
-  narrow run of pages in each row group. The engine still applies the whole predicate. A scan
+  narrow run of pages in each row group. A past date weir holds has no statistics: the same
+  comparisons choose its rows as each write is read, and the small writes that pass are combined
+  into large batches, as a live table combines a replay's while it loads. The engine still
+  applies the whole predicate.
   reads only the columns the plan uses of it (all after `*`), matched by column ID so renamed
   columns read under their new names; a file written before columns had IDs is read whole. A
   head or slice over a scan, through operators that keep rows in place, reads only the first
